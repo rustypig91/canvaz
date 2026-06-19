@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>CAN Signals</title>
+    <link rel="stylesheet" href="/src/styles.css" />
+    <script type="module" src="/src/main.ts" defer></script>
+  </head>
+  <body>
+    <!-- Menu bar -->
+    <header id="menubar">
+      <nav id="menu-nav">
+
+        <div class="menu-item" id="menu-project">
+          <button class="menu-trigger">Project</button>
+          <div class="menu-dropdown">
+            <button class="menu-action" data-action="open-project">
+              Open Project… <kbd>Ctrl+O</kbd>
+            </button>
+            <button class="menu-action" data-action="save-project">
+              Save Project <kbd>Ctrl+S</kbd>
+            </button>
+            <button class="menu-action" data-action="save-as-project">
+              Save As… <kbd>Ctrl+Shift+S</kbd>
+            </button>
+          </div>
+        </div>
+
+        <div class="menu-item" id="menu-about">
+          <button class="menu-trigger">About</button>
+          <div class="menu-dropdown">
+            <button class="menu-action" data-action="about">About CAN Signals</button>
+          </div>
+        </div>
+
+      </nav>
+      <span id="status-bar" class="label-muted"></span>
+    </header>
+
+    <!-- Main layout -->
+    <div id="layout">
+      <!-- Left sidebar -->
+      <aside id="sidebar">
+        <!-- Channel management -->
+        <section class="sidebar-section">
+          <div class="section-header">
+            <span>CAN Channels</span>
+            <button id="btn-add-channel" class="btn-icon" title="Add CAN channel">+</button>
+          </div>
+          <div id="channel-list"></div>
+        </section>
+
+        <!-- DBC signal browser -->
+        <section class="sidebar-section sidebar-dbc">
+          <div class="section-header">
+            <span>DBC Signals</span>
+            <input id="signal-search" type="text" placeholder="Filter…" class="search-input" />
+          </div>
+          <div id="dbc-tree"></div>
+        </section>
+      </aside>
+
+      <!-- Main content -->
+      <main id="content">
+        <!-- Tab bar -->
+        <nav id="tab-bar">
+          <button class="tab-btn active" data-tab="plot">Plot</button>
+          <button class="tab-btn" data-tab="simulate">Simulate</button>
+          <button class="tab-btn" data-tab="trace">Trace</button>
+        </nav>
+
+        <!-- Plot tab -->
+        <div id="tab-plot" class="tab-content active">
+          <div id="plot-toolbar">
+            <button id="btn-clear-plot" class="btn btn-sm">Clear all</button>
+            <label class="label-muted">Max points:</label>
+            <input id="input-max-points" type="number" value="500" min="50" max="5000" step="50" class="small-input" />
+            <button id="btn-pause-plot" class="btn btn-sm">Pause</button>
+          </div>
+          <div id="plot-panes-container">
+            <!-- plot panes injected here by JS -->
+            <div id="drop-zone-new" class="drop-zone">
+              <span>↓ Drop signal here to create a new plot</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Simulate tab -->
+        <div id="tab-simulate" class="tab-content">
+          <div id="sim-toolbar">
+            <span class="hint">Drag or double-click DBC signal to add to simulation</span>
+          </div>
+          <div id="drop-zone-sim" class="drop-zone">
+            <span>↓ Drop signal here to simulate</span>
+          </div>
+          <table id="sim-table">
+            <thead>
+              <tr>
+                <th>Signal</th>
+                <th>Message</th>
+                <th>Channel</th>
+                <th>Value</th>
+                <th>Period (ms)</th>
+                <th>Actions</th>
+              </tr>
+            </thead>
+            <tbody id="sim-tbody"></tbody>
+          </table>
+        </div>
+        <!-- Trace tab -->
+        <div id="tab-trace" class="tab-content">
+          <div id="trace-toolbar">
+            <button id="btn-clear-trace" class="btn btn-sm">Clear</button>
+            <label class="label-muted">Data:</label>
+            <select id="select-trace-format">
+              <option value="hex" selected>Hex</option>
+              <option value="dec">Dec</option>
+              <option value="ascii">ASCII</option>
+            </select>
+            <div class="trace-mode-group">
+              <label class="trace-mode-label">
+                <input type="radio" name="trace-mode" value="overwrite" checked /> Overwrite
+              </label>
+              <label class="trace-mode-label">
+                <input type="radio" name="trace-mode" value="append" /> Append
+              </label>
+            </div>
+            <label class="label-muted">Max rows:</label>
+            <input id="input-trace-max" type="number" value="1000" min="100" max="10000" step="100" class="small-input" />
+            <button id="btn-pause-trace" class="btn btn-sm">Pause</button>
+          </div>
+          <div id="trace-container">
+            <table id="trace-table">
+              <colgroup>
+                <col /><col /><col /><col /><col /><col /><col />
+              </colgroup>
+              <thead>
+                <tr>
+                  <th>Timestamp</th>
+                  <th>Channel</th>
+                  <th>CAN ID</th>
+                  <th>Message</th>
+                  <th>DLC</th>
+                  <th>Data</th>
+                  <th>Cycle (ms)</th>
+                </tr>
+              </thead>
+              <tbody id="trace-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </main>
+    </div>
+
+    <!-- Channel dialog (add + edit) -->
+    <dialog id="dialog-channel">
+      <form id="form-channel">
+        <h3 id="dialog-channel-title">Add CAN Channel</h3>
+
+        <div class="form-row" id="row-iface">
+          <label>Interface</label>
+          <select id="select-iface"></select>
+          <input id="input-iface-custom" type="text" placeholder="or type name…" />
+        </div>
+
+        <div class="form-row">
+          <label>Bitrate</label>
+          <select id="select-bitrate">
+            <option value="125000">125 kbps</option>
+            <option value="250000">250 kbps</option>
+            <option value="500000" selected>500 kbps</option>
+            <option value="1000000">1 Mbps</option>
+            <option value="custom">Custom…</option>
+            <option value="vcan">Virtual (vcan)</option>
+          </select>
+          <input id="input-bitrate-custom" type="number" placeholder="bits/s" class="small-input" style="display:none" />
+        </div>
+
+        <div class="form-row">
+          <label>DBC File</label>
+          <span id="lbl-dbc-path" class="label-muted dbc-path-label">None</span>
+          <button type="button" id="btn-browse-dbc" class="btn btn-sm">Browse…</button>
+          <button type="button" id="btn-clear-dbc" class="btn btn-sm">Clear</button>
+        </div>
+
+        <div class="dialog-actions">
+          <button type="button" id="btn-channel-cancel" class="btn">Cancel</button>
+          <button type="submit" id="btn-channel-apply" class="btn btn-primary">Add</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- Sudo password prompt -->
+    <dialog id="dialog-sudo">
+      <form id="form-sudo">
+        <h3>Authentication Required</h3>
+        <p class="sudo-hint">Administrator privileges are needed to configure the network interface.</p>
+        <div class="form-row">
+          <label>Password</label>
+          <input id="input-sudo-pw" type="password" autocomplete="new-password" />
+        </div>
+        <div class="dialog-actions">
+          <button type="button" id="btn-sudo-cancel" class="btn">Cancel</button>
+          <button type="submit" class="btn btn-primary">Authenticate</button>
+        </div>
+      </form>
+    </dialog>
+
+    <!-- About dialog -->
+    <dialog id="dialog-about">
+      <div class="about-content">
+        <h2>CAN Signals</h2>
+        <p class="about-version">Version 0.1.0</p>
+        <p>Desktop application for viewing and simulating CAN bus traffic using DBC files.</p>
+        <ul class="about-features">
+          <li>Load DBC files per channel</li>
+          <li>Real-time signal plotting</li>
+          <li>CAN frame simulation</li>
+          <li>Project save &amp; restore</li>
+          <li>Linux SocketCAN support</li>
+        </ul>
+        <div class="dialog-actions">
+          <button id="btn-about-close" class="btn btn-primary">Close</button>
+        </div>
+      </div>
+    </dialog>
+  </body>
+</html>
