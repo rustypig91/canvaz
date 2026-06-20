@@ -27,6 +27,21 @@
           </div>
         </div>
 
+        <div class="menu-item" id="menu-options">
+          <button class="menu-trigger">Options</button>
+          <div class="menu-dropdown">
+            <div class="menu-option-row">
+              <label class="chk-label">
+                <input type="checkbox" id="chk-max-time" /> Max time
+              </label>
+              <input id="input-max-time" type="number" value="60" min="1" class="small-input" style="display:none" />
+              <span id="lbl-max-time-unit" class="label-muted" style="display:none">s</span>
+            </div>
+            <div class="menu-separator"></div>
+            <button class="menu-action" data-action="export-csv">Export CSV…</button>
+          </div>
+        </div>
+
         <div class="menu-item" id="menu-about">
           <button class="menu-trigger">About</button>
           <div class="menu-dropdown">
@@ -35,6 +50,7 @@
         </div>
 
       </nav>
+      <button id="btn-app-run" class="running" title="Stop recording">■ Stop</button>
       <span id="status-bar" class="label-muted"></span>
     </header>
 
@@ -74,11 +90,6 @@
         <div id="tab-plot" class="tab-content">
           <div id="plot-toolbar">
             <button id="btn-clear-plot" class="btn btn-sm">Clear all</button>
-            <label class="label-muted chk-label">
-              <input type="checkbox" id="chk-max-time" /> Max time
-            </label>
-            <input id="input-max-time" type="number" value="60" min="1" class="small-input" style="display:none" />
-            <span id="lbl-max-time-unit" class="label-muted" style="display:none">s</span>
             <button id="btn-pause-plot" class="btn btn-sm">Pause</button>
           </div>
           <div id="plot-panes-container">

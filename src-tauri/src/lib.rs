@@ -146,6 +146,11 @@ fn get_app_data_dir(app: AppHandle) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn write_text_file(path: String, content: String) -> Result<(), String> {
+    std::fs::write(&path, content).map_err(|e| e.to_string())
+}
+
 // ── Project commands ──────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -189,6 +194,7 @@ pub fn run() {
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             get_app_data_dir,
+            write_text_file,
             configure_channel,
             list_can_interfaces,
             open_channel,

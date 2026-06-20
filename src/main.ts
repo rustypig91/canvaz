@@ -111,6 +111,12 @@ let paneCounter = 0;
 let plotPaused = false;
 let maxTimeSecs: number | null = null; // null = unlimited
 
+let appRunning = true;
+let appStartTime = Date.now();
+
+interface SignalSample { ts: number; value: number; unit: string; }
+const signalHistory = new Map<string, SignalSample[]>();
+
 function plotKey(channel: string, signalName: string) {
   return `${channel}::${signalName}`;
 }
@@ -267,17 +273,30 @@ function addSignalToPane(pane: PlotPane, channel: string, sig: DbcSignal) {
   const key = plotKey(channel, sig.name);
   if (pane.series.has(key)) return;
   const color = PLOT_COLORS[pane.series.size % PLOT_COLORS.length];
-  pane.series.set(key, {
-    signalName: sig.name,
-    messageName: sig.message_name,
-    unit: sig.unit,
-    color,
-    channel,
-    timestamps: [],
-    labels: [],
-    values: [],
-    lastValue: null,
-  });
+  const series: PlotSeries = {
+    signalName: sig.name, messageName: sig.message_name, unit: sig.unit,
+    color, channel, timestamps: [], labels: [], values: [], lastValue: null,
+  };
+
+  // Pre-populate from global history
+  const now = Date.now();
+  const hist = signalHistory.get(key) ?? [];
+  for (const sample of hist) {
+    if (maxTimeSecs !== null && (now - sample.ts) > maxTimeSecs * 1000) continue;
+    series.timestamps.push(sample.ts);
+    series.labels.push(fmtPlotLabel(sample.ts));
+    series.values.push(sample.value);
+  }
+  if (series.values.length > 0) series.lastValue = series.values[series.values.length - 1];
+
+  pane.series.set(key, series);
+
+  // Extend chart labels if this series has more data than the current chart
+  const chartLabels = (pane.chart.data as { labels: string[] }).labels as string[];
+  if (series.labels.length > chartLabels.length) {
+    (pane.chart.data as { labels: string[] }).labels = series.labels;
+  }
+
   syncDatasets(pane);
   updatePaneTitle(pane);
   updateSignalHighlights();
@@ -307,9 +326,19 @@ function syncDatasets(pane: PlotPane) {
 // ── Signal value events ───────────────────────────────────────────────────────
 
 function onSignalValue(ev: SignalValueEvent) {
+  if (!appRunning) return;
   const key = plotKey(ev.channel, ev.signal_name);
 
-  // Always update sidebar value regardless of plot pause state
+  // Store in global history
+  let hist = signalHistory.get(key);
+  if (!hist) { hist = []; signalHistory.set(key, hist); }
+  hist.push({ ts: ev.timestamp_ms, value: ev.value, unit: ev.unit });
+  if (maxTimeSecs !== null) {
+    const cutoff = ev.timestamp_ms - maxTimeSecs * 1000;
+    while (hist.length > 0 && hist[0].ts < cutoff) hist.shift();
+  }
+
+  // Update sidebar value
   signalLastValues.set(key, ev.value);
   const valEl = signalValueEls.get(key);
   if (valEl) {
@@ -318,7 +347,7 @@ function onSignalValue(ev: SignalValueEvent) {
   }
 
   if (plotPaused) return;
-  const ts = new Date(ev.timestamp_ms).toISOString().slice(11, 23);
+  const ts = fmtPlotLabel(ev.timestamp_ms);
 
   for (const pane of plotPanes) {
     const series = pane.series.get(key);
@@ -956,6 +985,89 @@ async function applyProject(project: Project) {
   renderSimTable();
 }
 
+// ── App recording start / stop ────────────────────────────────────────────────
+
+function startApp() {
+  appRunning = true;
+  appStartTime = Date.now();
+  signalHistory.clear();
+  signalLastValues.clear();
+
+  // Rebuild DBC tree to clear sidebar values
+  renderDbcTree((document.getElementById("signal-search") as HTMLInputElement).value);
+
+  // Reset plot pause state
+  plotPaused = false;
+  const pausePlotBtn = document.getElementById("btn-pause-plot")!;
+  pausePlotBtn.textContent = "Pause";
+  pausePlotBtn.classList.remove("running");
+
+  // Clear all plot pane data and reset zoom
+  for (const pane of plotPanes) {
+    for (const s of pane.series.values()) { s.timestamps = []; s.labels = []; s.values = []; s.lastValue = null; }
+    (pane.chart.data as { labels: string[] }).labels = [];
+    if (pane.zoomed) {
+      pane.chart.resetZoom();
+      pane.zoomed = false;
+      pane.el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!.style.display = "none";
+    }
+    pane.chart.update("none");
+  }
+
+  // Reset trace pause state and clear trace
+  tracePaused = false;
+  const pauseTraceBtn = document.getElementById("btn-pause-trace")!;
+  pauseTraceBtn.textContent = "Pause";
+  pauseTraceBtn.classList.remove("running");
+  clearTrace();
+
+  const btn = document.getElementById("btn-app-run")!;
+  btn.textContent = "■ Stop";
+  btn.classList.add("running");
+  btn.title = "Stop recording";
+  setStatus("Recording started");
+}
+
+function stopApp() {
+  appRunning = false;
+  const btn = document.getElementById("btn-app-run")!;
+  btn.textContent = "▶ Start";
+  btn.classList.remove("running");
+  btn.title = "Start recording";
+  setStatus("Recording stopped");
+}
+
+async function exportCsv() {
+  if (signalHistory.size === 0) { setStatus("No data to export"); return; }
+  const path = await dialogSave({
+    defaultPath: "can_signals.csv",
+    filters: [{ name: "CSV Files", extensions: ["csv"] }],
+  });
+  if (!path) return;
+
+  const rows: string[] = ["timestamp_ms,elapsed_s,channel,signal_name,value,unit"];
+  const allSamples: Array<{ ts: number; channel: string; signalName: string; value: number; unit: string }> = [];
+
+  for (const [key, samples] of signalHistory) {
+    const sep = key.indexOf("::");
+    const channel = key.substring(0, sep);
+    const signalName = key.substring(sep + 2);
+    for (const s of samples) allSamples.push({ ts: s.ts, channel, signalName, value: s.value, unit: s.unit });
+  }
+  allSamples.sort((a, b) => a.ts - b.ts);
+
+  for (const s of allSamples) {
+    const elapsed = ((s.ts - appStartTime) / 1000).toFixed(3);
+    const unitSafe = s.unit.includes(",") ? `"${s.unit}"` : s.unit;
+    rows.push(`${s.ts},${elapsed},${s.channel},${s.signalName},${s.value},${unitSafe}`);
+  }
+
+  try {
+    await invoke("write_text_file", { path, content: rows.join("\n") });
+    setStatus(`Exported ${allSamples.length} samples to CSV`);
+  } catch (e) { setStatus(`Export error: ${e}`); }
+}
+
 // ── Menu bar ──────────────────────────────────────────────────────────────────
 
 function setupMenuBar() {
@@ -968,6 +1080,12 @@ function setupMenuBar() {
     });
   });
   document.addEventListener("click", closeAllMenus);
+
+  // Prevent clicks inside dropdowns from closing them — lets Options controls work inline
+  document.querySelectorAll<HTMLElement>(".menu-dropdown").forEach(dd => {
+    dd.addEventListener("click", (e) => e.stopPropagation());
+  });
+
   document.querySelectorAll<HTMLButtonElement>(".menu-action").forEach(btn => {
     btn.addEventListener("click", () => { closeAllMenus(); handleMenuAction(btn.dataset.action ?? ""); });
   });
@@ -978,6 +1096,20 @@ function setupMenuBar() {
     if (e.ctrlKey && !e.shiftKey && e.key === "o") { e.preventDefault(); handleMenuAction("open-project"); }
     if (e.ctrlKey && !e.shiftKey && e.key === "s") { e.preventDefault(); handleMenuAction("save-project"); }
     if (e.ctrlKey && e.shiftKey  && e.key === "S") { e.preventDefault(); handleMenuAction("save-as-project"); }
+  });
+
+  // Options: Max time controls
+  const chkMaxTime    = document.getElementById("chk-max-time") as HTMLInputElement;
+  const inputMaxTime  = document.getElementById("input-max-time") as HTMLInputElement;
+  const lblMaxTimeUnit = document.getElementById("lbl-max-time-unit") as HTMLElement;
+  chkMaxTime.addEventListener("change", () => {
+    const show = chkMaxTime.checked;
+    inputMaxTime.style.display  = show ? "" : "none";
+    lblMaxTimeUnit.style.display = show ? "" : "none";
+    maxTimeSecs = show ? (parseInt(inputMaxTime.value) || 60) : null;
+  });
+  inputMaxTime.addEventListener("change", () => {
+    if (chkMaxTime.checked) maxTimeSecs = parseInt(inputMaxTime.value) || 60;
   });
 }
 
@@ -990,6 +1122,7 @@ function handleMenuAction(action: string) {
     case "open-project":    openProject(); break;
     case "save-project":    saveProject(); break;
     case "save-as-project": saveProjectAs(); break;
+    case "export-csv":      exportCsv(); break;
     case "about": (document.getElementById("dialog-about") as HTMLDialogElement).showModal(); break;
   }
 }
@@ -1035,12 +1168,18 @@ function fmtData(data: number[]): string {
   }
 }
 
-function fmtTs(ms: number): string {
-  const d = new Date(ms);
-  return d.getHours().toString().padStart(2, "0") + ":" +
-         d.getMinutes().toString().padStart(2, "0") + ":" +
-         d.getSeconds().toString().padStart(2, "0") + "." +
-         d.getMilliseconds().toString().padStart(3, "0");
+function fmtElapsed(ts: number): string {
+  const elapsed = Math.max(0, ts - appStartTime);
+  const h = Math.floor(elapsed / 3600000);
+  const m = Math.floor((elapsed % 3600000) / 60000);
+  const s = Math.floor((elapsed % 60000) / 1000);
+  const ms = elapsed % 1000;
+  const hPart = h > 0 ? `${h}:` : "";
+  return `${hPart}${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}.${ms.toString().padStart(3, "0")}`;
+}
+
+function fmtPlotLabel(ts: number): string {
+  return `${(Math.max(0, ts - appStartTime) / 1000).toFixed(1)}s`;
 }
 
 function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
@@ -1048,7 +1187,7 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
   tr.dataset.bytes = JSON.stringify(entry.data);
   if (entry.messageName) tr.classList.add("dbc-match");
   tr.innerHTML = `
-    <td class="td-ts">${fmtTs(entry.timestampMs)}</td>
+    <td class="td-ts">${fmtElapsed(entry.timestampMs)}</td>
     <td>${entry.channel}</td>
     <td class="td-canid">${fmtId(entry.canId, entry.isExtended)}</td>
     <td>${entry.messageName ?? "<em style='color:var(--text-muted)'>Raw</em>"}</td>
@@ -1062,14 +1201,14 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
 function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
   tr.dataset.bytes = JSON.stringify(entry.data);
   const cells = tr.cells;
-  cells[0].textContent = fmtTs(entry.timestampMs);
+  cells[0].textContent = fmtElapsed(entry.timestampMs);
   cells[4].textContent = String(entry.dlc);
   cells[5].textContent = fmtData(entry.data);
   cells[6].textContent = entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—";
 }
 
 function onCanFrame(ev: CanFrameEvent) {
-  if (tracePaused) return;
+  if (!appRunning || tracePaused) return;
 
   const key = traceKey(ev.channel, ev.can_id);
   const prev = traceLastTs.get(key);
@@ -1210,18 +1349,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
   });
 
-  const chkMaxTime   = document.getElementById("chk-max-time") as HTMLInputElement;
-  const inputMaxTime = document.getElementById("input-max-time") as HTMLInputElement;
-  const lblMaxTimeUnit = document.getElementById("lbl-max-time-unit") as HTMLElement;
-  chkMaxTime.addEventListener("change", () => {
-    const show = chkMaxTime.checked;
-    inputMaxTime.style.display = show ? "" : "none";
-    lblMaxTimeUnit.style.display = show ? "" : "none";
-    maxTimeSecs = show ? (parseInt(inputMaxTime.value) || 60) : null;
+  // Play / Stop
+  document.getElementById("btn-app-run")!.addEventListener("click", () => {
+    if (appRunning) stopApp(); else startApp();
   });
-  inputMaxTime.addEventListener("change", () => {
-    if (chkMaxTime.checked) maxTimeSecs = parseInt(inputMaxTime.value) || 60;
-  });
+
   const pauseBtn = document.getElementById("btn-pause-plot")!;
   pauseBtn.addEventListener("click", () => {
     plotPaused = !plotPaused;
