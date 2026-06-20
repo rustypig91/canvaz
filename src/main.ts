@@ -13,8 +13,9 @@ import {
   Filler,
   CategoryScale,
 } from "chart.js";
+import ZoomPlugin from "chartjs-plugin-zoom";
 
-Chart.register(LineController, LineElement, PointElement, LinearScale, Legend, Title, Tooltip, Filler, CategoryScale);
+Chart.register(LineController, LineElement, PointElement, LinearScale, Legend, Title, Tooltip, Filler, CategoryScale, ZoomPlugin);
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -88,6 +89,7 @@ interface PlotSeries {
   unit: string;
   color: string;
   channel: string;
+  timestamps: number[];
   labels: string[];
   values: number[];
   lastValue: number | null;
@@ -99,13 +101,15 @@ interface PlotPane {
   chart: Chart;
   series: Map<string, PlotSeries>;   // key: channel::signalName
   interpolate: boolean;
+  showPoints: boolean;
   hoveredDatasetIndex: number | null;
+  zoomed: boolean;
 }
 
 const plotPanes: PlotPane[] = [];
 let paneCounter = 0;
 let plotPaused = false;
-let maxPoints = 500;
+let maxTimeSecs: number | null = null; // null = unlimited
 
 function plotKey(channel: string, signalName: string) {
   return `${channel}::${signalName}`;
@@ -141,7 +145,7 @@ function createPlotPane(): PlotPane {
   const id = `pane-${++paneCounter}`;
 
   // Allocate pane object first so legend callbacks can close over it
-  const pane: PlotPane = { id, el: null!, chart: null!, series: new Map(), interpolate: false, hoveredDatasetIndex: null };
+  const pane: PlotPane = { id, el: null!, chart: null!, series: new Map(), interpolate: false, showPoints: false, hoveredDatasetIndex: null, zoomed: false };
 
   const el = document.createElement("div");
   el.className = "plot-pane";
@@ -150,6 +154,8 @@ function createPlotPane(): PlotPane {
   el.innerHTML = `
     <div class="pane-header">
       <span class="pane-title">Plot ${paneCounter}</span>
+      <button class="btn-reset-zoom pane-btn" title="Reset zoom" style="display:none">⟲</button>
+      <button class="btn-show-points pane-btn" title="Show data points: off">•</button>
       <button class="btn-interp pane-btn" title="Interpolation: off">∿</button>
       <button class="btn-close-pane" title="Close plot">×</button>
     </div>
@@ -158,12 +164,25 @@ function createPlotPane(): PlotPane {
     </div>
   `;
   el.querySelector(".btn-close-pane")!.addEventListener("click", () => closePlotPane(id));
+  el.querySelector<HTMLButtonElement>(".btn-show-points")!.addEventListener("click", (e) => {
+    pane.showPoints = !pane.showPoints;
+    const btn = e.currentTarget as HTMLButtonElement;
+    btn.classList.toggle("active", pane.showPoints);
+    btn.title = `Show data points: ${pane.showPoints ? "on" : "off"}`;
+    syncDatasets(pane);
+  });
   el.querySelector<HTMLButtonElement>(".btn-interp")!.addEventListener("click", (e) => {
     pane.interpolate = !pane.interpolate;
     const btn = e.currentTarget as HTMLButtonElement;
     btn.classList.toggle("active", pane.interpolate);
     btn.title = `Interpolation: ${pane.interpolate ? "on" : "off"}`;
     syncDatasets(pane);
+  });
+  const resetZoomBtn = el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!;
+  resetZoomBtn.addEventListener("click", () => {
+    pane.chart.resetZoom();
+    pane.zoomed = false;
+    resetZoomBtn.style.display = "none";
   });
 
   const canvas = el.querySelector<HTMLCanvasElement>("canvas")!;
@@ -191,6 +210,27 @@ function createPlotPane(): PlotPane {
           onClick: (_evt, item) => {
             const key = [...pane.series.keys()][item.datasetIndex!];
             if (key) removeSigFromPane(pane, key);
+          },
+        },
+        zoom: {
+          zoom: {
+            drag: {
+              enabled: true,
+              backgroundColor: "rgba(59,130,246,0.10)",
+              borderColor: "rgba(59,130,246,0.5)",
+              borderWidth: 1,
+            },
+            mode: "x" as const,
+            onZoomComplete: () => {
+              pane.zoomed = true;
+              resetZoomBtn.style.display = "";
+              if (!plotPaused) {
+                plotPaused = true;
+                const btn = document.getElementById("btn-pause-plot")!;
+                btn.textContent = "Resume";
+                btn.classList.add("running");
+              }
+            },
           },
         },
       },
@@ -233,6 +273,7 @@ function addSignalToPane(pane: PlotPane, channel: string, sig: DbcSignal) {
     unit: sig.unit,
     color,
     channel,
+    timestamps: [],
     labels: [],
     values: [],
     lastValue: null,
@@ -247,6 +288,7 @@ function syncDatasets(pane: PlotPane) {
   const tension = pane.interpolate ? 0.4 : 0;
   pane.chart.data.datasets = [...pane.series.values()].map((s, i) => {
     const hovered = pane.hoveredDatasetIndex === i;
+    const showDot = pane.showPoints || hovered;
     return {
       label: s.signalName,
       data: s.values,
@@ -254,8 +296,8 @@ function syncDatasets(pane: PlotPane) {
       pointBackgroundColor: s.color,
       backgroundColor: "transparent",
       borderWidth: hovered ? 2.5 : 1.5,
-      pointRadius: hovered ? 3 : 0,
-      pointHoverRadius: hovered ? 4 : 3,
+      pointRadius: showDot ? 3 : 0,
+      pointHoverRadius: hovered ? 5 : 3,
       tension,
     };
   });
@@ -281,10 +323,18 @@ function onSignalValue(ev: SignalValueEvent) {
   for (const pane of plotPanes) {
     const series = pane.series.get(key);
     if (!series) continue;
+    series.timestamps.push(ev.timestamp_ms);
     series.labels.push(ts);
     series.values.push(ev.value);
     series.lastValue = ev.value;
-    if (series.labels.length > maxPoints) { series.labels.shift(); series.values.shift(); }
+    if (maxTimeSecs !== null) {
+      const cutoff = ev.timestamp_ms - maxTimeSecs * 1000;
+      while (series.timestamps.length > 0 && series.timestamps[0] < cutoff) {
+        series.timestamps.shift();
+        series.labels.shift();
+        series.values.shift();
+      }
+    }
     (pane.chart.data as { labels: string[] }).labels = series.labels;
     pane.chart.update("none");
   }
@@ -1154,13 +1204,23 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Plot controls
   document.getElementById("btn-clear-plot")!.addEventListener("click", () => {
     for (const pane of plotPanes) {
-      for (const s of pane.series.values()) { s.labels = []; s.values = []; s.lastValue = null; }
+      for (const s of pane.series.values()) { s.timestamps = []; s.labels = []; s.values = []; s.lastValue = null; }
       (pane.chart.data as { labels: string[] }).labels = [];
       pane.chart.update("none");
     }
   });
-  document.getElementById("input-max-points")!.addEventListener("change", (e) => {
-    maxPoints = parseInt((e.target as HTMLInputElement).value) || 500;
+
+  const chkMaxTime   = document.getElementById("chk-max-time") as HTMLInputElement;
+  const inputMaxTime = document.getElementById("input-max-time") as HTMLInputElement;
+  const lblMaxTimeUnit = document.getElementById("lbl-max-time-unit") as HTMLElement;
+  chkMaxTime.addEventListener("change", () => {
+    const show = chkMaxTime.checked;
+    inputMaxTime.style.display = show ? "" : "none";
+    lblMaxTimeUnit.style.display = show ? "" : "none";
+    maxTimeSecs = show ? (parseInt(inputMaxTime.value) || 60) : null;
+  });
+  inputMaxTime.addEventListener("change", () => {
+    if (chkMaxTime.checked) maxTimeSecs = parseInt(inputMaxTime.value) || 60;
   });
   const pauseBtn = document.getElementById("btn-pause-plot")!;
   pauseBtn.addEventListener("click", () => {

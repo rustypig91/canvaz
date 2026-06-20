@@ -150,6 +150,7 @@ fn get_app_data_dir(app: AppHandle) -> Result<String, String> {
 
 #[tauri::command]
 fn save_project(path: String, project: Project) -> Result<(), String> {
+    println!("Saving project to '{}'", path);
     project.save(&path)
 }
 

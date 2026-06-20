@@ -318,6 +318,7 @@ kbd {
   flex-shrink: 0;
 }
 #tab-plot { flex-direction: column; }
+.chk-label { display: flex; align-items: center; gap: 5px; cursor: pointer; user-select: none; }
 
 #plot-panes-container {
   flex: 1;

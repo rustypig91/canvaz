@@ -65,17 +65,20 @@
       <main id="content">
         <!-- Tab bar -->
         <nav id="tab-bar">
-          <button class="tab-btn active" data-tab="plot">Plot</button>
+          <button class="tab-btn active" data-tab="trace">Trace</button>
+          <button class="tab-btn" data-tab="plot">Plot</button>
           <button class="tab-btn" data-tab="simulate">Simulate</button>
-          <button class="tab-btn" data-tab="trace">Trace</button>
         </nav>
 
         <!-- Plot tab -->
-        <div id="tab-plot" class="tab-content active">
+        <div id="tab-plot" class="tab-content">
           <div id="plot-toolbar">
             <button id="btn-clear-plot" class="btn btn-sm">Clear all</button>
-            <label class="label-muted">Max points:</label>
-            <input id="input-max-points" type="number" value="500" min="50" max="5000" step="50" class="small-input" />
+            <label class="label-muted chk-label">
+              <input type="checkbox" id="chk-max-time" /> Max time
+            </label>
+            <input id="input-max-time" type="number" value="60" min="1" class="small-input" style="display:none" />
+            <span id="lbl-max-time-unit" class="label-muted" style="display:none">s</span>
             <button id="btn-pause-plot" class="btn btn-sm">Pause</button>
           </div>
           <div id="plot-panes-container">
@@ -109,7 +112,7 @@
           </table>
         </div>
         <!-- Trace tab -->
-        <div id="tab-trace" class="tab-content">
+        <div id="tab-trace" class="tab-content active">
           <div id="trace-toolbar">
             <button id="btn-clear-trace" class="btn btn-sm">Clear</button>
             <label class="label-muted">Data:</label>
