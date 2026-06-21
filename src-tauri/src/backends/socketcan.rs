@@ -256,6 +256,11 @@ impl CanChannel for SocketCanChannel {
         if self.is_virtual() {
             return Err("vcan interfaces do not support bitrate configuration".to_string());
         }
+        let current = self.get_bitrate()?;
+        if current == bitrate {
+            return Ok(());
+        }
+
         let was_open = self.socket.is_some();
         if was_open {
             self.close()?;

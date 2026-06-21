@@ -1,18 +1,18 @@
 mod app_state;
 mod backends;
+mod can_manager;
 mod dbc_parser;
 mod project;
-mod can_manager;
 pub mod signal_codec;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use app_state::AppState;
-use backends::*;
+use backends::SocketCanBackend;
+use can_manager::{CanFrameEvent, CanManager, ChannelInfo, DbcState, ManagerState};
 use project::Project;
 use serde::Deserialize;
-use can_manager::*;
 use tauri::{Emitter, Manager, State};
 
 // ── Tauri managed state ───────────────────────────────────────────────────────
@@ -23,56 +23,79 @@ struct TauriState {
     dbc: DbcState,
 }
 
-// ── Sudo command ──────────────────────────────────────────────────────────────
+// ── Sudo ──────────────────────────────────────────────────────────────────────
 
 #[tauri::command]
 fn provide_sudo_password(password: Option<String>, state: State<'_, TauriState>) {
     state.app_state.provide_sudo_password(password);
 }
 
-// ── CAN commands ──────────────────────────────────────────────────────────────
+// ── CAN channel commands ──────────────────────────────────────────────────────
 
 #[tauri::command]
 fn list_can_interfaces(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>, String> {
-    let manager = state.can.lock().map_err(|e| e.to_string())?;
-    Ok(manager.list_channels())
+    Ok(state.can.lock().map_err(|e| e.to_string())?.list_channels())
 }
 
 #[tauri::command]
 async fn open_channel(
     backend_name: String,
     channel_name: String,
-    bitrate: Option<u32>,
+    bitrate: u32,
     state: State<'_, TauriState>,
 ) -> Result<ChannelInfo, String> {
+    println!(
+        "Request to open channel '{}' on backend '{}' with bitrate {:?}",
+        channel_name, backend_name, bitrate
+    );
+
+
     let can = Arc::clone(&state.can);
     let dbc = Arc::clone(&state.dbc);
-    // Run on a blocking thread so the tokio runtime stays free to dispatch
-    // provide_sudo_password while we wait for the user to enter a password.
-    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
-        let mut mgr = can.lock().map_err(|e| e.to_string())?;
-        mgr.open_channel(backend_name, channel_name, bitrate, dbc)
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        can.lock().map_err(|e| e.to_string())?.open_channel(
+            backend_name,
+            channel_name,
+            Some(bitrate),
+            dbc,
+        )
     })
     .await
-    .unwrap_or_else(|e| Err(e.to_string()))
+    .unwrap_or_else(|e| Err(e.to_string()));
+
+    if let Ok(ref info) = result {
+        println!("Opened channel '{}' with baudrate {:?}", info.id, bitrate);
+    } else {
+        println!("Failed to open channel: {}", result.as_ref().err().unwrap());
+    }
+    result
 }
 
 #[tauri::command]
-fn close_channel(channel_info: ChannelInfo, state: State<'_, TauriState>) -> Result<(), String> {
-    let mut manager = state.can.lock().map_err(|e| e.to_string())?;
-    manager.close_channel(&name)?;
-    let mut dbc = state.dbc.write().map_err(|e| e.to_string())?;
-    dbc.remove(&name);
+fn close_channel(channel_id: String, state: State<'_, TauriState>) -> Result<(), String> {
+    state
+        .can
+        .lock()
+        .map_err(|e| e.to_string())?
+        .close_channel(&channel_id)?;
+    state
+        .dbc
+        .write()
+        .map_err(|e| e.to_string())?
+        .remove(&channel_id);
     Ok(())
 }
 
 #[tauri::command]
 fn get_open_channels(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>, String> {
-    let manager = state.can.lock().map_err(|e| e.to_string())?;
-    Ok(manager.open_channels_info())
+    Ok(state
+        .can
+        .lock()
+        .map_err(|e| e.to_string())?
+        .open_channels_info())
 }
 
-// ── Message / raw frame send commands ────────────────────────────────────────
+// ── Send commands ─────────────────────────────────────────────────────────────
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -83,7 +106,7 @@ fn now_ms() -> u64 {
 
 #[derive(Deserialize)]
 struct SendMessageCmd {
-    channel: String,
+    channel_id: String,
     message_id: u32,
     signal_values: HashMap<String, f64>,
 }
@@ -93,8 +116,8 @@ fn send_message(cmd: SendMessageCmd, state: State<'_, TauriState>) -> Result<(),
     let (data, is_extended) = {
         let dbc = state.dbc.read().map_err(|e| e.to_string())?;
         let channel_dbc = dbc
-            .get(&cmd.channel)
-            .ok_or_else(|| format!("No DBC for '{}'", cmd.channel))?;
+            .get(&cmd.channel_id)
+            .ok_or_else(|| format!("No DBC for '{}'", cmd.channel_id))?;
         let msg = channel_dbc
             .messages
             .iter()
@@ -104,30 +127,45 @@ fn send_message(cmd: SendMessageCmd, state: State<'_, TauriState>) -> Result<(),
         for sig in &msg.signals {
             if let Some(&v) = cmd.signal_values.get(&sig.name) {
                 signal_codec::encode(
-                    &mut buf, v,
-                    sig.start_bit, sig.length,
-                    sig.little_endian, sig.factor, sig.offset,
+                    &mut buf,
+                    v,
+                    sig.start_bit,
+                    sig.length,
+                    sig.little_endian,
+                    sig.factor,
+                    sig.offset,
                 );
             }
         }
         (buf, cmd.message_id > 0x7FF)
     };
-    state.can.lock().map_err(|e| e.to_string())?.send_frame(&cmd.channel, cmd.message_id, &data)?;
-    let _ = state.app_state.app.emit("can-frame", backends::CanFrameEvent {
-        channel: cmd.channel,
-        can_id: cmd.message_id,
-        is_extended,
-        dlc: data.len() as u8,
-        data,
-        timestamp_ms: now_ms(),
-        direction: "tx",
-    });
+    state.can.lock().map_err(|e| e.to_string())?.send_frame(
+        &cmd.channel_id,
+        backends::CanFrame {
+            can_id: cmd.message_id,
+            is_extended,
+            data: data.clone(),
+            timestamp_ms: 0,
+        },
+    )?;
+    let _ = state.app_state.app.emit(
+        "can-frame",
+        CanFrameEvent {
+            channel_id: cmd.channel_id,
+            can_id: cmd.message_id,
+            is_extended,
+            dlc: data.len() as u8,
+            data,
+            timestamp_ms: now_ms(),
+            direction: "tx",
+        },
+    );
     Ok(())
 }
 
 #[derive(Deserialize)]
 struct SendRawFrameCmd {
-    channel: ChannelInfo,
+    channel_id: String,
     can_id: u32,
     data: Vec<u8>,
 }
@@ -136,20 +174,27 @@ struct SendRawFrameCmd {
 fn send_raw_frame(cmd: SendRawFrameCmd, state: State<'_, TauriState>) -> Result<(), String> {
     let is_extended = cmd.can_id > 0x7FF;
     let dlc = cmd.data.len() as u8;
-    state.can.lock().map_err(|e| e.to_string())?.send_frame(&cmd.channel, cmd.can_id, &cmd.data)?;
-
-    let can  = state.can.lock()?;
-    can.send_frame(&cmd.channel, cmd.can_id, &cmd.data)?;
-
-    let _ = state.app_state.app.emit("can-frame", CanFrameEvent {
-        channel: cmd.channel,
-        can_id: cmd.can_id,
-        is_extended,
-        dlc,
-        data: cmd.data,
-        timestamp_ms: now_ms(),
-        direction: "tx",
-    });
+    state.can.lock().map_err(|e| e.to_string())?.send_frame(
+        &cmd.channel_id,
+        backends::CanFrame {
+            can_id: cmd.can_id,
+            is_extended,
+            data: cmd.data.clone(),
+            timestamp_ms: 0,
+        },
+    )?;
+    let _ = state.app_state.app.emit(
+        "can-frame",
+        CanFrameEvent {
+            channel_id: cmd.channel_id,
+            can_id: cmd.can_id,
+            is_extended,
+            dlc,
+            data: cmd.data,
+            timestamp_ms: now_ms(),
+            direction: "tx",
+        },
+    );
     Ok(())
 }
 
@@ -157,38 +202,46 @@ fn send_raw_frame(cmd: SendRawFrameCmd, state: State<'_, TauriState>) -> Result<
 
 #[tauri::command]
 fn load_dbc(
-    channel: String,
+    channel_id: String,
     path: String,
     state: State<'_, TauriState>,
 ) -> Result<dbc_parser::ParsedDbc, String> {
     let parsed = dbc_parser::parse_dbc(&path)?;
-    let mut guard = state.dbc.write().map_err(|e| e.to_string())?;
-    guard.insert(channel, parsed.clone());
+    state
+        .dbc
+        .write()
+        .map_err(|e| e.to_string())?
+        .insert(channel_id, parsed.clone());
     Ok(parsed)
 }
 
 #[tauri::command]
 fn get_dbc_for_channel(
-    channel: String,
+    channel_id: String,
     state: State<'_, TauriState>,
 ) -> Result<Option<dbc_parser::ParsedDbc>, String> {
-    let guard = state.dbc.read().map_err(|e| e.to_string())?;
-    Ok(guard.get(&channel).cloned())
+    Ok(state
+        .dbc
+        .read()
+        .map_err(|e| e.to_string())?
+        .get(&channel_id)
+        .cloned())
 }
 
 #[tauri::command]
 fn get_all_dbcs(
     state: State<'_, TauriState>,
 ) -> Result<HashMap<String, dbc_parser::ParsedDbc>, String> {
-    let guard = state.dbc.read().map_err(|e| e.to_string())?;
-    Ok(guard.clone())
+    Ok(state.dbc.read().map_err(|e| e.to_string())?.clone())
 }
 
-// ── App path ──────────────────────────────────────────────────────────────────
+// ── App / file commands ───────────────────────────────────────────────────────
 
 #[tauri::command]
 fn get_app_data_dir(state: State<'_, TauriState>) -> Result<String, String> {
-    state.app_state.app
+    state
+        .app_state
+        .app
         .path()
         .app_data_dir()
         .map(|p| p.to_string_lossy().to_string())
@@ -214,14 +267,15 @@ fn load_project(path: String, state: State<'_, TauriState>) -> Result<Project, S
     for ch in &project.channels {
         if let Some(ref dbc_path) = ch.dbc_path {
             if let Ok(parsed) = dbc_parser::parse_dbc(dbc_path) {
-                dbc_guard.insert(ch.name.clone(), parsed);
+                let channel_id = format!("{}:{}", ch.backend, ch.name);
+                dbc_guard.insert(channel_id, parsed);
             }
         }
     }
     Ok(project)
 }
 
-// ── App entry point ───────────────────────────────────────────────────────────
+// ── Entry point ───────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -231,10 +285,8 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
             let app_state = AppState::new(app.handle().clone());
-
             let mut manager = CanManager::new(Arc::clone(&app_state));
             manager.register_backend(SocketCanBackend);
-
             app.manage(TauriState {
                 app_state,
                 can: Arc::new(Mutex::new(manager)),

@@ -47,7 +47,7 @@ interface ParsedDbc {
 }
 
 interface SignalValueEvent {
-  channel: string;
+  channel_id: string;
   signal_name: string;
   message_name: string;
   value: number;
@@ -56,7 +56,7 @@ interface SignalValueEvent {
 }
 
 interface CanFrameEvent {
-  channel: string;
+  channel_id: string;
   can_id: number;
   is_extended: boolean;
   dlc: number;
@@ -67,7 +67,7 @@ interface CanFrameEvent {
 
 interface PlotSignalEntry { signal_name: string; channel: string; }
 interface PlotPaneConfig  { signals: PlotSignalEntry[]; }
-interface ChannelInfo     { backend: string; name: string; }
+interface ChannelInfo     { id: string; backend: string; name: string; }
 interface ChannelConfig   { name: string; backend: string; dbc_path: string | null; bitrate?: number | null; }
 interface SimulateEntry   { signal_name: string; channel: string; value: number; period_ms: number; }
 
@@ -329,7 +329,7 @@ function syncDatasets(pane: PlotPane) {
 
 function onSignalValue(ev: SignalValueEvent) {
   if (!appRunning) return;
-  const key = plotKey(ev.channel, ev.signal_name);
+  const key = plotKey(ev.channel_id, ev.signal_name);
 
   // Store in global history
   let hist = signalHistory.get(key);
@@ -562,10 +562,12 @@ function setupSimDrop() {
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
-const dbcByChannel = new Map<string, ParsedDbc>();
-const channelBitrates = new Map<string, number | null>();
-const channelBackends = new Map<string, string>();   // channel name → backend name
-const interfaceBackends = new Map<string, string>(); // from list_can_interfaces, name → backend
+const dbcByChannel = new Map<string, ParsedDbc>();       // channel_id → DBC
+const channelBitrates = new Map<string, number | null>(); // channel_id → bitrate
+const interfaceBackends = new Map<string, string>();      // from list_can_interfaces: name → backend
+
+function channelDisplayName(id: string) { return id.includes(':') ? id.split(':')[1] : id; }
+function channelBackend(id: string)     { return id.includes(':') ? id.split(':')[0] : ""; }
 const signalLastValues = new Map<string, number>();   // key → latest value
 const signalValueEls   = new Map<string, HTMLElement>(); // key → .sig-value span
 let selectedChannel: string | null = null;
@@ -663,15 +665,16 @@ async function openChannelDialog(mode: DialogMode, channelName?: string) {
     // Auto-detect vcan from first item
     if (ifaces[0]?.name.startsWith("vcan")) setBitrateInDialog(null, true);
   } else {
-    const name = channelName!;
-    title.textContent = `Channel: ${name}`;
+    const id = channelName!;
+    const displayName = channelDisplayName(id);
+    title.textContent = `Channel: ${displayName}`;
     applyBtn.textContent = "Apply";
     ifaceRow.style.display = "none";
-    const dbc = dbcByChannel.get(name);
+    const dbc = dbcByChannel.get(id);
     dialogPendingDbc = dbc?.path ?? null;
     setDbcLabel(dialogPendingDbc);
-    setBitrateInDialog(channelBitrates.get(name) ?? null, name.startsWith("vcan"));
-    selectChannel(name);
+    setBitrateInDialog(channelBitrates.get(id) ?? null, displayName.startsWith("vcan"));
+    selectChannel(id);
   }
 
   dialog.showModal();
@@ -708,14 +711,14 @@ function promptSudoPassword(): Promise<string | null> {
 
 // Open a channel. If root is required the Rust side emits "request-sudo-password",
 // the global listener shows the dialog, and open_channel unblocks automatically.
-async function openChannelWithSudo(
+async function openChannel(
   backend: string,
   name: string,
   bitrate: number | null,
-): Promise<boolean> {
+): Promise<ChannelInfo | null> {
+  console.log(`Opening channel: backend=${backend}, name=${name}, bitrate=${bitrate}`);
   try {
-    await invoke("open_channel", { backend, name, bitrate });
-    return true;
+    return await invoke<ChannelInfo>("open_channel", { backendName: backend, channelName: name, bitrate: bitrate });
   } catch (e) {
     const msg = String(e);
     if (msg === "Sudo authentication cancelled") {
@@ -723,7 +726,7 @@ async function openChannelWithSudo(
     } else {
       setStatus(`Channel error: ${msg}`);
     }
-    return false;
+    return null;
   }
 }
 
@@ -737,17 +740,18 @@ async function applyChannelDialog() {
     if (!name) return;
     const backend = interfaceBackends.get(name) ?? "socketcan";
 
-    // open_channel handles configure + socket open in one step
-    const ok = await openChannelWithSudo(backend, name, bitrate);
-    if (!ok) { dialog.close(); return; }
-    channelBitrates.set(name, bitrate);
-    channelBackends.set(name, backend);
+    const info = await openChannel(backend, name, bitrate);
+    if (!info) {
+      console.error("Failed to open channel: ", name);
+      dialog.close();
+      return;
+    }
+    channelBitrates.set(info.id, bitrate);
 
-    // Load DBC if selected
     if (dialogPendingDbc) {
       try {
-        const dbc = await invoke<ParsedDbc>("load_dbc", { channel: name, path: dialogPendingDbc });
-        dbcByChannel.set(name, dbc);
+        const dbc = await invoke<ParsedDbc>("load_dbc", { channelId: info.id, path: dialogPendingDbc });
+        dbcByChannel.set(info.id, dbc);
       } catch (e) { setStatus(`DBC error: ${e}`); }
     }
 
@@ -755,29 +759,27 @@ async function applyChannelDialog() {
     setStatus(`Opened channel: ${name}`);
     scheduleAutoSave();
   } else {
-    const name = dialogEditTarget!;
-    const backend = channelBackends.get(name) ?? "socketcan";
-    const wasOpen = openChannels.includes(name);
+    const id = dialogEditTarget!;
+    const name = channelDisplayName(id);
+    const backend = channelBackend(id);
+    const wasOpen = openChannels.includes(id);
 
-    // Close the existing channel first, then reopen with updated settings
     if (wasOpen) {
-      try { await invoke("close_channel", { name }); dbcByChannel.delete(name); } catch {}
+      try { await invoke("close_channel", { channelId: id }); dbcByChannel.delete(id); } catch {}
     }
-    const ok = await openChannelWithSudo(backend, name, bitrate);
-    if (!ok) { dialog.close(); return; }
-    channelBitrates.set(name, bitrate);
-    channelBackends.set(name, backend);
+    const info = await openChannel(backend, name, bitrate);
+    if (!info) { dialog.close(); return; }
+    channelBitrates.set(info.id, bitrate);
 
-    // Reload DBC
     if (dialogPendingDbc) {
       try {
-        const dbc = await invoke<ParsedDbc>("load_dbc", { channel: name, path: dialogPendingDbc });
-        dbcByChannel.set(name, dbc);
+        const dbc = await invoke<ParsedDbc>("load_dbc", { channelId: info.id, path: dialogPendingDbc });
+        dbcByChannel.set(info.id, dbc);
       } catch (e) { setStatus(`DBC error: ${e}`); }
     }
 
     await refreshChannelList();
-    if (selectedChannel === name) renderDbcTree();
+    if (selectedChannel === info.id) renderDbcTree();
     setStatus(`Updated channel: ${name}`);
     scheduleAutoSave();
   }
@@ -796,8 +798,7 @@ function selectChannel(name: string | null) {
 async function refreshChannelList() {
   try {
     const infos = await invoke<ChannelInfo[]>("get_open_channels");
-    openChannels = infos.map(i => i.name);
-    for (const i of infos) channelBackends.set(i.name, i.backend);
+    openChannels = infos.map(i => i.id);
   } catch { openChannels = []; }
   if (selectedChannel && !openChannels.includes(selectedChannel)) selectChannel(openChannels[0] ?? null);
   else if (!selectedChannel && openChannels.length > 0) selectChannel(openChannels[0]);
@@ -808,15 +809,16 @@ async function refreshChannelList() {
 function renderChannelList() {
   const list = document.getElementById("channel-list")!;
   list.innerHTML = "";
-  for (const name of openChannels) {
-    const dbc = dbcByChannel.get(name);
-    const bitrate = channelBitrates.get(name);
-    const backend = channelBackends.get(name) ?? "";
-    const isSelected = name === selectedChannel;
-    const bitrateLabel = name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate/1000).toFixed(0)}k` : "—");
+  for (const id of openChannels) {
+    const dbc = dbcByChannel.get(id);
+    const bitrate = channelBitrates.get(id);
+    const name = channelDisplayName(id);
+    const backend = channelBackend(id);
+    const isSelected = id === selectedChannel;
+    const bitrateLabel = name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
     const item = document.createElement("div");
     item.className = `channel-item${isSelected ? " selected" : ""}`;
-    item.dataset.channel = name;
+    item.dataset.channel = id;
     item.innerHTML = `
       <span class="dot"></span>
       <span class="ch-name">${name}<span class="ch-backend label-muted"> ${backend}</span></span>
@@ -826,15 +828,15 @@ function renderChannelList() {
     `;
     item.addEventListener("click", (e) => {
       if ((e.target as HTMLElement).closest(".btn-close-ch")) return;
-      openChannelDialog("edit", name);
+      openChannelDialog("edit", id);
     });
     item.querySelector(".btn-close-ch")!.addEventListener("click", async (e) => {
       e.stopPropagation();
       try {
-        await invoke("close_channel", { name });
-        dbcByChannel.delete(name);
-        channelBitrates.delete(name);
-        if (selectedChannel === name) selectChannel(null);
+        await invoke("close_channel", { channelId: id });
+        dbcByChannel.delete(id);
+        channelBitrates.delete(id);
+        if (selectedChannel === id) selectChannel(null);
         await refreshChannelList();
         scheduleAutoSave();
       } catch (err) { setStatus(`Close error: ${err}`); }
@@ -1043,12 +1045,12 @@ function startSim(key: string) {
     entry.timerId = setInterval(async () => {
       const signalValues: Record<string, number> = {};
       for (const s of entry.signals) signalValues[s.def.name] = s.value;
-      try { await invoke("send_message", { cmd: { channel: entry.channel, message_id: entry.messageId, signal_values: signalValues } }); }
+      try { await invoke("send_message", { cmd: { channel_id: entry.channel, message_id: entry.messageId, signal_values: signalValues } }); }
       catch (e) { setStatus(`Send error: ${e}`); }
     }, entry.periodMs);
   } else {
     entry.timerId = setInterval(async () => {
-      try { await invoke("send_raw_frame", { cmd: { channel: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc) } }); }
+      try { await invoke("send_raw_frame", { cmd: { channel_id: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc) } }); }
       catch (e) { setStatus(`Send error: ${e}`); }
     }, entry.periodMs);
   }
@@ -1071,11 +1073,11 @@ function stopSim(key: string) {
 function buildProject(): Project {
   return {
     version: 1,
-    channels: openChannels.map(name => ({
-      name,
-      backend: channelBackends.get(name) ?? "socketcan",
-      dbc_path: dbcByChannel.get(name)?.path ?? null,
-      bitrate: channelBitrates.get(name) ?? null,
+    channels: openChannels.map(id => ({
+      name: channelDisplayName(id),
+      backend: channelBackend(id),
+      dbc_path: dbcByChannel.get(id)?.path ?? null,
+      bitrate: channelBitrates.get(id) ?? null,
     })),
     plot_panes: plotPanes.map(pane => ({
       signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: s.channel })),
@@ -1119,17 +1121,14 @@ async function openProject() {
 async function applyProject(project: Project) {
   for (const ch of project.channels) {
     const backend = ch.backend ?? "socketcan";
-    const ok = await openChannelWithSudo(backend, ch.name, ch.bitrate ?? null);
-    if (ok) {
-      channelBitrates.set(ch.name, ch.bitrate ?? null);
-      channelBackends.set(ch.name, backend);
-    }
+    const info = await openChannel(backend, ch.name, ch.bitrate ?? null);
+    if (info) channelBitrates.set(info.id, ch.bitrate ?? null);
   }
   await refreshChannelList();
 
   try {
     const all = await invoke<Record<string, ParsedDbc>>("get_all_dbcs");
-    for (const [ch, dbc] of Object.entries(all)) dbcByChannel.set(ch, dbc);
+    for (const [id, dbc] of Object.entries(all)) dbcByChannel.set(id, dbc);
   } catch { }
   renderChannelList();
   if (selectedChannel) renderDbcTree();
@@ -1379,7 +1378,7 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
   tr.innerHTML = `
     <td class="td-ts">${fmtElapsed(entry.timestampMs)}</td>
     <td><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>
-    <td>${entry.channel}</td>
+    <td>${channelDisplayName(entry.channel)}</td>
     <td class="td-canid">${fmtId(entry.canId, entry.isExtended)}</td>
     <td>${entry.messageName ?? "<em style='color:var(--text-muted)'>Raw</em>"}</td>
     <td style="text-align:center">${entry.dlc}</td>
@@ -1402,16 +1401,16 @@ function onCanFrame(ev: CanFrameEvent) {
   if (!appRunning || tracePaused) return;
 
   const direction = ev.direction ?? "rx";
-  const key = traceKey(ev.channel, ev.can_id, direction);
+  const key = traceKey(ev.channel_id, ev.can_id, direction);
   const prev = traceLastTs.get(key);
   const cycleTime = prev != null ? ev.timestamp_ms - prev : null;
   traceLastTs.set(key, ev.timestamp_ms);
 
-  const dbc = dbcByChannel.get(ev.channel);
+  const dbc = dbcByChannel.get(ev.channel_id);
   const msg = dbc?.messages.find(m => m.id === ev.can_id) ?? null;
 
   const entry: TraceEntry = {
-    channel: ev.channel,
+    channel: ev.channel_id,
     canId: ev.can_id,
     isExtended: ev.is_extended,
     dlc: ev.dlc,
@@ -1486,6 +1485,7 @@ function setupTrace() {
 function setStatus(msg: string) {
   const el = document.getElementById("status-bar")!;
   el.textContent = msg;
+  console.log("Status: ", msg);
   setTimeout(() => { if (el.textContent === msg) el.textContent = ""; }, 4000);
 }
 

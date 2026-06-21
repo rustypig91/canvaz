@@ -1,24 +1,35 @@
-mod backends;
-
-use backends::{CanBackend, CanChannel, CanFrame, ChannelInfo, DbcState};
-
+use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, RwLock,
 };
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 
-// ── Channel info ──────────────────────────────────────────────────────────────
-#[derive(Debug, Clone, Serialize)]
+use crate::app_state::AppState;
+use crate::backends::{CanBackend, CanChannel, CanFrame};
+use crate::dbc_parser::ParsedDbc;
+
+pub type ManagerState = Arc<Mutex<CanManager>>;
+pub type DbcState = Arc<RwLock<HashMap<String, ParsedDbc>>>;
+
+// ── Channel identity ──────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelInfo {
+    pub id: String,
     pub backend: String,
     pub name: String,
 }
 
 impl ChannelInfo {
-    pub fn id(&self) -> String {
-        format!("{}:{}", self.backend, self.name)
+    fn new(backend: &str, name: &str) -> Self {
+        Self {
+            id: format!("{backend}:{name}"),
+            backend: backend.to_string(),
+            name: name.to_string(),
+        }
     }
 }
 
@@ -26,7 +37,7 @@ impl ChannelInfo {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CanFrameEvent {
-    pub channel: ChannelInfo,
+    pub channel_id: String,
     pub can_id: u32,
     pub is_extended: bool,
     pub dlc: u8,
@@ -37,7 +48,7 @@ pub struct CanFrameEvent {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SignalValueEvent {
-    pub channel: String,
+    pub channel_id: String,
     pub signal_name: String,
     pub message_name: String,
     pub value: f64,
@@ -45,11 +56,12 @@ pub struct SignalValueEvent {
     pub timestamp_ms: u64,
 }
 
-// ── Manager ───────────────────────────────────────────────────────────────────
+// ── Manager internals ─────────────────────────────────────────────────────────
+
 struct OpenChannelState {
     stop_flag: Arc<AtomicBool>,
     channel: Arc<Mutex<Box<dyn CanChannel>>>,
-    backend_name: String,
+    channel_info: ChannelInfo,
 }
 
 pub struct CanManager {
@@ -72,19 +84,16 @@ impl CanManager {
     }
 
     pub fn list_channels(&self) -> Vec<ChannelInfo> {
-        let mut result = Vec::new();
-        for backend in &self.backends {
-            if let Ok(b) = backend.lock() {
+        let mut out = Vec::new();
+        for b in &self.backends {
+            if let Ok(b) = b.lock() {
                 let bname = b.name().to_string();
                 for ch in b.list_channels() {
-                    result.push(ChannelInfo {
-                        backend: bname.clone(),
-                        name: ch,
-                    });
+                    out.push(ChannelInfo::new(&bname, &ch));
                 }
             }
         }
-        result
+        out
     }
 
     pub fn open_channel(
@@ -94,14 +103,17 @@ impl CanManager {
         bitrate: Option<u32>,
         dbc: DbcState,
     ) -> Result<ChannelInfo, String> {
-        let channel_info = ChannelInfo {
-            backend: backend_name,
-            name: channel_name,
-        };
-        let channel_id = channel_info.id();
+        let info = ChannelInfo::new(&backend_name, &channel_name);
+        if self.channels.contains_key(&info.id) {
+            let channel_state = self.channels.get(&info.id).unwrap();
+            let mut channel = channel_state
+                .channel
+                .lock()
+                .map_err(|_| "Channel lock poisoned".to_string())?;
+            let channel_info = channel_state.channel_info.clone();
+            channel.set_bitrate(bitrate.unwrap_or(0))?;
 
-        if self.channels.contains_key(&channel_id) {
-            return Err(format!("Channel '{}' is already open", channel_id));
+            return Ok(channel_info);
         }
 
         let backend = self
@@ -109,75 +121,66 @@ impl CanManager {
             .iter()
             .find_map(|b| {
                 let g = b.lock().ok()?;
-                if g.name() == channel_info.backend {
-                    Some(Arc::clone(b))
-                } else {
-                    None
-                }
+                (g.name() == backend_name).then(|| Arc::clone(b))
             })
-            .ok_or_else(|| format!("No backend named '{}'", channel_info.backend))?;
+            .ok_or_else(|| format!("No backend '{backend_name}'"))?;
 
-        let mut channel = {
+        let mut ch = {
             let mut b = backend
                 .lock()
                 .map_err(|_| "Backend lock poisoned".to_string())?;
-            b.open_channel(channel_info.name.as_str(), bitrate, Arc::clone(&self.state))?
+            b.open_channel(&channel_name, bitrate, Arc::clone(&self.state))?
         };
+        ch.open()?;
 
-        channel.open()?;
-
-        let channel = Arc::new(Mutex::new(channel));
+        let ch = Arc::new(Mutex::new(ch));
         let stop_flag = Arc::new(AtomicBool::new(false));
 
         std::thread::spawn({
-            let channel = Arc::clone(&channel);
+            let ch = Arc::clone(&ch);
             let stop = Arc::clone(&stop_flag);
-            let ch_id = channel_info.clone();
+            let info = info.clone();
             let state = Arc::clone(&self.state);
-            move || reading_loop(channel, ch_id, state, dbc, stop)
+            move || reading_loop(ch, info, state, dbc, stop)
         });
 
         self.channels.insert(
-            channel_id.clone(),
+            info.id.clone(),
             OpenChannelState {
                 stop_flag,
-                channel,
-                backend_name: channel_info.backend.clone(),
+                channel: ch,
+                channel_info: info.clone(),
             },
         );
-        Ok(channel_info)
+        Ok(info)
     }
 
     pub fn close_channel(&mut self, channel_id: &str) -> Result<(), String> {
-        match self.channels.remove(channel_id) {
-            Some(state) => {
-                state.stop_flag.store(true, Ordering::Relaxed);
-                Ok(())
-            }
-            None => Err(format!("Channel '{channel_id}' is not open")),
-        }
+        self.channels
+            .remove(channel_id)
+            .map(|s| s.stop_flag.store(true, Ordering::Relaxed))
+            .ok_or_else(|| format!("'{channel_id}' is not open"))
     }
 
     pub fn open_channels_info(&self) -> Vec<ChannelInfo> {
         self.channels
-            .iter()
-            .map(|(name, state)| ChannelInfo {
-                backend: state.backend_name.clone(),
-                name: name.clone(),
+            .keys()
+            .filter_map(|id| {
+                let (backend, name) = id.split_once(':')?;
+                Some(ChannelInfo::new(backend, name))
             })
             .collect()
     }
 
+    // Hot path — avoid allocation, HashMap lookup is O(1).
     pub fn send_frame(&self, channel_id: &str, frame: CanFrame) -> Result<(), String> {
-        let state = self
-            .channels
+        self.channels
             .get(channel_id)
-            .ok_or_else(|| format!("Channel '{channel_id}' is not open"))?;
-        let ch = state
+            .ok_or_else(|| format!("'{channel_id}' is not open"))?
             .channel
             .lock()
-            .map_err(|_| "Channel lock poisoned".to_string())?;
-        ch.send(frame)
+            .map_err(|_| "Channel lock poisoned".to_string())?
+            .send(frame)
     }
 }
 
@@ -185,18 +188,15 @@ impl CanManager {
 
 fn reading_loop(
     channel: Arc<Mutex<Box<dyn CanChannel>>>,
-    channel_info: ChannelInfo,
+    info: ChannelInfo,
     state: Arc<AppState>,
     dbc: DbcState,
     stop: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::Relaxed) {
-        let result = {
-            let ch = match channel.lock() {
-                Ok(g) => g,
-                Err(_) => break,
-            };
-            ch.receive()
+        let result = match channel.lock() {
+            Ok(ch) => ch.receive(),
+            Err(_) => break,
         };
 
         match result {
@@ -205,7 +205,7 @@ fn reading_loop(
                 let _ = state.app.emit(
                     "can-frame",
                     CanFrameEvent {
-                        channel: channel_info.clone(),
+                        channel_id: info.id.clone(),
                         can_id: frame.can_id,
                         is_extended: frame.is_extended,
                         dlc: frame.data.len() as u8,
@@ -215,7 +215,7 @@ fn reading_loop(
                     },
                 );
                 if let Ok(guard) = dbc.read() {
-                    if let Some(channel_dbc) = guard.get(&channel_info) {
+                    if let Some(channel_dbc) = guard.get(&info.id) {
                         if let Some(signals) = channel_dbc.signals_for_message(frame.can_id) {
                             for sig in signals {
                                 let value = crate::signal_codec::decode(
@@ -230,7 +230,7 @@ fn reading_loop(
                                 let _ = state.app.emit(
                                     "signal-value",
                                     SignalValueEvent {
-                                        channel: channel_id.clone(),
+                                        channel_id: info.id.clone(),
                                         signal_name: sig.name.clone(),
                                         message_name: sig.message_name.clone(),
                                         value,
@@ -245,7 +245,7 @@ fn reading_loop(
             }
             Ok(None) => {}
             Err(e) => {
-                log::warn!("CAN read error on '{}': {}", channel_id, e);
+                log::warn!("CAN read error on '{}': {e}", info.id);
                 break;
             }
         }
@@ -255,8 +255,3 @@ fn reading_loop(
         let _ = ch.close();
     }
 }
-
-// ── Shared state types ────────────────────────────────────────────────────────
-
-pub type ManagerState = Arc<Mutex<CanManager>>;
-pub type DbcState = Arc<RwLock<HashMap<String, ParsedDbc>>>;

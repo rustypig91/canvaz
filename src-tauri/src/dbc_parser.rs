@@ -96,6 +96,7 @@ pub fn parse_dbc(path: &str) -> Result<ParsedDbc, String> {
     })
 }
 
+#[allow(dead_code)]
 impl ParsedDbc {
     pub fn find_signal(&self, signal_name: &str) -> Option<&ParsedSignal> {
         self.messages

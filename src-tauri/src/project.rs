@@ -42,6 +42,7 @@ pub struct SimulateEntry {
     pub period_ms: u64,
 }
 
+#[allow(dead_code)]
 impl Project {
     pub fn new() -> Self {
         Self {

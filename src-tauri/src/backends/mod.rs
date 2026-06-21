@@ -1,17 +1,8 @@
 mod socketcan;
 pub use socketcan::SocketCanBackend;
-
-use std::collections::HashMap;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex, RwLock,
-};
-
+use std::sync::Arc;
 use serde::Serialize;
-use tauri::Emitter;
-
 use crate::app_state::AppState;
-use crate::dbc_parser::ParsedDbc;
 
 // ── Frame ─────────────────────────────────────────────────────────────────────
 
@@ -25,6 +16,7 @@ pub struct CanFrame {
 
 // ── Traits ────────────────────────────────────────────────────────────────────
 
+#[allow(dead_code)]
 pub trait CanChannel: Send {
     fn name(&self) -> &str;
     fn app_state(&self) -> &Arc<AppState>;
@@ -36,6 +28,7 @@ pub trait CanChannel: Send {
     fn get_bitrate(&self) -> Result<u32, String>;
 }
 
+#[allow(dead_code)]
 pub trait CanBackend: Send + Sync + 'static {
     fn name(&self) -> &str;
     fn list_channels(&self) -> Vec<String>;
