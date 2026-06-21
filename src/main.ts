@@ -825,6 +825,7 @@ function showFilterMenu(
   if (ctxMenu) ctxMenu.remove();
   const menu = document.createElement("div");
   menu.className = "ctx-menu filter-menu";
+  menu.addEventListener("click", e => e.stopPropagation());
 
   const controls = document.createElement("div");
   controls.className = "filter-controls";
@@ -861,6 +862,60 @@ function showFilterMenu(
   document.body.appendChild(menu);
   ctxMenu = menu;
 
+  const rect = menu.getBoundingClientRect();
+  if (rect.right > window.innerWidth) menu.style.left = `${x - rect.width}px`;
+  if (rect.bottom > window.innerHeight) menu.style.top = `${y - rect.height}px`;
+}
+
+function showRangeFilterMenu(
+  x: number, y: number,
+  label: string,
+  initMin: number | null, initMax: number | null,
+  onChange: (min: number | null, max: number | null) => void,
+) {
+  if (ctxMenu) ctxMenu.remove();
+  const menu = document.createElement("div");
+  menu.className = "ctx-menu range-filter-menu";
+  menu.addEventListener("click", ev => ev.stopPropagation());
+
+  const state = { min: initMin, max: initMax };
+
+  const title = document.createElement("div");
+  title.className = "range-filter-title";
+  title.textContent = label;
+  menu.appendChild(title);
+
+  for (const key of ["min", "max"] as const) {
+    const row = document.createElement("div");
+    row.className = "range-filter-row";
+    const lbl = document.createElement("span");
+    lbl.className = "range-filter-lbl";
+    lbl.textContent = key === "min" ? "Min:" : "Max:";
+    const inp = document.createElement("input");
+    inp.type = "number"; inp.min = "0";
+    inp.className = "range-filter-inp";
+    inp.placeholder = "—";
+    if (state[key] !== null) inp.value = String(state[key]);
+    inp.addEventListener("input", () => {
+      const v = parseFloat(inp.value);
+      state[key] = inp.value.trim() && !isNaN(v) ? v : null;
+      onChange(state.min, state.max);
+    });
+    row.append(lbl, inp);
+    menu.appendChild(row);
+  }
+
+  const clearBtn = document.createElement("button");
+  clearBtn.textContent = "Clear";
+  clearBtn.className = "filter-ctrl-btn";
+  clearBtn.style.cssText = "margin-top:6px;width:100%";
+  clearBtn.addEventListener("click", () => { onChange(null, null); menu.remove(); ctxMenu = null; });
+  menu.appendChild(clearBtn);
+
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  document.body.appendChild(menu);
+  ctxMenu = menu;
   const rect = menu.getBoundingClientRect();
   if (rect.right > window.innerWidth) menu.style.left = `${x - rect.width}px`;
   if (rect.bottom > window.innerHeight) menu.style.top = `${y - rect.height}px`;
@@ -1436,7 +1491,14 @@ const traceSeenChannels = new Set<string>();
 const traceSeenCanIds = new Set<number>();
 let traceFilterChannels: Set<string> | null = null;
 let traceFilterCanIds: Set<number> | null = null;
-let traceSortCol: "channel" | "canId" | null = null;
+let traceFilterData: (number | null)[] = new Array(8).fill(null);
+let traceFilterCycleMin: number | null = null;
+let traceFilterCycleMax: number | null = null;
+let traceFilterDlcMin: number | null = null;
+let traceFilterDlcMax: number | null = null;
+let traceFilterDir: Set<string> | null = null;
+type TraceSortCol = "ts" | "dir" | "channel" | "canId" | "msg" | "dlc" | "data" | "cycle" | null;
+let traceSortCol: TraceSortCol = null;
 let traceSortDir: "asc" | "desc" = "asc";
 
 function traceKey(channel: string, canId: number, direction: "rx" | "tx") {
@@ -1471,10 +1533,29 @@ function fmtPlotLabel(ts: number): string {
   return `${(Math.max(0, ts - appStartTime) / 1000).toFixed(1)}s`;
 }
 
-function traceRowVisible(channel: string, canId: number): boolean {
-  const chOk = traceFilterChannels === null || traceFilterChannels.has(channel);
-  const idOk = traceFilterCanIds === null || traceFilterCanIds.has(canId);
-  return chOk && idOk;
+function parseByte(s: string): number | null {
+  s = s.trim();
+  if (!s) return null;
+  const n = (s.startsWith("0x") || /[a-fA-F]/.test(s))
+    ? parseInt(s.replace(/^0x/i, ""), 16)
+    : parseInt(s, 10);
+  return (isNaN(n) || n < 0 || n > 255) ? null : n;
+}
+
+function traceRowVisible(channel: string, canId: number, bytes: number[], dir: string, cycleMs: number | null, dlc: number): boolean {
+  if (traceFilterChannels !== null && !traceFilterChannels.has(channel)) return false;
+  if (traceFilterCanIds !== null && !traceFilterCanIds.has(canId)) return false;
+  if (traceFilterDir !== null && !traceFilterDir.has(dir)) return false;
+  for (let i = 0; i < traceFilterData.length; i++) {
+    const expected = traceFilterData[i];
+    if (expected === null) continue;
+    if (bytes[i] !== expected) return false;
+  }
+  if (traceFilterDlcMin !== null && dlc < traceFilterDlcMin) return false;
+  if (traceFilterDlcMax !== null && dlc > traceFilterDlcMax) return false;
+  if (traceFilterCycleMin !== null && (cycleMs === null || cycleMs < traceFilterCycleMin)) return false;
+  if (traceFilterCycleMax !== null && (cycleMs === null || cycleMs > traceFilterCycleMax)) return false;
+  return true;
 }
 
 function applyTraceFilter() {
@@ -1482,20 +1563,46 @@ function applyTraceFilter() {
   for (const tr of Array.from(tbody.rows) as HTMLTableRowElement[]) {
     const ch = tr.dataset.channel ?? "";
     const id = parseInt(tr.dataset.canid ?? "0");
-    tr.style.display = traceRowVisible(ch, id) ? "" : "none";
+    const bytes: number[] = JSON.parse(tr.dataset.bytes ?? "[]");
+    const dir = tr.dataset.dir ?? "";
+    const cycleMs = tr.dataset.cycle ? parseFloat(tr.dataset.cycle) : null;
+    const dlc = parseInt(tr.dataset.dlc ?? "0");
+    tr.style.display = traceRowVisible(ch, id, bytes, dir, cycleMs, dlc) ? "" : "none";
   }
 }
 
 function applyTraceSort() {
   if (!traceSortCol) return;
+  const col = traceSortCol;
   const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
   const rows = Array.from(tbody.rows) as HTMLTableRowElement[];
   rows.sort((a, b) => {
     let cmp = 0;
-    if (traceSortCol === "channel") {
-      cmp = (a.dataset.channel ?? "").localeCompare(b.dataset.channel ?? "");
-    } else {
-      cmp = parseInt(a.dataset.canid ?? "0") - parseInt(b.dataset.canid ?? "0");
+    switch (col) {
+      case "ts":      cmp = parseInt(a.dataset.ts ?? "0") - parseInt(b.dataset.ts ?? "0"); break;
+      case "dir":     cmp = (a.dataset.dir ?? "").localeCompare(b.dataset.dir ?? ""); break;
+      case "channel": cmp = (a.dataset.channel ?? "").localeCompare(b.dataset.channel ?? ""); break;
+      case "canId":   cmp = parseInt(a.dataset.canid ?? "0") - parseInt(b.dataset.canid ?? "0"); break;
+      case "msg":     cmp = (a.dataset.msg ?? "").localeCompare(b.dataset.msg ?? ""); break;
+      case "dlc":     cmp = parseInt(a.dataset.dlc ?? "0") - parseInt(b.dataset.dlc ?? "0"); break;
+      case "data": {
+        const ba: number[] = JSON.parse(a.dataset.bytes ?? "[]");
+        const bb: number[] = JSON.parse(b.dataset.bytes ?? "[]");
+        for (let i = 0; i < Math.max(ba.length, bb.length); i++) {
+          cmp = (ba[i] ?? -1) - (bb[i] ?? -1);
+          if (cmp !== 0) break;
+        }
+        break;
+      }
+      case "cycle": {
+        const ca = parseFloat(a.dataset.cycle ?? "");
+        const cb = parseFloat(b.dataset.cycle ?? "");
+        if (isNaN(ca) && isNaN(cb)) cmp = 0;
+        else if (isNaN(ca)) cmp = 1;
+        else if (isNaN(cb)) cmp = -1;
+        else cmp = ca - cb;
+        break;
+      }
     }
     return traceSortDir === "asc" ? cmp : -cmp;
   });
@@ -1508,8 +1615,12 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
   tr.dataset.channel = entry.channel;
   tr.dataset.canid = String(entry.canId);
   tr.dataset.ts = String(entry.timestampMs);
+  tr.dataset.dir = entry.direction;
+  tr.dataset.msg = entry.messageName ?? "";
+  tr.dataset.dlc = String(entry.dlc);
+  tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
   if (entry.messageName) tr.classList.add("dbc-match");
-  if (!traceRowVisible(entry.channel, entry.canId)) tr.style.display = "none";
+  if (!traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc)) tr.style.display = "none";
   const dirClass = entry.direction === "tx" ? "dir-tx" : "dir-rx";
   tr.innerHTML = `
     <td class="td-ts">${fmtElapsed(entry.timestampMs)}</td>
@@ -1526,6 +1637,10 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
 
 function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
   tr.dataset.bytes = JSON.stringify(entry.data);
+  tr.dataset.ts = String(entry.timestampMs);
+  tr.dataset.dlc = String(entry.dlc);
+  tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
+  tr.style.display = traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc) ? "" : "none";
   const cells = tr.cells;
   cells[0].textContent = fmtElapsed(entry.timestampMs);
   cells[5].textContent = String(entry.dlc);
@@ -1599,42 +1714,40 @@ function setupTrace() {
 
   // ── Column header sort + filter ───────────────────────────────────────────
   const headerRow = document.querySelector("#trace-table thead tr")!;
-  const thChannel = headerRow.children[2] as HTMLTableCellElement;
-  const thCanId   = headerRow.children[3] as HTMLTableCellElement;
+  const ths = Array.from(headerRow.children) as HTMLTableCellElement[];
+  const thCols: TraceSortCol[] = ["ts", "dir", "channel", "canId", "msg", "dlc", "data", "cycle"];
+  const thLabels = ["Timestamp", "Dir", "Channel", "CAN ID", "Message", "DLC", "Data", "Cycle (ms)"];
 
   function updateSortIndicators() {
-    thChannel.dataset.sortActive = traceSortCol === "channel" ? traceSortDir : "";
-    thCanId.dataset.sortActive   = traceSortCol === "canId"   ? traceSortDir : "";
-    const arrow = (col: typeof traceSortCol) =>
-      traceSortCol === col ? (traceSortDir === "asc" ? " ▲" : " ▼") : "";
-    thChannel.childNodes[0].textContent = "Channel" + arrow("channel");
-    thCanId.childNodes[0].textContent   = "CAN ID"  + arrow("canId");
+    thCols.forEach((col, i) => {
+      const active = traceSortCol === col;
+      ths[i].childNodes[0].textContent = thLabels[i] + (active ? (traceSortDir === "asc" ? " ▲" : " ▼") : "");
+    });
   }
 
-  function setSortCol(col: "channel" | "canId") {
+  function setSortCol(col: TraceSortCol) {
     if (traceSortCol === col) traceSortDir = traceSortDir === "asc" ? "desc" : "asc";
     else { traceSortCol = col; traceSortDir = "asc"; }
     updateSortIndicators();
     applyTraceSort();
   }
 
-  thChannel.addEventListener("click", () => setSortCol("channel"));
-  thCanId.addEventListener("click",   () => setSortCol("canId"));
+  thCols.forEach((col, i) => ths[i].addEventListener("click", () => setSortCol(col)));
 
-  thChannel.addEventListener("contextmenu", (e) => {
+  // Channel filter (right-click col 2)
+  ths[2].addEventListener("contextmenu", (e) => {
     e.preventDefault();
-    const items = [...traceSeenChannels].sort().map(ch => ({
-      label: channelDisplayName(ch), key: ch,
-    }));
+    const items = [...traceSeenChannels].sort().map(ch => ({ label: channelDisplayName(ch), key: ch }));
     if (!items.length) return;
     showFilterMenu(e.clientX, e.clientY, items, traceFilterChannels, (active) => {
       traceFilterChannels = active;
-      thChannel.classList.toggle("th-filtered", active !== null);
+      ths[2].classList.toggle("th-filtered", active !== null);
       applyTraceFilter();
     });
   });
 
-  thCanId.addEventListener("contextmenu", (e) => {
+  // CAN ID filter (right-click col 3)
+  ths[3].addEventListener("contextmenu", (e) => {
     e.preventDefault();
     const items = [...traceSeenCanIds].sort((a, b) => a - b).map(id => ({
       label: fmtId(id, id > 0x7FF), key: String(id),
@@ -1644,9 +1757,107 @@ function setupTrace() {
       traceFilterCanIds !== null ? new Set([...traceFilterCanIds].map(String)) : null,
       (active) => {
         traceFilterCanIds = active !== null ? new Set([...active].map(Number)) : null;
-        thCanId.classList.toggle("th-filtered", active !== null);
+        ths[3].classList.toggle("th-filtered", active !== null);
         applyTraceFilter();
       });
+  });
+
+  // Data byte filter (right-click col 6)
+  ths[6].addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    if (ctxMenu) ctxMenu.remove();
+    const menu = document.createElement("div");
+    menu.className = "ctx-menu data-filter-menu";
+    menu.addEventListener("click", ev => ev.stopPropagation());
+
+    const inputs: HTMLInputElement[] = [];
+    const grid = document.createElement("div");
+    grid.className = "data-filter-grid";
+    for (let i = 0; i < 8; i++) {
+      const cell = document.createElement("div");
+      cell.className = "data-filter-cell";
+      const lbl = document.createElement("span");
+      lbl.className = "data-filter-lbl";
+      lbl.textContent = String(i);
+      const inp = document.createElement("input");
+      inp.type = "text";
+      inp.className = "data-filter-inp";
+      inp.placeholder = "—";
+      inp.maxLength = 4;
+      const cur = traceFilterData[i];
+      if (cur !== null) inp.value = cur.toString(16).toUpperCase().padStart(2, "0");
+      inp.addEventListener("input", () => {
+        const val = parseByte(inp.value);
+        traceFilterData[i] = val;
+        inp.classList.toggle("data-filter-invalid", inp.value.trim() !== "" && val === null);
+        const hasAny = traceFilterData.some(v => v !== null);
+        ths[6].classList.toggle("th-filtered", hasAny);
+        applyTraceFilter();
+      });
+      cell.append(lbl, inp);
+      grid.appendChild(cell);
+      inputs.push(inp);
+    }
+    menu.appendChild(grid);
+
+    const hint = document.createElement("div");
+    hint.className = "data-filter-hint";
+    hint.textContent = "hex (FF) or decimal (255), empty = any";
+    menu.appendChild(hint);
+
+    const clearBtn = document.createElement("button");
+    clearBtn.textContent = "Clear all";
+    clearBtn.className = "filter-ctrl-btn";
+    clearBtn.style.marginTop = "6px";
+    clearBtn.style.width = "100%";
+    clearBtn.addEventListener("click", () => {
+      traceFilterData.fill(null);
+      inputs.forEach(inp => { inp.value = ""; inp.classList.remove("data-filter-invalid"); });
+      ths[6].classList.remove("th-filtered");
+      applyTraceFilter();
+    });
+    menu.appendChild(clearBtn);
+
+    menu.style.left = `${e.clientX}px`;
+    menu.style.top = `${e.clientY}px`;
+    document.body.appendChild(menu);
+    ctxMenu = menu;
+    const rect = menu.getBoundingClientRect();
+    if (rect.right > window.innerWidth) menu.style.left = `${e.clientX - rect.width}px`;
+    if (rect.bottom > window.innerHeight) menu.style.top = `${e.clientY - rect.height}px`;
+  });
+
+  // Dir filter (right-click col 1)
+  ths[1].addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    showFilterMenu(e.clientX, e.clientY,
+      [{ label: "RX", key: "rx" }, { label: "TX", key: "tx" }],
+      traceFilterDir,
+      (active) => {
+        traceFilterDir = active;
+        ths[1].classList.toggle("th-filtered", active !== null);
+        applyTraceFilter();
+      });
+  });
+
+  // DLC filter (right-click col 5)
+  ths[5].addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    showRangeFilterMenu(e.clientX, e.clientY, "DLC", traceFilterDlcMin, traceFilterDlcMax, (mn, mx) => {
+      traceFilterDlcMin = mn; traceFilterDlcMax = mx;
+      ths[5].classList.toggle("th-filtered", mn !== null || mx !== null);
+      applyTraceFilter();
+    });
+  });
+
+  // Cycle filter (right-click col 7)
+  ths[7].addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    showRangeFilterMenu(e.clientX, e.clientY, "Cycle (ms)", traceFilterCycleMin, traceFilterCycleMax, (mn, mx) => {
+      traceFilterCycleMin = mn; traceFilterCycleMax = mx;
+      ths[7].classList.toggle("th-filtered", mn !== null || mx !== null);
+      applyTraceFilter();
+    });
   });
 
   document.getElementById("select-trace-format")!.addEventListener("change", (e) => {

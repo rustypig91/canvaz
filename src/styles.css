@@ -693,14 +693,36 @@ kbd {
   border-bottom: 1px solid var(--border);
   z-index: 1;
 }
-#trace-table thead th:nth-child(3),
-#trace-table thead th:nth-child(4) {
-  cursor: pointer;
-  user-select: none;
-}
-#trace-table thead th:nth-child(3):hover,
-#trace-table thead th:nth-child(4):hover { color: var(--text); }
+#trace-table thead th { cursor: pointer; user-select: none; }
+#trace-table thead th:hover { color: var(--text); }
 #trace-table thead th.th-filtered { color: var(--accent); }
+.data-filter-menu { padding: 8px; width: 220px; }
+.data-filter-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 4px;
+  margin-bottom: 6px;
+}
+.data-filter-cell { display: flex; flex-direction: column; align-items: center; gap: 2px; }
+.data-filter-lbl { font-size: 10px; color: var(--text-muted); }
+.data-filter-inp {
+  width: 100%; background: var(--bg2); border: 1px solid var(--border);
+  color: var(--text); border-radius: 3px; padding: 2px 4px;
+  font-family: monospace; font-size: 12px; text-align: center;
+}
+.data-filter-inp:focus { outline: none; border-color: var(--accent); }
+.data-filter-inp.data-filter-invalid { border-color: var(--danger); }
+.data-filter-hint { font-size: 10px; color: var(--text-muted); text-align: center; margin-bottom: 4px; }
+.range-filter-menu { padding: 8px; min-width: 160px; }
+.range-filter-title { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin-bottom: 6px; }
+.range-filter-row { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
+.range-filter-lbl { font-size: 12px; color: var(--text-muted); width: 32px; flex-shrink: 0; }
+.range-filter-inp {
+  flex: 1; background: var(--bg2); border: 1px solid var(--border);
+  color: var(--text); border-radius: 3px; padding: 3px 6px;
+  font-size: 12px; font-family: monospace;
+}
+.range-filter-inp:focus { outline: none; border-color: var(--accent); }
 #trace-table tbody tr { border-bottom: 1px solid rgba(255,255,255,0.04); }
 #trace-table tbody tr:hover td { background: var(--bg3); }
 #trace-table tbody tr.dbc-match td:nth-child(5) { color: var(--accent); }
