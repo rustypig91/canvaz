@@ -258,6 +258,18 @@ kbd {
 .ctx-menu-item:hover { background: var(--bg2); }
 .ctx-menu-item.danger { color: var(--danger); }
 .ctx-menu-item.danger:hover { background: color-mix(in srgb, var(--danger) 15%, var(--bg2)); }
+.filter-menu { padding: 6px; min-width: 160px; max-height: 320px; overflow-y: auto; }
+.filter-controls { display: flex; gap: 4px; margin-bottom: 6px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+.filter-ctrl-btn {
+  flex: 1; background: var(--bg2); border: 1px solid var(--border); color: var(--text-muted);
+  border-radius: 4px; padding: 2px 6px; cursor: pointer; font-size: 11px;
+}
+.filter-ctrl-btn:hover { background: var(--bg); color: var(--text); }
+.filter-row {
+  display: flex; align-items: center; gap: 6px; padding: 3px 4px;
+  border-radius: 4px; cursor: pointer; font-size: 12px; user-select: none;
+}
+.filter-row:hover { background: var(--bg2); }
 .channel-item .dot {
   width: 8px; height: 8px;
   border-radius: 50%;
@@ -681,6 +693,14 @@ kbd {
   border-bottom: 1px solid var(--border);
   z-index: 1;
 }
+#trace-table thead th:nth-child(3),
+#trace-table thead th:nth-child(4) {
+  cursor: pointer;
+  user-select: none;
+}
+#trace-table thead th:nth-child(3):hover,
+#trace-table thead th:nth-child(4):hover { color: var(--text); }
+#trace-table thead th.th-filtered { color: var(--accent); }
 #trace-table tbody tr { border-bottom: 1px solid rgba(255,255,255,0.04); }
 #trace-table tbody tr:hover td { background: var(--bg3); }
 #trace-table tbody tr.dbc-match td:nth-child(5) { color: var(--accent); }

@@ -816,6 +816,56 @@ function showContextMenu(x: number, y: number, items: { label: string; danger?: 
 document.addEventListener("click", () => { if (ctxMenu) { ctxMenu.remove(); ctxMenu = null; } });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && ctxMenu) { ctxMenu.remove(); ctxMenu = null; } });
 
+function showFilterMenu(
+  x: number, y: number,
+  items: { label: string; key: string }[],
+  active: Set<string> | null,
+  onFilter: (active: Set<string> | null) => void,
+) {
+  if (ctxMenu) ctxMenu.remove();
+  const menu = document.createElement("div");
+  menu.className = "ctx-menu filter-menu";
+
+  const controls = document.createElement("div");
+  controls.className = "filter-controls";
+  const allBtn = document.createElement("button");
+  allBtn.textContent = "All"; allBtn.className = "filter-ctrl-btn";
+  const noneBtn = document.createElement("button");
+  noneBtn.textContent = "None"; noneBtn.className = "filter-ctrl-btn";
+  controls.append(allBtn, noneBtn);
+  menu.appendChild(controls);
+
+  const checkboxes: { el: HTMLInputElement; key: string }[] = [];
+  for (const item of items) {
+    const lbl = document.createElement("label");
+    lbl.className = "filter-row";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = active === null || active.has(item.key);
+    lbl.append(cb, document.createTextNode(" " + item.label));
+    menu.appendChild(lbl);
+    checkboxes.push({ el: cb, key: item.key });
+  }
+
+  function notifyChange() {
+    const checked = new Set(checkboxes.filter(c => c.el.checked).map(c => c.key));
+    onFilter(checked.size === items.length ? null : checked);
+  }
+
+  for (const { el } of checkboxes) el.addEventListener("change", notifyChange);
+  allBtn.addEventListener("click", (e) => { e.stopPropagation(); checkboxes.forEach(c => c.el.checked = true); onFilter(null); });
+  noneBtn.addEventListener("click", (e) => { e.stopPropagation(); checkboxes.forEach(c => c.el.checked = false); onFilter(new Set()); });
+
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  document.body.appendChild(menu);
+  ctxMenu = menu;
+
+  const rect = menu.getBoundingClientRect();
+  if (rect.right > window.innerWidth) menu.style.left = `${x - rect.width}px`;
+  if (rect.bottom > window.innerHeight) menu.style.top = `${y - rect.height}px`;
+}
+
 // ── Channel management ────────────────────────────────────────────────────────
 
 function selectChannel(name: string | null) {
@@ -1382,6 +1432,12 @@ let traceMaxRows = 1000;
 
 const traceLastTs = new Map<string, number>();
 const traceRowEls = new Map<string, HTMLTableRowElement>();
+const traceSeenChannels = new Set<string>();
+const traceSeenCanIds = new Set<number>();
+let traceFilterChannels: Set<string> | null = null;
+let traceFilterCanIds: Set<number> | null = null;
+let traceSortCol: "channel" | "canId" | null = null;
+let traceSortDir: "asc" | "desc" = "asc";
 
 function traceKey(channel: string, canId: number, direction: "rx" | "tx") {
   return `${channel}::${canId}::${direction}`;
@@ -1415,10 +1471,45 @@ function fmtPlotLabel(ts: number): string {
   return `${(Math.max(0, ts - appStartTime) / 1000).toFixed(1)}s`;
 }
 
+function traceRowVisible(channel: string, canId: number): boolean {
+  const chOk = traceFilterChannels === null || traceFilterChannels.has(channel);
+  const idOk = traceFilterCanIds === null || traceFilterCanIds.has(canId);
+  return chOk && idOk;
+}
+
+function applyTraceFilter() {
+  const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
+  for (const tr of Array.from(tbody.rows) as HTMLTableRowElement[]) {
+    const ch = tr.dataset.channel ?? "";
+    const id = parseInt(tr.dataset.canid ?? "0");
+    tr.style.display = traceRowVisible(ch, id) ? "" : "none";
+  }
+}
+
+function applyTraceSort() {
+  if (!traceSortCol) return;
+  const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
+  const rows = Array.from(tbody.rows) as HTMLTableRowElement[];
+  rows.sort((a, b) => {
+    let cmp = 0;
+    if (traceSortCol === "channel") {
+      cmp = (a.dataset.channel ?? "").localeCompare(b.dataset.channel ?? "");
+    } else {
+      cmp = parseInt(a.dataset.canid ?? "0") - parseInt(b.dataset.canid ?? "0");
+    }
+    return traceSortDir === "asc" ? cmp : -cmp;
+  });
+  for (const row of rows) tbody.appendChild(row);
+}
+
 function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
   const tr = document.createElement("tr");
   tr.dataset.bytes = JSON.stringify(entry.data);
+  tr.dataset.channel = entry.channel;
+  tr.dataset.canid = String(entry.canId);
+  tr.dataset.ts = String(entry.timestampMs);
   if (entry.messageName) tr.classList.add("dbc-match");
+  if (!traceRowVisible(entry.channel, entry.canId)) tr.style.display = "none";
   const dirClass = entry.direction === "tx" ? "dir-tx" : "dir-rx";
   tr.innerHTML = `
     <td class="td-ts">${fmtElapsed(entry.timestampMs)}</td>
@@ -1444,6 +1535,9 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
 
 function onCanFrame(ev: CanFrameEvent) {
   if (!appRunning || tracePaused) return;
+
+  traceSeenChannels.add(ev.channel_id);
+  traceSeenCanIds.add(ev.can_id);
 
   const direction = ev.direction ?? "rx";
   const key = traceKey(ev.channel_id, ev.can_id, direction);
@@ -1488,6 +1582,8 @@ function clearTrace() {
   (document.getElementById("trace-tbody") as HTMLTableSectionElement).innerHTML = "";
   traceRowEls.clear();
   traceLastTs.clear();
+  traceSeenChannels.clear();
+  traceSeenCanIds.clear();
 }
 
 function refreshTraceFormat() {
@@ -1500,6 +1596,58 @@ function refreshTraceFormat() {
 
 function setupTrace() {
   document.getElementById("btn-clear-trace")!.addEventListener("click", clearTrace);
+
+  // ── Column header sort + filter ───────────────────────────────────────────
+  const headerRow = document.querySelector("#trace-table thead tr")!;
+  const thChannel = headerRow.children[2] as HTMLTableCellElement;
+  const thCanId   = headerRow.children[3] as HTMLTableCellElement;
+
+  function updateSortIndicators() {
+    thChannel.dataset.sortActive = traceSortCol === "channel" ? traceSortDir : "";
+    thCanId.dataset.sortActive   = traceSortCol === "canId"   ? traceSortDir : "";
+    const arrow = (col: typeof traceSortCol) =>
+      traceSortCol === col ? (traceSortDir === "asc" ? " ▲" : " ▼") : "";
+    thChannel.childNodes[0].textContent = "Channel" + arrow("channel");
+    thCanId.childNodes[0].textContent   = "CAN ID"  + arrow("canId");
+  }
+
+  function setSortCol(col: "channel" | "canId") {
+    if (traceSortCol === col) traceSortDir = traceSortDir === "asc" ? "desc" : "asc";
+    else { traceSortCol = col; traceSortDir = "asc"; }
+    updateSortIndicators();
+    applyTraceSort();
+  }
+
+  thChannel.addEventListener("click", () => setSortCol("channel"));
+  thCanId.addEventListener("click",   () => setSortCol("canId"));
+
+  thChannel.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    const items = [...traceSeenChannels].sort().map(ch => ({
+      label: channelDisplayName(ch), key: ch,
+    }));
+    if (!items.length) return;
+    showFilterMenu(e.clientX, e.clientY, items, traceFilterChannels, (active) => {
+      traceFilterChannels = active;
+      thChannel.classList.toggle("th-filtered", active !== null);
+      applyTraceFilter();
+    });
+  });
+
+  thCanId.addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    const items = [...traceSeenCanIds].sort((a, b) => a - b).map(id => ({
+      label: fmtId(id, id > 0x7FF), key: String(id),
+    }));
+    if (!items.length) return;
+    showFilterMenu(e.clientX, e.clientY, items,
+      traceFilterCanIds !== null ? new Set([...traceFilterCanIds].map(String)) : null,
+      (active) => {
+        traceFilterCanIds = active !== null ? new Set([...active].map(Number)) : null;
+        thCanId.classList.toggle("th-filtered", active !== null);
+        applyTraceFilter();
+      });
+  });
 
   document.getElementById("select-trace-format")!.addEventListener("change", (e) => {
     traceDataFormat = (e.target as HTMLSelectElement).value as TraceDataFormat;
