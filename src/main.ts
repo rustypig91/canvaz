@@ -1500,6 +1500,7 @@ let traceFilterDir: Set<string> | null = null;
 type TraceSortCol = "ts" | "dir" | "channel" | "canId" | "msg" | "dlc" | "data" | "cycle" | null;
 let traceSortCol: TraceSortCol = null;
 let traceSortDir: "asc" | "desc" = "asc";
+const traceAppendBuffer: TraceEntry[] = [];
 
 function traceKey(channel: string, canId: number, direction: "rx" | "tx") {
   return `${channel}::${canId}::${direction}`;
@@ -1560,6 +1561,17 @@ function traceRowVisible(channel: string, canId: number, bytes: number[], dir: s
 
 function applyTraceFilter() {
   const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
+  if (traceMode === "append") {
+    // Rebuild DOM entirely from the in-memory buffer — never keep invisible rows in the DOM.
+    tbody.innerHTML = "";
+    for (const entry of traceAppendBuffer) {
+      if (traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc)) {
+        tbody.appendChild(buildTraceRow(entry));
+      }
+    }
+    return;
+  }
+  // Overwrite mode: toggle visibility on the fixed set of rows.
   for (const tr of Array.from(tbody.rows) as HTMLTableRowElement[]) {
     const ch = tr.dataset.channel ?? "";
     const id = parseInt(tr.dataset.canid ?? "0");
@@ -1687,9 +1699,18 @@ function onCanFrame(ev: CanFrameEvent) {
       tbody.appendChild(tr);
     }
   } else {
-    const tr = buildTraceRow(entry);
-    tbody.insertBefore(tr, tbody.firstChild);
-    while (tbody.rows.length > traceMaxRows) tbody.deleteRow(-1);
+    // Buffer stores the last traceMaxRows entries regardless of filter.
+    traceAppendBuffer.unshift(entry);
+    if (traceAppendBuffer.length > traceMaxRows) traceAppendBuffer.pop();
+
+    // Only add a DOM row if the entry passes the current filter.
+    // The DOM therefore contains only visible rows — no hidden rows, no slow scans.
+    if (traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc)) {
+      const tr = buildTraceRow(entry);
+      tbody.insertBefore(tr, tbody.firstChild);
+      // DOM visible-row count mirrors the buffer's visible subset; trim from the bottom.
+      while (tbody.rows.length > traceMaxRows) tbody.deleteRow(-1);
+    }
   }
 }
 
@@ -1699,6 +1720,7 @@ function clearTrace() {
   traceLastTs.clear();
   traceSeenChannels.clear();
   traceSeenCanIds.clear();
+  traceAppendBuffer.length = 0;
 }
 
 function refreshTraceFormat() {
@@ -1874,6 +1896,7 @@ function setupTrace() {
 
   document.getElementById("input-trace-max")!.addEventListener("change", (e) => {
     traceMaxRows = parseInt((e.target as HTMLInputElement).value) || 1000;
+    while (traceAppendBuffer.length > traceMaxRows) traceAppendBuffer.pop();
   });
 
   const pauseBtn = document.getElementById("btn-pause-trace")!;
