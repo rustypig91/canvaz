@@ -123,6 +123,34 @@ function plotKey(channel: string, signalName: string) {
   return `${channel}::${signalName}`;
 }
 
+function decodeSignal(data: number[], sig: DbcSignal): number {
+  const { start_bit, length, little_endian, signed, factor, offset: sigOffset } = sig;
+  let raw = 0n;
+  const len = BigInt(length);
+  if (little_endian) {
+    for (let i = 0; i < length; i++) {
+      const byteIdx = ((start_bit + i) / 8) | 0;
+      const bitInByte = (start_bit + i) % 8;
+      if (byteIdx < data.length) raw |= BigInt((data[byteIdx] >> bitInByte) & 1) << BigInt(i);
+    }
+  } else {
+    let bitPos = start_bit;
+    for (let i = 0; i < length; i++) {
+      const byteIdx = (bitPos / 8) | 0;
+      const bitInByte = bitPos % 8;
+      if (byteIdx < data.length) raw |= BigInt((data[byteIdx] >> bitInByte) & 1) << BigInt(length - 1 - i);
+      if (bitPos % 8 === 0) bitPos += 15; else bitPos -= 1;
+    }
+  }
+  let physical: number;
+  if (signed && length > 0 && (raw & (1n << (len - 1n)))) {
+    physical = Number(BigInt.asIntN(64, raw | (~((1n << len) - 1n))));
+  } else {
+    physical = Number(raw);
+  }
+  return physical * factor + sigOffset;
+}
+
 function formatSigValue(value: number, unit: string): string {
   const abs = Math.abs(value);
   const s = abs >= 10000 ? value.toFixed(0)
@@ -340,12 +368,24 @@ function onSignalValue(ev: SignalValueEvent) {
     while (hist.length > 0 && hist[0].ts < cutoff) hist.shift();
   }
 
-  // Update sidebar value
+  // Update sidebar value + min/max
   signalLastValues.set(key, ev.value);
+  const prevMin = signalMinValues.get(key);
+  const prevMax = signalMaxValues.get(key);
+  if (prevMin === undefined || ev.value < prevMin) signalMinValues.set(key, ev.value);
+  if (prevMax === undefined || ev.value > prevMax) signalMaxValues.set(key, ev.value);
+
   const valEl = signalValueEls.get(key);
   if (valEl) {
     valEl.textContent = formatSigValue(ev.value, ev.unit);
     valEl.classList.remove("sig-value--empty");
+  }
+  const rangeEl = signalRangeEls.get(key);
+  if (rangeEl) {
+    const mn = signalMinValues.get(key)!;
+    const mx = signalMaxValues.get(key)!;
+    rangeEl.textContent = `↓${formatSigValue(mn, "")} ↑${formatSigValue(mx, "")}`;
+    rangeEl.classList.remove("sig-value--empty");
   }
 
   if (plotPaused) return;
@@ -398,6 +438,7 @@ function renderDbcTree(filter = "") {
   const tree = document.getElementById("dbc-tree")!;
   tree.innerHTML = "";
   signalValueEls.clear();
+  signalRangeEls.clear();
 
   const dbc = selectedChannel ? dbcByChannel.get(selectedChannel) : null;
   if (!dbc) {
@@ -431,8 +472,15 @@ function renderDbcTree(filter = "") {
       const key = plotKey(selectedChannel!, sig.name);
       const lastVal = signalLastValues.get(key);
       const valText = lastVal != null ? formatSigValue(lastVal, sig.unit) : (sig.unit || "");
-      row.innerHTML = `<span class="sig-name">${sig.name}</span><span class="sig-value${lastVal == null ? " sig-value--empty" : ""}">${valText}</span>`;
+      const mn = signalMinValues.get(key);
+      const mx = signalMaxValues.get(key);
+      const rangeText = mn !== undefined ? `↓${formatSigValue(mn, "")} ↑${formatSigValue(mx!, "")}` : "↓— ↑—";
+      row.innerHTML = `
+        <span class="sig-name">${sig.name}</span>
+        <span class="sig-value${lastVal == null ? " sig-value--empty" : ""}">${valText}</span>
+        <span class="sig-range${mn === undefined ? " sig-value--empty" : ""}">${rangeText}</span>`;
       signalValueEls.set(key, row.querySelector<HTMLElement>(".sig-value")!);
+      signalRangeEls.set(key, row.querySelector<HTMLElement>(".sig-range")!);
 
       // Drag to plot
       row.setAttribute("draggable", "true");
@@ -568,8 +616,11 @@ const interfaceBackends = new Map<string, string>();      // from list_can_inter
 
 function channelDisplayName(id: string) { return id.includes(':') ? id.split(':')[1] : id; }
 function channelBackend(id: string)     { return id.includes(':') ? id.split(':')[0] : ""; }
-const signalLastValues = new Map<string, number>();   // key → latest value
-const signalValueEls   = new Map<string, HTMLElement>(); // key → .sig-value span
+const signalLastValues = new Map<string, number>();
+const signalMinValues  = new Map<string, number>();
+const signalMaxValues  = new Map<string, number>();
+const signalValueEls   = new Map<string, HTMLElement>();
+const signalRangeEls   = new Map<string, HTMLElement>();
 let selectedChannel: string | null = null;
 
 // ── Auto-save / session restore ───────────────────────────────────────────────
@@ -1329,6 +1380,8 @@ function startApp() {
   appStartTime = Date.now();
   signalHistory.clear();
   signalLastValues.clear();
+  signalMinValues.clear();
+  signalMaxValues.clear();
 
   // Rebuild DBC tree to clear sidebar values
   renderDbcTree((document.getElementById("signal-search") as HTMLInputElement).value);
@@ -1489,8 +1542,11 @@ const traceLastTs = new Map<string, number>();
 const traceRowEls = new Map<string, HTMLTableRowElement>();
 const traceSeenChannels = new Set<string>();
 const traceSeenCanIds = new Set<number>();
+const traceSeenMsgNames = new Set<string>();
+let traceSeenNoMsg = false;
 let traceFilterChannels: Set<string> | null = null;
 let traceFilterCanIds: Set<number> | null = null;
+let traceFilterMsgNames: Set<string> | null = null;
 let traceFilterData: (number | null)[] = new Array(8).fill(null);
 let traceFilterCycleMin: number | null = null;
 let traceFilterCycleMax: number | null = null;
@@ -1543,10 +1599,11 @@ function parseByte(s: string): number | null {
   return (isNaN(n) || n < 0 || n > 255) ? null : n;
 }
 
-function traceRowVisible(channel: string, canId: number, bytes: number[], dir: string, cycleMs: number | null, dlc: number): boolean {
+function traceRowVisible(channel: string, canId: number, bytes: number[], dir: string, cycleMs: number | null, dlc: number, msgName: string | null = null): boolean {
   if (traceFilterChannels !== null && !traceFilterChannels.has(channel)) return false;
   if (traceFilterCanIds !== null && !traceFilterCanIds.has(canId)) return false;
   if (traceFilterDir !== null && !traceFilterDir.has(dir)) return false;
+  if (traceFilterMsgNames !== null && !traceFilterMsgNames.has(msgName ?? "")) return false;
   for (let i = 0; i < traceFilterData.length; i++) {
     const expected = traceFilterData[i];
     if (expected === null) continue;
@@ -1565,7 +1622,7 @@ function applyTraceFilter() {
     // Rebuild DOM entirely from the in-memory buffer — never keep invisible rows in the DOM.
     tbody.innerHTML = "";
     for (const entry of traceAppendBuffer) {
-      if (traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc)) {
+      if (traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) {
         tbody.appendChild(buildTraceRow(entry));
       }
     }
@@ -1573,13 +1630,21 @@ function applyTraceFilter() {
   }
   // Overwrite mode: toggle visibility on the fixed set of rows.
   for (const tr of Array.from(tbody.rows) as HTMLTableRowElement[]) {
+    if ((tr as HTMLTableRowElement).dataset.expand) continue;
     const ch = tr.dataset.channel ?? "";
     const id = parseInt(tr.dataset.canid ?? "0");
     const bytes: number[] = JSON.parse(tr.dataset.bytes ?? "[]");
     const dir = tr.dataset.dir ?? "";
     const cycleMs = tr.dataset.cycle ? parseFloat(tr.dataset.cycle) : null;
     const dlc = parseInt(tr.dataset.dlc ?? "0");
-    tr.style.display = traceRowVisible(ch, id, bytes, dir, cycleMs, dlc) ? "" : "none";
+    const msgName = tr.dataset.msg || null;
+    const visible = traceRowVisible(ch, id, bytes, dir, cycleMs, dlc, msgName);
+    tr.style.display = visible ? "" : "none";
+    // If hiding a row that has an open expansion, close it
+    if (!visible) {
+      const next = tr.nextElementSibling as HTMLTableRowElement | null;
+      if (next?.dataset.expand) { next.remove(); tr.classList.remove("trace-row-expanded"); }
+    }
   }
 }
 
@@ -1587,7 +1652,12 @@ function applyTraceSort() {
   if (!traceSortCol) return;
   const col = traceSortCol;
   const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
-  const rows = Array.from(tbody.rows) as HTMLTableRowElement[];
+  // Close any open expansion rows — they'd get orphaned during sort
+  tbody.querySelectorAll<HTMLTableRowElement>("tr[data-expand]").forEach(r => {
+    (r.previousElementSibling as HTMLTableRowElement | null)?.classList.remove("trace-row-expanded");
+    r.remove();
+  });
+  const rows = Array.from(tbody.rows).filter(r => !(r as HTMLTableRowElement).dataset.expand) as HTMLTableRowElement[];
   rows.sort((a, b) => {
     let cmp = 0;
     switch (col) {
@@ -1658,6 +1728,25 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
   cells[5].textContent = String(entry.dlc);
   cells[6].textContent = fmtData(entry.data);
   cells[7].textContent = entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—";
+
+  // Refresh open expansion row with updated signal values + current min/max
+  const next = tr.nextElementSibling as HTMLTableRowElement | null;
+  if (next?.dataset.expand) {
+    const msg = dbcByChannel.get(entry.channel)?.messages.find(m => m.id === entry.canId);
+    if (msg) {
+      const valCells = next.querySelectorAll<HTMLElement>(".te-val");
+      const minCells = next.querySelectorAll<HTMLElement>(".te-min");
+      const maxCells = next.querySelectorAll<HTMLElement>(".te-max");
+      msg.signals.forEach((sig, i) => {
+        if (valCells[i]) valCells[i].textContent = formatSigValue(decodeSignal(entry.data, sig), "");
+        const key = plotKey(entry.channel, sig.name);
+        const mn = signalMinValues.get(key);
+        const mx = signalMaxValues.get(key);
+        if (minCells[i]) minCells[i].textContent = mn !== undefined ? formatSigValue(mn, "") : "—";
+        if (maxCells[i]) maxCells[i].textContent = mx !== undefined ? formatSigValue(mx, "") : "—";
+      });
+    }
+  }
 }
 
 function onCanFrame(ev: CanFrameEvent) {
@@ -1665,6 +1754,9 @@ function onCanFrame(ev: CanFrameEvent) {
 
   traceSeenChannels.add(ev.channel_id);
   traceSeenCanIds.add(ev.can_id);
+  const msgNameForFrame = dbcByChannel.get(ev.channel_id)?.messages.find(m => m.id === ev.can_id)?.name ?? null;
+  if (msgNameForFrame) traceSeenMsgNames.add(msgNameForFrame);
+  else traceSeenNoMsg = true;
 
   const direction = ev.direction ?? "rx";
   const key = traceKey(ev.channel_id, ev.can_id, direction);
@@ -1705,7 +1797,7 @@ function onCanFrame(ev: CanFrameEvent) {
 
     // Only add a DOM row if the entry passes the current filter.
     // The DOM therefore contains only visible rows — no hidden rows, no slow scans.
-    if (traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc)) {
+    if (traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) {
       const tr = buildTraceRow(entry);
       tbody.insertBefore(tr, tbody.firstChild);
       // DOM visible-row count mirrors the buffer's visible subset; trim from the bottom.
@@ -1720,6 +1812,8 @@ function clearTrace() {
   traceLastTs.clear();
   traceSeenChannels.clear();
   traceSeenCanIds.clear();
+  traceSeenMsgNames.clear();
+  traceSeenNoMsg = false;
   traceAppendBuffer.length = 0;
 }
 
@@ -1733,6 +1827,53 @@ function refreshTraceFormat() {
 
 function setupTrace() {
   document.getElementById("btn-clear-trace")!.addEventListener("click", clearTrace);
+
+  // ── Trace row expansion ───────────────────────────────────────────────────
+  document.getElementById("trace-tbody")!.addEventListener("click", (e) => {
+    const tr = (e.target as HTMLElement).closest("tr") as HTMLTableRowElement | null;
+    if (!tr || tr.dataset.expand || !tr.classList.contains("dbc-match")) return;
+
+    const next = tr.nextElementSibling as HTMLTableRowElement | null;
+    if (next?.dataset.expand) {
+      next.remove();
+      tr.classList.remove("trace-row-expanded");
+      return;
+    }
+
+    const channel = tr.dataset.channel ?? "";
+    const canId = parseInt(tr.dataset.canid ?? "0");
+    const bytes: number[] = JSON.parse(tr.dataset.bytes ?? "[]");
+    const msg = dbcByChannel.get(channel)?.messages.find(m => m.id === canId);
+    if (!msg) return;
+
+    const expandTr = document.createElement("tr");
+    expandTr.dataset.expand = "1";
+    const td = document.createElement("td");
+    td.colSpan = 8;
+    td.className = "trace-expand-cell";
+
+    let html = '<table class="trace-expand-table"><thead><tr>'
+      + '<th>Signal</th><th>Value</th><th>Min</th><th>Max</th><th>Unit</th>'
+      + '</tr></thead><tbody>';
+    for (const sig of msg.signals) {
+      const val = decodeSignal(bytes, sig);
+      const key = plotKey(channel, sig.name);
+      const mn = signalMinValues.get(key);
+      const mx = signalMaxValues.get(key);
+      const fmt = (v: number | undefined) => v !== undefined ? formatSigValue(v, "") : "—";
+      html += `<tr>
+        <td class="te-name">${sig.name}</td>
+        <td class="te-val">${formatSigValue(val, "")}</td>
+        <td class="te-min">${fmt(mn)}</td>
+        <td class="te-max">${fmt(mx)}</td>
+        <td class="te-unit">${sig.unit || "—"}</td></tr>`;
+    }
+    html += '</tbody></table>';
+    td.innerHTML = html;
+    expandTr.appendChild(td);
+    tr.after(expandTr);
+    tr.classList.add("trace-row-expanded");
+  });
 
   // ── Column header sort + filter ───────────────────────────────────────────
   const headerRow = document.querySelector("#trace-table thead tr")!;
@@ -1755,6 +1896,19 @@ function setupTrace() {
   }
 
   thCols.forEach((col, i) => ths[i].addEventListener("click", () => setSortCol(col)));
+
+  // Message filter (right-click col 4)
+  ths[4].addEventListener("contextmenu", (e) => {
+    e.preventDefault();
+    const items = [...traceSeenMsgNames].sort().map(n => ({ label: n, key: n }));
+    if (traceSeenNoMsg) items.push({ label: "(no message)", key: "" });
+    if (!items.length) return;
+    showFilterMenu(e.clientX, e.clientY, items, traceFilterMsgNames, (active) => {
+      traceFilterMsgNames = active;
+      ths[4].classList.toggle("th-filtered", active !== null);
+      applyTraceFilter();
+    });
+  });
 
   // Channel filter (right-click col 2)
   ths[2].addEventListener("contextmenu", (e) => {

@@ -347,6 +347,14 @@ kbd {
   min-width: 60px;
 }
 .signal-row .sig-value--empty { color: var(--text-muted); }
+.signal-row .sig-range {
+  font-family: monospace;
+  font-size: 10px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  white-space: nowrap;
+  letter-spacing: -0.02em;
+}
 
 /* ── Main content ────────────────────────────────────────────────────────── */
 #content {
@@ -726,6 +734,32 @@ kbd {
 #trace-table tbody tr { border-bottom: 1px solid rgba(255,255,255,0.04); }
 #trace-table tbody tr:hover td { background: var(--bg3); }
 #trace-table tbody tr.dbc-match td:nth-child(5) { color: var(--accent); }
+#trace-table tbody tr.dbc-match { cursor: pointer; }
+#trace-table tbody tr.trace-row-expanded td { background: var(--bg3); }
+.trace-expand-cell { padding: 0 !important; border-bottom: 2px solid var(--accent) !important; }
+.trace-expand-table {
+  border-collapse: collapse;
+  font-size: 12px;
+  margin: 6px 16px 8px 32px;
+}
+.trace-expand-table thead th {
+  text-align: left;
+  padding: 0 16px 4px 0;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  font-weight: 700;
+  position: static;
+  background: none;
+  border-bottom: 1px solid var(--border);
+}
+.trace-expand-table td { padding: 3px 16px 3px 0; }
+.trace-expand-table .te-name { color: var(--text); }
+.trace-expand-table .te-val  { font-family: monospace; color: var(--accent); font-weight: 600; }
+.trace-expand-table .te-min  { font-family: monospace; color: var(--success); }
+.trace-expand-table .te-max  { font-family: monospace; color: var(--warning); }
+.trace-expand-table .te-unit { color: var(--text-muted); }
 #trace-table td {
   padding: 3px 8px;
   white-space: nowrap;
