@@ -787,6 +787,35 @@ async function applyChannelDialog() {
   dialog.close();
 }
 
+// ── Context menu ──────────────────────────────────────────────────────────────
+
+let ctxMenu: HTMLElement | null = null;
+
+function showContextMenu(x: number, y: number, items: { label: string; danger?: boolean; action: () => void }[]) {
+  if (ctxMenu) ctxMenu.remove();
+  const menu = document.createElement("div");
+  menu.className = "ctx-menu";
+  for (const item of items) {
+    const btn = document.createElement("button");
+    btn.className = "ctx-menu-item" + (item.danger ? " danger" : "");
+    btn.textContent = item.label;
+    btn.addEventListener("click", () => { menu.remove(); ctxMenu = null; item.action(); });
+    menu.appendChild(btn);
+  }
+  menu.style.left = `${x}px`;
+  menu.style.top = `${y}px`;
+  document.body.appendChild(menu);
+  ctxMenu = menu;
+
+  // Flip if overflowing viewport
+  const rect = menu.getBoundingClientRect();
+  if (rect.right > window.innerWidth) menu.style.left = `${x - rect.width}px`;
+  if (rect.bottom > window.innerHeight) menu.style.top = `${y - rect.height}px`;
+}
+
+document.addEventListener("click", () => { if (ctxMenu) { ctxMenu.remove(); ctxMenu = null; } });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape" && ctxMenu) { ctxMenu.remove(); ctxMenu = null; } });
+
 // ── Channel management ────────────────────────────────────────────────────────
 
 function selectChannel(name: string | null) {
@@ -828,7 +857,23 @@ function renderChannelList() {
     `;
     item.addEventListener("click", (e) => {
       if ((e.target as HTMLElement).closest(".btn-close-ch")) return;
-      openChannelDialog("edit", id);
+      selectChannel(id);
+    });
+    item.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      showContextMenu(e.clientX, e.clientY, [
+        { label: "Configure…", action: () => openChannelDialog("edit", id) },
+        { label: "Close Channel", danger: true, action: async () => {
+          try {
+            await invoke("close_channel", { channelId: id });
+            dbcByChannel.delete(id);
+            channelBitrates.delete(id);
+            if (selectedChannel === id) selectChannel(null);
+            await refreshChannelList();
+            scheduleAutoSave();
+          } catch (err) { setStatus(`Close error: ${err}`); }
+        }},
+      ]);
     });
     item.querySelector(".btn-close-ch")!.addEventListener("click", async (e) => {
       e.stopPropagation();

@@ -231,8 +231,33 @@ kbd {
   align-items: center;
   gap: 6px;
   padding: 4px 10px;
-  cursor: default;
+  cursor: pointer;
 }
+.ctx-menu {
+  position: fixed;
+  z-index: 9999;
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px;
+  min-width: 140px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+}
+.ctx-menu-item {
+  display: block;
+  width: 100%;
+  background: none;
+  border: none;
+  color: var(--text);
+  text-align: left;
+  padding: 5px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.ctx-menu-item:hover { background: var(--bg2); }
+.ctx-menu-item.danger { color: var(--danger); }
+.ctx-menu-item.danger:hover { background: color-mix(in srgb, var(--danger) 15%, var(--bg2)); }
 .channel-item .dot {
   width: 8px; height: 8px;
   border-radius: 50%;
