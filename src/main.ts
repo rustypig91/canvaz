@@ -1471,6 +1471,7 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
     ths[6].classList.toggle("th-filtered", traceFilterData.some(v => v !== null));
     ths[7].classList.toggle("th-filtered", traceFilterCycleMin !== null || traceFilterCycleMax !== null);
   }
+  updateClearFiltersBtn();
 }
 
 // ── App recording start / stop ────────────────────────────────────────────────
@@ -1783,6 +1784,7 @@ function applyTraceFilter() {
       if (next?.dataset.expand) { next.remove(); tr.classList.remove("trace-row-expanded"); }
     }
   }
+  updateClearFiltersBtn();
   scheduleAutoSave();
 }
 
@@ -1963,8 +1965,44 @@ function refreshTraceFormat() {
   }
 }
 
+function anyFilterActive(): boolean {
+  return traceFilterChannels !== null
+    || traceFilterCanIds !== null
+    || traceFilterMsgNames !== null
+    || traceFilterDir !== null
+    || traceFilterDlcMin !== null
+    || traceFilterDlcMax !== null
+    || traceFilterCycleMin !== null
+    || traceFilterCycleMax !== null
+    || traceFilterData.some(v => v !== null);
+}
+
+function updateClearFiltersBtn() {
+  const btn = document.getElementById("btn-clear-filters") as HTMLButtonElement | null;
+  if (btn) btn.style.display = anyFilterActive() ? "" : "none";
+}
+
+function clearAllFilters() {
+  traceFilterChannels  = null;
+  traceFilterCanIds    = null;
+  traceFilterMsgNames  = null;
+  traceFilterDir       = null;
+  traceFilterDlcMin    = null;
+  traceFilterDlcMax    = null;
+  traceFilterCycleMin  = null;
+  traceFilterCycleMax  = null;
+  traceFilterData.fill(null);
+  const ths = traceHeaderEls;
+  [1, 2, 3, 4, 5, 6, 7].forEach(i => ths[i]?.classList.remove("th-filtered"));
+  applyTraceFilter();
+}
+
 function setupTrace() {
   document.getElementById("btn-clear-trace")!.addEventListener("click", clearTrace);
+  document.getElementById("btn-clear-filters")!.addEventListener("click", () => {
+    clearAllFilters();
+    scheduleAutoSave();
+  });
 
   // ── Trace row expansion ───────────────────────────────────────────────────
   document.getElementById("trace-tbody")!.addEventListener("click", (e) => {
