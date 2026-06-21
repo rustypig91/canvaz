@@ -115,20 +115,7 @@
         <div id="tab-trace" class="tab-content active">
           <div id="trace-toolbar">
             <button id="btn-clear-trace" class="btn btn-sm">Clear</button>
-            <label class="label-muted">Data:</label>
-            <select id="select-trace-format">
-              <option value="hex" selected>Hex</option>
-              <option value="dec">Dec</option>
-              <option value="ascii">ASCII</option>
-            </select>
-            <div class="trace-mode-group">
-              <label class="trace-mode-label">
-                <input type="radio" name="trace-mode" value="overwrite" checked /> Overwrite
-              </label>
-              <label class="trace-mode-label">
-                <input type="radio" name="trace-mode" value="append" /> Append
-              </label>
-            </div>
+            <button id="btn-trace-overwrite" class="btn btn-sm active" title="Toggle overwrite mode">Overwrite</button>
             <label class="label-muted">Max rows:</label>
             <input id="input-trace-max" type="number" value="1000" min="100" max="10000" step="100" class="small-input" />
             <button id="btn-pause-trace" class="btn btn-sm">Pause</button>

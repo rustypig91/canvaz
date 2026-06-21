@@ -1721,7 +1721,7 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
     <td><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>
     <td>${channelDisplayName(entry.channel)}</td>
     <td class="td-canid">${fmtId(entry.canId, entry.isExtended)}</td>
-    <td>${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>
+    <td${entry.messageName ? ` title="${entry.messageName}"` : ""}>${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>
     <td style="text-align:center">${entry.dlc}</td>
     <td class="td-data">${fmtData(entry.data)}</td>
     <td class="td-cycle">${entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—"}</td>
@@ -1950,13 +1950,34 @@ function setupTrace() {
       });
   });
 
-  // Data byte filter (right-click col 6)
+  // Data column: format + byte filter (right-click col 6)
   ths[6].addEventListener("contextmenu", (e) => {
     e.preventDefault();
     if (ctxMenu) ctxMenu.remove();
     const menu = document.createElement("div");
     menu.className = "ctx-menu data-filter-menu";
     menu.addEventListener("click", ev => ev.stopPropagation());
+
+    // Format selector
+    const fmtRow = document.createElement("div");
+    fmtRow.className = "data-fmt-row";
+    for (const [value, label] of [["hex", "Hex"], ["dec", "Dec"], ["ascii", "ASCII"]] as const) {
+      const btn = document.createElement("button");
+      btn.textContent = label;
+      btn.className = "data-fmt-btn" + (traceDataFormat === value ? " active" : "");
+      btn.addEventListener("click", () => {
+        traceDataFormat = value;
+        fmtRow.querySelectorAll<HTMLButtonElement>(".data-fmt-btn").forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        refreshTraceFormat();
+      });
+      fmtRow.appendChild(btn);
+    }
+    menu.appendChild(fmtRow);
+
+    const sep = document.createElement("div");
+    sep.className = "data-filter-sep";
+    menu.appendChild(sep);
 
     const inputs: HTMLInputElement[] = [];
     const grid = document.createElement("div");
@@ -2048,16 +2069,10 @@ function setupTrace() {
     });
   });
 
-  document.getElementById("select-trace-format")!.addEventListener("change", (e) => {
-    traceDataFormat = (e.target as HTMLSelectElement).value as TraceDataFormat;
-    refreshTraceFormat();
-  });
-
-  document.querySelectorAll<HTMLInputElement>("input[name='trace-mode']").forEach(radio => {
-    radio.addEventListener("change", () => {
-      traceMode = radio.value as TraceMode;
-      clearTrace();
-    });
+  document.getElementById("btn-trace-overwrite")!.addEventListener("click", function () {
+    const active = this.classList.toggle("active");
+    traceMode = active ? "overwrite" : "append";
+    clearTrace();
   });
 
   document.getElementById("input-trace-max")!.addEventListener("change", (e) => {
