@@ -2,15 +2,17 @@ mod app_state;
 mod backends;
 mod dbc_parser;
 mod project;
+mod can_manager;
 pub mod signal_codec;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use app_state::AppState;
-use backends::{CanManager, ChannelInfo, DbcState, ManagerState, SocketCanBackend};
+use backends::*;
 use project::Project;
 use serde::Deserialize;
+use can_manager::*;
 use tauri::{Emitter, Manager, State};
 
 // ── Tauri managed state ───────────────────────────────────────────────────────
@@ -38,25 +40,25 @@ fn list_can_interfaces(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>,
 
 #[tauri::command]
 async fn open_channel(
-    backend: String,
-    name: String,
+    backend_name: String,
+    channel_name: String,
     bitrate: Option<u32>,
     state: State<'_, TauriState>,
-) -> Result<(), String> {
+) -> Result<ChannelInfo, String> {
     let can = Arc::clone(&state.can);
     let dbc = Arc::clone(&state.dbc);
     // Run on a blocking thread so the tokio runtime stays free to dispatch
     // provide_sudo_password while we wait for the user to enter a password.
-    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
         let mut mgr = can.lock().map_err(|e| e.to_string())?;
-        mgr.open_channel(&backend, &name, bitrate, dbc)
+        mgr.open_channel(backend_name, channel_name, bitrate, dbc)
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()))
 }
 
 #[tauri::command]
-fn close_channel(name: String, state: State<'_, TauriState>) -> Result<(), String> {
+fn close_channel(channel_info: ChannelInfo, state: State<'_, TauriState>) -> Result<(), String> {
     let mut manager = state.can.lock().map_err(|e| e.to_string())?;
     manager.close_channel(&name)?;
     let mut dbc = state.dbc.write().map_err(|e| e.to_string())?;
@@ -68,46 +70,6 @@ fn close_channel(name: String, state: State<'_, TauriState>) -> Result<(), Strin
 fn get_open_channels(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>, String> {
     let manager = state.can.lock().map_err(|e| e.to_string())?;
     Ok(manager.open_channels_info())
-}
-
-#[derive(Deserialize)]
-struct SendSignalCmd {
-    channel: String,
-    signal_name: String,
-    value: f64,
-}
-
-#[tauri::command]
-fn send_signal(cmd: SendSignalCmd, state: State<'_, TauriState>) -> Result<(), String> {
-    let (message_id, data) = {
-        let dbc_guard = state.dbc.read().map_err(|e| e.to_string())?;
-        let channel_dbc = dbc_guard
-            .get(&cmd.channel)
-            .ok_or_else(|| format!("No DBC loaded for channel '{}'", cmd.channel))?;
-        let sig = channel_dbc
-            .find_signal(&cmd.signal_name)
-            .ok_or_else(|| format!("Signal '{}' not found in DBC", cmd.signal_name))?
-            .clone();
-        let dlc = channel_dbc
-            .messages
-            .iter()
-            .find(|m| m.id == sig.message_id)
-            .map(|m| m.dlc as usize)
-            .unwrap_or(8);
-        let mut data = vec![0u8; dlc.min(8)];
-        signal_codec::encode(
-            &mut data,
-            cmd.value,
-            sig.start_bit,
-            sig.length,
-            sig.little_endian,
-            sig.factor,
-            sig.offset,
-        );
-        (sig.message_id, data)
-    };
-    let manager = state.can.lock().map_err(|e| e.to_string())?;
-    manager.send_frame(&cmd.channel, message_id, &data)
 }
 
 // ── Message / raw frame send commands ────────────────────────────────────────
@@ -165,7 +127,7 @@ fn send_message(cmd: SendMessageCmd, state: State<'_, TauriState>) -> Result<(),
 
 #[derive(Deserialize)]
 struct SendRawFrameCmd {
-    channel: String,
+    channel: ChannelInfo,
     can_id: u32,
     data: Vec<u8>,
 }
@@ -175,7 +137,11 @@ fn send_raw_frame(cmd: SendRawFrameCmd, state: State<'_, TauriState>) -> Result<
     let is_extended = cmd.can_id > 0x7FF;
     let dlc = cmd.data.len() as u8;
     state.can.lock().map_err(|e| e.to_string())?.send_frame(&cmd.channel, cmd.can_id, &cmd.data)?;
-    let _ = state.app_state.app.emit("can-frame", backends::CanFrameEvent {
+
+    let can  = state.can.lock()?;
+    can.send_frame(&cmd.channel, cmd.can_id, &cmd.data)?;
+
+    let _ = state.app_state.app.emit("can-frame", CanFrameEvent {
         channel: cmd.channel,
         can_id: cmd.can_id,
         is_extended,
@@ -284,7 +250,6 @@ pub fn run() {
             open_channel,
             close_channel,
             get_open_channels,
-            send_signal,
             send_message,
             send_raw_frame,
             load_dbc,
