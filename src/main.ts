@@ -1375,7 +1375,19 @@ async function applyProject(project: Project) {
 
 // ── App recording start / stop ────────────────────────────────────────────────
 
-function startApp() {
+async function startApp() {
+  // Reload DBC files so the latest version on disk is used for this run
+  await Promise.all(openChannels.map(async (id) => {
+    const path = dbcByChannel.get(id)?.path;
+    if (!path) return;
+    try {
+      const dbc = await invoke<ParsedDbc>("load_dbc", { channelId: id, path });
+      dbcByChannel.set(id, dbc);
+    } catch (e) {
+      setStatus(`DBC reload failed for ${channelDisplayName(id)}: ${e}`);
+    }
+  }));
+
   appRunning = true;
   appStartTime = Date.now();
   signalHistory.clear();
