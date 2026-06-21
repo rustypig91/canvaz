@@ -7,6 +7,10 @@ pub struct Project {
     /// Each entry is one plot pane; each pane holds its signal list.
     pub plot_panes: Vec<PlotPaneConfig>,
     pub simulate_signals: Vec<SimulateEntry>,
+    #[serde(default)]
+    pub simulate_raw_frames: Vec<SimulateRawFrame>,
+    #[serde(default)]
+    pub trace_filters: Option<TraceFiltersConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +46,47 @@ pub struct SimulateEntry {
     pub period_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulateRawFrame {
+    pub channel: String,
+    pub can_id: u32,
+    pub is_extended: bool,
+    pub dlc: u8,
+    pub data: Vec<u8>,
+    pub period_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TraceFiltersConfig {
+    #[serde(default)]
+    pub channels: Option<Vec<String>>,
+    #[serde(default)]
+    pub can_ids: Option<Vec<u32>>,
+    #[serde(default)]
+    pub msg_names: Option<Vec<String>>,
+    #[serde(default)]
+    pub dir: Option<Vec<String>>,
+    #[serde(default)]
+    pub dlc_min: Option<u32>,
+    #[serde(default)]
+    pub dlc_max: Option<u32>,
+    #[serde(default)]
+    pub cycle_min: Option<f64>,
+    #[serde(default)]
+    pub cycle_max: Option<f64>,
+    #[serde(default)]
+    pub data: Vec<Option<u8>>,
+    #[serde(default = "default_data_format")]
+    pub data_format: String,
+    #[serde(default = "default_true")]
+    pub overwrite: bool,
+    #[serde(default)]
+    pub max_rows: Option<u32>,
+}
+
+fn default_data_format() -> String { "hex".to_string() }
+fn default_true() -> bool { true }
+
 #[allow(dead_code)]
 impl Project {
     pub fn new() -> Self {
@@ -52,6 +97,7 @@ impl Project {
     }
 
     pub fn save(&self, path: &str) -> Result<(), String> {
+        println!("Saving project to '{}'", path);
         let p = std::path::Path::new(path);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("Dir error: {e}"))?;

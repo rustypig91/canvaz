@@ -71,11 +71,33 @@ interface ChannelInfo     { id: string; backend: string; name: string; }
 interface ChannelConfig   { name: string; backend: string; dbc_path: string | null; bitrate?: number | null; }
 interface SimulateEntry   { signal_name: string; channel: string; value: number; period_ms: number; }
 
+interface SimRawFrameConfig {
+  channel: string; can_id: number; is_extended: boolean;
+  dlc: number; data: number[]; period_ms: number;
+}
+
+interface TraceFiltersConfig {
+  channels?: string[] | null;
+  can_ids?: number[] | null;
+  msg_names?: string[] | null;
+  dir?: string[] | null;
+  dlc_min?: number | null;
+  dlc_max?: number | null;
+  cycle_min?: number | null;
+  cycle_max?: number | null;
+  data?: (number | null)[];
+  data_format?: string;
+  overwrite?: boolean;
+  max_rows?: number | null;
+}
+
 interface Project {
   version: number;
   channels: ChannelConfig[];
   plot_panes: PlotPaneConfig[];
   simulate_signals: SimulateEntry[];
+  simulate_raw_frames?: SimRawFrameConfig[];
+  trace_filters?: TraceFiltersConfig;
 }
 
 // ── Plot pane state ───────────────────────────────────────────────────────────
@@ -1288,6 +1310,23 @@ function buildProject(): Project {
         ? e.signals.map(s => ({ signal_name: s.def.name, channel: e.channel, value: s.value, period_ms: e.periodMs }))
         : []
     ),
+    simulate_raw_frames: [...simEntries.values()]
+      .filter((e): e is SimRawEntry => e.kind === "raw")
+      .map(e => ({ channel: e.channel, can_id: e.canId, is_extended: e.isExtended, dlc: e.dlc, data: e.data, period_ms: e.periodMs })),
+    trace_filters: {
+      channels:   traceFilterChannels  ? [...traceFilterChannels]  : null,
+      can_ids:    traceFilterCanIds    ? [...traceFilterCanIds]    : null,
+      msg_names:  traceFilterMsgNames  ? [...traceFilterMsgNames]  : null,
+      dir:        traceFilterDir       ? [...traceFilterDir]       : null,
+      dlc_min:    traceFilterDlcMin,
+      dlc_max:    traceFilterDlcMax,
+      cycle_min:  traceFilterCycleMin,
+      cycle_max:  traceFilterCycleMax,
+      data:       traceFilterData,
+      data_format: traceDataFormat,
+      overwrite:  traceMode === "overwrite",
+      max_rows:   traceMaxRows,
+    },
   };
 }
 
@@ -1371,6 +1410,66 @@ async function applyProject(project: Project) {
     simEntries.set(key, simEntry);
     container.appendChild(createSimEntryEl(key, simEntry));
   }
+
+  // Restore raw sim frames
+  for (const raw of project.simulate_raw_frames ?? []) {
+    const key = `raw::${++rawEntryCounter}`;
+    const entry: SimRawEntry = {
+      kind: "raw", channel: raw.channel,
+      canId: raw.can_id, isExtended: raw.is_extended,
+      dlc: raw.dlc, data: raw.data,
+      periodMs: raw.period_ms, timerId: null,
+    };
+    simEntries.set(key, entry);
+    container.appendChild(createSimEntryEl(key, entry));
+  }
+
+  // Restore trace filter settings
+  if (project.trace_filters) restoreTraceFilters(project.trace_filters);
+}
+
+function restoreTraceFilters(f: TraceFiltersConfig) {
+  traceFilterChannels  = f.channels  ? new Set(f.channels)        : null;
+  traceFilterCanIds    = f.can_ids   ? new Set(f.can_ids)         : null;
+  traceFilterMsgNames  = f.msg_names ? new Set(f.msg_names)       : null;
+  traceFilterDir       = f.dir       ? new Set(f.dir)             : null;
+  traceFilterDlcMin    = f.dlc_min   ?? null;
+  traceFilterDlcMax    = f.dlc_max   ?? null;
+  traceFilterCycleMin  = f.cycle_min ?? null;
+  traceFilterCycleMax  = f.cycle_max ?? null;
+  const savedData = f.data ?? [];
+  traceFilterData = Array.from({ length: 8 }, (_, i) => savedData[i] ?? null);
+
+  if (f.data_format === "hex" || f.data_format === "dec" || f.data_format === "ascii")
+    traceDataFormat = f.data_format;
+
+  traceMode = (f.overwrite ?? true) ? "overwrite" : "append";
+  const overwriteBtn = document.getElementById("btn-trace-overwrite")!;
+  overwriteBtn.classList.toggle("active", traceMode === "overwrite");
+
+  if (f.max_rows != null) {
+    traceMaxRows = f.max_rows;
+    (document.getElementById("input-trace-max") as HTMLInputElement).value = String(traceMaxRows);
+  }
+
+  // Seed "seen" sets from saved filter values so the filter menus open correctly
+  traceFilterChannels?.forEach(v => traceSeenChannels.add(v));
+  traceFilterCanIds?.forEach(v => traceSeenCanIds.add(v));
+  if (traceFilterMsgNames) {
+    traceFilterMsgNames.forEach(v => { if (v === "") traceSeenNoMsg = true; else traceSeenMsgNames.add(v); });
+  }
+
+  // Refresh header highlight indicators
+  const ths = traceHeaderEls;
+  if (ths.length) {
+    ths[1].classList.toggle("th-filtered", traceFilterDir !== null);
+    ths[2].classList.toggle("th-filtered", traceFilterChannels !== null);
+    ths[3].classList.toggle("th-filtered", traceFilterCanIds !== null);
+    ths[4].classList.toggle("th-filtered", traceFilterMsgNames !== null);
+    ths[5].classList.toggle("th-filtered", traceFilterDlcMin !== null || traceFilterDlcMax !== null);
+    ths[6].classList.toggle("th-filtered", traceFilterData.some(v => v !== null));
+    ths[7].classList.toggle("th-filtered", traceFilterCycleMin !== null || traceFilterCycleMax !== null);
+  }
 }
 
 // ── App recording start / stop ────────────────────────────────────────────────
@@ -1387,6 +1486,30 @@ async function startApp() {
       setStatus(`DBC reload failed for ${channelDisplayName(id)}: ${e}`);
     }
   }));
+
+  // Prune simulated message entries whose message no longer exists in the reloaded DBC
+  {
+    const simContainer = document.getElementById("sim-entries")!;
+    for (const [key, entry] of [...simEntries]) {
+      if (entry.kind !== "message") continue;
+      const msg = dbcByChannel.get(entry.channel)?.messages.find(m => m.id === entry.messageId);
+      if (!msg) {
+        if (entry.timerId != null) clearInterval(entry.timerId);
+        simEntries.delete(key);
+        simContainer.querySelector(`[data-sim-key="${key}"]`)?.remove();
+      }
+    }
+  }
+
+  // Prune message names from filter that no longer exist in any DBC
+  if (traceFilterMsgNames !== null) {
+    const validNames = new Set([...dbcByChannel.values()].flatMap(d => d.messages.map(m => m.name)));
+    for (const name of [...traceFilterMsgNames]) {
+      if (name !== "" && !validNames.has(name)) traceFilterMsgNames.delete(name);
+    }
+    if (traceFilterMsgNames.size === 0) traceFilterMsgNames = null;
+    traceHeaderEls[4]?.classList.toggle("th-filtered", traceFilterMsgNames !== null);
+  }
 
   appRunning = true;
   appStartTime = Date.now();
@@ -1549,6 +1672,7 @@ let traceMode: TraceMode = "overwrite";
 let traceDataFormat: TraceDataFormat = "hex";
 let tracePaused = false;
 let traceMaxRows = 1000;
+let traceHeaderEls: HTMLTableCellElement[] = [];
 
 const traceLastTs = new Map<string, number>();
 const traceRowEls = new Map<string, HTMLTableRowElement>();
@@ -1890,6 +2014,7 @@ function setupTrace() {
   // ── Column header sort + filter ───────────────────────────────────────────
   const headerRow = document.querySelector("#trace-table thead tr")!;
   const ths = Array.from(headerRow.children) as HTMLTableCellElement[];
+  traceHeaderEls = ths;
   const thCols: TraceSortCol[] = ["ts", "dir", "channel", "canId", "msg", "dlc", "data", "cycle"];
   const thLabels = ["Timestamp", "Dir", "Channel", "CAN ID", "Message", "DLC", "Data", "Cycle (ms)"];
 
