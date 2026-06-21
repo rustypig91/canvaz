@@ -1702,14 +1702,14 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
   tr.dataset.dlc = String(entry.dlc);
   tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
   if (entry.messageName) tr.classList.add("dbc-match");
-  if (!traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc)) tr.style.display = "none";
+  if (!traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) tr.style.display = "none";
   const dirClass = entry.direction === "tx" ? "dir-tx" : "dir-rx";
   tr.innerHTML = `
     <td class="td-ts">${fmtElapsed(entry.timestampMs)}</td>
     <td><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>
     <td>${channelDisplayName(entry.channel)}</td>
     <td class="td-canid">${fmtId(entry.canId, entry.isExtended)}</td>
-    <td>${entry.messageName ?? "<em style='color:var(--text-muted)'>Raw</em>"}</td>
+    <td>${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>
     <td style="text-align:center">${entry.dlc}</td>
     <td class="td-data">${fmtData(entry.data)}</td>
     <td class="td-cycle">${entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—"}</td>
@@ -1722,7 +1722,7 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
   tr.dataset.ts = String(entry.timestampMs);
   tr.dataset.dlc = String(entry.dlc);
   tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
-  tr.style.display = traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc) ? "" : "none";
+  tr.style.display = traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName) ? "" : "none";
   const cells = tr.cells;
   cells[0].textContent = fmtElapsed(entry.timestampMs);
   cells[5].textContent = String(entry.dlc);
