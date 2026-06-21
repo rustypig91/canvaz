@@ -1248,6 +1248,7 @@ function addRawFrame() {
   };
   simEntries.set(key, entry);
   document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
+  scheduleAutoSave();
 }
 
 function removeSimEntry(key: string) {
@@ -1782,6 +1783,7 @@ function applyTraceFilter() {
       if (next?.dataset.expand) { next.remove(); tr.classList.remove("trace-row-expanded"); }
     }
   }
+  scheduleAutoSave();
 }
 
 function applyTraceSort() {
@@ -2095,6 +2097,7 @@ function setupTrace() {
         fmtRow.querySelectorAll<HTMLButtonElement>(".data-fmt-btn").forEach(b => b.classList.remove("active"));
         btn.classList.add("active");
         refreshTraceFormat();
+        scheduleAutoSave();
       });
       fmtRow.appendChild(btn);
     }
@@ -2198,11 +2201,13 @@ function setupTrace() {
     const active = this.classList.toggle("active");
     traceMode = active ? "overwrite" : "append";
     clearTrace();
+    scheduleAutoSave();
   });
 
   document.getElementById("input-trace-max")!.addEventListener("change", (e) => {
     traceMaxRows = parseInt((e.target as HTMLInputElement).value) || 1000;
     while (traceAppendBuffer.length > traceMaxRows) traceAppendBuffer.pop();
+    scheduleAutoSave();
   });
 
   const pauseBtn = document.getElementById("btn-pause-trace")!;
