@@ -8,8 +8,9 @@ use std::sync::{
 };
 
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::Emitter;
 
+use crate::app_state::AppState;
 use crate::dbc_parser::ParsedDbc;
 
 // ── Wire events ───────────────────────────────────────────────────────────────
@@ -47,12 +48,10 @@ pub struct CanFrame {
 
 pub trait CanChannel: Send {
     fn name(&self) -> &str;
-    /// Configure + open the socket.  Pass a sudo password when a previous call
-    /// returned `Err("needs-sudo: …")` and the user authenticated.
-    fn open(&mut self, sudo_password: Option<&str>) -> Result<(), String>;
+    fn app_state(&self) -> &Arc<AppState>;
+    fn open(&mut self) -> Result<(), String>;
     fn close(&mut self) -> Result<(), String>;
     fn send(&self, frame: CanFrame) -> Result<(), String>;
-    /// Blocks for up to the channel's read-timeout, then returns `Ok(None)`.
     fn receive(&self) -> Result<Option<CanFrame>, String>;
     fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String>;
     fn get_bitrate(&self) -> Result<u32, String>;
@@ -60,17 +59,16 @@ pub trait CanChannel: Send {
 
 pub trait CanBackend: Send + Sync + 'static {
     fn name(&self) -> &str;
-    /// List all interface names currently visible to this backend.
     fn list_channels(&self) -> Vec<String>;
-    /// Create a closed channel handle.  Call `open()` on it to activate.
     fn open_channel(
         &mut self,
         name: &str,
         bitrate: Option<u32>,
+        state: Arc<AppState>,
     ) -> Result<Box<dyn CanChannel>, String>;
 }
 
-// ── Channel info (serialized to frontend) ─────────────────────────────────────
+// ── Channel info ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ChannelInfo {
@@ -82,27 +80,25 @@ pub struct ChannelInfo {
 
 struct OpenChannelState {
     stop_flag: Arc<AtomicBool>,
-    /// Shared with the reading thread so that sends can proceed concurrently.
-    /// The reading thread holds the lock for at most ~100 ms per receive call.
     channel: Arc<Mutex<Box<dyn CanChannel>>>,
     backend_name: String,
 }
 
 pub struct CanManager {
+    state: Arc<AppState>,
     backends: Vec<Arc<Mutex<dyn CanBackend>>>,
     channels: HashMap<String, OpenChannelState>,
 }
 
 impl CanManager {
-    pub fn new() -> Self {
-        Self { backends: Vec::new(), channels: HashMap::new() }
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self { state, backends: Vec::new(), channels: HashMap::new() }
     }
 
     pub fn register_backend(&mut self, backend: impl CanBackend) {
         self.backends.push(Arc::new(Mutex::new(backend)));
     }
 
-    /// All interfaces known to all registered backends.
     pub fn list_channels(&self) -> Vec<ChannelInfo> {
         let mut result = Vec::new();
         for backend in &self.backends {
@@ -116,14 +112,11 @@ impl CanManager {
         result
     }
 
-    /// Open a channel and start its reading thread.
     pub fn open_channel(
         &mut self,
         backend_name: &str,
         channel_name: &str,
         bitrate: Option<u32>,
-        sudo_password: Option<&str>,
-        app: AppHandle,
         dbc: DbcState,
     ) -> Result<(), String> {
         if self.channels.contains_key(channel_name) {
@@ -141,10 +134,10 @@ impl CanManager {
 
         let mut channel = {
             let mut b = backend.lock().map_err(|_| "Backend lock poisoned".to_string())?;
-            b.open_channel(channel_name, bitrate)?
+            b.open_channel(channel_name, bitrate, Arc::clone(&self.state))?
         };
 
-        channel.open(sudo_password)?;
+        channel.open()?;
 
         let channel = Arc::new(Mutex::new(channel));
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -153,7 +146,8 @@ impl CanManager {
             let channel = Arc::clone(&channel);
             let stop = Arc::clone(&stop_flag);
             let ch_name = channel_name.to_string();
-            move || reading_loop(channel, ch_name, app, dbc, stop)
+            let state = Arc::clone(&self.state);
+            move || reading_loop(channel, ch_name, state, dbc, stop)
         });
 
         self.channels.insert(
@@ -171,16 +165,6 @@ impl CanManager {
             }
             None => Err(format!("Channel '{name}' is not open")),
         }
-    }
-
-    pub fn close_all(&mut self) {
-        for (_, state) in self.channels.drain() {
-            state.stop_flag.store(true, Ordering::Relaxed);
-        }
-    }
-
-    pub fn open_names(&self) -> Vec<String> {
-        self.channels.keys().cloned().collect()
     }
 
     pub fn open_channels_info(&self) -> Vec<ChannelInfo> {
@@ -213,13 +197,11 @@ impl CanManager {
 fn reading_loop(
     channel: Arc<Mutex<Box<dyn CanChannel>>>,
     channel_name: String,
-    app: AppHandle,
+    state: Arc<AppState>,
     dbc: DbcState,
     stop: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::Relaxed) {
-        // Release the lock as soon as receive() returns so sends are not blocked
-        // for more than one receive timeout (~100 ms).
         let result = {
             let ch = match channel.lock() {
                 Ok(g) => g,
@@ -231,8 +213,7 @@ fn reading_loop(
         match result {
             Ok(Some(frame)) => {
                 let ts = frame.timestamp_ms;
-
-                let _ = app.emit("can-frame", CanFrameEvent {
+                let _ = state.app.emit("can-frame", CanFrameEvent {
                     channel: channel_name.clone(),
                     can_id: frame.can_id,
                     is_extended: frame.is_extended,
@@ -240,7 +221,6 @@ fn reading_loop(
                     data: frame.data.clone(),
                     timestamp_ms: ts,
                 });
-
                 if let Ok(guard) = dbc.read() {
                     if let Some(channel_dbc) = guard.get(&channel_name) {
                         if let Some(signals) = channel_dbc.signals_for_message(frame.can_id) {
@@ -254,7 +234,7 @@ fn reading_loop(
                                     sig.factor,
                                     sig.offset,
                                 );
-                                let _ = app.emit("signal-value", SignalValueEvent {
+                                let _ = state.app.emit("signal-value", SignalValueEvent {
                                     channel: channel_name.clone(),
                                     signal_name: sig.name.clone(),
                                     message_name: sig.message_name.clone(),

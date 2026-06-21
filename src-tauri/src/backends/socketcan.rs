@@ -1,11 +1,13 @@
-use std::io::Write as _;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::io::Write as _;
 
 use socketcan::embedded_can::{ExtendedId, StandardId};
 use socketcan::CanFrame as SocketCanFrame;
 use socketcan::{CanDataFrame, CanSocket, EmbeddedFrame, Frame, Socket};
 
+use crate::app_state::AppState;
 use crate::backends::{CanBackend, CanChannel, CanFrame};
+use std::sync::Arc;
 
 // ── Backend ───────────────────────────────────────────────────────────────────
 
@@ -38,15 +40,13 @@ impl CanBackend for SocketCanBackend {
         &mut self,
         name: &str,
         bitrate: Option<u32>,
+        state: Arc<AppState>,
     ) -> Result<Box<dyn CanChannel>, String> {
-        if !name.starts_with("can") && !name.starts_with("vcan") {
-            return Err(format!("SocketCanBackend does not handle channel '{name}'"));
-        }
         Ok(Box::new(SocketCanChannel {
             name: name.to_string(),
             bitrate,
             socket: None,
-            sudo_password: None,
+            state,
         }))
     }
 }
@@ -57,17 +57,25 @@ pub struct SocketCanChannel {
     name: String,
     bitrate: Option<u32>,
     socket: Option<CanSocket>,
-    /// Stored after first successful sudo authentication so that set_bitrate
-    /// can reconfigure the interface without prompting again.
-    sudo_password: Option<String>,
+    state: Arc<AppState>,
 }
 
 impl SocketCanChannel {
     fn is_virtual(&self) -> bool {
         self.name.starts_with("vcan")
     }
-    fn is_open(&self) -> bool {
-        self.socket.is_some()
+
+    /// Try `ip` without sudo; on permission denied, request the password
+    /// through the app state (prompts once, then caches) and retry.
+    fn run_ip_auto(&self, args: &[&str]) -> Result<(), String> {
+        match run_ip(args, None) {
+            Ok(()) => Ok(()),
+            Err(e) if e.starts_with("needs-sudo:") => {
+                let pw = self.state.get_sudo_password()?;
+                run_ip(args, Some(&pw))
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -161,26 +169,24 @@ impl CanChannel for SocketCanChannel {
         &self.name
     }
 
-    fn open(&mut self, sudo_password: Option<&str>) -> Result<(), String> {
-        if let Some(p) = sudo_password {
-            self.sudo_password = Some(p.to_string());
-        }
-        let pw = self.sudo_password.as_deref();
+    fn app_state(&self) -> &Arc<AppState> {
+        &self.state
+    }
 
+    fn open(&mut self) -> Result<(), String> {
         if !already_up(&self.name, self.bitrate) {
             if self.is_virtual() {
-                let _ = run_ip(&["link", "add", "dev", &self.name, "type", "vcan"], pw);
-                run_ip(&["link", "set", &self.name, "up"], pw)?;
+                let _ = self.run_ip_auto(&["link", "add", "dev", &self.name, "type", "vcan"]);
+                self.run_ip_auto(&["link", "set", &self.name, "up"])?;
             } else {
-                let _ = run_ip(&["link", "set", &self.name, "down"], pw);
+                let _ = self.run_ip_auto(&["link", "set", &self.name, "down"]);
                 if let Some(baud) = self.bitrate {
                     let baud_s = baud.to_string();
-                    run_ip(
-                        &["link", "set", &self.name, "type", "can", "bitrate", &baud_s],
-                        pw,
-                    )?;
+                    self.run_ip_auto(&[
+                        "link", "set", &self.name, "type", "can", "bitrate", &baud_s,
+                    ])?;
                 }
-                run_ip(&["link", "set", &self.name, "up"], pw)?;
+                self.run_ip_auto(&["link", "set", &self.name, "up"])?;
             }
         }
 
@@ -200,7 +206,6 @@ impl CanChannel for SocketCanChannel {
 
     fn send(&self, frame: CanFrame) -> Result<(), String> {
         let socket = self.socket.as_ref().ok_or("Channel is not open")?;
-
         let df: CanDataFrame = if frame.is_extended {
             if frame.can_id > 0x1FFF_FFFF {
                 return Err(format!(
@@ -222,13 +227,11 @@ impl CanChannel for SocketCanChannel {
                 .ok_or_else(|| format!("Invalid standard CAN ID: {:#x}", frame.can_id))?;
             CanDataFrame::new(sid, &frame.data).ok_or("Failed to build CAN frame")?
         };
-
         socket.write_frame(&df).map_err(|e| format!("Write failed: {e}"))
     }
 
     fn receive(&self) -> Result<Option<CanFrame>, String> {
         let socket = self.socket.as_ref().ok_or("Channel is not open")?;
-
         match socket.read_frame() {
             Ok(SocketCanFrame::Data(df)) => Ok(Some(CanFrame {
                 can_id: df.raw_id(),
@@ -253,21 +256,17 @@ impl CanChannel for SocketCanChannel {
         if self.is_virtual() {
             return Err("vcan interfaces do not support bitrate configuration".to_string());
         }
-        let was_open = self.is_open();
+        let was_open = self.socket.is_some();
         if was_open {
             self.close()?;
         }
         self.bitrate = Some(bitrate);
-        let pw = self.sudo_password.clone();
-        let pw = pw.as_deref();
-
         let baud_s = bitrate.to_string();
-        let _ = run_ip(&["link", "set", &self.name, "down"], pw);
-        run_ip(&["link", "set", &self.name, "type", "can", "bitrate", &baud_s], pw)?;
-        run_ip(&["link", "set", &self.name, "up"], pw)?;
-
+        let _ = self.run_ip_auto(&["link", "set", &self.name, "down"]);
+        self.run_ip_auto(&["link", "set", &self.name, "type", "can", "bitrate", &baud_s])?;
+        self.run_ip_auto(&["link", "set", &self.name, "up"])?;
         if was_open {
-            self.open(None)?;
+            self.open()?;
         }
         Ok(())
     }

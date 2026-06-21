@@ -1,162 +1,62 @@
+mod app_state;
 mod backends;
 mod dbc_parser;
 mod project;
 pub mod signal_codec;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
+use app_state::AppState;
 use backends::{CanManager, ChannelInfo, DbcState, ManagerState, SocketCanBackend};
 use project::Project;
 use serde::Deserialize;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{Manager, State};
 
-// ── Sudo password state ───────────────────────────────────────────────────────
+// ── Tauri managed state ───────────────────────────────────────────────────────
 
-enum SudoRequest {
-    Idle,
-    Waiting,
-    Done,
-}
-
-pub struct SudoState {
-    cached: Mutex<Option<String>>,
-    request: Mutex<SudoRequest>,
-    condvar: Condvar,
-}
-
-impl SudoState {
-    fn new() -> Self {
-        Self {
-            cached: Mutex::new(None),
-            request: Mutex::new(SudoRequest::Idle),
-            condvar: Condvar::new(),
-        }
-    }
-
-    /// Returns the cached password without blocking.
-    fn get_cached(&self) -> Option<String> {
-        self.cached.lock().unwrap().clone()
-    }
-
-    /// Returns the cached password immediately, or emits "request-sudo-password"
-    /// to the frontend and blocks the calling thread until the user responds.
-    /// Call this from any Tauri command that may need root.
-    pub fn get_or_request(&self, app: &AppHandle) -> Result<String, String> {
-        // Fast path — already have it.
-        {
-            let c = self.cached.lock().map_err(|e| e.to_string())?;
-            if let Some(pw) = c.as_ref() {
-                return Ok(pw.clone());
-            }
-        }
-
-        // Transition to Waiting and ask the frontend (only once even if multiple
-        // callers race here simultaneously).
-        {
-            let mut req = self.request.lock().map_err(|e| e.to_string())?;
-            if matches!(*req, SudoRequest::Idle | SudoRequest::Done) {
-                *req = SudoRequest::Waiting;
-                let _ = app.emit("request-sudo-password", ());
-            }
-        }
-
-        // Block until provide_sudo_password resolves the request.
-        {
-            let mut req = self
-                .condvar
-                .wait_while(
-                    self.request.lock().map_err(|e| e.to_string())?,
-                    |req| matches!(req, SudoRequest::Waiting),
-                )
-                .map_err(|e| e.to_string())?;
-            // Reset so future calls can issue a new request if needed.
-            *req = SudoRequest::Idle;
-        }
-
-        // provide() caches the password before notifying, so this is safe.
-        self.cached
-            .lock()
-            .map_err(|e| e.to_string())?
-            .clone()
-            .ok_or_else(|| "Sudo authentication cancelled".to_string())
-    }
-
-    /// Called by the frontend with the user's password (or None if cancelled).
-    fn provide(&self, password: Option<String>) {
-        // Cache a valid password before waking waiters.
-        if let Some(pw) = &password {
-            if !pw.is_empty() {
-                if let Ok(mut c) = self.cached.lock() {
-                    *c = Some(pw.clone());
-                }
-            }
-        }
-        if let Ok(mut req) = self.request.lock() {
-            *req = SudoRequest::Done;
-        }
-        self.condvar.notify_all();
-    }
-}
-
-// ── Shared app state ──────────────────────────────────────────────────────────
-
-struct AppState {
+struct TauriState {
+    app_state: Arc<AppState>,
     can: ManagerState,
     dbc: DbcState,
-    sudo: Arc<SudoState>,
 }
 
 // ── Sudo command ──────────────────────────────────────────────────────────────
 
-/// Called by the frontend in response to the "request-sudo-password" event.
-/// Pass `None` when the user cancels the dialog.
 #[tauri::command]
-fn provide_sudo_password(password: Option<String>, state: State<'_, AppState>) {
-    state.sudo.provide(password);
+fn provide_sudo_password(password: Option<String>, state: State<'_, TauriState>) {
+    state.app_state.provide_sudo_password(password);
 }
 
 // ── CAN commands ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
-fn list_can_interfaces(state: State<'_, AppState>) -> Result<Vec<ChannelInfo>, String> {
+fn list_can_interfaces(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>, String> {
     let manager = state.can.lock().map_err(|e| e.to_string())?;
     Ok(manager.list_channels())
 }
 
 #[tauri::command]
-fn open_channel(
+async fn open_channel(
     backend: String,
     name: String,
     bitrate: Option<u32>,
-    state: State<'_, AppState>,
-    app: AppHandle,
+    state: State<'_, TauriState>,
 ) -> Result<(), String> {
-    let dbc_arc = Arc::clone(&state.dbc);
-
-    // First attempt with the cached password (may be None — works if the
-    // interface is already up or doesn't need root, e.g. vcan).
-    let first_err = {
-        let pw = state.sudo.get_cached();
-        let mut mgr = state.can.lock().map_err(|e| e.to_string())?;
-        match mgr.open_channel(&backend, &name, bitrate, pw.as_deref(), app.clone(), Arc::clone(&dbc_arc)) {
-            Ok(()) => return Ok(()),
-            Err(e) => e,
-        }
-    };
-
-    if !first_err.starts_with("needs-sudo:") {
-        return Err(first_err);
-    }
-
-    // Root is required — ask the user (blocks until the frontend responds).
-    let pw = state.sudo.get_or_request(&app)?;
-    let mut mgr = state.can.lock().map_err(|e| e.to_string())?;
-    mgr.open_channel(&backend, &name, bitrate, Some(&pw), app, dbc_arc)
+    let can = Arc::clone(&state.can);
+    let dbc = Arc::clone(&state.dbc);
+    // Run on a blocking thread so the tokio runtime stays free to dispatch
+    // provide_sudo_password while we wait for the user to enter a password.
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let mut mgr = can.lock().map_err(|e| e.to_string())?;
+        mgr.open_channel(&backend, &name, bitrate, dbc)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()))
 }
 
 #[tauri::command]
-fn close_channel(name: String, state: State<'_, AppState>) -> Result<(), String> {
+fn close_channel(name: String, state: State<'_, TauriState>) -> Result<(), String> {
     let mut manager = state.can.lock().map_err(|e| e.to_string())?;
     manager.close_channel(&name)?;
     let mut dbc = state.dbc.write().map_err(|e| e.to_string())?;
@@ -165,7 +65,7 @@ fn close_channel(name: String, state: State<'_, AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
-fn get_open_channels(state: State<'_, AppState>) -> Result<Vec<ChannelInfo>, String> {
+fn get_open_channels(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>, String> {
     let manager = state.can.lock().map_err(|e| e.to_string())?;
     Ok(manager.open_channels_info())
 }
@@ -178,7 +78,7 @@ struct SendSignalCmd {
 }
 
 #[tauri::command]
-fn send_signal(cmd: SendSignalCmd, state: State<'_, AppState>) -> Result<(), String> {
+fn send_signal(cmd: SendSignalCmd, state: State<'_, TauriState>) -> Result<(), String> {
     let (message_id, data) = {
         let dbc_guard = state.dbc.read().map_err(|e| e.to_string())?;
         let channel_dbc = dbc_guard
@@ -216,7 +116,7 @@ fn send_signal(cmd: SendSignalCmd, state: State<'_, AppState>) -> Result<(), Str
 fn load_dbc(
     channel: String,
     path: String,
-    state: State<'_, AppState>,
+    state: State<'_, TauriState>,
 ) -> Result<dbc_parser::ParsedDbc, String> {
     let parsed = dbc_parser::parse_dbc(&path)?;
     let mut guard = state.dbc.write().map_err(|e| e.to_string())?;
@@ -227,7 +127,7 @@ fn load_dbc(
 #[tauri::command]
 fn get_dbc_for_channel(
     channel: String,
-    state: State<'_, AppState>,
+    state: State<'_, TauriState>,
 ) -> Result<Option<dbc_parser::ParsedDbc>, String> {
     let guard = state.dbc.read().map_err(|e| e.to_string())?;
     Ok(guard.get(&channel).cloned())
@@ -235,7 +135,7 @@ fn get_dbc_for_channel(
 
 #[tauri::command]
 fn get_all_dbcs(
-    state: State<'_, AppState>,
+    state: State<'_, TauriState>,
 ) -> Result<HashMap<String, dbc_parser::ParsedDbc>, String> {
     let guard = state.dbc.read().map_err(|e| e.to_string())?;
     Ok(guard.clone())
@@ -244,8 +144,9 @@ fn get_all_dbcs(
 // ── App path ──────────────────────────────────────────────────────────────────
 
 #[tauri::command]
-fn get_app_data_dir(app: AppHandle) -> Result<String, String> {
-    app.path()
+fn get_app_data_dir(state: State<'_, TauriState>) -> Result<String, String> {
+    state.app_state.app
+        .path()
         .app_data_dir()
         .map(|p| p.to_string_lossy().to_string())
         .map_err(|e| e.to_string())
@@ -264,7 +165,7 @@ fn save_project(path: String, project: Project) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn load_project(path: String, state: State<'_, AppState>) -> Result<Project, String> {
+fn load_project(path: String, state: State<'_, TauriState>) -> Result<Project, String> {
     let project = Project::load(&path)?;
     let mut dbc_guard = state.dbc.write().map_err(|e| e.to_string())?;
     for ch in &project.channels {
@@ -281,20 +182,23 @@ fn load_project(path: String, state: State<'_, AppState>) -> Result<Project, Str
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let mut manager = CanManager::new();
-    manager.register_backend(SocketCanBackend);
-
-    let app_state = AppState {
-        can: Arc::new(Mutex::new(manager)),
-        dbc: Arc::new(RwLock::new(HashMap::new())),
-        sudo: Arc::new(SudoState::new()),
-    };
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
-        .manage(app_state)
+        .setup(|app| {
+            let app_state = AppState::new(app.handle().clone());
+
+            let mut manager = CanManager::new(Arc::clone(&app_state));
+            manager.register_backend(SocketCanBackend);
+
+            app.manage(TauriState {
+                app_state,
+                can: Arc::new(Mutex::new(manager)),
+                dbc: Arc::new(RwLock::new(HashMap::new())),
+            });
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             get_app_data_dir,
             write_text_file,
