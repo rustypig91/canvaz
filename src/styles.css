@@ -241,6 +241,7 @@ kbd {
 }
 .channel-item .dot.closed { background: var(--text-muted); }
 .channel-item .ch-name { flex: 1; }
+.channel-item .ch-backend { font-size: 10px; }
 .channel-item .btn-close-ch {
   background: none; border: none; color: var(--text-muted);
   cursor: pointer; padding: 0 2px; font-size: 14px; line-height: 1;

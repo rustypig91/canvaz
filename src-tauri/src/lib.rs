@@ -1,54 +1,158 @@
 mod backends;
-mod backends2;
-mod can_interface;
 mod dbc_parser;
 mod project;
 pub mod signal_codec;
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 
-use backends::SocketCanBackend;
-use can_interface::{CanManager, DbcState, ManagerState};
+use backends::{CanManager, ChannelInfo, DbcState, ManagerState, SocketCanBackend};
 use project::Project;
 use serde::Deserialize;
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+// ── Sudo password state ───────────────────────────────────────────────────────
+
+enum SudoRequest {
+    Idle,
+    Waiting,
+    Done,
+}
+
+pub struct SudoState {
+    cached: Mutex<Option<String>>,
+    request: Mutex<SudoRequest>,
+    condvar: Condvar,
+}
+
+impl SudoState {
+    fn new() -> Self {
+        Self {
+            cached: Mutex::new(None),
+            request: Mutex::new(SudoRequest::Idle),
+            condvar: Condvar::new(),
+        }
+    }
+
+    /// Returns the cached password without blocking.
+    fn get_cached(&self) -> Option<String> {
+        self.cached.lock().unwrap().clone()
+    }
+
+    /// Returns the cached password immediately, or emits "request-sudo-password"
+    /// to the frontend and blocks the calling thread until the user responds.
+    /// Call this from any Tauri command that may need root.
+    pub fn get_or_request(&self, app: &AppHandle) -> Result<String, String> {
+        // Fast path — already have it.
+        {
+            let c = self.cached.lock().map_err(|e| e.to_string())?;
+            if let Some(pw) = c.as_ref() {
+                return Ok(pw.clone());
+            }
+        }
+
+        // Transition to Waiting and ask the frontend (only once even if multiple
+        // callers race here simultaneously).
+        {
+            let mut req = self.request.lock().map_err(|e| e.to_string())?;
+            if matches!(*req, SudoRequest::Idle | SudoRequest::Done) {
+                *req = SudoRequest::Waiting;
+                let _ = app.emit("request-sudo-password", ());
+            }
+        }
+
+        // Block until provide_sudo_password resolves the request.
+        {
+            let mut req = self
+                .condvar
+                .wait_while(
+                    self.request.lock().map_err(|e| e.to_string())?,
+                    |req| matches!(req, SudoRequest::Waiting),
+                )
+                .map_err(|e| e.to_string())?;
+            // Reset so future calls can issue a new request if needed.
+            *req = SudoRequest::Idle;
+        }
+
+        // provide() caches the password before notifying, so this is safe.
+        self.cached
+            .lock()
+            .map_err(|e| e.to_string())?
+            .clone()
+            .ok_or_else(|| "Sudo authentication cancelled".to_string())
+    }
+
+    /// Called by the frontend with the user's password (or None if cancelled).
+    fn provide(&self, password: Option<String>) {
+        // Cache a valid password before waking waiters.
+        if let Some(pw) = &password {
+            if !pw.is_empty() {
+                if let Ok(mut c) = self.cached.lock() {
+                    *c = Some(pw.clone());
+                }
+            }
+        }
+        if let Ok(mut req) = self.request.lock() {
+            *req = SudoRequest::Done;
+        }
+        self.condvar.notify_all();
+    }
+}
 
 // ── Shared app state ──────────────────────────────────────────────────────────
 
 struct AppState {
     can: ManagerState,
     dbc: DbcState,
+    sudo: Arc<SudoState>,
+}
+
+// ── Sudo command ──────────────────────────────────────────────────────────────
+
+/// Called by the frontend in response to the "request-sudo-password" event.
+/// Pass `None` when the user cancels the dialog.
+#[tauri::command]
+fn provide_sudo_password(password: Option<String>, state: State<'_, AppState>) {
+    state.sudo.provide(password);
 }
 
 // ── CAN commands ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
-fn configure_channel(
-    name: String,
-    bitrate: Option<u32>,
-    sudo_password: Option<String>,
-    state: State<'_, AppState>,
-) -> Result<(), String> {
+fn list_can_interfaces(state: State<'_, AppState>) -> Result<Vec<ChannelInfo>, String> {
     let manager = state.can.lock().map_err(|e| e.to_string())?;
-    manager.configure_channel(&name, bitrate, sudo_password.as_deref())
-}
-
-#[tauri::command]
-fn list_can_interfaces(state: State<'_, AppState>) -> Result<Vec<String>, String> {
-    let manager = state.can.lock().map_err(|e| e.to_string())?;
-    Ok(manager.list_interfaces())
+    Ok(manager.list_channels())
 }
 
 #[tauri::command]
 fn open_channel(
+    backend: String,
     name: String,
+    bitrate: Option<u32>,
     state: State<'_, AppState>,
     app: AppHandle,
 ) -> Result<(), String> {
-    let mut manager = state.can.lock().map_err(|e| e.to_string())?;
     let dbc_arc = Arc::clone(&state.dbc);
-    manager.open_channel(name, app, dbc_arc)
+
+    // First attempt with the cached password (may be None — works if the
+    // interface is already up or doesn't need root, e.g. vcan).
+    let first_err = {
+        let pw = state.sudo.get_cached();
+        let mut mgr = state.can.lock().map_err(|e| e.to_string())?;
+        match mgr.open_channel(&backend, &name, bitrate, pw.as_deref(), app.clone(), Arc::clone(&dbc_arc)) {
+            Ok(()) => return Ok(()),
+            Err(e) => e,
+        }
+    };
+
+    if !first_err.starts_with("needs-sudo:") {
+        return Err(first_err);
+    }
+
+    // Root is required — ask the user (blocks until the frontend responds).
+    let pw = state.sudo.get_or_request(&app)?;
+    let mut mgr = state.can.lock().map_err(|e| e.to_string())?;
+    mgr.open_channel(&backend, &name, bitrate, Some(&pw), app, dbc_arc)
 }
 
 #[tauri::command]
@@ -61,9 +165,9 @@ fn close_channel(name: String, state: State<'_, AppState>) -> Result<(), String>
 }
 
 #[tauri::command]
-fn get_open_channels(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+fn get_open_channels(state: State<'_, AppState>) -> Result<Vec<ChannelInfo>, String> {
     let manager = state.can.lock().map_err(|e| e.to_string())?;
-    Ok(manager.open_names())
+    Ok(manager.open_channels_info())
 }
 
 #[derive(Deserialize)]
@@ -156,7 +260,6 @@ fn write_text_file(path: String, content: String) -> Result<(), String> {
 
 #[tauri::command]
 fn save_project(path: String, project: Project) -> Result<(), String> {
-    println!("Saving project to '{}'", path);
     project.save(&path)
 }
 
@@ -180,12 +283,11 @@ fn load_project(path: String, state: State<'_, AppState>) -> Result<Project, Str
 pub fn run() {
     let mut manager = CanManager::new();
     manager.register_backend(SocketCanBackend);
-    // Register additional backends here as they are added, e.g.:
-    // manager.register_backend(PeakCanBackend::new());
 
     let app_state = AppState {
         can: Arc::new(Mutex::new(manager)),
         dbc: Arc::new(RwLock::new(HashMap::new())),
+        sudo: Arc::new(SudoState::new()),
     };
 
     tauri::Builder::default()
@@ -196,7 +298,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_app_data_dir,
             write_text_file,
-            configure_channel,
+            provide_sudo_password,
             list_can_interfaces,
             open_channel,
             close_channel,

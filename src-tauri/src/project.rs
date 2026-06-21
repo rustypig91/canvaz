@@ -12,9 +12,15 @@ pub struct Project {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelConfig {
     pub name: String,
+    #[serde(default = "default_backend")]
+    pub backend: String,
     pub dbc_path: Option<String>,
     #[serde(default)]
     pub bitrate: Option<u32>,
+}
+
+fn default_backend() -> String {
+    "socketcan".to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

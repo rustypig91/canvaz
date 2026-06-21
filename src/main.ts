@@ -66,7 +66,8 @@ interface CanFrameEvent {
 
 interface PlotSignalEntry { signal_name: string; channel: string; }
 interface PlotPaneConfig  { signals: PlotSignalEntry[]; }
-interface ChannelConfig   { name: string; dbc_path: string | null; bitrate?: number | null; }
+interface ChannelInfo     { backend: string; name: string; }
+interface ChannelConfig   { name: string; backend: string; dbc_path: string | null; bitrate?: number | null; }
 interface SimulateEntry   { signal_name: string; channel: string; value: number; period_ms: number; }
 
 interface Project {
@@ -557,6 +558,8 @@ function setupSimDrop() {
 
 const dbcByChannel = new Map<string, ParsedDbc>();
 const channelBitrates = new Map<string, number | null>();
+const channelBackends = new Map<string, string>();   // channel name → backend name
+const interfaceBackends = new Map<string, string>(); // from list_can_interfaces, name → backend
 const signalLastValues = new Map<string, number>();   // key → latest value
 const signalValueEls   = new Map<string, HTMLElement>(); // key → .sig-value span
 let selectedChannel: string | null = null;
@@ -635,10 +638,24 @@ async function openChannelDialog(mode: DialogMode, channelName?: string) {
     dialogPendingDbc = null;
     setDbcLabel(null);
     setBitrateInDialog(500000, false);
-    const ifaces = await invoke<string[]>("list_can_interfaces").catch(() => [] as string[]);
-    sel.innerHTML = ifaces.map(i => `<option>${i}</option>`).join("");
+    const ifaces = await invoke<ChannelInfo[]>("list_can_interfaces").catch(() => [] as ChannelInfo[]);
+    interfaceBackends.clear();
+    for (const i of ifaces) interfaceBackends.set(i.name, i.backend);
+
+    // Group interfaces by backend into <optgroup> elements
+    const byBackend = new Map<string, string[]>();
+    for (const i of ifaces) {
+      const group = byBackend.get(i.backend) ?? [];
+      group.push(i.name);
+      byBackend.set(i.backend, group);
+    }
+    sel.innerHTML = [...byBackend.entries()]
+      .map(([backend, names]) =>
+        `<optgroup label="${backend}">${names.map(n => `<option value="${n}">${n}</option>`).join("")}</optgroup>`
+      ).join("");
+
     // Auto-detect vcan from first item
-    if (ifaces[0]?.startsWith("vcan")) setBitrateInDialog(null, true);
+    if (ifaces[0]?.name.startsWith("vcan")) setBitrateInDialog(null, true);
   } else {
     const name = channelName!;
     title.textContent = `Channel: ${name}`;
@@ -654,7 +671,7 @@ async function openChannelDialog(mode: DialogMode, channelName?: string) {
   dialog.showModal();
 }
 
-// ── Sudo password prompt ──────────────────────────────────────────────────────
+// ── Sudo password ─────────────────────────────────────────────────────────────
 
 function promptSudoPassword(): Promise<string | null> {
   return new Promise((resolve) => {
@@ -683,25 +700,24 @@ function promptSudoPassword(): Promise<string | null> {
   });
 }
 
-// Try `ip link` without sudo; if the backend returns "needs-sudo:" prompt for
-// the password and retry once. Returns false if the user cancelled.
-async function configureInterface(name: string, bitrate: number | null): Promise<boolean> {
+// Open a channel. If root is required the Rust side emits "request-sudo-password",
+// the global listener shows the dialog, and open_channel unblocks automatically.
+async function openChannelWithSudo(
+  backend: string,
+  name: string,
+  bitrate: number | null,
+): Promise<boolean> {
   try {
-    await invoke("configure_channel", { name, bitrate, sudoPassword: null });
+    await invoke("open_channel", { backend, name, bitrate });
     return true;
   } catch (e) {
     const msg = String(e);
-    if (msg.startsWith("needs-sudo:")) {
-      const password = await promptSudoPassword();
-      if (password === null) { setStatus("Configuration cancelled."); return false; }
-      try {
-        await invoke("configure_channel", { name, bitrate, sudoPassword: password });
-        return true;
-      } catch (e2) { setStatus(`Configure error: ${e2}`); return false; }
+    if (msg === "Sudo authentication cancelled") {
+      setStatus("Cancelled — sudo password required.");
+    } else {
+      setStatus(`Channel error: ${msg}`);
     }
-    // Non-permission error (e.g. interface already up) — treat as warning and proceed
-    setStatus(`Warning: could not configure ${name}: ${msg}`);
-    return true;
+    return false;
   }
 }
 
@@ -713,15 +729,13 @@ async function applyChannelDialog() {
     const custom = (document.getElementById("input-iface-custom") as HTMLInputElement).value.trim();
     const name = custom || (document.getElementById("select-iface") as HTMLSelectElement).value;
     if (!name) return;
+    const backend = interfaceBackends.get(name) ?? "socketcan";
 
-    // Configure network interface (bring up with bitrate); prompts for sudo if needed
-    const ok = await configureInterface(name, bitrate);
+    // open_channel handles configure + socket open in one step
+    const ok = await openChannelWithSudo(backend, name, bitrate);
     if (!ok) { dialog.close(); return; }
-    // Open channel
-    try {
-      await invoke("open_channel", { name });
-      channelBitrates.set(name, bitrate);
-    } catch (e) { setStatus(`Channel error: ${e}`); dialog.close(); return; }
+    channelBitrates.set(name, bitrate);
+    channelBackends.set(name, backend);
 
     // Load DBC if selected
     if (dialogPendingDbc) {
@@ -736,18 +750,17 @@ async function applyChannelDialog() {
     scheduleAutoSave();
   } else {
     const name = dialogEditTarget!;
+    const backend = channelBackends.get(name) ?? "socketcan";
     const wasOpen = openChannels.includes(name);
 
-    // Close → reconfigure → reopen
+    // Close the existing channel first, then reopen with updated settings
     if (wasOpen) {
       try { await invoke("close_channel", { name }); dbcByChannel.delete(name); } catch {}
     }
-    const ok = await configureInterface(name, bitrate);
+    const ok = await openChannelWithSudo(backend, name, bitrate);
     if (!ok) { dialog.close(); return; }
-    if (wasOpen) {
-      try { await invoke("open_channel", { name }); } catch (e) { setStatus(`Reopen error: ${e}`); }
-    }
     channelBitrates.set(name, bitrate);
+    channelBackends.set(name, backend);
 
     // Reload DBC
     if (dialogPendingDbc) {
@@ -775,8 +788,11 @@ function selectChannel(name: string | null) {
 }
 
 async function refreshChannelList() {
-  try { openChannels = await invoke<string[]>("get_open_channels"); }
-  catch { openChannels = []; }
+  try {
+    const infos = await invoke<ChannelInfo[]>("get_open_channels");
+    openChannels = infos.map(i => i.name);
+    for (const i of infos) channelBackends.set(i.name, i.backend);
+  } catch { openChannels = []; }
   if (selectedChannel && !openChannels.includes(selectedChannel)) selectChannel(openChannels[0] ?? null);
   else if (!selectedChannel && openChannels.length > 0) selectChannel(openChannels[0]);
   renderChannelList();
@@ -789,6 +805,7 @@ function renderChannelList() {
   for (const name of openChannels) {
     const dbc = dbcByChannel.get(name);
     const bitrate = channelBitrates.get(name);
+    const backend = channelBackends.get(name) ?? "";
     const isSelected = name === selectedChannel;
     const bitrateLabel = name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate/1000).toFixed(0)}k` : "—");
     const item = document.createElement("div");
@@ -796,7 +813,7 @@ function renderChannelList() {
     item.dataset.channel = name;
     item.innerHTML = `
       <span class="dot"></span>
-      <span class="ch-name">${name}</span>
+      <span class="ch-name">${name}<span class="ch-backend label-muted"> ${backend}</span></span>
       <span class="ch-dbc">${dbc ? dbc.path.split("/").pop() : "No DBC"}</span>
       <span class="ch-baud label-muted">${bitrateLabel}</span>
       <button class="btn-close-ch" title="Close channel">×</button>
@@ -906,7 +923,12 @@ function renderSimTable() {
 function buildProject(): Project {
   return {
     version: 1,
-    channels: openChannels.map(name => ({ name, dbc_path: dbcByChannel.get(name)?.path ?? null, bitrate: channelBitrates.get(name) ?? null })),
+    channels: openChannels.map(name => ({
+      name,
+      backend: channelBackends.get(name) ?? "socketcan",
+      dbc_path: dbcByChannel.get(name)?.path ?? null,
+      bitrate: channelBitrates.get(name) ?? null,
+    })),
     plot_panes: plotPanes.map(pane => ({
       signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: s.channel })),
     })),
@@ -944,11 +966,12 @@ async function openProject() {
 
 async function applyProject(project: Project) {
   for (const ch of project.channels) {
-    await configureInterface(ch.name, ch.bitrate ?? null);
-    try {
-      await invoke("open_channel", { name: ch.name });
+    const backend = ch.backend ?? "socketcan";
+    const ok = await openChannelWithSudo(backend, ch.name, ch.bitrate ?? null);
+    if (ok) {
       channelBitrates.set(ch.name, ch.bitrate ?? null);
-    } catch { }
+      channelBackends.set(ch.name, backend);
+    }
   }
   await refreshChannelList();
 
@@ -1374,6 +1397,12 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Events
   await listen<SignalValueEvent>("signal-value", (event) => onSignalValue(event.payload));
   await listen<CanFrameEvent>("can-frame", (event) => onCanFrame(event.payload));
+
+  // Sudo password request from the Rust backend — show dialog once, cache in Rust.
+  await listen("request-sudo-password", async () => {
+    const pw = await promptSudoPassword();
+    await invoke("provide_sudo_password", { password: pw ?? null }).catch(() => {});
+  });
 
   // Resolve session file path, then try to restore the last session
   try {
