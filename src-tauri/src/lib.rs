@@ -110,6 +110,54 @@ fn send_signal(cmd: SendSignalCmd, state: State<'_, TauriState>) -> Result<(), S
     manager.send_frame(&cmd.channel, message_id, &data)
 }
 
+// ── Message / raw frame send commands ────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SendMessageCmd {
+    channel: String,
+    message_id: u32,
+    signal_values: HashMap<String, f64>,
+}
+
+#[tauri::command]
+fn send_message(cmd: SendMessageCmd, state: State<'_, TauriState>) -> Result<(), String> {
+    let data = {
+        let dbc = state.dbc.read().map_err(|e| e.to_string())?;
+        let channel_dbc = dbc
+            .get(&cmd.channel)
+            .ok_or_else(|| format!("No DBC for '{}'", cmd.channel))?;
+        let msg = channel_dbc
+            .messages
+            .iter()
+            .find(|m| m.id == cmd.message_id)
+            .ok_or_else(|| format!("Message 0x{:X} not in DBC", cmd.message_id))?;
+        let mut buf = vec![0u8; msg.dlc as usize];
+        for sig in &msg.signals {
+            if let Some(&v) = cmd.signal_values.get(&sig.name) {
+                signal_codec::encode(
+                    &mut buf, v,
+                    sig.start_bit, sig.length,
+                    sig.little_endian, sig.factor, sig.offset,
+                );
+            }
+        }
+        buf
+    };
+    state.can.lock().map_err(|e| e.to_string())?.send_frame(&cmd.channel, cmd.message_id, &data)
+}
+
+#[derive(Deserialize)]
+struct SendRawFrameCmd {
+    channel: String,
+    can_id: u32,
+    data: Vec<u8>,
+}
+
+#[tauri::command]
+fn send_raw_frame(cmd: SendRawFrameCmd, state: State<'_, TauriState>) -> Result<(), String> {
+    state.can.lock().map_err(|e| e.to_string())?.send_frame(&cmd.channel, cmd.can_id, &cmd.data)
+}
+
 // ── DBC commands ──────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -208,6 +256,8 @@ pub fn run() {
             close_channel,
             get_open_channels,
             send_signal,
+            send_message,
+            send_raw_frame,
             load_dbc,
             get_dbc_for_channel,
             get_all_dbcs,

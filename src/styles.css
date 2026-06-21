@@ -452,34 +452,76 @@ kbd {
 .hint { font-size: 11px; color: var(--text-muted); font-weight: 400; text-transform: none; }
 
 /* ── Simulate tab ────────────────────────────────────────────────────────── */
+/* ── Simulate tab ────────────────────────────────────────────────────────── */
+#tab-simulate { flex-direction: column; }
+
 #sim-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
   padding: 6px 12px;
   background: var(--bg2);
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
-#tab-simulate { flex-direction: column; }
-#sim-table {
-  width: 100%;
-  border-collapse: collapse;
+
+#sim-entries {
+  flex: 1;
+  overflow-y: auto;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sim-group {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.sim-group-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--bg3);
+  flex-wrap: nowrap;
+}
+
+.sim-kind-badge {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 3px;
+  letter-spacing: 0.05em;
   flex-shrink: 0;
 }
-#sim-table th {
-  text-align: left;
-  padding: 6px 12px;
-  background: var(--bg3);
-  border-bottom: 1px solid var(--border);
-  font-size: 11px;
-  text-transform: uppercase;
+.sim-kind-badge.kind-msg { background: rgba(59,130,246,0.2); color: var(--accent); }
+.sim-kind-badge.kind-raw { background: rgba(249,115,22,0.2); color: #f97316; }
+
+.sim-msg-name { font-weight: 600; font-size: 12px; }
+.sim-msg-id   { font-family: monospace; font-size: 11px; }
+
+.sim-group-body { padding: 4px 0; }
+
+.sim-signal-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 14px;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+}
+.sim-signal-row:last-child { border-bottom: none; }
+
+.sim-sig-name {
+  flex: 1;
+  font-size: 12px;
   color: var(--text-muted);
-  font-weight: 600;
 }
-#sim-table td {
-  padding: 5px 12px;
-  border-bottom: 1px solid var(--border);
-  vertical-align: middle;
-}
-#sim-table tr:hover td { background: var(--bg3); }
+.sim-sig-unit { min-width: 32px; text-align: right; }
+
 .sim-value-input {
   background: var(--bg);
   border: 1px solid var(--border);
@@ -489,15 +531,67 @@ kbd {
   width: 90px;
   font-size: 12px;
 }
-.sim-period-input {
+
+.sim-period {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--text);
   padding: 2px 6px;
-  width: 70px;
+  width: 60px;
   font-size: 12px;
 }
+
+.sim-raw-data-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 14px;
+}
+.sim-bytes { display: flex; gap: 4px; flex-wrap: wrap; }
+.sim-byte {
+  width: 28px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font-family: monospace;
+  font-size: 12px;
+  text-align: center;
+  padding: 2px 3px;
+  text-transform: uppercase;
+}
+.sim-byte:disabled { opacity: 0.3; }
+
+.sim-channel-sel,
+.sim-dlc-sel {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12px;
+  padding: 2px 4px;
+  font-family: monospace;
+}
+.sim-dlc-sel { width: 44px; }
+
+.sim-canid-input {
+  width: 72px;
+  text-transform: uppercase;
+}
+
+.sim-ext-label {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
+.sim-toggle.running { background: var(--danger); }
+
 .channel-select {
   background: var(--bg);
   border: 1px solid var(--border);
@@ -506,7 +600,6 @@ kbd {
   padding: 2px 6px;
   font-size: 12px;
 }
-.sim-actions { display: flex; gap: 6px; align-items: center; }
 
 /* ── Trace tab ───────────────────────────────────────────────────────────── */
 #tab-trace { flex-direction: column; }

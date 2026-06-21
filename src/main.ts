@@ -377,7 +377,12 @@ function updateSignalHighlights() {
   for (const pane of plotPanes)
     for (const key of pane.series.keys()) plotted.add(key);
 
-  const simulated = new Set(simRows.keys());
+  const simulated = new Set<string>();
+  for (const entry of simEntries.values()) {
+    if (entry.kind === "message") {
+      for (const s of entry.signals) simulated.add(plotKey(entry.channel, s.def.name));
+    }
+  }
 
   document.querySelectorAll<HTMLElement>(".signal-row").forEach(row => {
     const key = plotKey(row.dataset.channel ?? "", row.dataset.signal ?? "");
@@ -796,7 +801,7 @@ async function refreshChannelList() {
   if (selectedChannel && !openChannels.includes(selectedChannel)) selectChannel(openChannels[0] ?? null);
   else if (!selectedChannel && openChannels.length > 0) selectChannel(openChannels[0]);
   renderChannelList();
-  renderSimTable();
+  renderSimEntries();
 }
 
 function renderChannelList() {
@@ -839,83 +844,225 @@ function renderChannelList() {
 
 // ── Simulate tab ──────────────────────────────────────────────────────────────
 
-interface SimRow {
-  signalName: string;
-  messageName: string;
-  messageId: number;
+interface SimMessageEntry {
+  kind: "message";
   channel: string;
-  value: number;
+  messageId: number;
+  messageName: string;
+  dlc: number;
+  signals: { def: DbcSignal; value: number }[];
   periodMs: number;
   timerId: ReturnType<typeof setInterval> | null;
 }
 
-const simRows = new Map<string, SimRow>();
+interface SimRawEntry {
+  kind: "raw";
+  channel: string;
+  canId: number;
+  isExtended: boolean;
+  dlc: number;
+  data: number[];
+  periodMs: number;
+  timerId: ReturnType<typeof setInterval> | null;
+}
 
-function simKey(channel: string, signalName: string) { return `${channel}::${signalName}`; }
+type SimEntry = SimMessageEntry | SimRawEntry;
+
+const simEntries = new Map<string, SimEntry>();
+let rawEntryCounter = 0;
+
+// ── Sim entry element builders ────────────────────────────────────────────────
+
+function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
+  const el = document.createElement("div");
+  el.className = "sim-group";
+  el.dataset.simKey = key;
+
+  if (entry.kind === "message") {
+    const idHex = "0x" + entry.messageId.toString(16).toUpperCase().padStart(3, "0");
+    el.innerHTML = `
+      <div class="sim-group-header">
+        <span class="sim-kind-badge kind-msg">MSG</span>
+        <span class="sim-msg-name">${entry.messageName}</span>
+        <span class="label-muted sim-msg-id">${idHex}</span>
+        <span class="ch-badge">${entry.channel}</span>
+        <span class="label-muted">Period</span>
+        <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
+        <span class="label-muted">ms</span>
+        <button class="btn btn-sm sim-toggle">Start</button>
+        <button class="btn btn-sm btn-danger sim-remove">✕</button>
+      </div>
+      <div class="sim-group-body">
+        ${entry.signals.map((s, i) => `
+          <div class="sim-signal-row">
+            <span class="sim-sig-name">${s.def.name}</span>
+            <input type="number" class="sim-value-input" data-idx="${i}" value="${s.value}" step="any">
+            ${s.def.unit ? `<span class="sim-sig-unit label-muted">${s.def.unit}</span>` : ""}
+          </div>`).join("")}
+      </div>`;
+
+    el.querySelector<HTMLInputElement>(".sim-period")!.addEventListener("input", (e) => {
+      const p = parseInt((e.target as HTMLInputElement).value) || 100;
+      if (entry.timerId != null) { stopSim(key); entry.periodMs = p; startSim(key); }
+      else entry.periodMs = p;
+    });
+    el.querySelectorAll<HTMLInputElement>(".sim-value-input").forEach(inp => {
+      inp.addEventListener("input", () => {
+        entry.signals[parseInt(inp.dataset.idx ?? "0")].value = parseFloat(inp.value) || 0;
+      });
+    });
+
+  } else {
+    const idHex = entry.canId.toString(16).toUpperCase().padStart(3, "0");
+    el.innerHTML = `
+      <div class="sim-group-header">
+        <span class="sim-kind-badge kind-raw">RAW</span>
+        <select class="sim-channel-sel">
+          ${openChannels.map(ch => `<option value="${ch}"${ch === entry.channel ? " selected" : ""}>${ch}</option>`).join("")}
+        </select>
+        <span class="label-muted">ID</span>
+        <input type="text" class="sim-canid-input small-input" value="${idHex}" maxlength="8" placeholder="hex">
+        <label class="sim-ext-label label-muted"><input type="checkbox" class="sim-ext-cb"${entry.isExtended ? " checked" : ""}> Ext</label>
+        <span class="label-muted">DLC</span>
+        <select class="sim-dlc-sel">
+          ${[1,2,3,4,5,6,7,8].map(n => `<option value="${n}"${n === entry.dlc ? " selected" : ""}>${n}</option>`).join("")}
+        </select>
+        <span class="label-muted">Period</span>
+        <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
+        <span class="label-muted">ms</span>
+        <button class="btn btn-sm sim-toggle">Start</button>
+        <button class="btn btn-sm btn-danger sim-remove">✕</button>
+      </div>
+      <div class="sim-group-body">
+        <div class="sim-raw-data-row">
+          <span class="label-muted">Data</span>
+          <div class="sim-bytes">
+            ${entry.data.map((b, i) => `<input type="text" class="sim-byte" data-idx="${i}" value="${b.toString(16).toUpperCase().padStart(2,"0")}" maxlength="2"${i >= entry.dlc ? " disabled" : ""}>`).join("")}
+          </div>
+        </div>
+      </div>`;
+
+    el.querySelector<HTMLSelectElement>(".sim-channel-sel")!.addEventListener("change", (e) => {
+      entry.channel = (e.target as HTMLSelectElement).value;
+    });
+    el.querySelector<HTMLInputElement>(".sim-canid-input")!.addEventListener("input", (e) => {
+      entry.canId = parseInt((e.target as HTMLInputElement).value, 16) || 0;
+    });
+    el.querySelector<HTMLInputElement>(".sim-ext-cb")!.addEventListener("change", (e) => {
+      entry.isExtended = (e.target as HTMLInputElement).checked;
+    });
+    el.querySelector<HTMLSelectElement>(".sim-dlc-sel")!.addEventListener("change", (e) => {
+      entry.dlc = parseInt((e.target as HTMLSelectElement).value);
+      el.querySelectorAll<HTMLInputElement>(".sim-byte").forEach((inp, i) => {
+        inp.disabled = i >= entry.dlc;
+      });
+    });
+    el.querySelector<HTMLInputElement>(".sim-period")!.addEventListener("input", (e) => {
+      const p = parseInt((e.target as HTMLInputElement).value) || 100;
+      if (entry.timerId != null) { stopSim(key); entry.periodMs = p; startSim(key); }
+      else entry.periodMs = p;
+    });
+    el.querySelectorAll<HTMLInputElement>(".sim-byte").forEach(inp => {
+      inp.addEventListener("input", () => {
+        entry.data[parseInt(inp.dataset.idx ?? "0")] = parseInt(inp.value, 16) || 0;
+      });
+      inp.addEventListener("blur", () => {
+        const i = parseInt(inp.dataset.idx ?? "0");
+        inp.value = entry.data[i].toString(16).toUpperCase().padStart(2, "0");
+      });
+    });
+  }
+
+  el.querySelector(".sim-toggle")!.addEventListener("click", () => {
+    entry.timerId != null ? stopSim(key) : startSim(key);
+  });
+  el.querySelector(".sim-remove")!.addEventListener("click", () => removeSimEntry(key));
+  return el;
+}
+
+function renderSimEntries() {
+  const container = document.getElementById("sim-entries")!;
+  container.innerHTML = "";
+  for (const [key, entry] of simEntries) {
+    container.appendChild(createSimEntryEl(key, entry));
+  }
+}
+
+// ── Sim actions ───────────────────────────────────────────────────────────────
 
 function addSimSignal(channel: string, sig: DbcSignal) {
-  const key = simKey(channel, sig.name);
-  if (simRows.has(key)) return;
-  simRows.set(key, { signalName: sig.name, messageName: sig.message_name, messageId: sig.message_id, channel, value: sig.min ?? 0, periodMs: 100, timerId: null });
-  renderSimTable();
+  const dbc = dbcByChannel.get(channel);
+  if (!dbc) { setStatus("No DBC loaded for this channel"); return; }
+  const msg = dbc.messages.find(m => m.signals.some(s => s.name === sig.name));
+  if (!msg) return;
+
+  const key = `msg::${channel}::${msg.id}`;
+  if (simEntries.has(key)) { setStatus(`Message '${msg.name}' already added`); return; }
+
+  const entry: SimMessageEntry = {
+    kind: "message", channel,
+    messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
+    signals: msg.signals.map(s => ({ def: s, value: s.min ?? 0 })),
+    periodMs: 100, timerId: null,
+  };
+  simEntries.set(key, entry);
+  document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
   updateSignalHighlights();
   scheduleAutoSave();
 }
 
-function removeSimSignal(key: string) {
-  const row = simRows.get(key);
-  if (row?.timerId != null) clearInterval(row.timerId);
-  simRows.delete(key);
-  renderSimTable();
+function addRawFrame() {
+  const key = `raw::${++rawEntryCounter}`;
+  const entry: SimRawEntry = {
+    kind: "raw",
+    channel: openChannels[0] ?? "",
+    canId: 0x100, isExtended: false, dlc: 8,
+    data: new Array(8).fill(0),
+    periodMs: 100, timerId: null,
+  };
+  simEntries.set(key, entry);
+  document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
+}
+
+function removeSimEntry(key: string) {
+  const entry = simEntries.get(key);
+  if (entry?.timerId != null) clearInterval(entry.timerId);
+  simEntries.delete(key);
+  document.querySelector(`[data-sim-key="${key}"]`)?.remove();
   updateSignalHighlights();
   scheduleAutoSave();
 }
 
 function startSim(key: string) {
-  const row = simRows.get(key);
-  if (!row || row.timerId != null) return;
-  if (!row.channel) { setStatus("Select a channel first"); return; }
-  row.timerId = setInterval(async () => {
-    try { await invoke("send_signal", { cmd: { channel: row.channel, signal_name: row.signalName, value: row.value } }); }
-    catch (e) { setStatus(`Send error: ${e}`); }
-  }, row.periodMs);
-  renderSimTable();
+  const entry = simEntries.get(key);
+  if (!entry || entry.timerId != null) return;
+  if (!entry.channel) { setStatus("Select a channel first"); return; }
+
+  if (entry.kind === "message") {
+    entry.timerId = setInterval(async () => {
+      const signalValues: Record<string, number> = {};
+      for (const s of entry.signals) signalValues[s.def.name] = s.value;
+      try { await invoke("send_message", { cmd: { channel: entry.channel, message_id: entry.messageId, signal_values: signalValues } }); }
+      catch (e) { setStatus(`Send error: ${e}`); }
+    }, entry.periodMs);
+  } else {
+    entry.timerId = setInterval(async () => {
+      try { await invoke("send_raw_frame", { cmd: { channel: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc) } }); }
+      catch (e) { setStatus(`Send error: ${e}`); }
+    }, entry.periodMs);
+  }
+
+  const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
+  if (btn) { btn.textContent = "Stop"; btn.classList.add("running"); }
 }
 
 function stopSim(key: string) {
-  const row = simRows.get(key);
-  if (!row || row.timerId == null) return;
-  clearInterval(row.timerId);
-  row.timerId = null;
-  renderSimTable();
-}
-
-function renderSimTable() {
-  const tbody = document.getElementById("sim-tbody")!;
-  tbody.innerHTML = "";
-  for (const [key, row] of simRows) {
-    const running = row.timerId != null;
-    const tr = document.createElement("tr");
-    tr.innerHTML = `
-      <td>${row.signalName}</td>
-      <td>${row.messageName}</td>
-      <td><span class="ch-badge">${row.channel}</span></td>
-      <td><input type="number" class="sim-value-input" value="${row.value}" step="any" /></td>
-      <td><input type="number" class="sim-period-input" value="${row.periodMs}" min="10" /></td>
-      <td class="sim-actions">
-        <button class="btn btn-sm ${running ? "running" : ""}" data-action="toggle">${running ? "Stop" : "Start"}</button>
-        <button class="btn btn-sm btn-danger" data-action="remove">✕</button>
-      </td>
-    `;
-    tr.querySelector<HTMLInputElement>(".sim-value-input")!.addEventListener("input", (e) => { row.value = parseFloat((e.target as HTMLInputElement).value) || 0; });
-    tr.querySelector<HTMLInputElement>(".sim-period-input")!.addEventListener("input", (e) => {
-      const p = parseInt((e.target as HTMLInputElement).value) || 100;
-      if (row.timerId != null) { stopSim(key); row.periodMs = p; startSim(key); } else row.periodMs = p;
-    });
-    tr.querySelector("[data-action='toggle']")!.addEventListener("click", () => { running ? stopSim(key) : startSim(key); });
-    tr.querySelector("[data-action='remove']")!.addEventListener("click", () => removeSimSignal(key));
-    tbody.appendChild(tr);
-  }
+  const entry = simEntries.get(key);
+  if (!entry || entry.timerId == null) return;
+  clearInterval(entry.timerId);
+  entry.timerId = null;
+  const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
+  if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
 }
 
 // ── Project ───────────────────────────────────────────────────────────────────
@@ -932,7 +1079,11 @@ function buildProject(): Project {
     plot_panes: plotPanes.map(pane => ({
       signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: s.channel })),
     })),
-    simulate_signals: [...simRows.values()].map(r => ({ signal_name: r.signalName, channel: r.channel, value: r.value, period_ms: r.periodMs })),
+    simulate_signals: [...simEntries.values()].flatMap(e =>
+      e.kind === "message"
+        ? e.signals.map(s => ({ signal_name: s.def.name, channel: e.channel, value: s.value, period_ms: e.periodMs }))
+        : []
+    ),
   };
 }
 
@@ -994,18 +1145,31 @@ async function applyProject(project: Project) {
     }
   }
 
-  simRows.clear();
+  for (const entry of simEntries.values()) { if (entry.timerId != null) clearInterval(entry.timerId); }
+  simEntries.clear();
+  document.getElementById("sim-entries")!.innerHTML = "";
+
+  // Group saved signal entries by message so each message becomes one card
+  const msgMap = new Map<string, { channel: string; msg: DbcMessage; periodMs: number; values: Map<string, number> }>();
   for (const entry of project.simulate_signals) {
     const dbc = dbcByChannel.get(entry.channel);
-    const sig = dbc?.messages.flatMap(m => m.signals).find(s => s.name === entry.signal_name);
-    if (sig) {
-      simRows.set(simKey(entry.channel, sig.name), {
-        signalName: sig.name, messageName: sig.message_name, messageId: sig.message_id,
-        channel: entry.channel, value: entry.value, periodMs: entry.period_ms, timerId: null,
-      });
-    }
+    const msg = dbc?.messages.find(m => m.signals.some(s => s.name === entry.signal_name));
+    if (!msg) continue;
+    const key = `msg::${entry.channel}::${msg.id}`;
+    if (!msgMap.has(key)) msgMap.set(key, { channel: entry.channel, msg, periodMs: entry.period_ms, values: new Map() });
+    msgMap.get(key)!.values.set(entry.signal_name, entry.value);
   }
-  renderSimTable();
+  const container = document.getElementById("sim-entries")!;
+  for (const [key, { channel, msg, periodMs, values }] of msgMap) {
+    const simEntry: SimMessageEntry = {
+      kind: "message", channel,
+      messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
+      signals: msg.signals.map(s => ({ def: s, value: values.get(s.name) ?? s.min ?? 0 })),
+      periodMs, timerId: null,
+    };
+    simEntries.set(key, simEntry);
+    container.appendChild(createSimEntryEl(key, simEntry));
+  }
 }
 
 // ── App recording start / stop ────────────────────────────────────────────────
@@ -1371,6 +1535,8 @@ window.addEventListener("DOMContentLoaded", async () => {
       pane.chart.update("none");
     }
   });
+
+  document.getElementById("btn-add-raw-frame")!.addEventListener("click", addRawFrame);
 
   // Play / Stop
   document.getElementById("btn-app-run")!.addEventListener("click", () => {
