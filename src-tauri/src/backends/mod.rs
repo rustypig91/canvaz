@@ -23,6 +23,7 @@ pub struct CanFrameEvent {
     pub dlc: u8,
     pub data: Vec<u8>,
     pub timestamp_ms: u64,
+    pub direction: &'static str,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -220,6 +221,7 @@ fn reading_loop(
                     dlc: frame.data.len() as u8,
                     data: frame.data.clone(),
                     timestamp_ms: ts,
+                    direction: "rx",
                 });
                 if let Ok(guard) = dbc.read() {
                     if let Some(channel_dbc) = guard.get(&channel_name) {

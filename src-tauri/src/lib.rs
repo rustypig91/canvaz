@@ -11,7 +11,7 @@ use app_state::AppState;
 use backends::{CanManager, ChannelInfo, DbcState, ManagerState, SocketCanBackend};
 use project::Project;
 use serde::Deserialize;
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 // ── Tauri managed state ───────────────────────────────────────────────────────
 
@@ -112,6 +112,13 @@ fn send_signal(cmd: SendSignalCmd, state: State<'_, TauriState>) -> Result<(), S
 
 // ── Message / raw frame send commands ────────────────────────────────────────
 
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
 #[derive(Deserialize)]
 struct SendMessageCmd {
     channel: String,
@@ -121,7 +128,7 @@ struct SendMessageCmd {
 
 #[tauri::command]
 fn send_message(cmd: SendMessageCmd, state: State<'_, TauriState>) -> Result<(), String> {
-    let data = {
+    let (data, is_extended) = {
         let dbc = state.dbc.read().map_err(|e| e.to_string())?;
         let channel_dbc = dbc
             .get(&cmd.channel)
@@ -141,9 +148,19 @@ fn send_message(cmd: SendMessageCmd, state: State<'_, TauriState>) -> Result<(),
                 );
             }
         }
-        buf
+        (buf, cmd.message_id > 0x7FF)
     };
-    state.can.lock().map_err(|e| e.to_string())?.send_frame(&cmd.channel, cmd.message_id, &data)
+    state.can.lock().map_err(|e| e.to_string())?.send_frame(&cmd.channel, cmd.message_id, &data)?;
+    let _ = state.app_state.app.emit("can-frame", backends::CanFrameEvent {
+        channel: cmd.channel,
+        can_id: cmd.message_id,
+        is_extended,
+        dlc: data.len() as u8,
+        data,
+        timestamp_ms: now_ms(),
+        direction: "tx",
+    });
+    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -155,7 +172,19 @@ struct SendRawFrameCmd {
 
 #[tauri::command]
 fn send_raw_frame(cmd: SendRawFrameCmd, state: State<'_, TauriState>) -> Result<(), String> {
-    state.can.lock().map_err(|e| e.to_string())?.send_frame(&cmd.channel, cmd.can_id, &cmd.data)
+    let is_extended = cmd.can_id > 0x7FF;
+    let dlc = cmd.data.len() as u8;
+    state.can.lock().map_err(|e| e.to_string())?.send_frame(&cmd.channel, cmd.can_id, &cmd.data)?;
+    let _ = state.app_state.app.emit("can-frame", backends::CanFrameEvent {
+        channel: cmd.channel,
+        can_id: cmd.can_id,
+        is_extended,
+        dlc,
+        data: cmd.data,
+        timestamp_ms: now_ms(),
+        direction: "tx",
+    });
+    Ok(())
 }
 
 // ── DBC commands ──────────────────────────────────────────────────────────────

@@ -62,6 +62,7 @@ interface CanFrameEvent {
   dlc: number;
   data: number[];
   timestamp_ms: number;
+  direction: "rx" | "tx";
 }
 
 interface PlotSignalEntry { signal_name: string; channel: string; }
@@ -1325,6 +1326,7 @@ interface TraceEntry {
   messageName: string | null;
   timestampMs: number;
   cycleTimeMs: number | null;
+  direction: "rx" | "tx";
 }
 
 type TraceMode = "overwrite" | "append";
@@ -1337,8 +1339,8 @@ let traceMaxRows = 1000;
 const traceLastTs = new Map<string, number>();
 const traceRowEls = new Map<string, HTMLTableRowElement>();
 
-function traceKey(channel: string, canId: number) {
-  return `${channel}::${canId}`;
+function traceKey(channel: string, canId: number, direction: "rx" | "tx") {
+  return `${channel}::${canId}::${direction}`;
 }
 
 function fmtId(canId: number, isExtended: boolean): string {
@@ -1373,8 +1375,10 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
   const tr = document.createElement("tr");
   tr.dataset.bytes = JSON.stringify(entry.data);
   if (entry.messageName) tr.classList.add("dbc-match");
+  const dirClass = entry.direction === "tx" ? "dir-tx" : "dir-rx";
   tr.innerHTML = `
     <td class="td-ts">${fmtElapsed(entry.timestampMs)}</td>
+    <td><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>
     <td>${entry.channel}</td>
     <td class="td-canid">${fmtId(entry.canId, entry.isExtended)}</td>
     <td>${entry.messageName ?? "<em style='color:var(--text-muted)'>Raw</em>"}</td>
@@ -1389,15 +1393,16 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
   tr.dataset.bytes = JSON.stringify(entry.data);
   const cells = tr.cells;
   cells[0].textContent = fmtElapsed(entry.timestampMs);
-  cells[4].textContent = String(entry.dlc);
-  cells[5].textContent = fmtData(entry.data);
-  cells[6].textContent = entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—";
+  cells[5].textContent = String(entry.dlc);
+  cells[6].textContent = fmtData(entry.data);
+  cells[7].textContent = entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—";
 }
 
 function onCanFrame(ev: CanFrameEvent) {
   if (!appRunning || tracePaused) return;
 
-  const key = traceKey(ev.channel, ev.can_id);
+  const direction = ev.direction ?? "rx";
+  const key = traceKey(ev.channel, ev.can_id, direction);
   const prev = traceLastTs.get(key);
   const cycleTime = prev != null ? ev.timestamp_ms - prev : null;
   traceLastTs.set(key, ev.timestamp_ms);
@@ -1414,6 +1419,7 @@ function onCanFrame(ev: CanFrameEvent) {
     messageName: msg?.name ?? null,
     timestampMs: ev.timestamp_ms,
     cycleTimeMs: cycleTime,
+    direction,
   };
 
   const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
@@ -1444,7 +1450,7 @@ function refreshTraceFormat() {
   const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
   for (const tr of Array.from(tbody.rows)) {
     const bytes: number[] = JSON.parse((tr as HTMLTableRowElement).dataset.bytes ?? "[]");
-    tr.cells[5].textContent = fmtData(bytes);
+    tr.cells[6].textContent = fmtData(bytes);
   }
 }
 

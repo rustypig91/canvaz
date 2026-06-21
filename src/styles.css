@@ -635,12 +635,13 @@ kbd {
   table-layout: fixed;
 }
 #trace-table colgroup col:nth-child(1) { width: 100px; }
-#trace-table colgroup col:nth-child(2) { width: 80px; }
-#trace-table colgroup col:nth-child(3) { width: 90px; }
-#trace-table colgroup col:nth-child(4) { width: 160px; }
-#trace-table colgroup col:nth-child(5) { width: 44px; }
-#trace-table colgroup col:nth-child(6) { width: auto; }
-#trace-table colgroup col:nth-child(7) { width: 90px; }
+#trace-table colgroup col:nth-child(2) { width: 46px; }
+#trace-table colgroup col:nth-child(3) { width: 80px; }
+#trace-table colgroup col:nth-child(4) { width: 90px; }
+#trace-table colgroup col:nth-child(5) { width: 160px; }
+#trace-table colgroup col:nth-child(6) { width: 44px; }
+#trace-table colgroup col:nth-child(7) { width: auto; }
+#trace-table colgroup col:nth-child(8) { width: 90px; }
 #trace-table thead th {
   position: sticky;
   top: 0;
@@ -657,7 +658,7 @@ kbd {
 }
 #trace-table tbody tr { border-bottom: 1px solid rgba(255,255,255,0.04); }
 #trace-table tbody tr:hover td { background: var(--bg3); }
-#trace-table tbody tr.dbc-match td:nth-child(4) { color: var(--accent); }
+#trace-table tbody tr.dbc-match td:nth-child(5) { color: var(--accent); }
 #trace-table td {
   padding: 3px 8px;
   white-space: nowrap;
@@ -668,6 +669,17 @@ kbd {
 .td-data  { font-family: monospace; font-size: 11px; letter-spacing: 0.05em; color: #a1a1aa; }
 .td-cycle { font-family: monospace; font-size: 11px; text-align: right; padding-right: 12px; }
 .td-ts    { font-family: monospace; font-size: 11px; color: #52525b; }
+
+.dir-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 3px;
+  letter-spacing: 0.04em;
+}
+.dir-rx { background: rgba(34,197,94,0.15);  color: #4ade80; }
+.dir-tx { background: rgba(249,115,22,0.15); color: #fb923c; }
 
 /* ── Buttons ─────────────────────────────────────────────────────────────── */
 .btn {
