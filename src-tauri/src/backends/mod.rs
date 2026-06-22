@@ -1,4 +1,6 @@
+#[cfg(target_os = "linux")]
 mod socketcan;
+#[cfg(target_os = "linux")]
 pub use socketcan::SocketCanBackend;
 use std::sync::Arc;
 use serde::Serialize;

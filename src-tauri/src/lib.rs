@@ -9,7 +9,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
 use app_state::AppState;
+
+#[cfg(target_os = "linux")]
 use backends::SocketCanBackend;
+
 use can_manager::{CanFrameEvent, CanManager, ChannelInfo, DbcState, ManagerState};
 use project::Project;
 use serde::Deserialize;
@@ -286,6 +289,7 @@ pub fn run() {
         .setup(|app| {
             let app_state = AppState::new(app.handle().clone());
             let mut manager = CanManager::new(Arc::clone(&app_state));
+            #[cfg(target_os = "linux")]
             manager.register_backend(SocketCanBackend);
             app.manage(TauriState {
                 app_state,
