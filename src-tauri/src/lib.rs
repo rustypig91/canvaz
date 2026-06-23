@@ -10,9 +10,6 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use app_state::AppState;
 
-#[cfg(target_os = "linux")]
-use backends::SocketCanBackend;
-
 use can_manager::{CanFrameEvent, CanManager, ChannelInfo, DbcState, ManagerState};
 use project::Project;
 use serde::Deserialize;
@@ -37,7 +34,7 @@ fn provide_sudo_password(password: Option<String>, state: State<'_, TauriState>)
 
 #[tauri::command]
 fn list_can_interfaces(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>, String> {
-    Ok(state.can.lock().map_err(|e| e.to_string())?.list_channels())
+    state.can.lock().map_err(|e| e.to_string())?.list_channels()
 }
 
 #[tauri::command]
@@ -47,12 +44,6 @@ async fn open_channel(
     bitrate: u32,
     state: State<'_, TauriState>,
 ) -> Result<ChannelInfo, String> {
-    println!(
-        "Request to open channel '{}' on backend '{}' with bitrate {:?}",
-        channel_name, backend_name, bitrate
-    );
-
-
     let can = Arc::clone(&state.can);
     let dbc = Arc::clone(&state.dbc);
     let result = tauri::async_runtime::spawn_blocking(move || {
@@ -288,9 +279,7 @@ pub fn run() {
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
             let app_state = AppState::new(app.handle().clone());
-            let mut manager = CanManager::new(Arc::clone(&app_state));
-            #[cfg(target_os = "linux")]
-            manager.register_backend(SocketCanBackend);
+            let manager = CanManager::new(Arc::clone(&app_state));
             app.manage(TauriState {
                 app_state,
                 can: Arc::new(Mutex::new(manager)),

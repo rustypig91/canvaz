@@ -21,12 +21,16 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 can-dbc = "9"
 socketcan = { version = "3", optional = true }
+can-hal = { version = "0.4.1", package = "can-hal-rs", optional = true }
+can-hal-kvaser = { version = "0.4.1", optional = true }
+libloading = { version = "0.8", optional = true }
 thiserror = "1"
 log = "0.4"
 
 [features]
-default = ["linux-can"]
+default = ["linux-can", "kvaser"]
 linux-can = ["socketcan"]
+kvaser = ["can-hal", "can-hal-kvaser", "libloading"]
 
 [profile.release]
 codegen-units = 1

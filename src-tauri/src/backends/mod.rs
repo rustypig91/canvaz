@@ -1,10 +1,16 @@
+#[cfg(feature = "kvaser")]
+mod kvaser;
 #[cfg(target_os = "linux")]
 mod socketcan;
+
+#[cfg(feature = "kvaser")]
+use kvaser::{KvaserBackend, KvaserBackendChannel};
 #[cfg(target_os = "linux")]
-pub use socketcan::SocketCanBackend;
-use std::sync::Arc;
-use serde::Serialize;
+use socketcan::{SocketCanBackend, SocketCanChannel};
+
 use crate::app_state::AppState;
+use serde::Serialize;
+use std::sync::Arc;
 
 // ── Frame ─────────────────────────────────────────────────────────────────────
 
@@ -16,28 +22,94 @@ pub struct CanFrame {
     pub timestamp_ms: u64,
 }
 
-// ── Traits ────────────────────────────────────────────────────────────────────
-
-#[allow(dead_code)]
-pub trait CanChannel: Send {
-    fn name(&self) -> &str;
-    fn app_state(&self) -> &Arc<AppState>;
-    fn open(&mut self) -> Result<(), String>;
-    fn close(&mut self) -> Result<(), String>;
-    fn send(&self, frame: CanFrame) -> Result<(), String>;
-    fn receive(&self) -> Result<Option<CanFrame>, String>;
-    fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String>;
-    fn get_bitrate(&self) -> Result<u32, String>;
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
-#[allow(dead_code)]
-pub trait CanBackend: Send + Sync + 'static {
-    fn name(&self) -> &str;
-    fn list_channels(&self) -> Vec<String>;
-    fn open_channel(
-        &mut self,
-        name: &str,
-        bitrate: Option<u32>,
-        state: Arc<AppState>,
-    ) -> Result<Box<dyn CanChannel>, String>;
+// ── Channel ───────────────────────────────────────────────────────────────────
+
+pub enum Channel {
+    #[cfg(target_os = "linux")]
+    SocketCan(SocketCanChannel),
+    #[cfg(feature = "kvaser")]
+    Kvaser(KvaserBackendChannel),
+}
+
+macro_rules! dispatch {
+    ($self:expr, $method:ident $(, $arg:expr)*) => {
+        match $self {
+            #[cfg(target_os = "linux")]
+            Channel::SocketCan(c) => c.$method($($arg),*),
+            #[cfg(feature = "kvaser")]
+            Channel::Kvaser(c) => c.$method($($arg),*),
+        }
+    };
+}
+
+impl Channel {
+    pub fn open(&mut self) -> Result<(), String> {
+        dispatch!(self, open)
+    }
+    pub fn close(&mut self) -> Result<(), String> {
+        dispatch!(self, close)
+    }
+    pub fn send(&self, frame: CanFrame) -> Result<(), String> {
+        dispatch!(self, send, frame)
+    }
+    pub fn receive(&self) -> Result<Option<CanFrame>, String> {
+        dispatch!(self, receive)
+    }
+    pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
+        dispatch!(self, set_bitrate, bitrate)
+    }
+}
+
+// ── Backend ───────────────────────────────────────────────────────────────────
+
+pub enum Backend {
+    #[cfg(target_os = "linux")]
+    SocketCan(SocketCanBackend),
+    #[cfg(feature = "kvaser")]
+    Kvaser(KvaserBackend),
+}
+
+impl Backend {
+    pub fn name(&self) -> &str {
+        match self {
+            #[cfg(target_os = "linux")]
+            Backend::SocketCan(backend) => backend.name(),
+            #[cfg(feature = "kvaser")]
+            Backend::Kvaser(backend) => backend.name(),
+        }
+    }
+
+    pub fn list_channels(&self) -> Result<Vec<String>, String> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Backend::SocketCan(backend) => backend.list_channels(),
+            #[cfg(feature = "kvaser")]
+            Backend::Kvaser(backend) => backend.list_channels(),
+        }
+    }
+
+    pub fn open_channel(&self, name: &str, bitrate: Option<u32>, state: Arc<AppState>) -> Result<Channel, String> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Backend::SocketCan(backend) => backend.open_channel(name, bitrate, state).map(Channel::SocketCan),
+            #[cfg(feature = "kvaser")]
+            Backend::Kvaser(backend) => backend.open_channel(name, bitrate, state).map(Channel::Kvaser),
+        }
+    }
+}
+
+pub fn default_backends() -> Vec<Backend> {
+    let mut backends = Vec::new();
+    #[cfg(target_os = "linux")]
+    backends.push(Backend::SocketCan(SocketCanBackend));
+    #[cfg(feature = "kvaser")]
+    backends.push(Backend::Kvaser(KvaserBackend));
+    backends
 }

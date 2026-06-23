@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
 use crate::app_state::AppState;
-use crate::backends::{CanBackend, CanChannel, CanFrame};
+use crate::backends::{default_backends, Backend, CanFrame, Channel};
 use crate::dbc_parser::ParsedDbc;
 
 pub type ManagerState = Arc<Mutex<CanManager>>;
@@ -60,13 +60,13 @@ pub struct SignalValueEvent {
 
 struct OpenChannelState {
     stop_flag: Arc<AtomicBool>,
-    channel: Arc<Mutex<Box<dyn CanChannel>>>,
+    channel: Arc<Mutex<Channel>>,
     channel_info: ChannelInfo,
 }
 
 pub struct CanManager {
     state: Arc<AppState>,
-    backends: Vec<Arc<Mutex<dyn CanBackend>>>,
+    backends: Vec<Backend>,
     channels: HashMap<String, OpenChannelState>,
 }
 
@@ -74,26 +74,20 @@ impl CanManager {
     pub fn new(state: Arc<AppState>) -> Self {
         Self {
             state,
-            backends: Vec::new(),
+            backends: default_backends(),
             channels: HashMap::new(),
         }
     }
 
-    pub fn register_backend(&mut self, backend: impl CanBackend) {
-        self.backends.push(Arc::new(Mutex::new(backend)));
-    }
-
-    pub fn list_channels(&self) -> Vec<ChannelInfo> {
+    pub fn list_channels(&self) -> Result<Vec<ChannelInfo>, String> {
         let mut out = Vec::new();
         for b in &self.backends {
-            if let Ok(b) = b.lock() {
-                let bname = b.name().to_string();
-                for ch in b.list_channels() {
-                    out.push(ChannelInfo::new(&bname, &ch));
-                }
+            let bname = b.name().to_string();
+            for ch in b.list_channels()? {
+                out.push(ChannelInfo::new(&bname, &ch));
             }
         }
-        out
+        Ok(out)
     }
 
     pub fn open_channel(
@@ -112,25 +106,16 @@ impl CanManager {
                 .map_err(|_| "Channel lock poisoned".to_string())?;
             let channel_info = channel_state.channel_info.clone();
             channel.set_bitrate(bitrate.unwrap_or(0))?;
-
             return Ok(channel_info);
         }
 
         let backend = self
             .backends
             .iter()
-            .find_map(|b| {
-                let g = b.lock().ok()?;
-                (g.name() == backend_name).then(|| Arc::clone(b))
-            })
+            .find(|b| b.name() == backend_name)
             .ok_or_else(|| format!("No backend '{backend_name}'"))?;
 
-        let mut ch = {
-            let mut b = backend
-                .lock()
-                .map_err(|_| "Backend lock poisoned".to_string())?;
-            b.open_channel(&channel_name, bitrate, Arc::clone(&self.state))?
-        };
+        let mut ch = backend.open_channel(&channel_name, bitrate, Arc::clone(&self.state))?;
         ch.open()?;
 
         let ch = Arc::new(Mutex::new(ch));
@@ -187,7 +172,7 @@ impl CanManager {
 // ── Reading thread ────────────────────────────────────────────────────────────
 
 fn reading_loop(
-    channel: Arc<Mutex<Box<dyn CanChannel>>>,
+    channel: Arc<Mutex<Channel>>,
     info: ChannelInfo,
     state: Arc<AppState>,
     dbc: DbcState,
