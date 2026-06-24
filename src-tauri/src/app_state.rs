@@ -76,6 +76,7 @@ impl AppState {
         Arc::new(Self { app, sudo: SudoState::new() })
     }
 
+    #[cfg(target_os = "linux")]
     pub fn get_sudo_password(&self) -> Result<String, String> {
         self.sudo.get_or_request(&self.app)
     }
