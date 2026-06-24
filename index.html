@@ -51,8 +51,19 @@
 
       </nav>
       <button id="btn-app-run" class="running" title="Stop recording">■ Stop</button>
-      <span id="status-bar" class="label-muted"></span>
+      <span id="status-bar"></span>
+      <button id="btn-show-log" title="View message log">Log</button>
     </header>
+
+    <!-- Message log panel -->
+    <div id="log-panel" hidden>
+      <div id="log-panel-header">
+        <span>Message Log</span>
+        <button id="btn-clear-log" class="btn btn-sm">Clear</button>
+        <button id="btn-close-log" class="btn-icon" title="Close">✕</button>
+      </div>
+      <div id="log-entries"></div>
+    </div>
 
     <!-- Main layout -->
     <div id="layout">

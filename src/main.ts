@@ -795,9 +795,9 @@ async function openChannel(
   } catch (e) {
     const msg = String(e);
     if (msg === "Sudo authentication cancelled") {
-      setStatus("Cancelled — sudo password required.");
+      setError("Cancelled — sudo password required.");
     } else {
-      setStatus(`Channel error: ${msg}`);
+      setError(`Channel error: ${msg}`);
     }
     return null;
   }
@@ -825,7 +825,7 @@ async function applyChannelDialog() {
       try {
         const dbc = await invoke<ParsedDbc>("load_dbc", { channelId: info.id, path: dialogPendingDbc });
         dbcByChannel.set(info.id, dbc);
-      } catch (e) { setStatus(`DBC error: ${e}`); }
+      } catch (e) { setError(`DBC error: ${e}`); }
     }
 
     await refreshChannelList();
@@ -848,7 +848,7 @@ async function applyChannelDialog() {
       try {
         const dbc = await invoke<ParsedDbc>("load_dbc", { channelId: info.id, path: dialogPendingDbc });
         dbcByChannel.set(info.id, dbc);
-      } catch (e) { setStatus(`DBC error: ${e}`); }
+      } catch (e) { setError(`DBC error: ${e}`); }
     }
 
     await refreshChannelList();
@@ -1049,7 +1049,7 @@ function renderChannelList() {
             if (selectedChannel === id) selectChannel(null);
             await refreshChannelList();
             scheduleAutoSave();
-          } catch (err) { setStatus(`Close error: ${err}`); }
+          } catch (err) { setError(`Close error: ${err}`); }
         }},
       ]);
     });
@@ -1062,7 +1062,7 @@ function renderChannelList() {
         if (selectedChannel === id) selectChannel(null);
         await refreshChannelList();
         scheduleAutoSave();
-      } catch (err) { setStatus(`Close error: ${err}`); }
+      } catch (err) { setError(`Close error: ${err}`); }
     });
     list.appendChild(item);
   }
@@ -1270,12 +1270,12 @@ function startSim(key: string) {
       const signalValues: Record<string, number> = {};
       for (const s of entry.signals) signalValues[s.def.name] = s.value;
       try { await invoke("send_message", { cmd: { channel_id: entry.channel, message_id: entry.messageId, signal_values: signalValues } }); }
-      catch (e) { setStatus(`Send error: ${e}`); }
+      catch (e) { setError(`Send error: ${e}`); }
     }, entry.periodMs);
   } else {
     entry.timerId = setInterval(async () => {
       try { await invoke("send_raw_frame", { cmd: { channel_id: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc) } }); }
-      catch (e) { setStatus(`Send error: ${e}`); }
+      catch (e) { setError(`Send error: ${e}`); }
     }, entry.periodMs);
   }
 
@@ -1334,7 +1334,7 @@ function buildProject(): Project {
 async function saveProject() {
   if (projectPath) {
     try { await invoke("save_project", { path: projectPath, project: buildProject() }); setStatus(`Saved: ${projectPath}`); }
-    catch (e) { setStatus(`Save error: ${e}`); }
+    catch (e) { setError(`Save error: ${e}`); }
   } else { await saveProjectAs(); }
 }
 
@@ -1345,7 +1345,7 @@ async function saveProjectAs() {
     projectPath = path;
     await invoke("save_project", { path, project: buildProject() });
     setStatus(`Saved: ${path}`);
-  } catch (e) { setStatus(`Save error: ${e}`); }
+  } catch (e) { setError(`Save error: ${e}`); }
 }
 
 async function openProject() {
@@ -1356,7 +1356,7 @@ async function openProject() {
     projectPath = path;
     await applyProject(project);
     setStatus(`Loaded: ${path}`);
-  } catch (e) { setStatus(`Load error: ${e}`); }
+  } catch (e) { setError(`Load error: ${e}`); }
 }
 
 async function applyProject(project: Project) {
@@ -1485,7 +1485,7 @@ async function startApp() {
       const dbc = await invoke<ParsedDbc>("load_dbc", { channelId: id, path });
       dbcByChannel.set(id, dbc);
     } catch (e) {
-      setStatus(`DBC reload failed for ${channelDisplayName(id)}: ${e}`);
+      setError(`DBC reload failed for ${channelDisplayName(id)}: ${e}`);
     }
   }));
 
@@ -1592,7 +1592,7 @@ async function exportCsv() {
   try {
     await invoke("write_text_file", { path, content: rows.join("\n") });
     setStatus(`Exported ${allSamples.length} samples to CSV`);
-  } catch (e) { setStatus(`Export error: ${e}`); }
+  } catch (e) { setError(`Export error: ${e}`); }
 }
 
 // ── Menu bar ──────────────────────────────────────────────────────────────────
@@ -2258,11 +2258,47 @@ function setupTrace() {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
-function setStatus(msg: string) {
+interface LogEntry { ts: string; text: string; isError: boolean; }
+const messageLog: LogEntry[] = [];
+
+function setStatus(msg: string, isError = false) {
   const el = document.getElementById("status-bar")!;
   el.textContent = msg;
-  console.log("Status: ", msg);
-  setTimeout(() => { if (el.textContent === msg) el.textContent = ""; }, 4000);
+  el.classList.toggle("status-error", isError);
+  console.log(isError ? "Error: " : "Status: ", msg);
+
+  const entry: LogEntry = { ts: new Date().toLocaleTimeString(), text: msg, isError };
+  messageLog.push(entry);
+  appendLogEntry(entry);
+
+  if (isError) {
+    document.getElementById("btn-show-log")?.classList.add("log-has-error");
+  }
+
+  setTimeout(() => {
+    if (el.textContent === msg) {
+      el.textContent = "";
+      el.classList.remove("status-error");
+    }
+  }, 4000);
+}
+
+function setError(msg: string) { setStatus(msg, true); }
+
+function appendLogEntry(entry: LogEntry) {
+  const container = document.getElementById("log-entries");
+  if (!container) return;
+  const div = document.createElement("div");
+  div.className = `log-entry${entry.isError ? " log-error" : ""}`;
+  const ts = document.createElement("span");
+  ts.className = "log-ts";
+  ts.textContent = entry.ts;
+  const text = document.createElement("span");
+  text.textContent = entry.text;
+  div.appendChild(ts);
+  div.appendChild(text);
+  container.appendChild(div);
+  container.scrollTop = container.scrollHeight;
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
@@ -2330,6 +2366,24 @@ window.addEventListener("DOMContentLoaded", async () => {
     plotPaused = !plotPaused;
     pauseBtn.textContent = plotPaused ? "Resume" : "Pause";
     pauseBtn.classList.toggle("running", plotPaused);
+  });
+
+  // Log panel
+  document.getElementById("btn-show-log")!.addEventListener("click", () => {
+    const panel = document.getElementById("log-panel")!;
+    panel.hidden = !panel.hidden;
+    if (!panel.hidden) {
+      document.getElementById("btn-show-log")!.classList.remove("log-has-error");
+      const entries = document.getElementById("log-entries")!;
+      entries.scrollTop = entries.scrollHeight;
+    }
+  });
+  document.getElementById("btn-close-log")!.addEventListener("click", () => {
+    document.getElementById("log-panel")!.hidden = true;
+  });
+  document.getElementById("btn-clear-log")!.addEventListener("click", () => {
+    messageLog.length = 0;
+    document.getElementById("log-entries")!.innerHTML = "";
   });
 
   // Menu bar
