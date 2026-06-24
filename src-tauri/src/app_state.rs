@@ -1,18 +1,29 @@
-use std::sync::{Arc, Condvar, Mutex};
-use tauri::{AppHandle, Emitter};
+use std::sync::Arc;
 
-enum SudoRequestState { Idle, Waiting, Done }
+#[cfg(target_os = "linux")]
+use std::sync::{Condvar, Mutex};
 
+use tauri::AppHandle;
+
+#[cfg(target_os = "linux")]
+enum SudoRequestState {
+    Idle,
+    Waiting,
+    Done,
+}
+
+#[cfg(target_os = "linux")]
 struct SudoState {
-    cached:  Mutex<Option<String>>,
+    cached: Mutex<Option<String>>,
     request: Mutex<SudoRequestState>,
     condvar: Condvar,
 }
 
+#[cfg(target_os = "linux")]
 impl SudoState {
     fn new() -> Self {
         Self {
-            cached:  Mutex::new(None),
+            cached: Mutex::new(None),
             request: Mutex::new(SudoRequestState::Idle),
             condvar: Condvar::new(),
         }
@@ -35,10 +46,9 @@ impl SudoState {
         {
             let mut req = self
                 .condvar
-                .wait_while(
-                    self.request.lock().map_err(|e| e.to_string())?,
-                    |r| matches!(r, SudoRequestState::Waiting),
-                )
+                .wait_while(self.request.lock().map_err(|e| e.to_string())?, |r| {
+                    matches!(r, SudoRequestState::Waiting)
+                })
                 .map_err(|e| e.to_string())?;
             *req = SudoRequestState::Idle;
         }
@@ -68,12 +78,17 @@ impl SudoState {
 
 pub struct AppState {
     pub app: AppHandle,
+    #[cfg(target_os = "linux")]
     sudo: SudoState,
 }
 
 impl AppState {
     pub fn new(app: AppHandle) -> Arc<Self> {
-        Arc::new(Self { app, sudo: SudoState::new() })
+        Arc::new(Self {
+            app,
+            #[cfg(target_os = "linux")]
+            sudo: SudoState::new(),
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -81,6 +96,7 @@ impl AppState {
         self.sudo.get_or_request(&self.app)
     }
 
+    #[cfg(target_os = "linux")]
     pub fn provide_sudo_password(&self, password: Option<String>) {
         self.sudo.provide(password);
     }

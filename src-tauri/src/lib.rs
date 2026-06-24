@@ -25,6 +25,7 @@ struct TauriState {
 
 // ── Sudo ──────────────────────────────────────────────────────────────────────
 
+#[cfg(target_os = "linux")]
 #[tauri::command]
 fn provide_sudo_password(password: Option<String>, state: State<'_, TauriState>) {
     state.app_state.provide_sudo_password(password);
@@ -310,6 +311,7 @@ pub fn run() {
             write_text_file,
             read_text_file,
             file_exists,
+            #[cfg(target_os = "linux")]
             provide_sudo_password,
             list_can_interfaces,
             open_channel,
