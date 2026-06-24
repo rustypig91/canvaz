@@ -1655,7 +1655,7 @@ function setupMenuBar() {
     (document.getElementById("dialog-about") as HTMLDialogElement).close();
   });
   document.getElementById("btn-github")!.addEventListener("click", () => {
-    openUrl("https://github.com/rustypig91/can-signals");
+    openUrl("https://github.com/rustypig91/canvaz");
   });
   document.addEventListener("keydown", (e) => {
     if (e.ctrlKey && !e.shiftKey && e.key === "o") { e.preventDefault(); handleMenuAction("open-project"); }
