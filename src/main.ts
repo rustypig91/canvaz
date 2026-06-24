@@ -13,11 +13,10 @@ import {
   Title,
   Tooltip,
   Filler,
-  CategoryScale,
 } from "chart.js";
 import ZoomPlugin from "chartjs-plugin-zoom";
 
-Chart.register(LineController, LineElement, PointElement, LinearScale, Legend, Title, Tooltip, Filler, CategoryScale, ZoomPlugin);
+Chart.register(LineController, LineElement, PointElement, LinearScale, Legend, Title, Tooltip, Filler, ZoomPlugin);
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -116,9 +115,8 @@ interface PlotSeries {
   unit: string;
   color: string;
   channel: string;
-  timestamps: number[];
-  labels: string[];
-  values: number[];
+  timestamps: number[];       // absolute ms, used for pruning
+  data: { x: number; y: number }[];  // x = elapsed seconds from appStartTime
   lastValue: number | null;
 }
 
@@ -136,6 +134,30 @@ interface PlotPane {
 const plotPanes: PlotPane[] = [];
 let paneCounter = 0;
 let plotPaused = false;
+
+// Batches chart redraws to one per animation frame instead of one per signal event.
+// Also updates the rolling X-axis window each frame so the view scrolls smoothly.
+const dirtyPanes = new Set<PlotPane>();
+let rafPending = false;
+function markPaneDirty(pane: PlotPane) {
+  dirtyPanes.add(pane);
+  if (!rafPending) {
+    rafPending = true;
+    requestAnimationFrame(() => {
+      rafPending = false;
+      for (const p of dirtyPanes) {
+        dirtyPanes.delete(p);
+        if (appRunning && !plotPaused && !p.zoomed) {
+          const now = (Date.now() - appStartTime) / 1000;
+          const xScale = (p.chart.options.scales as any)["x"];
+          xScale.min = Math.max(0, now - windowSizeSec);
+          xScale.max = Math.max(windowSizeSec, now);
+        }
+        p.chart.update("none");
+      }
+    });
+  }
+}
 
 let appRunning = true;
 let appStartTime = Date.now();
@@ -196,7 +218,6 @@ function removeSigFromPane(pane: PlotPane, key: string) {
   if (!pane.series.delete(key)) return;
   syncDatasets(pane);
   updatePaneTitle(pane);
-  (pane.chart.data as { labels: string[] }).labels = [];
   updateSignalHighlights();
   scheduleAutoSave();
 }
@@ -248,12 +269,13 @@ function createPlotPane(): PlotPane {
   const canvas = el.querySelector<HTMLCanvasElement>("canvas")!;
   const chart = new Chart(canvas, {
     type: "line",
-    data: { labels: [], datasets: [] },
+    data: { datasets: [] },
     options: {
       animation: false,
       responsive: true,
       maintainAspectRatio: false,
       interaction: { mode: "index", intersect: false },
+      parsing: false,
       plugins: {
         legend: {
           display: true,
@@ -295,8 +317,45 @@ function createPlotPane(): PlotPane {
         },
       },
       scales: {
-        x: { ticks: { color: "#71717a", maxTicksLimit: 8, maxRotation: 0 }, grid: { color: "#2a2b30" } },
-        y: { ticks: { color: "#71717a" }, grid: { color: "#2a2b30" } },
+        x: {
+          type: "linear" as const,
+          min: 0,
+          max: windowSizeSec,
+          afterBuildTicks: (axis: any) => {
+            const range = axis.max - axis.min;
+            const rawStep = range / 6;
+            const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
+            const n = rawStep / mag;
+            const step = n < 1.5 ? mag : n < 3.5 ? 2 * mag : n < 7.5 ? 5 * mag : 10 * mag;
+            const rightMargin = step * 0.5;
+            // Pin a tick at the left edge; regular ticks start at least half a
+            // step past it so they never crowd the pinned label.
+            const first = Math.ceil((axis.min + step * 0.5) / step) * step;
+            const ticks: { value: number }[] = [{ value: axis.min }];
+            for (let v = first; v < axis.max - rightMargin + 1e-9; v += step) {
+              ticks.push({ value: v });
+            }
+            axis.ticks = ticks;
+          },
+          ticks: {
+            color: "#71717a",
+            maxTicksLimit: 8,
+            maxRotation: 0,
+            callback: function(v, index, ticks) {
+              const s = typeof v === "number" ? v : parseFloat(String(v));
+              const range = this.max - this.min;
+              const label = range < 1 ? `${Math.round(s * 1000)}ms` : `${Math.round(s)}s`;
+              if (index > 0) {
+                const prev = ticks[index - 1].value;
+                const prevLabel = range < 1 ? `${Math.round(prev * 1000)}ms` : `${Math.round(prev)}s`;
+                if (label === prevLabel) return null;
+              }
+              return label;
+            },
+          },
+          grid: { color: "#2a2b30" },
+        },
+        y: { border: { display: true, color: "#2a2b30" }, ticks: { color: "#71717a" }, grid: { color: "#2a2b30" } },
       },
     },
   });
@@ -329,26 +388,18 @@ function addSignalToPane(pane: PlotPane, channel: string, sig: DbcSignal) {
   const color = PLOT_COLORS[pane.series.size % PLOT_COLORS.length];
   const series: PlotSeries = {
     signalName: sig.name, messageName: sig.message_name, unit: sig.unit,
-    color, channel, timestamps: [], labels: [], values: [], lastValue: null,
+    color, channel, timestamps: [], data: [], lastValue: null,
   };
 
   // Pre-populate from global history
   const hist = signalHistory.get(key) ?? [];
   for (const sample of hist) {
     series.timestamps.push(sample.ts);
-    series.labels.push(fmtPlotLabel(sample.ts));
-    series.values.push(sample.value);
+    series.data.push({ x: (sample.ts - appStartTime) / 1000, y: sample.value });
   }
-  if (series.values.length > 0) series.lastValue = series.values[series.values.length - 1];
+  if (series.data.length > 0) series.lastValue = series.data[series.data.length - 1].y;
 
   pane.series.set(key, series);
-
-  // Extend chart labels if this series has more data than the current chart
-  const chartLabels = (pane.chart.data as { labels: string[] }).labels as string[];
-  if (series.labels.length > chartLabels.length) {
-    (pane.chart.data as { labels: string[] }).labels = series.labels;
-  }
-
   syncDatasets(pane);
   updatePaneTitle(pane);
   updateSignalHighlights();
@@ -357,22 +408,34 @@ function addSignalToPane(pane: PlotPane, channel: string, sig: DbcSignal) {
 
 function syncDatasets(pane: PlotPane) {
   const tension = pane.interpolate ? 0.4 : 0;
-  pane.chart.data.datasets = [...pane.series.values()].map((s, i) => {
+  const seriesArray = [...pane.series.values()];
+
+  // Grow / shrink the datasets array to match the series count, mutating
+  // existing objects in-place so Chart.js keeps its internal meta state
+  // for each dataset instead of re-initialising and flashing blank.
+  while (pane.chart.data.datasets.length > seriesArray.length)
+    pane.chart.data.datasets.pop();
+  while (pane.chart.data.datasets.length < seriesArray.length)
+    pane.chart.data.datasets.push({} as any);
+
+  for (let i = 0; i < seriesArray.length; i++) {
+    const s = seriesArray[i];
     const hovered = pane.hoveredDatasetIndex === i;
     const showDot = pane.showPoints || hovered;
-    return {
-      label: s.signalName,
-      data: s.values,
-      borderColor: s.color,
-      pointBackgroundColor: s.color,
-      backgroundColor: "transparent",
-      borderWidth: hovered ? 2.5 : 1.5,
-      pointRadius: showDot ? 3 : 0,
-      pointHoverRadius: hovered ? 5 : 3,
-      tension,
-    };
-  });
-  pane.chart.update("none");
+    const ds = pane.chart.data.datasets[i] as any;
+    ds.label = s.signalName;
+    ds.data = s.data;
+    ds.borderColor = s.color;
+    ds.pointBackgroundColor = s.color;
+    ds.backgroundColor = "transparent";
+    ds.borderWidth = hovered ? 2.5 : 1.5;
+    ds.pointRadius = showDot ? 3 : 0;
+    ds.pointHoverRadius = hovered ? 5 : 3;
+    ds.tension = tension;
+  }
+  // Route through the RAF loop so there is never more than one update()
+  // per frame, even when syncDatasets is called synchronously (e.g. hover).
+  markPaneDirty(pane);
 }
 
 // ── Signal value events ───────────────────────────────────────────────────────
@@ -407,17 +470,15 @@ function onSignalValue(ev: SignalValueEvent) {
   }
 
   if (plotPaused) return;
-  const ts = fmtPlotLabel(ev.timestamp_ms);
+  const x = (ev.timestamp_ms - appStartTime) / 1000;
 
   for (const pane of plotPanes) {
     const series = pane.series.get(key);
     if (!series) continue;
     series.timestamps.push(ev.timestamp_ms);
-    series.labels.push(ts);
-    series.values.push(ev.value);
+    series.data.push({ x, y: ev.value });
     series.lastValue = ev.value;
-    (pane.chart.data as { labels: string[] }).labels = series.labels;
-    pane.chart.update("none");
+    markPaneDirty(pane);
   }
 }
 
@@ -1545,15 +1606,17 @@ async function startApp() {
   pausePlotBtn.textContent = "Pause";
   pausePlotBtn.classList.remove("running");
 
-  // Clear all plot pane data and reset zoom
+  // Clear all plot pane data, reset zoom and X-axis bounds
   for (const pane of plotPanes) {
-    for (const s of pane.series.values()) { s.timestamps = []; s.labels = []; s.values = []; s.lastValue = null; }
-    (pane.chart.data as { labels: string[] }).labels = [];
+    for (const s of pane.series.values()) { s.timestamps.length = 0; s.data.length = 0; s.lastValue = null; }
     if (pane.zoomed) {
       pane.chart.resetZoom();
       pane.zoomed = false;
       pane.el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!.style.display = "none";
     }
+    const xScale = (pane.chart.options.scales as any)["x"];
+    xScale.min = 0;
+    xScale.max = windowSizeSec;
     pane.chart.update("none");
   }
 
@@ -1661,17 +1724,14 @@ function pruneOldData() {
     if (i > 0) samples.splice(0, i);
     if (samples.length === 0) signalHistory.delete(key);
   }
-  if (plotPaused) return; // leave a frozen / zoomed chart untouched
+  if (!appRunning || plotPaused) return; // leave a stopped / frozen / zoomed chart untouched
   for (const pane of plotPanes) {
-    let longest: PlotSeries | null = null;
     for (const s of pane.series.values()) {
       let i = 0;
       while (i < s.timestamps.length && s.timestamps[i] < cutoff) i++;
-      if (i > 0) { s.timestamps.splice(0, i); s.values.splice(0, i); s.labels.splice(0, i); }
-      if (!longest || s.labels.length > longest.labels.length) longest = s;
+      if (i > 0) { s.timestamps.splice(0, i); s.data.splice(0, i); }
     }
-    (pane.chart.data as { labels: string[] }).labels = longest ? longest.labels : [];
-    pane.chart.update("none");
+    markPaneDirty(pane);
   }
 }
 
@@ -1903,10 +1963,6 @@ function fmtElapsed(ts: number): string {
   const ms = elapsed % 1000;
   const hPart = h > 0 ? `${h}:` : "";
   return `${hPart}${m.toString().padStart(2, "0")}:${s.toString().padStart(2, "0")}.${ms.toString().padStart(3, "0")}`;
-}
-
-function fmtPlotLabel(ts: number): string {
-  return `${(Math.max(0, ts - appStartTime) / 1000).toFixed(1)}s`;
 }
 
 function parseByte(s: string): number | null {
@@ -2529,15 +2585,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.getElementById("btn-clear-dbc")!.addEventListener("click", () => {
     dialogPendingDbc = null;
     setDbcLabel(null);
-  });
-
-  // Plot controls
-  document.getElementById("btn-clear-plot")!.addEventListener("click", () => {
-    for (const pane of plotPanes) {
-      for (const s of pane.series.values()) { s.timestamps = []; s.labels = []; s.values = []; s.lastValue = null; }
-      (pane.chart.data as { labels: string[] }).labels = [];
-      pane.chart.update("none");
-    }
   });
 
   document.getElementById("btn-add-raw-frame")!.addEventListener("click", addRawFrame);
