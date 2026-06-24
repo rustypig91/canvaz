@@ -220,6 +220,9 @@ function markPaneDirty(pane: PlotPane, force = false) {
 let appRunning = true;
 let appStartTime = Date.now();
 
+// Middle-mouse pan state
+let midPan: { startX: number; startMin: number; startMax: number; chartWidth: number } | null = null;
+
 
 interface SignalSample { ts: number; value: number; unit: string; }
 const signalHistory = new Map<string, SignalSample[]>();
@@ -345,6 +348,30 @@ function createPlotPane(): PlotPane {
   });
 
   const canvas = el.querySelector<HTMLCanvasElement>("canvas")!;
+
+  canvas.addEventListener("mousedown", (e) => {
+    if (e.button !== 1) return;
+    e.preventDefault(); // suppress autoscroll cursor
+    const xScale = (pane.chart.scales as any)["x"];
+    const area = pane.chart.chartArea;
+    if (!area) return;
+    midPan = {
+      startX: e.clientX,
+      startMin: xScale.min,
+      startMax: xScale.max,
+      chartWidth: area.right - area.left,
+    };
+    if (!viewPaused) {
+      viewPaused = true;
+      updatePauseViewBtn();
+      snapshotPlotPanes();
+    }
+    for (const p of plotPanes) {
+      p.zoomed = true;
+      p.el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!.style.display = "";
+    }
+  });
+
   const chart = new Chart(canvas, {
     type: "line",
     data: { datasets: [] },
@@ -1044,6 +1071,23 @@ function showContextMenu(x: number, y: number, items: { label: string; danger?: 
 
 document.addEventListener("click", () => { if (ctxMenu) { ctxMenu.remove(); ctxMenu = null; } });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && ctxMenu) { ctxMenu.remove(); ctxMenu = null; } });
+
+document.addEventListener("mousemove", (e) => {
+  if (!midPan) return;
+  if (!(e.buttons & 4)) { midPan = null; return; }
+  if (plotPanes.length === 0 || midPan.chartWidth <= 0) return;
+  const range = midPan.startMax - midPan.startMin;
+  const dataDelta = ((e.clientX - midPan.startX) / midPan.chartWidth) * range;
+  const newMin = midPan.startMin - dataDelta;
+  const newMax = midPan.startMax - dataDelta;
+  for (const p of plotPanes) {
+    const xs = (p.chart.options.scales as any)["x"];
+    xs.min = newMin;
+    xs.max = newMax;
+    p.chart.update("none");
+  }
+});
+document.addEventListener("mouseup", (e) => { if (e.button === 1) midPan = null; });
 
 function showFilterMenu(
   x: number, y: number,
