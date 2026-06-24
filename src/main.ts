@@ -652,8 +652,12 @@ let selectedChannel: string | null = null;
 let sessionFilePath: string | null = null;
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
+let projectDirty = false;
+
 function scheduleAutoSave() {
   if (!sessionFilePath) return;
+  projectDirty = true;
+  updateWindowTitle();
   if (autoSaveTimer) clearTimeout(autoSaveTimer);
   autoSaveTimer = setTimeout(async () => {
     try { await invoke("save_project", { path: sessionFilePath, project: buildProject() }); }
@@ -662,6 +666,12 @@ function scheduleAutoSave() {
 }
 let openChannels: string[] = [];
 let projectPath: string | null = null;
+let lastProjectIndexPath: string | null = null;
+
+function persistLastProjectPath(path: string) {
+  if (lastProjectIndexPath)
+    invoke("write_text_file", { path: lastProjectIndexPath, content: path }).catch(() => {});
+}
 
 // ── Channel dialog ────────────────────────────────────────────────────────────
 
@@ -1335,8 +1345,12 @@ function buildProject(): Project {
 
 async function saveProject() {
   if (projectPath) {
-    try { await invoke("save_project", { path: projectPath, project: buildProject() }); setStatus(`Saved: ${projectPath}`); }
-    catch (e) { setError(`Save error: ${e}`); }
+    try {
+      await invoke("save_project", { path: projectPath, project: buildProject() });
+      projectDirty = false;
+      updateWindowTitle();
+      setStatus(`Saved: ${projectPath}`);
+    } catch (e) { setError(`Save error: ${e}`); }
   } else { await saveProjectAs(); }
 }
 
@@ -1350,7 +1364,9 @@ async function saveProjectAs() {
     if (!raw) return;
     const path = ensureCanvazExt(raw);
     projectPath = path;
-    setProjectName(path);
+    projectDirty = false;
+    updateWindowTitle();
+    persistLastProjectPath(path);
     await invoke("save_project", { path, project: buildProject() });
     setStatus(`Saved: ${path}`);
   } catch (e) { setError(`Save error: ${e}`); }
@@ -1362,7 +1378,9 @@ async function openProject() {
     if (!path || Array.isArray(path)) return;
     const project = await invoke<Project>("load_project", { path });
     projectPath = path;
-    setProjectName(path);
+    projectDirty = false;
+    updateWindowTitle();
+    persistLastProjectPath(path);
     await applyProject(project);
     setStatus(`Loaded: ${path}`);
   } catch (e) { setError(`Load error: ${e}`); }
@@ -2276,8 +2294,9 @@ function setupTrace() {
 interface LogEntry { ts: string; text: string; isError: boolean; }
 const messageLog: LogEntry[] = [];
 
-function setProjectName(path: string | null) {
-  getCurrentWindow().setTitle(path ? `Canvaz — ${path}` : "Canvaz");
+function updateWindowTitle() {
+  const base = projectPath ? `Canvaz — ${projectPath}` : "Canvaz";
+  getCurrentWindow().setTitle(projectDirty ? `${base} ●` : base);
 }
 
 function setStatus(msg: string, isError = false) {
@@ -2435,14 +2454,37 @@ window.addEventListener("DOMContentLoaded", async () => {
     await invoke("provide_sudo_password", { password: pw ?? null }).catch(() => {});
   });
 
-  // Resolve session file path, then try to restore the last session
-  try {
-    const dir = await invoke<string>("get_app_data_dir");
-    sessionFilePath = `${dir}/last-session.canvaz`;
-    const project = await invoke<Project>("load_project", { path: sessionFilePath });
-    await applyProject(project);
+  // Resolve paths
+  const dir = await invoke<string>("get_app_data_dir");
+  const sess = `${dir}/last-session.canvaz`;
+  lastProjectIndexPath = `${dir}/last-project.txt`;
+
+  const lastPath = await invoke<string>("read_text_file", { path: lastProjectIndexPath }).catch(() => null);
+  const lastPathExists = lastPath ? await invoke<boolean>("file_exists", { path: lastPath }) : false;
+
+  let sessionProject: Project | null = null;
+  try { sessionProject = await invoke<Project>("load_project", { path: sess }); } catch { }
+
+  if (sessionProject) {
+    // Apply session without triggering auto-save or dirty tracking during restore
+    await applyProject(sessionProject);
+    sessionFilePath = sess;
+
+    if (lastPathExists) {
+      projectPath = lastPath!;
+      // Mark dirty only if session differs from the saved project file
+      const [sessionContent, projectContent] = await Promise.all([
+        invoke<string>("read_text_file", { path: sess }).catch(() => ""),
+        invoke<string>("read_text_file", { path: lastPath! }).catch(() => ""),
+      ]);
+      projectDirty = sessionContent !== projectContent;
+    } else {
+      projectDirty = false;
+    }
+    updateWindowTitle();
     setStatus("Session restored");
-  } catch {
+  } else {
+    sessionFilePath = sess;
     // No previous session — start fresh with one empty pane
     createPlotPane();
     await refreshChannelList();

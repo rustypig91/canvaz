@@ -254,6 +254,16 @@ fn write_text_file(path: String, content: String) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+fn read_text_file(path: String) -> Result<String, String> {
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn file_exists(path: String) -> bool {
+    std::path::Path::new(&path).exists()
+}
+
 // ── Project commands ──────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -298,6 +308,8 @@ pub fn run() {
             get_version,
             get_app_data_dir,
             write_text_file,
+            read_text_file,
+            file_exists,
             provide_sudo_password,
             list_can_interfaces,
             open_channel,
