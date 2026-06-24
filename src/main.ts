@@ -379,12 +379,11 @@ function createPlotPane(): PlotPane {
             const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
             const n = rawStep / mag;
             const step = n < 1.5 ? mag : n < 3.5 ? 2 * mag : n < 7.5 ? 5 * mag : 10 * mag;
-            const rightMargin = step * 0.5;
-            // Pin a tick at the left edge; regular ticks start at least half a
-            // step past it so they never crowd the pinned label.
-            const first = Math.ceil((axis.min + step * 0.5) / step) * step;
-            const ticks: { value: number }[] = [{ value: axis.min }];
-            for (let v = first; v < axis.max - rightMargin + 1e-9; v += step) {
+            // Ticks at exact multiples of step: they enter at axis.max (right edge)
+            // and exit when axis.min scrolls past them (y-axis / left edge).
+            const first = Math.ceil(axis.min / step) * step;
+            const ticks: { value: number }[] = [];
+            for (let v = first; v <= axis.max + 1e-9; v += step) {
               ticks.push({ value: v });
             }
             axis.ticks = ticks;
