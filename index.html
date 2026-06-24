@@ -27,18 +27,10 @@
           </div>
         </div>
 
-        <div class="menu-item" id="menu-options">
-          <button class="menu-trigger">Options</button>
+        <div class="menu-item" id="menu-data">
+          <button class="menu-trigger">Data</button>
           <div class="menu-dropdown">
-            <div class="menu-option-row">
-              <label class="chk-label">
-                <input type="checkbox" id="chk-max-time" /> Max time
-              </label>
-              <input id="input-max-time" type="number" value="60" min="1" class="small-input" style="display:none" />
-              <span id="lbl-max-time-unit" class="label-muted" style="display:none">s</span>
-            </div>
-            <div class="menu-separator"></div>
-            <button class="menu-action" data-action="export-csv">Export CSV…</button>
+            <button class="menu-action" data-action="export-csv">Export Signal Values as CSV…</button>
           </div>
         </div>
 
@@ -213,6 +205,38 @@
     <!-- About dialog -->
     <dialog id="dialog-about">
       <div class="about-content">
+        <svg class="about-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" aria-hidden="true">
+          <defs>
+            <linearGradient id="about-bg" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#1e2027"/>
+              <stop offset="100%" stop-color="#13151a"/>
+            </linearGradient>
+            <linearGradient id="about-sig" x1="0" y1="0" x2="1" y2="0">
+              <stop offset="0%" stop-color="#60a5fa"/>
+              <stop offset="50%" stop-color="#3b82f6"/>
+              <stop offset="100%" stop-color="#60a5fa"/>
+            </linearGradient>
+          </defs>
+          <rect width="512" height="512" rx="96" fill="url(#about-bg)"/>
+          <rect x="74"  y="334" width="11" height="38" rx="3" fill="#4b5563"/>
+          <rect x="427" y="334" width="11" height="38" rx="3" fill="#4b5563"/>
+          <line x1="85" y1="353" x2="427" y2="353" stroke="#374151" stroke-width="9" stroke-linecap="round"/>
+          <line x1="160" y1="353" x2="160" y2="392" stroke="#374151" stroke-width="7" stroke-linecap="round"/>
+          <line x1="256" y1="353" x2="256" y2="392" stroke="#374151" stroke-width="7" stroke-linecap="round"/>
+          <line x1="352" y1="353" x2="352" y2="392" stroke="#374151" stroke-width="7" stroke-linecap="round"/>
+          <rect x="124" y="392" width="72" height="46" rx="9" fill="#21242d" stroke="#3a3f4d" stroke-width="2"/>
+          <rect x="220" y="392" width="72" height="46" rx="9" fill="#21242d" stroke="#3a3f4d" stroke-width="2"/>
+          <rect x="316" y="392" width="72" height="46" rx="9" fill="#21242d" stroke="#3a3f4d" stroke-width="2"/>
+          <line x1="134" y1="408" x2="186" y2="408" stroke="#3a3f4d" stroke-width="2"/>
+          <line x1="134" y1="419" x2="178" y2="419" stroke="#3a3f4d" stroke-width="2"/>
+          <line x1="230" y1="408" x2="282" y2="408" stroke="#3a3f4d" stroke-width="2"/>
+          <line x1="230" y1="419" x2="274" y2="419" stroke="#3a3f4d" stroke-width="2"/>
+          <line x1="326" y1="408" x2="378" y2="408" stroke="#3a3f4d" stroke-width="2"/>
+          <line x1="326" y1="419" x2="370" y2="419" stroke="#3a3f4d" stroke-width="2"/>
+          <polyline points="76,250 114,250 114,170 146,170 146,250 186,250 186,170 218,170 218,210 244,210 244,170 278,170 278,250 310,250 310,170 368,170 368,250 398,250 398,170 436,170" fill="none" stroke="#1d4ed8" stroke-width="28" stroke-linecap="round" stroke-linejoin="round" opacity="0.22"/>
+          <polyline points="76,250 114,250 114,170 146,170 146,250 186,250 186,170 218,170 218,210 244,210 244,170 278,170 278,250 310,250 310,170 368,170 368,250 398,250 398,170 436,170" fill="none" stroke="url(#about-sig)" stroke-width="17" stroke-linecap="round" stroke-linejoin="round"/>
+          <polyline points="76,250 114,250 114,170 146,170 146,250 186,250 186,170 218,170 218,210 244,210 244,170 278,170 278,250 310,250 310,170 368,170 368,250 398,250 398,170 436,170" fill="none" stroke="#dbeafe" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" opacity="0.45"/>
+        </svg>
         <h2>Canvaz</h2>
         <p class="about-version">Version <span id="about-version">…</span></p>
         <p>View and simulate CAN bus traffic using DBC files.</p>

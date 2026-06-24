@@ -135,7 +135,6 @@ interface PlotPane {
 const plotPanes: PlotPane[] = [];
 let paneCounter = 0;
 let plotPaused = false;
-let maxTimeSecs: number | null = null; // null = unlimited
 
 let appRunning = true;
 let appStartTime = Date.now();
@@ -333,10 +332,8 @@ function addSignalToPane(pane: PlotPane, channel: string, sig: DbcSignal) {
   };
 
   // Pre-populate from global history
-  const now = Date.now();
   const hist = signalHistory.get(key) ?? [];
   for (const sample of hist) {
-    if (maxTimeSecs !== null && (now - sample.ts) > maxTimeSecs * 1000) continue;
     series.timestamps.push(sample.ts);
     series.labels.push(fmtPlotLabel(sample.ts));
     series.values.push(sample.value);
@@ -387,11 +384,6 @@ function onSignalValue(ev: SignalValueEvent) {
   let hist = signalHistory.get(key);
   if (!hist) { hist = []; signalHistory.set(key, hist); }
   hist.push({ ts: ev.timestamp_ms, value: ev.value, unit: ev.unit });
-  if (maxTimeSecs !== null) {
-    const cutoff = ev.timestamp_ms - maxTimeSecs * 1000;
-    while (hist.length > 0 && hist[0].ts < cutoff) hist.shift();
-  }
-
   // Update sidebar value + min/max
   signalLastValues.set(key, ev.value);
   const prevMin = signalMinValues.get(key);
@@ -422,14 +414,6 @@ function onSignalValue(ev: SignalValueEvent) {
     series.labels.push(ts);
     series.values.push(ev.value);
     series.lastValue = ev.value;
-    if (maxTimeSecs !== null) {
-      const cutoff = ev.timestamp_ms - maxTimeSecs * 1000;
-      while (series.timestamps.length > 0 && series.timestamps[0] < cutoff) {
-        series.timestamps.shift();
-        series.labels.shift();
-        series.values.shift();
-      }
-    }
     (pane.chart.data as { labels: string[] }).labels = series.labels;
     pane.chart.update("none");
   }
@@ -1663,19 +1647,6 @@ function setupMenuBar() {
     if (e.ctrlKey && e.shiftKey  && e.key === "S") { e.preventDefault(); handleMenuAction("save-as-project"); }
   });
 
-  // Options: Max time controls
-  const chkMaxTime    = document.getElementById("chk-max-time") as HTMLInputElement;
-  const inputMaxTime  = document.getElementById("input-max-time") as HTMLInputElement;
-  const lblMaxTimeUnit = document.getElementById("lbl-max-time-unit") as HTMLElement;
-  chkMaxTime.addEventListener("change", () => {
-    const show = chkMaxTime.checked;
-    inputMaxTime.style.display  = show ? "" : "none";
-    lblMaxTimeUnit.style.display = show ? "" : "none";
-    maxTimeSecs = show ? (parseInt(inputMaxTime.value) || 60) : null;
-  });
-  inputMaxTime.addEventListener("change", () => {
-    if (chkMaxTime.checked) maxTimeSecs = parseInt(inputMaxTime.value) || 60;
-  });
 }
 
 function closeAllMenus() {
