@@ -37,7 +37,11 @@ pub struct PlotPaneConfig {
     pub signals: Vec<PlotSignalEntry>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interpolation: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub show_points: bool,
 }
+
+fn is_false(b: &bool) -> bool { !b }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlotSignalEntry {

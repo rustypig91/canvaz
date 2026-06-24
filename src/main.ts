@@ -67,7 +67,7 @@ interface CanFrameEvent {
 }
 
 interface PlotSignalEntry { signal_name: string; channel: string; }
-interface PlotPaneConfig  { signals: PlotSignalEntry[]; interpolation?: string; }
+interface PlotPaneConfig  { signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean; }
 interface ChannelInfo     { id: string; backend: string; name: string; }
 interface ChannelConfig   { name: string; backend: string; dbc_path: string | null; bitrate?: number | null; }
 interface SimulateEntry   { signal_name: string; channel: string; value: number; period_ms: number; }
@@ -331,10 +331,12 @@ function createPlotPane(): PlotPane {
     btn.classList.toggle("active", pane.showPoints);
     btn.title = `Show data points: ${pane.showPoints ? "on" : "off"}`;
     syncDatasets(pane);
+    scheduleAutoSave();
   });
   el.querySelector<HTMLSelectElement>(".sel-interp")!.addEventListener("change", (e) => {
     pane.interpolation = (e.currentTarget as HTMLSelectElement).value as PlotPane["interpolation"];
     syncDatasets(pane);
+    scheduleAutoSave();
   });
   const resetZoomBtn = el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!;
   resetZoomBtn.addEventListener("click", () => {
@@ -1447,6 +1449,7 @@ function buildProject(): Project {
     plot_panes: plotPanes.map(pane => ({
       signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: s.channel })),
       interpolation: pane.interpolation,
+      show_points: pane.showPoints,
     })),
     simulate_signals: [...simEntries.values()].flatMap(e =>
       e.kind === "message"
@@ -1545,6 +1548,12 @@ async function applyProject(project: Project) {
     if (paneConfig.interpolation) {
       pane.interpolation = paneConfig.interpolation as PlotPane["interpolation"];
       pane.el.querySelector<HTMLSelectElement>(".sel-interp")!.value = pane.interpolation;
+    }
+    if (paneConfig.show_points) {
+      pane.showPoints = true;
+      const btn = pane.el.querySelector<HTMLButtonElement>(".btn-show-points")!;
+      btn.classList.add("active");
+      btn.title = "Show data points: on";
     }
     for (const entry of paneConfig.signals) {
       const dbc = dbcByChannel.get(entry.channel);
