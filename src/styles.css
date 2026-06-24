@@ -389,7 +389,7 @@ body.resizing {
   flex-shrink: 0;
 }
 .channel-item .dot.closed { background: var(--text-muted); }
-.channel-item .ch-name { flex: 1; }
+.channel-item .ch-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .channel-item .ch-backend { font-size: 10px; }
 .channel-item .btn-close-ch {
   background: none; border: none; color: var(--text-muted);

@@ -1087,8 +1087,8 @@ function renderChannelList() {
     item.dataset.channel = id;
     item.innerHTML = `
       <span class="dot"></span>
-      <span class="ch-name">${name}<span class="ch-backend label-muted"> ${backend}</span></span>
-      <span class="ch-dbc">${dbc ? dbc.path.split("/").pop() : "No DBC"}</span>
+      <span class="ch-name" title="${name}">${name}<span class="ch-backend label-muted"> ${backend}</span></span>
+      <span class="ch-dbc"${dbc ? ` title="${dbc.path}"` : ""}>${dbc ? dbc.path.replace(/.*[/\\]/, "") : "No DBC"}</span>
       <span class="ch-baud label-muted">${bitrateLabel}</span>
       <button class="btn-close-ch" title="Close channel">×</button>
     `;
@@ -2559,6 +2559,14 @@ window.addEventListener("DOMContentLoaded", async () => {
   // DBC filter
   document.getElementById("signal-search")!.addEventListener("input", (e) => {
     renderDbcTree((e.target as HTMLInputElement).value);
+  });
+
+  // Expand / collapse all DBC message groups
+  document.getElementById("btn-expand-all")!.addEventListener("click", () => {
+    document.querySelectorAll<HTMLDetailsElement>("#dbc-tree details").forEach(d => { d.open = true; });
+  });
+  document.getElementById("btn-collapse-all")!.addEventListener("click", () => {
+    document.querySelectorAll<HTMLDetailsElement>("#dbc-tree details").forEach(d => { d.open = false; });
   });
 
   // Channel dialog

@@ -15,6 +15,9 @@ const CANLIB: &str = "canlib32.dll";
 // canOpenChannel flags
 const CAN_OPEN_ACCEPT_VIRTUAL: i32 = 0x0020;
 
+// canGetChannelData item IDs
+const CANLIB_CHANNEL_DATA_NAME: i32 = 13;
+
 // Predefined CANlib bitrate constants (negative → CANlib picks timing automatically)
 const BAUD_1M: c_long = -1;
 const BAUD_500K: c_long = -2;
@@ -43,10 +46,12 @@ type FnBusOff = unsafe extern "system" fn(i32) -> i32;
 type FnRead = unsafe extern "system" fn(i32, *mut c_long, *mut u8, *mut u32, *mut u32, *mut c_ulong) -> i32;
 type FnWrite = unsafe extern "system" fn(i32, c_long, *const u8, u32, u32) -> i32;
 type FnWriteSync = unsafe extern "system" fn(i32, c_ulong) -> i32;
+type FnGetChannelData = unsafe extern "system" fn(i32, i32, *mut u8, usize) -> i32;
 
 struct CanLib {
     _lib: Library,
     get_count: FnGetCount,
+    get_channel_data: FnGetChannelData,
     open: FnOpen,
     close: FnClose,
     set_bus: FnSetBus,
@@ -76,6 +81,7 @@ impl CanLib {
             }
             Ok(Arc::new(Self {
                 get_count: sym!(b"canGetNumberOfChannels\0", FnGetCount),
+                get_channel_data: sym!(b"canGetChannelData\0", FnGetChannelData),
                 open: sym!(b"canOpenChannel\0", FnOpen),
                 close: sym!(b"canClose\0", FnClose),
                 set_bus: sym!(b"canSetBusParams\0", FnSetBus),
@@ -169,6 +175,22 @@ fn canlib_err(status: i32) -> String {
 
 // ── Backend ───────────────────────────────────────────────────────────────────
 
+fn kvaser_channel_name(lib: &CanLib, index: i32) -> Option<String> {
+    let mut buf = [0u8; 256];
+    let s = unsafe {
+        (lib.get_channel_data)(
+            index,
+            CANLIB_CHANNEL_DATA_NAME,
+            buf.as_mut_ptr(),
+            buf.len(),
+        )
+    };
+    if s != CAN_OK { return None; }
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8(buf[..len].to_vec()).ok()
+}
+
+
 pub(crate) struct KvaserBackend;
 
 impl KvaserBackend {
@@ -183,7 +205,13 @@ impl KvaserBackend {
         if s < CAN_OK {
             return Err(format!("canGetNumberOfChannels failed: {}", canlib_err(s)));
         }
-        Ok((0..n.max(0) as u32).map(|i| format!("Channel {i}")).collect())
+        let mut names = Vec::new();
+        for i in 0..n.max(0) as i32 {
+            let ch_name = kvaser_channel_name(&lib, i)
+                .unwrap_or_else(|| format!("Channel {i}"));
+            names.push(ch_name);
+        }
+        Ok(names)
     }
 
     pub(super) fn open_channel(
@@ -192,10 +220,18 @@ impl KvaserBackend {
         bitrate: Option<u32>,
         _state: Arc<AppState>,
     ) -> Result<KvaserBackendChannel, String> {
-        let index = name
-            .strip_prefix("Channel ")
-            .and_then(|s| s.parse::<i32>().ok())
-            .ok_or_else(|| format!("Invalid Kvaser channel name: '{name}'"))?;
+        let lib = CanLib::load()?;
+        let mut n: i32 = 0;
+        unsafe { (lib.get_count)(&mut n) };
+
+        let index = (0..n.max(0) as i32)
+            .find(|&i| {
+                let ch_name = kvaser_channel_name(&lib, i)
+                    .unwrap_or_else(|| format!("Channel {i}"));
+                ch_name == name
+            })
+            .ok_or_else(|| format!("Kvaser channel '{name}' not found"))?;
+
         Ok(KvaserBackendChannel {
             name: name.to_string(),
             channel_index: index,
