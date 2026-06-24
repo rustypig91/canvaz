@@ -1506,6 +1506,17 @@ async function applyProject(project: Project) {
   if (project.trace_filters) restoreTraceFilters(project.trace_filters);
 }
 
+function syncFilteredHeaders() {
+  const th = (k: string) => document.querySelector<HTMLElement>(`#trace-table thead th[data-col="${k}"]`);
+  th("channel")?.classList.toggle("th-filtered", traceFilterChannels !== null);
+  th("canId")?.classList.toggle("th-filtered", traceFilterCanIds !== null);
+  th("msg")?.classList.toggle("th-filtered", traceFilterMsgNames !== null);
+  th("dir")?.classList.toggle("th-filtered", traceFilterDir !== null);
+  th("dlc")?.classList.toggle("th-filtered", traceFilterDlcMin !== null || traceFilterDlcMax !== null);
+  th("cycle")?.classList.toggle("th-filtered", traceFilterCycleMin !== null || traceFilterCycleMax !== null);
+  th("data")?.classList.toggle("th-filtered", traceFilterData.some(v => v !== null));
+}
+
 function restoreTraceFilters(f: TraceFiltersConfig) {
   traceFilterChannels  = f.channels  ? new Set(f.channels)        : null;
   traceFilterCanIds    = f.can_ids   ? new Set(f.can_ids)         : null;
@@ -1537,17 +1548,7 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
     traceFilterMsgNames.forEach(v => { if (v === "") traceSeenNoMsg = true; else traceSeenMsgNames.add(v); });
   }
 
-  // Refresh header highlight indicators
-  const ths = traceHeaderEls;
-  if (ths.length) {
-    ths[1].classList.toggle("th-filtered", traceFilterDir !== null);
-    ths[2].classList.toggle("th-filtered", traceFilterChannels !== null);
-    ths[3].classList.toggle("th-filtered", traceFilterCanIds !== null);
-    ths[4].classList.toggle("th-filtered", traceFilterMsgNames !== null);
-    ths[5].classList.toggle("th-filtered", traceFilterDlcMin !== null || traceFilterDlcMax !== null);
-    ths[6].classList.toggle("th-filtered", traceFilterData.some(v => v !== null));
-    ths[7].classList.toggle("th-filtered", traceFilterCycleMin !== null || traceFilterCycleMax !== null);
-  }
+  syncFilteredHeaders();
   updateClearFiltersBtn();
 }
 
@@ -1917,6 +1918,25 @@ let tracePaused = false;
 let traceMaxRows = 1000;
 let traceHeaderEls: HTMLTableCellElement[] = [];
 
+interface TraceColDef { key: string; label: string; defaultWidth: number; }
+const TRACE_COL_DEFS: TraceColDef[] = [
+  { key: "ts",      label: "Timestamp",  defaultWidth: 100 },
+  { key: "dir",     label: "Dir",        defaultWidth: 56  },
+  { key: "channel", label: "Channel",    defaultWidth: 80  },
+  { key: "canId",   label: "CAN ID",     defaultWidth: 90  },
+  { key: "msg",     label: "Message",    defaultWidth: 160 },
+  { key: "dlc",     label: "DLC",        defaultWidth: 56  },
+  { key: "data",    label: "Data",       defaultWidth: 0   },
+  { key: "cycle",   label: "Cycle (ms)", defaultWidth: 90  },
+];
+let traceColOrder: string[] = TRACE_COL_DEFS.map(d => d.key);
+let traceColHidden = new Set<string>();
+let traceColWidths: Record<string, number> = {};
+let colDragKey: string | null = null;
+let colDragGhost: HTMLDivElement | null = null;
+let colDropBefore: string | null | undefined = undefined;
+let colDropIndicator: HTMLDivElement | null = null;
+
 const traceLastTs = new Map<string, number>();
 const traceRowEls = new Map<string, HTMLTableRowElement>();
 const traceSeenChannels = new Set<string>();
@@ -2068,11 +2088,41 @@ function applyTraceSort() {
   for (const row of rows) tbody.appendChild(row);
 }
 
+function buildTraceCellHtml(key: string, entry: TraceEntry): string {
+  const dirClass = entry.direction === "tx" ? "dir-tx" : "dir-rx";
+  switch (key) {
+    case "ts":      return `<td data-col="ts" class="td-ts">${fmtElapsed(entry.timestampMs)}</td>`;
+    case "dir":     return `<td data-col="dir"><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>`;
+    case "channel": return `<td data-col="channel">${channelDisplayName(entry.channel)}</td>`;
+    case "canId":   return `<td data-col="canId" class="td-canid">${fmtId(entry.canId, entry.isExtended)}</td>`;
+    case "msg":     return `<td data-col="msg"${entry.messageName ? ` title="${entry.messageName}"` : ""}>${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>`;
+    case "dlc":     return `<td data-col="dlc" style="text-align:center">${entry.dlc}</td>`;
+    case "data":    return `<td data-col="data" class="td-data">${fmtData(entry.data)}</td>`;
+    case "cycle":   return `<td data-col="cycle" class="td-cycle">${entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—"}</td>`;
+    default:        return `<td data-col="${key}"></td>`;
+  }
+}
+
+function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
+  return {
+    data: JSON.parse(tr.dataset.bytes ?? "[]"),
+    channel: tr.dataset.channel ?? "",
+    canId: parseInt(tr.dataset.canid ?? "0"),
+    isExtended: tr.dataset.ext === "1",
+    timestampMs: parseInt(tr.dataset.ts ?? "0"),
+    direction: (tr.dataset.dir as "rx" | "tx") ?? "rx",
+    messageName: tr.dataset.msg || null,
+    dlc: parseInt(tr.dataset.dlc ?? "0"),
+    cycleTimeMs: tr.dataset.cycle ? parseFloat(tr.dataset.cycle) : null,
+  };
+}
+
 function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
   const tr = document.createElement("tr");
   tr.dataset.bytes = JSON.stringify(entry.data);
   tr.dataset.channel = entry.channel;
   tr.dataset.canid = String(entry.canId);
+  tr.dataset.ext = entry.isExtended ? "1" : "0";
   tr.dataset.ts = String(entry.timestampMs);
   tr.dataset.dir = entry.direction;
   tr.dataset.msg = entry.messageName ?? "";
@@ -2080,17 +2130,8 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
   tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
   if (entry.messageName) tr.classList.add("dbc-match");
   if (!traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) tr.style.display = "none";
-  const dirClass = entry.direction === "tx" ? "dir-tx" : "dir-rx";
-  tr.innerHTML = `
-    <td class="td-ts">${fmtElapsed(entry.timestampMs)}</td>
-    <td><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>
-    <td>${channelDisplayName(entry.channel)}</td>
-    <td class="td-canid">${fmtId(entry.canId, entry.isExtended)}</td>
-    <td${entry.messageName ? ` title="${entry.messageName}"` : ""}>${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>
-    <td style="text-align:center">${entry.dlc}</td>
-    <td class="td-data">${fmtData(entry.data)}</td>
-    <td class="td-cycle">${entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—"}</td>
-  `;
+  const visible = traceColOrder.filter(k => !traceColHidden.has(k));
+  tr.innerHTML = visible.map(k => buildTraceCellHtml(k, entry)).join("");
   return tr;
 }
 
@@ -2100,11 +2141,11 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
   tr.dataset.dlc = String(entry.dlc);
   tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
   tr.style.display = traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName) ? "" : "none";
-  const cells = tr.cells;
-  cells[0].textContent = fmtElapsed(entry.timestampMs);
-  cells[5].textContent = String(entry.dlc);
-  cells[6].textContent = fmtData(entry.data);
-  cells[7].textContent = entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—";
+  const gc = (k: string) => tr.querySelector<HTMLTableCellElement>(`[data-col="${k}"]`);
+  const tsCell = gc("ts"); if (tsCell) tsCell.textContent = fmtElapsed(entry.timestampMs);
+  const dlcCell = gc("dlc"); if (dlcCell) dlcCell.textContent = String(entry.dlc);
+  const dataCell = gc("data"); if (dataCell) dataCell.textContent = fmtData(entry.data);
+  const cycleCell = gc("cycle"); if (cycleCell) cycleCell.textContent = entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—";
 
   // Refresh open expansion row with updated signal values + current min/max
   const next = tr.nextElementSibling as HTMLTableRowElement | null;
@@ -2198,7 +2239,8 @@ function refreshTraceFormat() {
   const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
   for (const tr of Array.from(tbody.rows)) {
     const bytes: number[] = JSON.parse((tr as HTMLTableRowElement).dataset.bytes ?? "[]");
-    tr.cells[6].textContent = fmtData(bytes);
+    const dc = (tr as HTMLTableRowElement).querySelector<HTMLTableCellElement>('[data-col="data"]');
+    if (dc) dc.textContent = fmtData(bytes);
   }
 }
 
@@ -2229,16 +2271,319 @@ function clearAllFilters() {
   traceFilterCycleMin  = null;
   traceFilterCycleMax  = null;
   traceFilterData.fill(null);
-  const ths = traceHeaderEls;
-  [1, 2, 3, 4, 5, 6, 7].forEach(i => ths[i]?.classList.remove("th-filtered"));
+  syncFilteredHeaders();
   applyTraceFilter();
 }
 
+function updateSortIndicators() {
+  for (const def of TRACE_COL_DEFS) {
+    const th = document.querySelector<HTMLElement>(`#trace-table thead th[data-col="${def.key}"]`);
+    if (!th) continue;
+    const node = th.childNodes[0];
+    if (node) node.textContent = def.label + (traceSortCol === def.key ? (traceSortDir === "asc" ? " ▲" : " ▼") : "");
+  }
+}
+
+function calcColDropTarget(clientX: number, dragKey: string): string | null {
+  const ths = Array.from(document.querySelectorAll<HTMLTableCellElement>("#trace-table thead th"));
+  for (const th of ths) {
+    if (th.dataset.col === dragKey) continue;
+    const rect = th.getBoundingClientRect();
+    if (clientX < rect.left + rect.width / 2) return th.dataset.col ?? null;
+  }
+  return null;
+}
+
+function updateColDropIndicator(before: string | null) {
+  if (!colDropIndicator) {
+    colDropIndicator = document.createElement("div");
+    colDropIndicator.id = "col-drop-indicator";
+    document.body.appendChild(colDropIndicator);
+  }
+  const ths = Array.from(document.querySelectorAll<HTMLTableCellElement>("#trace-table thead th"));
+  let x: number;
+  if (before === null) {
+    const last = ths[ths.length - 1];
+    x = last ? last.getBoundingClientRect().right : 0;
+  } else {
+    const th = ths.find(t => t.dataset.col === before);
+    x = th ? th.getBoundingClientRect().left : 0;
+  }
+  const trRect = document.querySelector("#trace-table thead tr")!.getBoundingClientRect();
+  colDropIndicator.style.left = `${x}px`;
+  colDropIndicator.style.top = `${trRect.top}px`;
+  colDropIndicator.style.height = `${trRect.height}px`;
+  colDropIndicator.style.display = "block";
+}
+
+function hideColDropIndicator() {
+  if (colDropIndicator) colDropIndicator.style.display = "none";
+}
+
+function rebuildTraceColumns() {
+  const visible = traceColOrder.filter(k => !traceColHidden.has(k));
+
+  const colgroup = document.querySelector("#trace-table colgroup")!;
+  colgroup.innerHTML = visible.map(k => {
+    const w = traceColWidths[k] ?? TRACE_COL_DEFS.find(d => d.key === k)!.defaultWidth;
+    return w ? `<col style="width:${w}px">` : `<col>`;
+  }).join("");
+
+  const headerRow = document.querySelector("#trace-table thead tr")!;
+  headerRow.innerHTML = visible.map(k => {
+    const def = TRACE_COL_DEFS.find(d => d.key === k)!;
+    return `<th data-col="${k}">${def.label}</th>`;
+  }).join("");
+  traceHeaderEls = Array.from(headerRow.children) as HTMLTableCellElement[];
+
+  const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
+  for (const tr of Array.from(tbody.rows)) {
+    const row = tr as HTMLTableRowElement;
+    if (row.dataset.expand) { row.cells[0].colSpan = visible.length; continue; }
+    const entry = entryFromRow(row);
+    row.innerHTML = visible.map(k => buildTraceCellHtml(k, entry)).join("");
+  }
+
+  setupTraceHeaders();
+}
+
+function setupTraceHeaders() {
+  const ths = traceHeaderEls;
+  const traceCols = Array.from(document.querySelectorAll<HTMLElement>("#trace-table colgroup col"));
+
+  ths.forEach((th, i) => {
+    const key = th.dataset.col ?? "";
+
+    // Resize handle
+    const handle = document.createElement("span");
+    handle.className = "col-resizer";
+    handle.addEventListener("click", (e) => e.stopPropagation());
+    handle.addEventListener("mousedown", (e) => {
+      e.preventDefault(); e.stopPropagation();
+      const startX = e.clientX, startW = th.offsetWidth;
+      handle.classList.add("active");
+      document.body.classList.add("col-resizing");
+      const onMove = (ev: MouseEvent) => {
+        const w = Math.max(40, startW + ev.clientX - startX);
+        if (traceCols[i]) traceCols[i].style.width = `${w}px`;
+        traceColWidths[key] = w;
+      };
+      const onUp = () => {
+        handle.classList.remove("active"); document.body.classList.remove("col-resizing");
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+    th.appendChild(handle);
+
+    // Sort on click
+    th.addEventListener("click", () => {
+      if (traceSortCol === key) traceSortDir = traceSortDir === "asc" ? "desc" : "asc";
+      else { traceSortCol = key as TraceSortCol; traceSortDir = "asc"; }
+      updateSortIndicators();
+      applyTraceSort();
+    });
+
+    // Drag to reorder
+    th.addEventListener("mousedown", (e) => {
+      if ((e.target as HTMLElement).closest(".col-resizer")) return;
+      const startX = e.clientX;
+      let dragging = false;
+      const onMove = (ev: MouseEvent) => {
+        if (!dragging && Math.abs(ev.clientX - startX) >= 5) {
+          dragging = true;
+          colDragKey = key;
+          colDragGhost = document.createElement("div");
+          colDragGhost.className = "col-drag-ghost";
+          colDragGhost.textContent = TRACE_COL_DEFS.find(d => d.key === key)?.label ?? key;
+          document.body.appendChild(colDragGhost);
+          document.body.classList.add("col-resizing");
+        }
+        if (!dragging) return;
+        colDragGhost!.style.left = `${ev.clientX + 12}px`;
+        colDragGhost!.style.top = `${ev.clientY - 8}px`;
+        const before = calcColDropTarget(ev.clientX, key);
+        if (before !== colDropBefore) { colDropBefore = before; updateColDropIndicator(before); }
+      };
+      const onUp = () => {
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        colDragGhost?.remove(); colDragGhost = null;
+        hideColDropIndicator();
+        document.body.classList.remove("col-resizing");
+        if (dragging && colDragKey) {
+          const before = colDropBefore;
+          colDragKey = null; colDropBefore = undefined;
+          if (before !== key) {
+            traceColOrder = traceColOrder.filter(k => k !== key);
+            const idx = before === null ? traceColOrder.length : traceColOrder.indexOf(before as string);
+            traceColOrder.splice(idx >= 0 ? idx : traceColOrder.length, 0, key);
+            rebuildTraceColumns();
+            scheduleAutoSave();
+          }
+        } else { colDragKey = null; colDropBefore = undefined; }
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+
+    // Filter context menus
+    if (key === "msg") {
+      th.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        const items = [...traceSeenMsgNames].sort().map(n => ({ label: n, key: n }));
+        if (traceSeenNoMsg) items.push({ label: "(no message)", key: "" });
+        if (!items.length) return;
+        showFilterMenu(e.clientX, e.clientY, items, traceFilterMsgNames, (active) => {
+          traceFilterMsgNames = active; syncFilteredHeaders(); applyTraceFilter();
+        });
+      });
+    } else if (key === "channel") {
+      th.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        const items = [...traceSeenChannels].sort().map(ch => ({ label: channelDisplayName(ch), key: ch }));
+        if (!items.length) return;
+        showFilterMenu(e.clientX, e.clientY, items, traceFilterChannels, (active) => {
+          traceFilterChannels = active; syncFilteredHeaders(); applyTraceFilter();
+        });
+      });
+    } else if (key === "canId") {
+      th.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        const items = [...traceSeenCanIds].sort((a, b) => a - b).map(id => ({ label: fmtId(id, id > 0x7FF), key: String(id) }));
+        if (!items.length) return;
+        showFilterMenu(e.clientX, e.clientY, items,
+          traceFilterCanIds !== null ? new Set([...traceFilterCanIds].map(String)) : null,
+          (active) => {
+            traceFilterCanIds = active !== null ? new Set([...active].map(Number)) : null;
+            syncFilteredHeaders(); applyTraceFilter();
+          });
+      });
+    } else if (key === "data") {
+      th.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        if (ctxMenu) ctxMenu.remove();
+        const menu = document.createElement("div");
+        menu.className = "ctx-menu data-filter-menu";
+        menu.addEventListener("click", ev => ev.stopPropagation());
+        const fmtRow = document.createElement("div");
+        fmtRow.className = "data-fmt-row";
+        for (const [value, label] of [["hex", "Hex"], ["dec", "Dec"], ["ascii", "ASCII"]] as const) {
+          const btn = document.createElement("button");
+          btn.textContent = label;
+          btn.className = "data-fmt-btn" + (traceDataFormat === value ? " active" : "");
+          btn.addEventListener("click", () => {
+            traceDataFormat = value;
+            fmtRow.querySelectorAll<HTMLButtonElement>(".data-fmt-btn").forEach(b => b.classList.remove("active"));
+            btn.classList.add("active");
+            refreshTraceFormat(); scheduleAutoSave();
+          });
+          fmtRow.appendChild(btn);
+        }
+        menu.appendChild(fmtRow);
+        const sep = document.createElement("div"); sep.className = "data-filter-sep"; menu.appendChild(sep);
+        const inputs: HTMLInputElement[] = [];
+        const grid = document.createElement("div"); grid.className = "data-filter-grid";
+        for (let idx = 0; idx < 8; idx++) {
+          const cell = document.createElement("div"); cell.className = "data-filter-cell";
+          const lbl = document.createElement("span"); lbl.className = "data-filter-lbl"; lbl.textContent = String(idx);
+          const inp = document.createElement("input");
+          inp.type = "text"; inp.className = "data-filter-inp"; inp.placeholder = "—"; inp.maxLength = 4;
+          const cur = traceFilterData[idx];
+          if (cur !== null) inp.value = cur.toString(16).toUpperCase().padStart(2, "0");
+          inp.addEventListener("input", () => {
+            const val = parseByte(inp.value);
+            traceFilterData[idx] = val;
+            inp.classList.toggle("data-filter-invalid", inp.value.trim() !== "" && val === null);
+            syncFilteredHeaders(); applyTraceFilter();
+          });
+          cell.append(lbl, inp); grid.appendChild(cell); inputs.push(inp);
+        }
+        menu.appendChild(grid);
+        const hint = document.createElement("div"); hint.className = "data-filter-hint";
+        hint.textContent = "hex (FF) or decimal (255), empty = any"; menu.appendChild(hint);
+        const clearBtn = document.createElement("button");
+        clearBtn.textContent = "Clear all"; clearBtn.className = "filter-ctrl-btn";
+        clearBtn.style.marginTop = "6px"; clearBtn.style.width = "100%";
+        clearBtn.addEventListener("click", () => {
+          traceFilterData.fill(null);
+          inputs.forEach(inp => { inp.value = ""; inp.classList.remove("data-filter-invalid"); });
+          syncFilteredHeaders(); applyTraceFilter();
+        });
+        menu.appendChild(clearBtn);
+        menu.style.left = `${e.clientX}px`; menu.style.top = `${e.clientY}px`;
+        document.body.appendChild(menu); ctxMenu = menu;
+        const rect = menu.getBoundingClientRect();
+        if (rect.right > window.innerWidth) menu.style.left = `${e.clientX - rect.width}px`;
+        if (rect.bottom > window.innerHeight) menu.style.top = `${e.clientY - rect.height}px`;
+      });
+    } else if (key === "dir") {
+      th.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        showFilterMenu(e.clientX, e.clientY,
+          [{ label: "RX", key: "rx" }, { label: "TX", key: "tx" }],
+          traceFilterDir, (active) => { traceFilterDir = active; syncFilteredHeaders(); applyTraceFilter(); });
+      });
+    } else if (key === "dlc") {
+      th.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        showRangeFilterMenu(e.clientX, e.clientY, "DLC", traceFilterDlcMin, traceFilterDlcMax, (mn, mx) => {
+          traceFilterDlcMin = mn; traceFilterDlcMax = mx; syncFilteredHeaders(); applyTraceFilter();
+        });
+      });
+    } else if (key === "cycle") {
+      th.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        showRangeFilterMenu(e.clientX, e.clientY, "Cycle (ms)", traceFilterCycleMin, traceFilterCycleMax, (mn, mx) => {
+          traceFilterCycleMin = mn; traceFilterCycleMax = mx; syncFilteredHeaders(); applyTraceFilter();
+        });
+      });
+    }
+  });
+
+  updateSortIndicators();
+  syncFilteredHeaders();
+}
+
 function setupTrace() {
+  rebuildTraceColumns();
+
   document.getElementById("btn-clear-trace")!.addEventListener("click", clearTrace);
   document.getElementById("btn-clear-filters")!.addEventListener("click", () => {
     clearAllFilters();
     scheduleAutoSave();
+  });
+
+  // ── Columns visibility button ─────────────────────────────────────────────
+  document.getElementById("btn-trace-cols")!.addEventListener("click", (e) => {
+    e.stopPropagation();
+    if (ctxMenu) { ctxMenu.remove(); ctxMenu = null; return; }
+    const btn = e.currentTarget as HTMLElement;
+    const rect = btn.getBoundingClientRect();
+    const menu = document.createElement("div");
+    menu.className = "ctx-menu";
+    menu.style.left = `${rect.left}px`;
+    menu.style.top = `${rect.bottom + 4}px`;
+    menu.addEventListener("click", ev => ev.stopPropagation());
+    for (const def of TRACE_COL_DEFS) {
+      const item = document.createElement("label");
+      item.className = "ctx-col-item";
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = !traceColHidden.has(def.key);
+      cb.addEventListener("change", () => {
+        if (cb.checked) traceColHidden.delete(def.key);
+        else traceColHidden.add(def.key);
+        rebuildTraceColumns();
+        scheduleAutoSave();
+      });
+      item.append(cb, " ", def.label);
+      menu.appendChild(item);
+    }
+    ctxMenu = menu;
+    document.body.appendChild(menu);
   });
 
   // ── Trace row expansion ───────────────────────────────────────────────────
@@ -2262,7 +2607,7 @@ function setupTrace() {
     const expandTr = document.createElement("tr");
     expandTr.dataset.expand = "1";
     const td = document.createElement("td");
-    td.colSpan = 8;
+    td.colSpan = traceColOrder.filter(k => !traceColHidden.has(k)).length;
     td.className = "trace-expand-cell";
 
     let html = '<table class="trace-expand-table"><thead><tr>'
@@ -2286,220 +2631,6 @@ function setupTrace() {
     expandTr.appendChild(td);
     tr.after(expandTr);
     tr.classList.add("trace-row-expanded");
-  });
-
-  // ── Column header sort + filter ───────────────────────────────────────────
-  const headerRow = document.querySelector("#trace-table thead tr")!;
-  const ths = Array.from(headerRow.children) as HTMLTableCellElement[];
-  traceHeaderEls = ths;
-
-  // ── Column resize handles ─────────────────────────────────────────────────
-  const traceCols = Array.from(document.querySelectorAll<HTMLElement>("#trace-table colgroup col"));
-  ths.forEach((th, i) => {
-    const handle = document.createElement("span");
-    handle.className = "col-resizer";
-    handle.addEventListener("click", (e) => e.stopPropagation());
-    handle.addEventListener("mousedown", (e) => {
-      e.preventDefault();
-      e.stopPropagation();
-      const startX = e.clientX;
-      const startW = th.offsetWidth;
-      handle.classList.add("active");
-      document.body.classList.add("col-resizing");
-      const onMove = (ev: MouseEvent) => {
-        const w = Math.max(40, startW + ev.clientX - startX);
-        traceCols[i].style.width = `${w}px`;
-      };
-      const onUp = () => {
-        handle.classList.remove("active");
-        document.body.classList.remove("col-resizing");
-        document.removeEventListener("mousemove", onMove);
-        document.removeEventListener("mouseup", onUp);
-      };
-      document.addEventListener("mousemove", onMove);
-      document.addEventListener("mouseup", onUp);
-    });
-    th.appendChild(handle);
-  });
-
-  const thCols: TraceSortCol[] = ["ts", "dir", "channel", "canId", "msg", "dlc", "data", "cycle"];
-  const thLabels = ["Timestamp", "Dir", "Channel", "CAN ID", "Message", "DLC", "Data", "Cycle (ms)"];
-
-  function updateSortIndicators() {
-    thCols.forEach((col, i) => {
-      const active = traceSortCol === col;
-      ths[i].childNodes[0].textContent = thLabels[i] + (active ? (traceSortDir === "asc" ? " ▲" : " ▼") : "");
-    });
-  }
-
-  function setSortCol(col: TraceSortCol) {
-    if (traceSortCol === col) traceSortDir = traceSortDir === "asc" ? "desc" : "asc";
-    else { traceSortCol = col; traceSortDir = "asc"; }
-    updateSortIndicators();
-    applyTraceSort();
-  }
-
-  thCols.forEach((col, i) => ths[i].addEventListener("click", () => setSortCol(col)));
-
-  // Message filter (right-click col 4)
-  ths[4].addEventListener("contextmenu", (e) => {
-    e.preventDefault();
-    const items = [...traceSeenMsgNames].sort().map(n => ({ label: n, key: n }));
-    if (traceSeenNoMsg) items.push({ label: "(no message)", key: "" });
-    if (!items.length) return;
-    showFilterMenu(e.clientX, e.clientY, items, traceFilterMsgNames, (active) => {
-      traceFilterMsgNames = active;
-      ths[4].classList.toggle("th-filtered", active !== null);
-      applyTraceFilter();
-    });
-  });
-
-  // Channel filter (right-click col 2)
-  ths[2].addEventListener("contextmenu", (e) => {
-    e.preventDefault();
-    const items = [...traceSeenChannels].sort().map(ch => ({ label: channelDisplayName(ch), key: ch }));
-    if (!items.length) return;
-    showFilterMenu(e.clientX, e.clientY, items, traceFilterChannels, (active) => {
-      traceFilterChannels = active;
-      ths[2].classList.toggle("th-filtered", active !== null);
-      applyTraceFilter();
-    });
-  });
-
-  // CAN ID filter (right-click col 3)
-  ths[3].addEventListener("contextmenu", (e) => {
-    e.preventDefault();
-    const items = [...traceSeenCanIds].sort((a, b) => a - b).map(id => ({
-      label: fmtId(id, id > 0x7FF), key: String(id),
-    }));
-    if (!items.length) return;
-    showFilterMenu(e.clientX, e.clientY, items,
-      traceFilterCanIds !== null ? new Set([...traceFilterCanIds].map(String)) : null,
-      (active) => {
-        traceFilterCanIds = active !== null ? new Set([...active].map(Number)) : null;
-        ths[3].classList.toggle("th-filtered", active !== null);
-        applyTraceFilter();
-      });
-  });
-
-  // Data column: format + byte filter (right-click col 6)
-  ths[6].addEventListener("contextmenu", (e) => {
-    e.preventDefault();
-    if (ctxMenu) ctxMenu.remove();
-    const menu = document.createElement("div");
-    menu.className = "ctx-menu data-filter-menu";
-    menu.addEventListener("click", ev => ev.stopPropagation());
-
-    // Format selector
-    const fmtRow = document.createElement("div");
-    fmtRow.className = "data-fmt-row";
-    for (const [value, label] of [["hex", "Hex"], ["dec", "Dec"], ["ascii", "ASCII"]] as const) {
-      const btn = document.createElement("button");
-      btn.textContent = label;
-      btn.className = "data-fmt-btn" + (traceDataFormat === value ? " active" : "");
-      btn.addEventListener("click", () => {
-        traceDataFormat = value;
-        fmtRow.querySelectorAll<HTMLButtonElement>(".data-fmt-btn").forEach(b => b.classList.remove("active"));
-        btn.classList.add("active");
-        refreshTraceFormat();
-        scheduleAutoSave();
-      });
-      fmtRow.appendChild(btn);
-    }
-    menu.appendChild(fmtRow);
-
-    const sep = document.createElement("div");
-    sep.className = "data-filter-sep";
-    menu.appendChild(sep);
-
-    const inputs: HTMLInputElement[] = [];
-    const grid = document.createElement("div");
-    grid.className = "data-filter-grid";
-    for (let i = 0; i < 8; i++) {
-      const cell = document.createElement("div");
-      cell.className = "data-filter-cell";
-      const lbl = document.createElement("span");
-      lbl.className = "data-filter-lbl";
-      lbl.textContent = String(i);
-      const inp = document.createElement("input");
-      inp.type = "text";
-      inp.className = "data-filter-inp";
-      inp.placeholder = "—";
-      inp.maxLength = 4;
-      const cur = traceFilterData[i];
-      if (cur !== null) inp.value = cur.toString(16).toUpperCase().padStart(2, "0");
-      inp.addEventListener("input", () => {
-        const val = parseByte(inp.value);
-        traceFilterData[i] = val;
-        inp.classList.toggle("data-filter-invalid", inp.value.trim() !== "" && val === null);
-        const hasAny = traceFilterData.some(v => v !== null);
-        ths[6].classList.toggle("th-filtered", hasAny);
-        applyTraceFilter();
-      });
-      cell.append(lbl, inp);
-      grid.appendChild(cell);
-      inputs.push(inp);
-    }
-    menu.appendChild(grid);
-
-    const hint = document.createElement("div");
-    hint.className = "data-filter-hint";
-    hint.textContent = "hex (FF) or decimal (255), empty = any";
-    menu.appendChild(hint);
-
-    const clearBtn = document.createElement("button");
-    clearBtn.textContent = "Clear all";
-    clearBtn.className = "filter-ctrl-btn";
-    clearBtn.style.marginTop = "6px";
-    clearBtn.style.width = "100%";
-    clearBtn.addEventListener("click", () => {
-      traceFilterData.fill(null);
-      inputs.forEach(inp => { inp.value = ""; inp.classList.remove("data-filter-invalid"); });
-      ths[6].classList.remove("th-filtered");
-      applyTraceFilter();
-    });
-    menu.appendChild(clearBtn);
-
-    menu.style.left = `${e.clientX}px`;
-    menu.style.top = `${e.clientY}px`;
-    document.body.appendChild(menu);
-    ctxMenu = menu;
-    const rect = menu.getBoundingClientRect();
-    if (rect.right > window.innerWidth) menu.style.left = `${e.clientX - rect.width}px`;
-    if (rect.bottom > window.innerHeight) menu.style.top = `${e.clientY - rect.height}px`;
-  });
-
-  // Dir filter (right-click col 1)
-  ths[1].addEventListener("contextmenu", (e) => {
-    e.preventDefault();
-    showFilterMenu(e.clientX, e.clientY,
-      [{ label: "RX", key: "rx" }, { label: "TX", key: "tx" }],
-      traceFilterDir,
-      (active) => {
-        traceFilterDir = active;
-        ths[1].classList.toggle("th-filtered", active !== null);
-        applyTraceFilter();
-      });
-  });
-
-  // DLC filter (right-click col 5)
-  ths[5].addEventListener("contextmenu", (e) => {
-    e.preventDefault();
-    showRangeFilterMenu(e.clientX, e.clientY, "DLC", traceFilterDlcMin, traceFilterDlcMax, (mn, mx) => {
-      traceFilterDlcMin = mn; traceFilterDlcMax = mx;
-      ths[5].classList.toggle("th-filtered", mn !== null || mx !== null);
-      applyTraceFilter();
-    });
-  });
-
-  // Cycle filter (right-click col 7)
-  ths[7].addEventListener("contextmenu", (e) => {
-    e.preventDefault();
-    showRangeFilterMenu(e.clientX, e.clientY, "Cycle (ms)", traceFilterCycleMin, traceFilterCycleMax, (mn, mx) => {
-      traceFilterCycleMin = mn; traceFilterCycleMax = mx;
-      ths[7].classList.toggle("th-filtered", mn !== null || mx !== null);
-      applyTraceFilter();
-    });
   });
 
   document.getElementById("btn-trace-overwrite")!.addEventListener("click", function () {

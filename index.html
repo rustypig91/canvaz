@@ -111,6 +111,7 @@
           <div id="plot-toolbar">
             <button id="btn-pause-plot" class="btn btn-sm">Pause</button>
           </div>
+
           <div id="plot-panes-container">
             <!-- plot panes injected here by JS -->
             <div id="drop-zone-new" class="drop-zone">
@@ -138,25 +139,13 @@
             <label class="label-muted">Max rows:</label>
             <input id="input-trace-max" type="number" value="1000" min="100" max="10000" step="100" class="small-input" />
             <button id="btn-pause-trace" class="btn btn-sm">Pause</button>
+            <button id="btn-trace-cols" class="btn btn-sm" title="Show/hide columns">Columns ▾</button>
             <button id="btn-clear-filters" class="btn btn-sm" title="Clear all column filters" style="margin-left:auto;display:none">Clear filters</button>
           </div>
           <div id="trace-container">
             <table id="trace-table">
-              <colgroup>
-                <col /><col /><col /><col /><col /><col /><col /><col />
-              </colgroup>
-              <thead>
-                <tr>
-                  <th>Timestamp</th>
-                  <th>Dir</th>
-                  <th>Channel</th>
-                  <th>CAN ID</th>
-                  <th>Message</th>
-                  <th>DLC</th>
-                  <th>Data</th>
-                  <th>Cycle (ms)</th>
-                </tr>
-              </thead>
+              <colgroup></colgroup>
+              <thead><tr></tr></thead>
               <tbody id="trace-tbody"></tbody>
             </table>
           </div>
