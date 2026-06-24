@@ -807,6 +807,12 @@ body.resizing {
 #trace-table thead th { cursor: pointer; user-select: none; }
 #trace-table thead th:hover { color: var(--text); }
 #trace-table thead th.th-filtered { color: var(--accent); }
+.col-resizer {
+  position: absolute; right: 0; top: 0; bottom: 0; width: 5px;
+  cursor: col-resize; z-index: 2;
+}
+.col-resizer:hover, .col-resizer.active { background: rgba(255,255,255,0.18); }
+body.col-resizing { cursor: col-resize !important; user-select: none; }
 .data-filter-menu { padding: 8px; width: 220px; }
 .data-filter-grid {
   display: grid;

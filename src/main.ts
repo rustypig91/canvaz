@@ -2292,6 +2292,36 @@ function setupTrace() {
   const headerRow = document.querySelector("#trace-table thead tr")!;
   const ths = Array.from(headerRow.children) as HTMLTableCellElement[];
   traceHeaderEls = ths;
+
+  // ── Column resize handles ─────────────────────────────────────────────────
+  const traceCols = Array.from(document.querySelectorAll<HTMLElement>("#trace-table colgroup col"));
+  ths.forEach((th, i) => {
+    const handle = document.createElement("span");
+    handle.className = "col-resizer";
+    handle.addEventListener("click", (e) => e.stopPropagation());
+    handle.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      const startX = e.clientX;
+      const startW = th.offsetWidth;
+      handle.classList.add("active");
+      document.body.classList.add("col-resizing");
+      const onMove = (ev: MouseEvent) => {
+        const w = Math.max(40, startW + ev.clientX - startX);
+        traceCols[i].style.width = `${w}px`;
+      };
+      const onUp = () => {
+        handle.classList.remove("active");
+        document.body.classList.remove("col-resizing");
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+      };
+      document.addEventListener("mousemove", onMove);
+      document.addEventListener("mouseup", onUp);
+    });
+    th.appendChild(handle);
+  });
+
   const thCols: TraceSortCol[] = ["ts", "dir", "channel", "canId", "msg", "dlc", "data", "cycle"];
   const thLabels = ["Timestamp", "Dir", "Channel", "CAN ID", "Message", "DLC", "Data", "Cycle (ms)"];
 
