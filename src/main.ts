@@ -1626,11 +1626,19 @@ async function exportCsv() {
 
 function setupMenuBar() {
   document.querySelectorAll<HTMLElement>(".menu-item").forEach(item => {
-    item.querySelector<HTMLButtonElement>(".menu-trigger")!.addEventListener("click", (e) => {
+    const trigger = item.querySelector<HTMLButtonElement>(".menu-trigger")!;
+    trigger.addEventListener("click", (e) => {
       e.stopPropagation();
       const isOpen = item.classList.contains("open");
       closeAllMenus();
       if (!isOpen) item.classList.add("open");
+    });
+    trigger.addEventListener("mouseenter", () => {
+      const anyOpen = document.querySelector(".menu-item.open");
+      if (anyOpen && anyOpen !== item) {
+        closeAllMenus();
+        item.classList.add("open");
+      }
     });
   });
   document.addEventListener("click", closeAllMenus);
