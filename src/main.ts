@@ -92,6 +92,12 @@ interface TraceFiltersConfig {
   max_rows?: number | null;
 }
 
+interface TraceColumnsConfig {
+  order?: string[];
+  hidden?: string[];
+  widths?: Record<string, number>;
+}
+
 interface Project {
   version: number;
   channels: ChannelConfig[];
@@ -99,6 +105,7 @@ interface Project {
   simulate_signals: SimulateEntry[];
   simulate_raw_frames?: SimRawFrameConfig[];
   trace_filters?: TraceFiltersConfig;
+  trace_columns?: TraceColumnsConfig;
   window_size_sec?: number;
 }
 
@@ -1388,6 +1395,11 @@ function buildProject(): Project {
       max_rows:   traceMaxRows,
     },
     window_size_sec: windowSizeSec,
+    trace_columns: {
+      order: traceColOrder,
+      hidden: [...traceColHidden],
+      widths: { ...traceColWidths },
+    },
   };
 }
 
@@ -1500,6 +1512,20 @@ async function applyProject(project: Project) {
     };
     simEntries.set(key, entry);
     container.appendChild(createSimEntryEl(key, entry));
+  }
+
+  // Restore trace column layout
+  if (project.trace_columns) {
+    const tc = project.trace_columns;
+    const validKeys = new Set(TRACE_COL_DEFS.map(d => d.key));
+    if (tc.order?.length) {
+      const saved = tc.order.filter(k => validKeys.has(k));
+      const missing = TRACE_COL_DEFS.map(d => d.key).filter(k => !saved.includes(k));
+      traceColOrder = [...saved, ...missing];
+    }
+    if (tc.hidden) traceColHidden = new Set(tc.hidden.filter(k => validKeys.has(k)));
+    if (tc.widths) traceColWidths = Object.fromEntries(Object.entries(tc.widths).filter(([k]) => validKeys.has(k)));
+    rebuildTraceColumns();
   }
 
   // Restore trace filter settings
@@ -2582,6 +2608,22 @@ function setupTrace() {
       item.append(cb, " ", def.label);
       menu.appendChild(item);
     }
+    const sep = document.createElement("div");
+    sep.style.cssText = "border-top:1px solid var(--border);margin:4px 0";
+    menu.appendChild(sep);
+    const resetBtn = document.createElement("button");
+    resetBtn.textContent = "Reset columns";
+    resetBtn.className = "filter-ctrl-btn";
+    resetBtn.style.cssText = "width:100%;margin:0";
+    resetBtn.addEventListener("click", () => {
+      traceColOrder = TRACE_COL_DEFS.map(d => d.key);
+      traceColHidden = new Set();
+      traceColWidths = {};
+      rebuildTraceColumns();
+      scheduleAutoSave();
+      ctxMenu?.remove(); ctxMenu = null;
+    });
+    menu.appendChild(resetBtn);
     ctxMenu = menu;
     document.body.appendChild(menu);
   });

@@ -14,6 +14,8 @@ pub struct Project {
     /// Data-retention window in seconds; samples older than this are discarded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_size_sec: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trace_columns: Option<TraceColumnsConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,6 +91,16 @@ pub struct TraceFiltersConfig {
 
 fn default_data_format() -> String { "hex".to_string() }
 fn default_true() -> bool { true }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct TraceColumnsConfig {
+    #[serde(default)]
+    pub order: Vec<String>,
+    #[serde(default)]
+    pub hidden: Vec<String>,
+    #[serde(default)]
+    pub widths: std::collections::HashMap<String, u32>,
+}
 
 #[allow(dead_code)]
 impl Project {
