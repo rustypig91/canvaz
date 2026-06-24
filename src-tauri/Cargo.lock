@@ -401,30 +401,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "can-hal-kvaser"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71894feeb416b2284a1025e1323262cc53707bd8a07b3d7455c723f517618257"
-dependencies = [
- "can-hal-rs",
- "libc",
- "libloading 0.8.9",
- "windows-sys 0.59.0",
-]
-
-[[package]]
-name = "can-hal-rs"
-version = "0.4.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7ed7db194a45dd9085677964d47363a392a9aef467da6de56f3445b6f3a00791"
-
-[[package]]
 name = "canvaz"
 version = "0.1.0"
 dependencies = [
  "can-dbc",
- "can-hal-kvaser",
- "can-hal-rs",
  "libloading 0.8.9",
  "log",
  "serde",
