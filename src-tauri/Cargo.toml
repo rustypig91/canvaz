@@ -25,10 +25,19 @@ libloading = { version = "0.8", optional = true }
 thiserror = "1"
 log = "0.4"
 
+# Platform defaults: on each target the crate is non-optional so it compiles
+# without requiring --features. The feature flags are still used in cfg() guards
+# and can be activated manually (e.g. --features kvaser on Linux).
+[target.'cfg(windows)'.dependencies]
+libloading = { version = "0.8" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socketcan = { version = "3" }
+
 [features]
 default = ["kvaser"]
-linux-can = ["socketcan"]
-kvaser = ["libloading"]
+kvaser = ["dep:libloading"]
+linux-can = ["dep:socketcan"]
 
 [profile.release]
 codegen-units = 1

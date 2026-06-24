@@ -1,11 +1,11 @@
 #[cfg(feature = "kvaser")]
 mod kvaser;
-#[cfg(target_os = "linux")]
+#[cfg(feature = "linux-can")]
 mod socketcan;
 
 #[cfg(feature = "kvaser")]
 use kvaser::{KvaserBackend, KvaserBackendChannel};
-#[cfg(target_os = "linux")]
+#[cfg(feature = "linux-can")]
 use socketcan::{SocketCanBackend, SocketCanChannel};
 
 use crate::app_state::AppState;
@@ -32,7 +32,7 @@ fn now_ms() -> u64 {
 // ── Channel ───────────────────────────────────────────────────────────────────
 
 pub enum Channel {
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "linux-can")]
     SocketCan(SocketCanChannel),
     #[cfg(feature = "kvaser")]
     Kvaser(KvaserBackendChannel),
@@ -41,7 +41,7 @@ pub enum Channel {
 macro_rules! dispatch {
     ($self:expr, $method:ident $(, $arg:expr)*) => {
         match $self {
-            #[cfg(target_os = "linux")]
+            #[cfg(feature = "linux-can")]
             Channel::SocketCan(c) => c.$method($($arg),*),
             #[cfg(feature = "kvaser")]
             Channel::Kvaser(c) => c.$method($($arg),*),
@@ -70,7 +70,7 @@ impl Channel {
 // ── Backend ───────────────────────────────────────────────────────────────────
 
 pub enum Backend {
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "linux-can")]
     SocketCan(SocketCanBackend),
     #[cfg(feature = "kvaser")]
     Kvaser(KvaserBackend),
@@ -79,7 +79,7 @@ pub enum Backend {
 impl Backend {
     pub fn name(&self) -> &str {
         match self {
-            #[cfg(target_os = "linux")]
+            #[cfg(feature = "linux-can")]
             Backend::SocketCan(backend) => backend.name(),
             #[cfg(feature = "kvaser")]
             Backend::Kvaser(backend) => backend.name(),
@@ -88,7 +88,7 @@ impl Backend {
 
     pub fn list_channels(&self) -> Result<Vec<String>, String> {
         match self {
-            #[cfg(target_os = "linux")]
+            #[cfg(feature = "linux-can")]
             Backend::SocketCan(backend) => backend.list_channels(),
             #[cfg(feature = "kvaser")]
             Backend::Kvaser(backend) => backend.list_channels(),
@@ -97,7 +97,7 @@ impl Backend {
 
     pub fn open_channel(&self, name: &str, bitrate: Option<u32>, state: Arc<AppState>) -> Result<Channel, String> {
         match self {
-            #[cfg(target_os = "linux")]
+            #[cfg(feature = "linux-can")]
             Backend::SocketCan(backend) => backend.open_channel(name, bitrate, state).map(Channel::SocketCan),
             #[cfg(feature = "kvaser")]
             Backend::Kvaser(backend) => backend.open_channel(name, bitrate, state).map(Channel::Kvaser),
@@ -107,7 +107,7 @@ impl Backend {
 
 pub fn default_backends() -> Vec<Backend> {
     let mut backends = Vec::new();
-    #[cfg(target_os = "linux")]
+    #[cfg(feature = "linux-can")]
     backends.push(Backend::SocketCan(SocketCanBackend));
     #[cfg(feature = "kvaser")]
     backends.push(Backend::Kvaser(KvaserBackend));
