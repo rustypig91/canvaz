@@ -142,12 +142,39 @@ const plotPanes: PlotPane[] = [];
 let paneCounter = 0;
 let viewPaused = false;
 
-// Batches chart redraws to one per animation frame instead of one per signal event.
-// Also updates the rolling X-axis window each frame so the view scrolls smoothly.
+// Continuous scroll loop — runs every animation frame while the app is live.
+// Advances the X-axis window by wall time so the chart scrolls smoothly even
+// when signals arrive infrequently. Also redraws any panes with new data.
+let scrollRafId: number | null = null;
+
+function startScrollLoop() {
+  if (scrollRafId !== null) return;
+  function tick() {
+    if (!appRunning || viewPaused) { scrollRafId = null; return; }
+    const now = (Date.now() - appStartTime) / 1000;
+    for (const pane of plotPanes) {
+      if (!pane.zoomed) {
+        const xScale = (pane.chart.options.scales as any)["x"];
+        xScale.min = Math.max(0, now - windowSizeSec);
+        xScale.max = Math.max(windowSizeSec, now);
+      }
+      pane.chart.update();
+    }
+    scrollRafId = requestAnimationFrame(tick);
+  }
+  scrollRafId = requestAnimationFrame(tick);
+}
+
+// markPaneDirty: used for one-shot updates when the scroll loop is not running
+// (app stopped, paused interactive edits). When the loop is active it handles
+// all redraws, so this is a no-op in that case.
 const dirtyPanes = new Set<PlotPane>();
 let rafPending = false;
 function markPaneDirty(pane: PlotPane) {
   if (viewPaused) return;
+  if (scrollRafId !== null) return; // scroll loop redraws every frame
+  // Fallback: one-shot update used when the scroll loop is not running
+  // (app stopped, or interactive edits while paused).
   dirtyPanes.add(pane);
   if (!rafPending) {
     rafPending = true;
@@ -161,7 +188,7 @@ function markPaneDirty(pane: PlotPane) {
           xScale.min = Math.max(0, now - windowSizeSec);
           xScale.max = Math.max(windowSizeSec, now);
         }
-        p.chart.update("none");
+        p.chart.update();
       }
     });
   }
@@ -1639,10 +1666,11 @@ async function startApp() {
     const xScale = (pane.chart.options.scales as any)["x"];
     xScale.min = 0;
     xScale.max = windowSizeSec;
-    pane.chart.update("none");
+    pane.chart.update();
   }
 
   clearTrace();
+  startScrollLoop();
 
   const btn = document.getElementById("btn-app-run")!;
   btn.textContent = "■ Stop";
@@ -1746,7 +1774,19 @@ function pruneOldData() {
     for (const s of pane.series.values()) {
       let i = 0;
       while (i < s.timestamps.length && s.timestamps[i] < cutoff) i++;
-      if (i > 0) { s.timestamps.splice(0, i); s.data.splice(0, i); }
+      // Replace the last out-of-window point with an interpolated anchor at exactly
+      // xScale.min so the line extends to the left edge and the Y-axis range includes it.
+      if (i >= 1) {
+        const p0 = s.data[i - 1];
+        const p1 = s.data[i];
+        if (p1 !== undefined && p0.x !== p1.x) {
+          const cutoffX = (cutoff - appStartTime) / 1000;
+          const ratio = (cutoffX - p0.x) / (p1.x - p0.x);
+          s.data[i - 1] = { x: cutoffX, y: p0.y + ratio * (p1.y - p0.y) };
+          s.timestamps[i - 1] = cutoff;
+        }
+        if (i > 1) { s.timestamps.splice(0, i - 1); s.data.splice(0, i - 1); }
+      }
     }
     markPaneDirty(pane);
   }
@@ -2732,8 +2772,9 @@ function resumeFromPause() {
       xScale.min = Math.max(0, now - windowSizeSec);
       xScale.max = Math.max(windowSizeSec, now);
     }
-    pane.chart.update("none");
+    pane.chart.update();
   }
+  startScrollLoop();
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -2941,4 +2982,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     await refreshChannelList();
     renderDbcTree();
   }
+
+  // App launches in running state — kick off the scroll loop immediately.
+  startScrollLoop();
 });
