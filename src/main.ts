@@ -1606,6 +1606,78 @@ async function exportCsv() {
   } catch (e) { setError(`Export error: ${e}`); }
 }
 
+// ── Preferences ─────────────────────────────────────────────────────────────
+// Per-user global preferences, persisted across restarts in the user's app data
+// dir (next to the session file, not in the project file). The whole object is
+// loaded into memory on startup and written back as a whole so new keys added
+// in the future are preserved. Sidebar width is the first such preference.
+
+interface Preferences {
+  sidebarWidth?: number;
+}
+
+let preferencesPath: string | null = null;
+let preferences: Preferences = {};
+
+async function loadPreferences() {
+  try {
+    const dir = await invoke<string>("get_app_data_dir");
+    preferencesPath = `${dir}/preferences.json`;
+    const raw = await invoke<string>("read_text_file", { path: preferencesPath });
+    preferences = JSON.parse(raw);
+  } catch {
+    // No saved preferences yet — keep defaults.
+  }
+}
+
+function savePreferences() {
+  if (!preferencesPath) return;
+  invoke("write_text_file", {
+    path: preferencesPath,
+    content: JSON.stringify(preferences, null, 2),
+  }).catch(() => {});
+}
+
+// ── Sidebar resize ─────────────────────────────────────────────────────────────
+
+const SIDEBAR_MIN_WIDTH = 200;
+const SIDEBAR_MAX_WIDTH = 600;
+
+function applySidebarWidth() {
+  if (typeof preferences.sidebarWidth === "number") {
+    document.getElementById("sidebar")!.style.width = `${preferences.sidebarWidth}px`;
+  }
+}
+
+function setupSidebarResize() {
+  const sidebar = document.getElementById("sidebar")!;
+  const resizer = document.getElementById("sidebar-resizer")!;
+  let dragging = false;
+
+  resizer.addEventListener("mousedown", (e) => {
+    e.preventDefault();
+    dragging = true;
+    resizer.classList.add("dragging");
+    document.body.classList.add("resizing");
+  });
+
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const left = sidebar.getBoundingClientRect().left;
+    const width = Math.max(SIDEBAR_MIN_WIDTH, Math.min(SIDEBAR_MAX_WIDTH, e.clientX - left));
+    sidebar.style.width = `${width}px`;
+  });
+
+  window.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove("dragging");
+    document.body.classList.remove("resizing");
+    preferences.sidebarWidth = Math.round(sidebar.getBoundingClientRect().width);
+    savePreferences();
+  });
+}
+
 // ── Menu bar ──────────────────────────────────────────────────────────────────
 
 function setupMenuBar() {
@@ -2415,6 +2487,11 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   // Menu bar
   setupMenuBar();
+
+  // Preferences (per-user, persisted across restarts)
+  await loadPreferences();
+  applySidebarWidth();
+  setupSidebarResize();
 
   // Drop zones
   setupDropZone();

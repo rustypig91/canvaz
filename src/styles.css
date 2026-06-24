@@ -270,11 +270,31 @@ kbd {
 #sidebar {
   width: var(--sidebar-width);
   min-width: 200px;
+  flex-shrink: 0;
   background: var(--bg2);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
   overflow: hidden;
+}
+
+/* Drag handle between sidebar and main content */
+#sidebar-resizer {
+  flex-shrink: 0;
+  width: 5px;
+  margin-left: -1px;
+  cursor: col-resize;
+  background: transparent;
+  transition: background 0.15s;
+  z-index: 5;
+}
+#sidebar-resizer:hover,
+#sidebar-resizer.dragging {
+  background: var(--accent);
+}
+body.resizing {
+  cursor: col-resize;
+  user-select: none;
 }
 
 .sidebar-section {
