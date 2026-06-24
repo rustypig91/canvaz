@@ -379,13 +379,14 @@ function createPlotPane(): PlotPane {
             const mag = Math.pow(10, Math.floor(Math.log10(rawStep)));
             const n = rawStep / mag;
             const step = n < 1.5 ? mag : n < 3.5 ? 2 * mag : n < 7.5 ? 5 * mag : 10 * mag;
-            // Ticks at exact multiples of step: they enter at axis.max (right edge)
-            // and exit when axis.min scrolls past them (y-axis / left edge).
-            const first = Math.ceil(axis.min / step) * step;
+            // Fixed-length tick array so Chart.js never sees a length change and
+            // skips the expensive layout pass. Origin snaps to step multiples;
+            // off-screen buffer slots absorb the discrete shift so visible lines
+            // enter at axis.max and exit at axis.min without any count change.
+            const stepCount = Math.ceil(range / step) + 2;
+            const origin = Math.ceil(axis.min / step) * step;
             const ticks: { value: number }[] = [];
-            for (let v = first; v <= axis.max + 1e-9; v += step) {
-              ticks.push({ value: v });
-            }
+            for (let i = 0; i < stepCount; i++) ticks.push({ value: origin + i * step });
             axis.ticks = ticks;
           },
           ticks: {
@@ -395,6 +396,12 @@ function createPlotPane(): PlotPane {
             callback: function(v, index, ticks) {
               const s = typeof v === "number" ? v : parseFloat(String(v));
               const range = this.max - this.min;
+              // Suppress the label while the line is within half a step of the right
+              // edge. The grid line enters at axis.max first; the label appears once
+              // it has scrolled far enough that its text fits without overflowing —
+              // which is what was forcing Chart.js to add right-padding and stutter.
+              const step = ticks.length >= 2 ? ticks[1].value - ticks[0].value : range;
+              if (s > this.max - step * 0.5) return null;
               const label = range < 1 ? `${Math.round(s * 1000)}ms` : `${Math.round(s)}s`;
               if (index > 0) {
                 const prev = ticks[index - 1].value;
