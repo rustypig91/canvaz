@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "CAN Signals",
+  "productName": "Canvaz",
   "version": "0.1.0",
-  "identifier": "com.christoffer.can-signals",
+  "identifier": "com.christoffer.canvaz",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
@@ -13,7 +13,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "CAN Signals",
+        "title": "Canvaz",
         "width": 1280,
         "height": 800,
         "minWidth": 900,

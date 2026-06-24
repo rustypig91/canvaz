@@ -1,12 +1,12 @@
 [package]
-name = "can_signals"
+name = "canvaz"
 version = "0.1.0"
-description = "CAN Bus Signal Viewer and Simulator"
+description = "CAN bus signal viewer and simulator"
 authors = ["Christoffer Zakrisson"]
 edition = "2021"
 
 [lib]
-name = "can_signals_lib"
+name = "canvaz_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]

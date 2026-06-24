@@ -419,7 +419,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7ed7db194a45dd9085677964d47363a392a9aef467da6de56f3445b6f3a00791"
 
 [[package]]
-name = "can_signals"
+name = "canvaz"
 version = "0.1.0"
 dependencies = [
  "can-dbc",

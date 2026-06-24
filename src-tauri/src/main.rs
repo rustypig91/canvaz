@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    can_signals_lib::run()
+    canvaz_lib::run()
 }

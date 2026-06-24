@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as dialogOpen, save as dialogSave } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Chart,
   LineController,
@@ -1339,11 +1340,17 @@ async function saveProject() {
   } else { await saveProjectAs(); }
 }
 
+function ensureCanvazExt(path: string): string {
+  return path.endsWith(".canvaz") ? path : `${path}.canvaz`;
+}
+
 async function saveProjectAs() {
   try {
-    const path = await dialogSave({ filters: [{ name: "CAN Project", extensions: ["canproj"] }] });
-    if (!path) return;
+    const raw = await dialogSave({ filters: [{ name: "Canvaz Project", extensions: ["canvaz"] }] });
+    if (!raw) return;
+    const path = ensureCanvazExt(raw);
     projectPath = path;
+    setProjectName(path);
     await invoke("save_project", { path, project: buildProject() });
     setStatus(`Saved: ${path}`);
   } catch (e) { setError(`Save error: ${e}`); }
@@ -1351,10 +1358,11 @@ async function saveProjectAs() {
 
 async function openProject() {
   try {
-    const path = await dialogOpen({ filters: [{ name: "CAN Project", extensions: ["canproj"] }], multiple: false });
+    const path = await dialogOpen({ filters: [{ name: "Canvaz Project", extensions: ["canvaz"] }], multiple: false });
     if (!path || Array.isArray(path)) return;
     const project = await invoke<Project>("load_project", { path });
     projectPath = path;
+    setProjectName(path);
     await applyProject(project);
     setStatus(`Loaded: ${path}`);
   } catch (e) { setError(`Load error: ${e}`); }
@@ -1568,7 +1576,7 @@ function stopApp() {
 async function exportCsv() {
   if (signalHistory.size === 0) { setStatus("No data to export"); return; }
   const path = await dialogSave({
-    defaultPath: "can_signals.csv",
+    defaultPath: "canvaz.csv",
     filters: [{ name: "CSV Files", extensions: ["csv"] }],
   });
   if (!path) return;
@@ -2268,6 +2276,10 @@ function setupTrace() {
 interface LogEntry { ts: string; text: string; isError: boolean; }
 const messageLog: LogEntry[] = [];
 
+function setProjectName(path: string | null) {
+  getCurrentWindow().setTitle(path ? `Canvaz — ${path}` : "Canvaz");
+}
+
 function setStatus(msg: string, isError = false) {
   const el = document.getElementById("status-bar")!;
   el.textContent = msg;
@@ -2426,7 +2438,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Resolve session file path, then try to restore the last session
   try {
     const dir = await invoke<string>("get_app_data_dir");
-    sessionFilePath = `${dir}/last-session.canproj`;
+    sessionFilePath = `${dir}/last-session.canvaz`;
     const project = await invoke<Project>("load_project", { path: sessionFilePath });
     await applyProject(project);
     setStatus("Session restored");
