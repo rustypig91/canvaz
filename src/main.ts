@@ -148,6 +148,26 @@ let viewPaused = false;
 // when signals arrive infrequently. Also redraws any panes with new data.
 let scrollRafId: number | null = null;
 
+// s.data[0] is the left-edge anchor (interpolated at cutoffX in pruneOldData).
+// cutoffX is computed at prune time, which is slightly behind xScale.min at render
+// time, so Chart.js auto-scaling excludes it from Y range. We extend the Y axis
+// via suggestedMin/suggestedMax so the anchor's Y value is always visible.
+function applyYRange(pane: PlotPane) {
+  let yMin = Infinity, yMax = -Infinity;
+  for (const s of pane.series.values()) {
+    const len = s.frozenLength ?? s.data.length;
+    if (len === 0) continue;
+    const y = s.data[0].y;
+    if (y < yMin) yMin = y;
+    if (y > yMax) yMax = y;
+  }
+  const yScale = (pane.chart.options.scales as any)["y"];
+  if (isFinite(yMin)) yScale.suggestedMin = yMin;
+  else delete yScale.suggestedMin;
+  if (isFinite(yMax)) yScale.suggestedMax = yMax;
+  else delete yScale.suggestedMax;
+}
+
 function startScrollLoop() {
   if (scrollRafId !== null) return;
   function tick() {
@@ -159,6 +179,7 @@ function startScrollLoop() {
         xScale.min = Math.max(0, now - windowSizeSec);
         xScale.max = Math.max(windowSizeSec, now);
       }
+      applyYRange(pane);
       pane.chart.update();
     }
     scrollRafId = requestAnimationFrame(tick);
@@ -189,6 +210,7 @@ function markPaneDirty(pane: PlotPane, force = false) {
           xScale.min = Math.max(0, now - windowSizeSec);
           xScale.max = Math.max(windowSizeSec, now);
         }
+        applyYRange(p);
         p.chart.update();
       }
     });
