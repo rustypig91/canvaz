@@ -42,7 +42,19 @@
         </div>
 
       </nav>
-      <button id="btn-app-run" class="running" title="Stop recording">■ Stop</button>
+      <button id="btn-app-run" class="running" title="Pause live capture">■ Stop</button>
+      <div id="window-size-ctrl" title="Discard signal data older than this">
+        <span>Window</span>
+        <select id="select-window">
+          <option value="30">30 s</option>
+          <option value="60">1 min</option>
+          <option value="300">5 min</option>
+          <option value="900">15 min</option>
+          <option value="1800">30 min</option>
+          <option value="custom">Custom…</option>
+        </select>
+        <input id="input-window-custom" type="number" min="1" placeholder="sec" />
+      </div>
       <span id="status-bar"></span>
       <button id="btn-show-log" title="View message log">Log</button>
     </header>
@@ -130,7 +142,7 @@
           <div id="trace-container">
             <table id="trace-table">
               <colgroup>
-                <col /><col style="width:46px" /><col /><col /><col /><col /><col /><col />
+                <col /><col /><col /><col /><col /><col /><col /><col />
               </colgroup>
               <thead>
                 <tr>

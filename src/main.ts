@@ -100,6 +100,7 @@ interface Project {
   simulate_signals: SimulateEntry[];
   simulate_raw_frames?: SimRawFrameConfig[];
   trace_filters?: TraceFiltersConfig;
+  window_size_sec?: number;
 }
 
 // ── Plot pane state ───────────────────────────────────────────────────────────
@@ -380,7 +381,8 @@ function onSignalValue(ev: SignalValueEvent) {
   if (!appRunning) return;
   const key = plotKey(ev.channel_id, ev.signal_name);
 
-  // Store in global history
+  // Store every signal in history; samples older than the window are discarded
+  // periodically by pruneOldData() to bound memory usage.
   let hist = signalHistory.get(key);
   if (!hist) { hist = []; signalHistory.set(key, hist); }
   hist.push({ ts: ev.timestamp_ms, value: ev.value, unit: ev.unit });
@@ -1324,6 +1326,7 @@ function buildProject(): Project {
       overwrite:  traceMode === "overwrite",
       max_rows:   traceMaxRows,
     },
+    window_size_sec: windowSizeSec,
   };
 }
 
@@ -1396,6 +1399,8 @@ async function applyProject(project: Project) {
       if (sig) addSignalToPane(pane, entry.channel, sig);
     }
   }
+
+  setWindowSize(project.window_size_sec ?? DEFAULT_WINDOW_SEC);
 
   for (const entry of simEntries.values()) { if (entry.timerId != null) clearInterval(entry.timerId); }
   simEntries.clear();
@@ -1562,8 +1567,8 @@ async function startApp() {
   const btn = document.getElementById("btn-app-run")!;
   btn.textContent = "■ Stop";
   btn.classList.add("running");
-  btn.title = "Stop recording";
-  setStatus("Recording started");
+  btn.title = "Pause live capture";
+  setStatus("Live capture started");
 }
 
 function stopApp() {
@@ -1571,17 +1576,18 @@ function stopApp() {
   const btn = document.getElementById("btn-app-run")!;
   btn.textContent = "▶ Start";
   btn.classList.remove("running");
-  btn.title = "Start recording";
-  setStatus("Recording stopped");
+  btn.title = "Resume live capture";
+  setStatus("Live capture paused");
 }
 
-async function exportCsv() {
-  if (signalHistory.size === 0) { setStatus("No data to export"); return; }
+/** Exports the signal history to CSV. Returns true if a file was saved. */
+async function exportCsv(): Promise<boolean> {
+  if (signalHistory.size === 0) { setStatus("No data to export"); return false; }
   const path = await dialogSave({
     defaultPath: "canvaz.csv",
     filters: [{ name: "CSV Files", extensions: ["csv"] }],
   });
-  if (!path) return;
+  if (!path) return false;
 
   const rows: string[] = ["timestamp_ms,elapsed_s,channel,signal_name,value,unit"];
   const allSamples: Array<{ ts: number; channel: string; signalName: string; value: number; unit: string }> = [];
@@ -1603,7 +1609,8 @@ async function exportCsv() {
   try {
     await invoke("write_text_file", { path, content: rows.join("\n") });
     setStatus(`Exported ${allSamples.length} samples to CSV`);
-  } catch (e) { setError(`Export error: ${e}`); }
+    return true;
+  } catch (e) { setError(`Export error: ${e}`); return false; }
 }
 
 // ── Preferences ─────────────────────────────────────────────────────────────
@@ -1636,6 +1643,89 @@ function savePreferences() {
     path: preferencesPath,
     content: JSON.stringify(preferences, null, 2),
   }).catch(() => {});
+}
+
+// ── Window size (data retention) ─────────────────────────────────────────────
+// Signal values older than the window are discarded, bounding memory usage.
+// The window size is a per-project setting (stored in the project file).
+
+const WINDOW_PRESETS = new Set([30, 60, 300, 900, 1800]);
+const DEFAULT_WINDOW_SEC = 60;
+let windowSizeSec = DEFAULT_WINDOW_SEC;
+
+function pruneOldData() {
+  const cutoff = Date.now() - windowSizeSec * 1000;
+  for (const [key, samples] of signalHistory) {
+    let i = 0;
+    while (i < samples.length && samples[i].ts < cutoff) i++;
+    if (i > 0) samples.splice(0, i);
+    if (samples.length === 0) signalHistory.delete(key);
+  }
+  if (plotPaused) return; // leave a frozen / zoomed chart untouched
+  for (const pane of plotPanes) {
+    let longest: PlotSeries | null = null;
+    for (const s of pane.series.values()) {
+      let i = 0;
+      while (i < s.timestamps.length && s.timestamps[i] < cutoff) i++;
+      if (i > 0) { s.timestamps.splice(0, i); s.values.splice(0, i); s.labels.splice(0, i); }
+      if (!longest || s.labels.length > longest.labels.length) longest = s;
+    }
+    (pane.chart.data as { labels: string[] }).labels = longest ? longest.labels : [];
+    pane.chart.update("none");
+  }
+}
+
+// Sync the toolbar controls to the current windowSizeSec.
+function reflectWindowSize() {
+  const select = document.getElementById("select-window") as HTMLSelectElement;
+  const custom = document.getElementById("input-window-custom") as HTMLInputElement;
+  if (WINDOW_PRESETS.has(windowSizeSec)) {
+    select.value = String(windowSizeSec);
+    custom.style.display = "none";
+  } else {
+    select.value = "custom";
+    custom.value = String(windowSizeSec);
+    custom.style.display = "";
+  }
+}
+
+// Apply a window size loaded from a project (updates UI + prunes, no autosave).
+function setWindowSize(sec: number) {
+  windowSizeSec = Math.max(1, Math.round(sec));
+  reflectWindowSize();
+  pruneOldData();
+}
+
+// User changed the control: apply and mark the project dirty.
+function applyWindowSize(sec: number) {
+  setWindowSize(sec);
+  scheduleAutoSave();
+}
+
+function setupWindowSize() {
+  const select = document.getElementById("select-window") as HTMLSelectElement;
+  const custom = document.getElementById("input-window-custom") as HTMLInputElement;
+
+  reflectWindowSize();
+
+  select.addEventListener("change", () => {
+    if (select.value === "custom") {
+      custom.style.display = "";
+      custom.focus();
+      const v = parseInt(custom.value);
+      if (v > 0) applyWindowSize(v);
+    } else {
+      custom.style.display = "none";
+      applyWindowSize(parseInt(select.value));
+    }
+  });
+  custom.addEventListener("change", () => {
+    const v = parseInt(custom.value);
+    if (v > 0) applyWindowSize(v);
+  });
+
+  // Periodically discard data older than the window.
+  setInterval(pruneOldData, 1000);
 }
 
 // ── Sidebar resize ─────────────────────────────────────────────────────────────
@@ -2499,6 +2589,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   await loadPreferences();
   applySidebarWidth();
   setupSidebarResize();
+  setupWindowSize();
 
   // Drop zones
   setupDropZone();

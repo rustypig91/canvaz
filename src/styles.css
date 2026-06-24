@@ -235,6 +235,29 @@ kbd {
   color: var(--danger);
 }
 
+#window-size-ctrl {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: 12px;
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+#window-size-ctrl select,
+#window-size-ctrl input {
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 11px;
+  font-family: inherit;
+  padding: 1px 4px;
+  height: calc(var(--menubar-height) - 8px);
+}
+#window-size-ctrl input { width: 60px; }
+
 .btn-icon {
   background: none;
   border: none;
@@ -757,16 +780,19 @@ body.resizing {
   table-layout: fixed;
 }
 #trace-table colgroup col:nth-child(1) { width: 100px; }
-#trace-table colgroup col:nth-child(2) { width: 46px; }
+#trace-table colgroup col:nth-child(2) { width: 56px; }
 #trace-table colgroup col:nth-child(3) { width: 80px; }
 #trace-table colgroup col:nth-child(4) { width: 90px; }
 #trace-table colgroup col:nth-child(5) { width: 160px; }
-#trace-table colgroup col:nth-child(6) { width: 44px; }
+#trace-table colgroup col:nth-child(6) { width: 56px; }
 #trace-table colgroup col:nth-child(7) { width: auto; }
 #trace-table colgroup col:nth-child(8) { width: 90px; }
 #trace-table thead th {
   position: sticky;
   top: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   background: var(--bg3);
   color: var(--text-muted);
   font-size: 10px;

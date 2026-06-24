@@ -11,6 +11,9 @@ pub struct Project {
     pub simulate_raw_frames: Vec<SimulateRawFrame>,
     #[serde(default)]
     pub trace_filters: Option<TraceFiltersConfig>,
+    /// Data-retention window in seconds; samples older than this are discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_size_sec: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
