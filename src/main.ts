@@ -67,7 +67,7 @@ interface CanFrameEvent {
 }
 
 interface PlotSignalEntry { signal_name: string; channel: string; }
-interface PlotPaneConfig  { signals: PlotSignalEntry[]; }
+interface PlotPaneConfig  { signals: PlotSignalEntry[]; interpolation?: string; }
 interface ChannelInfo     { id: string; backend: string; name: string; }
 interface ChannelConfig   { name: string; backend: string; dbc_path: string | null; bitrate?: number | null; }
 interface SimulateEntry   { signal_name: string; channel: string; value: number; period_ms: number; }
@@ -125,6 +125,7 @@ interface PlotSeries {
   timestamps: number[];       // absolute ms, used for pruning
   data: { x: number; y: number }[];  // x = elapsed seconds from appStartTime
   lastValue: number | null;
+  frozenLength: number | null; // data.length snapshot taken at pause time; null = not frozen
 }
 
 interface PlotPane {
@@ -132,7 +133,7 @@ interface PlotPane {
   el: HTMLElement;
   chart: Chart;
   series: Map<string, PlotSeries>;   // key: channel::signalName
-  interpolate: boolean;
+  interpolation: 'none' | 'linear' | 'smooth';
   showPoints: boolean;
   hoveredDatasetIndex: number | null;
   zoomed: boolean;
@@ -170,8 +171,8 @@ function startScrollLoop() {
 // all redraws, so this is a no-op in that case.
 const dirtyPanes = new Set<PlotPane>();
 let rafPending = false;
-function markPaneDirty(pane: PlotPane) {
-  if (viewPaused) return;
+function markPaneDirty(pane: PlotPane, force = false) {
+  if (!force && viewPaused) return; // data ingestion is suppressed while paused; force=true for user-driven changes
   if (scrollRafId !== null) return; // scroll loop redraws every frame
   // Fallback: one-shot update used when the scroll loop is not running
   // (app stopped, or interactive edits while paused).
@@ -182,7 +183,7 @@ function markPaneDirty(pane: PlotPane) {
       rafPending = false;
       for (const p of dirtyPanes) {
         dirtyPanes.delete(p);
-        if (appRunning && !p.zoomed) {
+        if (appRunning && !p.zoomed && !viewPaused) {
           const now = (Date.now() - appStartTime) / 1000;
           const xScale = (p.chart.options.scales as any)["x"];
           xScale.min = Math.max(0, now - windowSizeSec);
@@ -249,8 +250,26 @@ function updatePaneTitle(pane: PlotPane) {
   title.textContent = names.length ? names.join(", ") : `Plot ${pane.id.replace("pane-", "")}`;
 }
 
+function clearPaneZoom(pane: PlotPane) {
+  if (!pane.zoomed) return;
+  const zoomOpts = (pane.chart.options.plugins as any).zoom.zoom;
+  const saved = zoomOpts.onZoomComplete;
+  delete zoomOpts.onZoomComplete;
+  pane.chart.resetZoom();
+  zoomOpts.onZoomComplete = saved;
+  pane.zoomed = false;
+  pane.el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!.style.display = "none";
+}
+
+function snapshotPlotPanes() {
+  for (const pane of plotPanes)
+    for (const s of pane.series.values())
+      s.frozenLength = s.data.length;
+}
+
 function removeSigFromPane(pane: PlotPane, key: string) {
   if (!pane.series.delete(key)) return;
+  if (pane.series.size === 0) { closePlotPane(pane.id); return; }
   syncDatasets(pane);
   updatePaneTitle(pane);
   updateSignalHighlights();
@@ -261,7 +280,7 @@ function createPlotPane(): PlotPane {
   const id = `pane-${++paneCounter}`;
 
   // Allocate pane object first so legend callbacks can close over it
-  const pane: PlotPane = { id, el: null!, chart: null!, series: new Map(), interpolate: false, showPoints: false, hoveredDatasetIndex: null, zoomed: false };
+  const pane: PlotPane = { id, el: null!, chart: null!, series: new Map(), interpolation: 'none', showPoints: false, hoveredDatasetIndex: null, zoomed: false };
 
   const el = document.createElement("div");
   el.className = "plot-pane";
@@ -272,7 +291,11 @@ function createPlotPane(): PlotPane {
       <span class="pane-title">Plot ${paneCounter}</span>
       <button class="btn-reset-zoom pane-btn" title="Reset zoom" style="display:none">⟲</button>
       <button class="btn-show-points pane-btn" title="Show data points: off">•</button>
-      <button class="btn-interp pane-btn" title="Interpolation: off">∿</button>
+      <select class="sel-interp" title="Interpolation">
+        <option value="none">None</option>
+        <option value="linear">Linear</option>
+        <option value="smooth">Smooth</option>
+      </select>
       <button class="btn-close-pane" title="Close plot">×</button>
     </div>
     <div class="pane-canvas-wrap">
@@ -287,18 +310,13 @@ function createPlotPane(): PlotPane {
     btn.title = `Show data points: ${pane.showPoints ? "on" : "off"}`;
     syncDatasets(pane);
   });
-  el.querySelector<HTMLButtonElement>(".btn-interp")!.addEventListener("click", (e) => {
-    pane.interpolate = !pane.interpolate;
-    const btn = e.currentTarget as HTMLButtonElement;
-    btn.classList.toggle("active", pane.interpolate);
-    btn.title = `Interpolation: ${pane.interpolate ? "on" : "off"}`;
+  el.querySelector<HTMLSelectElement>(".sel-interp")!.addEventListener("change", (e) => {
+    pane.interpolation = (e.currentTarget as HTMLSelectElement).value as PlotPane["interpolation"];
     syncDatasets(pane);
   });
   const resetZoomBtn = el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!;
   resetZoomBtn.addEventListener("click", () => {
-    pane.chart.resetZoom();
-    pane.zoomed = false;
-    resetZoomBtn.style.display = "none";
+    clearPaneZoom(pane);
   });
 
   const canvas = el.querySelector<HTMLCanvasElement>("canvas")!;
@@ -344,6 +362,7 @@ function createPlotPane(): PlotPane {
               if (!viewPaused) {
                 viewPaused = true;
                 updatePauseViewBtn();
+                snapshotPlotPanes();
               }
             },
           },
@@ -421,7 +440,7 @@ function addSignalToPane(pane: PlotPane, channel: string, sig: DbcSignal) {
   const color = PLOT_COLORS[pane.series.size % PLOT_COLORS.length];
   const series: PlotSeries = {
     signalName: sig.name, messageName: sig.message_name, unit: sig.unit,
-    color, channel, timestamps: [], data: [], lastValue: null,
+    color, channel, timestamps: [], data: [], lastValue: null, frozenLength: null,
   };
 
   // Pre-populate from global history
@@ -440,7 +459,8 @@ function addSignalToPane(pane: PlotPane, channel: string, sig: DbcSignal) {
 }
 
 function syncDatasets(pane: PlotPane) {
-  const tension = pane.interpolate ? 0.4 : 0;
+  const tension = pane.interpolation === 'smooth' ? 0.4 : 0;
+  const stepped: 'before' | false = pane.interpolation === 'none' ? 'before' : false;
   const seriesArray = [...pane.series.values()];
 
   // Grow / shrink the datasets array to match the series count, mutating
@@ -457,7 +477,7 @@ function syncDatasets(pane: PlotPane) {
     const showDot = pane.showPoints || hovered;
     const ds = pane.chart.data.datasets[i] as any;
     ds.label = s.signalName;
-    ds.data = s.data;
+    ds.data = viewPaused && s.frozenLength !== null ? s.data.slice(0, s.frozenLength) : s.data;
     ds.borderColor = s.color;
     ds.pointBackgroundColor = s.color;
     ds.backgroundColor = "transparent";
@@ -465,10 +485,13 @@ function syncDatasets(pane: PlotPane) {
     ds.pointRadius = showDot ? 3 : 0;
     ds.pointHoverRadius = hovered ? 5 : 3;
     ds.tension = tension;
+    ds.stepped = stepped;
   }
   // Route through the RAF loop so there is never more than one update()
   // per frame, even when syncDatasets is called synchronously (e.g. hover).
-  markPaneDirty(pane);
+  // force=true: user-driven changes (interpolation, show-points, hover) must
+  // redraw even while the view is paused or zoomed.
+  markPaneDirty(pane, true);
 }
 
 // ── Signal value events ───────────────────────────────────────────────────────
@@ -1395,6 +1418,7 @@ function buildProject(): Project {
     })),
     plot_panes: plotPanes.map(pane => ({
       signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: s.channel })),
+      interpolation: pane.interpolation,
     })),
     simulate_signals: [...simEntries.values()].flatMap(e =>
       e.kind === "message"
@@ -1490,6 +1514,10 @@ async function applyProject(project: Project) {
 
   for (const paneConfig of project.plot_panes) {
     const pane = createPlotPane();
+    if (paneConfig.interpolation) {
+      pane.interpolation = paneConfig.interpolation as PlotPane["interpolation"];
+      pane.el.querySelector<HTMLSelectElement>(".sel-interp")!.value = pane.interpolation;
+    }
     for (const entry of paneConfig.signals) {
       const dbc = dbcByChannel.get(entry.channel);
       const sig = dbc?.messages.flatMap(m => m.signals).find(s => s.name === entry.signal_name);
@@ -1657,12 +1685,8 @@ async function startApp() {
 
   // Clear all plot pane data, reset zoom and X-axis bounds
   for (const pane of plotPanes) {
-    for (const s of pane.series.values()) { s.timestamps.length = 0; s.data.length = 0; s.lastValue = null; }
-    if (pane.zoomed) {
-      pane.chart.resetZoom();
-      pane.zoomed = false;
-      pane.el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!.style.display = "none";
-    }
+    for (const s of pane.series.values()) { s.timestamps.length = 0; s.data.length = 0; s.lastValue = null; s.frozenLength = null; }
+    clearPaneZoom(pane);
     const xScale = (pane.chart.options.scales as any)["x"];
     xScale.min = 0;
     xScale.max = windowSizeSec;
@@ -2764,14 +2788,19 @@ function resumeFromPause() {
     tbody.appendChild(frag); // buffer is newest-first, so newest lands at top
   }
 
-  // Bring all plot panes up to date with accumulated data.
+  // Bring all plot panes up to date with accumulated data; clear any zoom.
   const now = (Date.now() - appStartTime) / 1000;
   for (const pane of plotPanes) {
-    if (!pane.zoomed) {
-      const xScale = (pane.chart.options.scales as any)["x"];
-      xScale.min = Math.max(0, now - windowSizeSec);
-      xScale.max = Math.max(windowSizeSec, now);
+    const seriesArray = [...pane.series.values()];
+    for (let i = 0; i < seriesArray.length; i++) {
+      seriesArray[i].frozenLength = null;
+      const ds = pane.chart.data.datasets[i] as any;
+      if (ds) ds.data = seriesArray[i].data;
     }
+    clearPaneZoom(pane);
+    const xScale = (pane.chart.options.scales as any)["x"];
+    xScale.min = Math.max(0, now - windowSizeSec);
+    xScale.max = Math.max(windowSizeSec, now);
     pane.chart.update();
   }
   startScrollLoop();
@@ -2889,7 +2918,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.getElementById("btn-pause-view")!.addEventListener("click", () => {
     viewPaused = !viewPaused;
     updatePauseViewBtn();
-    if (!viewPaused) resumeFromPause();
+    if (viewPaused) snapshotPlotPanes();
+    else resumeFromPause();
   });
 
   // Log panel

@@ -35,6 +35,8 @@ fn default_backend() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct PlotPaneConfig {
     pub signals: Vec<PlotSignalEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interpolation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
