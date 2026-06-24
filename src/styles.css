@@ -235,6 +235,23 @@ kbd {
   color: var(--danger);
 }
 
+#btn-pause-view {
+  margin-left: 8px;
+  padding: 0 10px;
+  height: calc(var(--menubar-height) - 8px);
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: var(--bg3);
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  font-family: inherit;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+#btn-pause-view:hover { color: var(--text); border-color: var(--text-muted); }
+#btn-pause-view.running { background: rgba(245,158,11,0.15); border-color: #f59e0b; color: #f59e0b; }
+
 #window-size-ctrl {
   display: flex;
   align-items: center;

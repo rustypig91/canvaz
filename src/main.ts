@@ -140,13 +140,14 @@ interface PlotPane {
 
 const plotPanes: PlotPane[] = [];
 let paneCounter = 0;
-let plotPaused = false;
+let viewPaused = false;
 
 // Batches chart redraws to one per animation frame instead of one per signal event.
 // Also updates the rolling X-axis window each frame so the view scrolls smoothly.
 const dirtyPanes = new Set<PlotPane>();
 let rafPending = false;
 function markPaneDirty(pane: PlotPane) {
+  if (viewPaused) return;
   dirtyPanes.add(pane);
   if (!rafPending) {
     rafPending = true;
@@ -154,7 +155,7 @@ function markPaneDirty(pane: PlotPane) {
       rafPending = false;
       for (const p of dirtyPanes) {
         dirtyPanes.delete(p);
-        if (appRunning && !plotPaused && !p.zoomed) {
+        if (appRunning && !p.zoomed) {
           const now = (Date.now() - appStartTime) / 1000;
           const xScale = (p.chart.options.scales as any)["x"];
           xScale.min = Math.max(0, now - windowSizeSec);
@@ -313,11 +314,9 @@ function createPlotPane(): PlotPane {
             onZoomComplete: () => {
               pane.zoomed = true;
               resetZoomBtn.style.display = "";
-              if (!plotPaused) {
-                plotPaused = true;
-                const btn = document.getElementById("btn-pause-plot")!;
-                btn.textContent = "Resume";
-                btn.classList.add("running");
+              if (!viewPaused) {
+                viewPaused = true;
+                updatePauseViewBtn();
               }
             },
           },
@@ -476,16 +475,14 @@ function onSignalValue(ev: SignalValueEvent) {
     rangeEl.classList.remove("sig-value--empty");
   }
 
-  if (plotPaused) return;
   const x = (ev.timestamp_ms - appStartTime) / 1000;
-
   for (const pane of plotPanes) {
     const series = pane.series.get(key);
     if (!series) continue;
     series.timestamps.push(ev.timestamp_ms);
     series.data.push({ x, y: ev.value });
     series.lastValue = ev.value;
-    markPaneDirty(pane);
+    markPaneDirty(pane); // no-op while viewPaused; data accumulates in series
   }
 }
 
@@ -1627,11 +1624,9 @@ async function startApp() {
   // Rebuild DBC tree to clear sidebar values
   renderDbcTree((document.getElementById("signal-search") as HTMLInputElement).value);
 
-  // Reset plot pause state
-  plotPaused = false;
-  const pausePlotBtn = document.getElementById("btn-pause-plot")!;
-  pausePlotBtn.textContent = "Pause";
-  pausePlotBtn.classList.remove("running");
+  // Reset global pause state
+  viewPaused = false;
+  updatePauseViewBtn();
 
   // Clear all plot pane data, reset zoom and X-axis bounds
   for (const pane of plotPanes) {
@@ -1647,11 +1642,6 @@ async function startApp() {
     pane.chart.update("none");
   }
 
-  // Reset trace pause state and clear trace
-  tracePaused = false;
-  const pauseTraceBtn = document.getElementById("btn-pause-trace")!;
-  pauseTraceBtn.textContent = "Pause";
-  pauseTraceBtn.classList.remove("running");
   clearTrace();
 
   const btn = document.getElementById("btn-app-run")!;
@@ -1751,7 +1741,7 @@ function pruneOldData() {
     if (i > 0) samples.splice(0, i);
     if (samples.length === 0) signalHistory.delete(key);
   }
-  if (!appRunning || plotPaused) return; // leave a stopped / frozen / zoomed chart untouched
+  if (!appRunning || viewPaused) return; // leave a stopped / frozen chart untouched
   for (const pane of plotPanes) {
     for (const s of pane.series.values()) {
       let i = 0;
@@ -1940,7 +1930,6 @@ type TraceMode = "overwrite" | "append";
 type TraceDataFormat = "hex" | "dec" | "ascii";
 let traceMode: TraceMode = "overwrite";
 let traceDataFormat: TraceDataFormat = "hex";
-let tracePaused = false;
 let traceMaxRows = 1000;
 let traceHeaderEls: HTMLTableCellElement[] = [];
 
@@ -1965,6 +1954,7 @@ let colDropIndicator: HTMLDivElement | null = null;
 
 const traceLastTs = new Map<string, number>();
 const traceRowEls = new Map<string, HTMLTableRowElement>();
+const tracePendingOverwrite = new Map<string, TraceEntry>(); // accumulates overwrite updates while viewPaused
 const traceSeenChannels = new Set<string>();
 const traceSeenCanIds = new Set<number>();
 const traceSeenMsgNames = new Set<string>();
@@ -2194,8 +2184,9 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
 }
 
 function onCanFrame(ev: CanFrameEvent) {
-  if (!appRunning || tracePaused) return;
+  if (!appRunning) return;
 
+  // Always update seen sets (for filter autocomplete) and cycle timing.
   traceSeenChannels.add(ev.channel_id);
   traceSeenCanIds.add(ev.can_id);
   const msgNameForFrame = dbcByChannel.get(ev.channel_id)?.messages.find(m => m.id === ev.can_id)?.name ?? null;
@@ -2223,6 +2214,17 @@ function onCanFrame(ev: CanFrameEvent) {
     direction,
   };
 
+  if (traceMode === "append") {
+    traceAppendBuffer.unshift(entry);
+    if (traceAppendBuffer.length > traceMaxRows) traceAppendBuffer.pop();
+  }
+
+  if (viewPaused) {
+    // Accumulate latest state per key; DOM stays frozen until resume.
+    if (traceMode === "overwrite") tracePendingOverwrite.set(key, entry);
+    return;
+  }
+
   const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
 
   if (traceMode === "overwrite") {
@@ -2235,16 +2237,9 @@ function onCanFrame(ev: CanFrameEvent) {
       tbody.appendChild(tr);
     }
   } else {
-    // Buffer stores the last traceMaxRows entries regardless of filter.
-    traceAppendBuffer.unshift(entry);
-    if (traceAppendBuffer.length > traceMaxRows) traceAppendBuffer.pop();
-
-    // Only add a DOM row if the entry passes the current filter.
-    // The DOM therefore contains only visible rows — no hidden rows, no slow scans.
     if (traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) {
       const tr = buildTraceRow(entry);
       tbody.insertBefore(tr, tbody.firstChild);
-      // DOM visible-row count mirrors the buffer's visible subset; trim from the bottom.
       while (tbody.rows.length > traceMaxRows) tbody.deleteRow(-1);
     }
   }
@@ -2253,6 +2248,7 @@ function onCanFrame(ev: CanFrameEvent) {
 function clearTrace() {
   (document.getElementById("trace-tbody") as HTMLTableSectionElement).innerHTML = "";
   traceRowEls.clear();
+  tracePendingOverwrite.clear();
   traceLastTs.clear();
   traceSeenChannels.clear();
   traceSeenCanIds.clear();
@@ -2688,12 +2684,56 @@ function setupTrace() {
     scheduleAutoSave();
   });
 
-  const pauseBtn = document.getElementById("btn-pause-trace")!;
-  pauseBtn.addEventListener("click", () => {
-    tracePaused = !tracePaused;
-    pauseBtn.textContent = tracePaused ? "Resume" : "Pause";
-    pauseBtn.classList.toggle("running", tracePaused);
-  });
+}
+
+// ── Global pause ─────────────────────────────────────────────────────────────
+
+function updatePauseViewBtn() {
+  const btn = document.getElementById("btn-pause-view")!;
+  btn.textContent = viewPaused ? "Resume" : "Pause";
+  btn.classList.toggle("running", viewPaused);
+}
+
+function resumeFromPause() {
+  // Flush pending trace updates
+  const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
+  if (traceMode === "overwrite") {
+    for (const [key, entry] of tracePendingOverwrite) {
+      const existing = traceRowEls.get(key);
+      if (existing) {
+        updateTraceRowEl(existing, entry);
+      } else {
+        const tr = buildTraceRow(entry);
+        traceRowEls.set(key, tr);
+        tbody.appendChild(tr);
+      }
+    }
+    tracePendingOverwrite.clear();
+  } else {
+    // Re-render visible rows from the accumulated buffer (newest first).
+    tbody.innerHTML = "";
+    const frag = document.createDocumentFragment();
+    let count = 0;
+    for (const e of traceAppendBuffer) {
+      if (count >= traceMaxRows) break;
+      if (traceRowVisible(e.channel, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName)) {
+        frag.appendChild(buildTraceRow(e));
+        count++;
+      }
+    }
+    tbody.appendChild(frag); // buffer is newest-first, so newest lands at top
+  }
+
+  // Bring all plot panes up to date with accumulated data.
+  const now = (Date.now() - appStartTime) / 1000;
+  for (const pane of plotPanes) {
+    if (!pane.zoomed) {
+      const xScale = (pane.chart.options.scales as any)["x"];
+      xScale.min = Math.max(0, now - windowSizeSec);
+      xScale.max = Math.max(windowSizeSec, now);
+    }
+    pane.chart.update("none");
+  }
 }
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
@@ -2805,11 +2845,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     if (appRunning) stopApp(); else startApp();
   });
 
-  const pauseBtn = document.getElementById("btn-pause-plot")!;
-  pauseBtn.addEventListener("click", () => {
-    plotPaused = !plotPaused;
-    pauseBtn.textContent = plotPaused ? "Resume" : "Pause";
-    pauseBtn.classList.toggle("running", plotPaused);
+  document.getElementById("btn-pause-view")!.addEventListener("click", () => {
+    viewPaused = !viewPaused;
+    updatePauseViewBtn();
+    if (!viewPaused) resumeFromPause();
   });
 
   // Log panel
