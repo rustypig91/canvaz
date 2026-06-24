@@ -220,6 +220,7 @@ function markPaneDirty(pane: PlotPane, force = false) {
 let appRunning = true;
 let appStartTime = Date.now();
 
+
 interface SignalSample { ts: number; value: number; unit: string; }
 const signalHistory = new Map<string, SignalSample[]>();
 
@@ -340,7 +341,7 @@ function createPlotPane(): PlotPane {
   });
   const resetZoomBtn = el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!;
   resetZoomBtn.addEventListener("click", () => {
-    clearPaneZoom(pane);
+    for (const p of plotPanes) clearPaneZoom(p);
   });
 
   const canvas = el.querySelector<HTMLCanvasElement>("canvas")!;
@@ -387,6 +388,18 @@ function createPlotPane(): PlotPane {
                 viewPaused = true;
                 updatePauseViewBtn();
                 snapshotPlotPanes();
+              }
+              // Mirror the same x range to every other pane.
+              const zoomedX = (pane.chart.scales as any)["x"];
+              const zMin = zoomedX.min, zMax = zoomedX.max;
+              for (const other of plotPanes) {
+                if (other === pane) continue;
+                const xScale = (other.chart.options.scales as any)["x"];
+                xScale.min = zMin;
+                xScale.max = zMax;
+                other.zoomed = true;
+                other.el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!.style.display = "";
+                other.chart.update();
               }
             },
           },
