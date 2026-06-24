@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open as dialogOpen, save as dialogSave } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import {
   Chart,
   LineController,
@@ -1619,6 +1620,9 @@ function setupMenuBar() {
   document.getElementById("btn-about-close")!.addEventListener("click", () => {
     (document.getElementById("dialog-about") as HTMLDialogElement).close();
   });
+  document.getElementById("btn-github")!.addEventListener("click", () => {
+    openUrl("https://github.com/rustypig91/can-signals");
+  });
   document.addEventListener("keydown", (e) => {
     if (e.ctrlKey && !e.shiftKey && e.key === "o") { e.preventDefault(); handleMenuAction("open-project"); }
     if (e.ctrlKey && !e.shiftKey && e.key === "s") { e.preventDefault(); handleMenuAction("save-project"); }
@@ -1650,7 +1654,10 @@ function handleMenuAction(action: string) {
     case "save-project":    saveProject(); break;
     case "save-as-project": saveProjectAs(); break;
     case "export-csv":      exportCsv(); break;
-    case "about": (document.getElementById("dialog-about") as HTMLDialogElement).showModal(); break;
+    case "about":
+      invoke<string>("get_version").then(v => { document.getElementById("about-version")!.textContent = v; }).catch(() => {});
+      (document.getElementById("dialog-about") as HTMLDialogElement).showModal();
+      break;
   }
 }
 

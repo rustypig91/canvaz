@@ -214,16 +214,10 @@
     <dialog id="dialog-about">
       <div class="about-content">
         <h2>CAN Signals</h2>
-        <p class="about-version">Version 0.1.0</p>
+        <p class="about-version">Version <span id="about-version">…</span></p>
         <p>Desktop application for viewing and simulating CAN bus traffic using DBC files.</p>
-        <ul class="about-features">
-          <li>Load DBC files per channel</li>
-          <li>Real-time signal plotting</li>
-          <li>CAN frame simulation</li>
-          <li>Project save &amp; restore</li>
-          <li>Linux SocketCAN support</li>
-        </ul>
-        <div class="dialog-actions">
+<div class="about-footer">
+          <button id="btn-github" class="btn btn-sm about-github">GitHub ↗</button>
           <button id="btn-about-close" class="btn btn-primary">Close</button>
         </div>
       </div>

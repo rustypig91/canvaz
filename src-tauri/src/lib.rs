@@ -229,6 +229,13 @@ fn get_all_dbcs(
     Ok(state.dbc.read().map_err(|e| e.to_string())?.clone())
 }
 
+// ── Version ───────────────────────────────────────────────────────────────────
+
+#[tauri::command]
+fn get_version() -> &'static str {
+    env!("GIT_VERSION")
+}
+
 // ── App / file commands ───────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -288,6 +295,7 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            get_version,
             get_app_data_dir,
             write_text_file,
             provide_sudo_password,
