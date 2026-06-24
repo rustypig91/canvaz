@@ -1676,6 +1676,13 @@ function setupSidebarResize() {
     preferences.sidebarWidth = Math.round(sidebar.getBoundingClientRect().width);
     savePreferences();
   });
+
+  // Double-click resets the sidebar to its default (CSS) width.
+  resizer.addEventListener("dblclick", () => {
+    sidebar.style.width = "";
+    delete preferences.sidebarWidth;
+    savePreferences();
+  });
 }
 
 // ── Menu bar ──────────────────────────────────────────────────────────────────

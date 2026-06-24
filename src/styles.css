@@ -235,17 +235,6 @@ kbd {
   color: var(--danger);
 }
 
-.menu-option-row {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 5px 16px 5px 20px;
-  white-space: nowrap;
-  cursor: default;
-  font-size: 12px;
-  color: var(--text);
-}
-
 .btn-icon {
   background: none;
   border: none;
@@ -398,7 +387,6 @@ body.resizing {
   font-size: 11px;
   width: 100px;
 }
-.search-input:focus { outline: 1px solid var(--accent); }
 
 #dbc-tree {
   flex: 1;
@@ -597,7 +585,6 @@ body.resizing {
 .hint { font-size: 11px; color: var(--text-muted); font-weight: 400; text-transform: none; }
 
 /* ── Simulate tab ────────────────────────────────────────────────────────── */
-/* ── Simulate tab ────────────────────────────────────────────────────────── */
 #tab-simulate { flex-direction: column; }
 
 #sim-toolbar {
@@ -757,14 +744,6 @@ body.resizing {
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
-#select-trace-format {
-  background: var(--bg3);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  color: var(--text);
-  font-size: 11px;
-  padding: 2px 4px;
-}
 #trace-container {
   flex: 1;
   min-height: 0;
@@ -839,6 +818,7 @@ body.resizing {
 }
 .range-filter-inp:focus { outline: none; border-color: var(--accent); }
 #trace-table tbody tr { border-bottom: 1px solid rgba(255,255,255,0.04); }
+#trace-table tbody tr:nth-child(even) td { background: rgba(255,255,255,0.018); }
 #trace-table tbody tr:hover td { background: var(--bg3); }
 #trace-table tbody tr.dbc-match td:nth-child(5) { color: var(--accent); }
 #trace-table tbody tr.dbc-match { cursor: pointer; }
@@ -923,6 +903,14 @@ dialog {
   margin: auto;
 }
 dialog::backdrop { background: rgba(0,0,0,0.6); }
+dialog[open] { animation: dialog-in 0.15s ease-out; }
+dialog[open]::backdrop { animation: backdrop-in 0.15s ease-out; }
+@keyframes dialog-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.98); }
+}
+@keyframes backdrop-in {
+  from { opacity: 0; }
+}
 dialog h3 { margin-bottom: 16px; font-size: 15px; }
 .form-row { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
 .form-row label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; }
@@ -965,3 +953,28 @@ dialog { min-width: 380px; }
 ::-webkit-scrollbar { width: 6px; height: 6px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-muted); }
+* { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+/* ── Focus & interaction ─────────────────────────────────────────────────── */
+/* Consistent focus ring across every input, select, and button. */
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.3);
+}
+.btn:focus-visible,
+.btn-icon:focus-visible,
+.tab-btn:focus-visible,
+.menu-trigger:focus-visible,
+.menu-action:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.btn:active { transform: translateY(1px); }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+}
