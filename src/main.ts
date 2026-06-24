@@ -2385,6 +2385,16 @@ window.addEventListener("DOMContentLoaded", async () => {
     messageLog.length = 0;
     document.getElementById("log-entries")!.innerHTML = "";
   });
+  document.addEventListener("pointerdown", (e) => {
+    const panel = document.getElementById("log-panel")!;
+    if (panel.hidden) return;
+    if (!panel.contains(e.target as Node) && e.target !== document.getElementById("btn-show-log")) {
+      panel.hidden = true;
+    }
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") document.getElementById("log-panel")!.hidden = true;
+  });
 
   // Menu bar
   setupMenuBar();
