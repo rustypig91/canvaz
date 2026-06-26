@@ -67,10 +67,10 @@ interface CanFrameEvent {
 }
 
 interface PlotSignalEntry { signal_name: string; channel: string; }
-interface PlotPaneConfig  { signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean; }
-interface ChannelInfo     { id: string; backend: string; name: string; }
-interface ChannelConfig   { name: string; backend: string; dbc_path: string | null; bitrate?: number | null; }
-interface SimulateEntry   { signal_name: string; channel: string; value: number; period_ms: number; }
+interface PlotPaneConfig { signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean; }
+interface ChannelInfo { id: string; backend: string; name: string; }
+interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate?: number | null; }
+interface SimulateEntry { signal_name: string; channel: string; value: number; period_ms: number; }
 
 interface SimRawFrameConfig {
   channel: string; can_id: number; is_extended: boolean;
@@ -112,8 +112,8 @@ interface Project {
 // ── Plot pane state ───────────────────────────────────────────────────────────
 
 const PLOT_COLORS = [
-  "#3b82f6","#22c55e","#f59e0b","#ef4444",
-  "#8b5cf6","#06b6d4","#f97316","#ec4899",
+  "#3b82f6", "#22c55e", "#f59e0b", "#ef4444",
+  "#8b5cf6", "#06b6d4", "#f97316", "#ec4899",
 ];
 
 interface PlotSeries {
@@ -262,9 +262,9 @@ function decodeSignal(data: number[], sig: DbcSignal): number {
 function formatSigValue(value: number, unit: string): string {
   const abs = Math.abs(value);
   const s = abs >= 10000 ? value.toFixed(0)
-           : abs >= 100  ? value.toFixed(1)
-           : abs >= 10   ? value.toFixed(2)
-           : value.toFixed(3);
+    : abs >= 100 ? value.toFixed(1)
+      : abs >= 10 ? value.toFixed(2)
+        : value.toFixed(3);
   return unit ? `${s} ${unit}` : s;
 }
 
@@ -457,7 +457,7 @@ function createPlotPane(): PlotPane {
             color: "#71717a",
             maxTicksLimit: 8,
             maxRotation: 0,
-            callback: function(v, index, ticks) {
+            callback: function (v, index, ticks) {
               const s = typeof v === "number" ? v : parseFloat(String(v));
               const range = this.max - this.min;
               // Suppress the label while the line is within half a step of the right
@@ -637,9 +637,8 @@ function renderDbcTree(filter = "") {
 
   const dbc = selectedChannel ? dbcByChannel.get(selectedChannel) : null;
   if (!dbc) {
-    tree.innerHTML = `<div style="padding:8px 12px;color:var(--text-muted);font-size:11px">${
-      selectedChannel ? "No DBC loaded for this channel" : "Select a channel"
-    }</div>`;
+    tree.innerHTML = `<div style="padding:8px 12px;color:var(--text-muted);font-size:11px">${selectedChannel ? "No DBC loaded for this channel" : "Select a channel"
+      }</div>`;
     return;
   }
 
@@ -656,7 +655,7 @@ function renderDbcTree(filter = "") {
     if (filter) details.open = true;
 
     const summary = document.createElement("summary");
-    summary.innerHTML = `${msg.name}<span class="msg-id-badge">0x${msg.id.toString(16).toUpperCase().padStart(3,"0")}</span>`;
+    summary.innerHTML = `${msg.name}<span class="msg-id-badge">0x${msg.id.toString(16).toUpperCase().padStart(3, "0")}</span>`;
     details.appendChild(summary);
 
     for (const sig of visibleSignals) {
@@ -810,12 +809,12 @@ const channelBitrates = new Map<string, number | null>(); // channel_id → bitr
 const interfaceBackends = new Map<string, string>();      // from list_can_interfaces: name → backend
 
 function channelDisplayName(id: string) { return id.includes(':') ? id.split(':')[1] : id; }
-function channelBackend(id: string)     { return id.includes(':') ? id.split(':')[0] : ""; }
+function channelBackend(id: string) { return id.includes(':') ? id.split(':')[0] : ""; }
 const signalLastValues = new Map<string, number>();
-const signalMinValues  = new Map<string, number>();
-const signalMaxValues  = new Map<string, number>();
-const signalValueEls   = new Map<string, HTMLElement>();
-const signalRangeEls   = new Map<string, HTMLElement>();
+const signalMinValues = new Map<string, number>();
+const signalMaxValues = new Map<string, number>();
+const signalValueEls = new Map<string, HTMLElement>();
+const signalRangeEls = new Map<string, HTMLElement>();
 let selectedChannel: string | null = null;
 
 // ── Auto-save / session restore ───────────────────────────────────────────────
@@ -841,7 +840,7 @@ let lastProjectIndexPath: string | null = null;
 
 function persistLastProjectPath(path: string) {
   if (lastProjectIndexPath)
-    invoke("write_text_file", { path: lastProjectIndexPath, content: path }).catch(() => {});
+    invoke("write_text_file", { path: lastProjectIndexPath, content: path }).catch(() => { });
 }
 
 // ── Channel dialog ────────────────────────────────────────────────────────────
@@ -870,7 +869,7 @@ function setBitrateInDialog(bitrate: number | null, isVcan: boolean) {
   if (isVcan) {
     sel.value = "vcan";
     custom.style.display = "none";
-  } else if (bitrate != null && ["125000","250000","500000","1000000"].includes(String(bitrate))) {
+  } else if (bitrate != null && ["125000", "250000", "500000", "1000000"].includes(String(bitrate))) {
     sel.value = String(bitrate);
     custom.style.display = "none";
   } else if (bitrate != null) {
@@ -941,8 +940,8 @@ async function openChannelDialog(mode: DialogMode, channelName?: string) {
 function promptSudoPassword(): Promise<string | null> {
   return new Promise((resolve) => {
     const dialog = document.getElementById("dialog-sudo") as HTMLDialogElement;
-    const input  = document.getElementById("input-sudo-pw") as HTMLInputElement;
-    const form   = document.getElementById("form-sudo")!;
+    const input = document.getElementById("input-sudo-pw") as HTMLInputElement;
+    const form = document.getElementById("form-sudo")!;
     const cancel = document.getElementById("btn-sudo-cancel")!;
 
     input.value = "";
@@ -1021,7 +1020,7 @@ async function applyChannelDialog() {
     const wasOpen = openChannels.includes(id);
 
     if (wasOpen) {
-      try { await invoke("close_channel", { channelId: id }); dbcByChannel.delete(id); } catch {}
+      try { await invoke("close_channel", { channelId: id }); dbcByChannel.delete(id); } catch { }
     }
     const info = await openChannel(backend, name, bitrate);
     if (!info) { dialog.close(); return; }
@@ -1241,16 +1240,18 @@ function renderChannelList() {
       e.preventDefault();
       showContextMenu(e.clientX, e.clientY, [
         { label: "Configure…", action: () => openChannelDialog("edit", id) },
-        { label: "Close Channel", danger: true, action: async () => {
-          try {
-            await invoke("close_channel", { channelId: id });
-            dbcByChannel.delete(id);
-            channelBitrates.delete(id);
-            if (selectedChannel === id) selectChannel(null);
-            await refreshChannelList();
-            scheduleAutoSave();
-          } catch (err) { setError(`Close error: ${err}`); }
-        }},
+        {
+          label: "Close Channel", danger: true, action: async () => {
+            try {
+              await invoke("close_channel", { channelId: id });
+              dbcByChannel.delete(id);
+              channelBitrates.delete(id);
+              if (selectedChannel === id) selectChannel(null);
+              await refreshChannelList();
+              scheduleAutoSave();
+            } catch (err) { setError(`Close error: ${err}`); }
+          }
+        },
       ]);
     });
     item.querySelector(".btn-close-ch")!.addEventListener("click", async (e) => {
@@ -1351,7 +1352,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         <label class="sim-ext-label label-muted"><input type="checkbox" class="sim-ext-cb"${entry.isExtended ? " checked" : ""}> Ext</label>
         <span class="label-muted">DLC</span>
         <select class="sim-dlc-sel">
-          ${[1,2,3,4,5,6,7,8].map(n => `<option value="${n}"${n === entry.dlc ? " selected" : ""}>${n}</option>`).join("")}
+          ${[1, 2, 3, 4, 5, 6, 7, 8].map(n => `<option value="${n}"${n === entry.dlc ? " selected" : ""}>${n}</option>`).join("")}
         </select>
         <span class="label-muted">Period</span>
         <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
@@ -1363,7 +1364,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         <div class="sim-raw-data-row">
           <span class="label-muted">Data</span>
           <div class="sim-bytes">
-            ${entry.data.map((b, i) => `<input type="text" class="sim-byte" data-idx="${i}" value="${b.toString(16).toUpperCase().padStart(2,"0")}" maxlength="2"${i >= entry.dlc ? " disabled" : ""}>`).join("")}
+            ${entry.data.map((b, i) => `<input type="text" class="sim-byte" data-idx="${i}" value="${b.toString(16).toUpperCase().padStart(2, "0")}" maxlength="2"${i >= entry.dlc ? " disabled" : ""}>`).join("")}
           </div>
         </div>
       </div>`;
@@ -1517,18 +1518,18 @@ function buildProject(): Project {
       .filter((e): e is SimRawEntry => e.kind === "raw")
       .map(e => ({ channel: e.channel, can_id: e.canId, is_extended: e.isExtended, dlc: e.dlc, data: e.data, period_ms: e.periodMs })),
     trace_filters: {
-      channels:   traceFilterChannels  ? [...traceFilterChannels]  : null,
-      can_ids:    traceFilterCanIds    ? [...traceFilterCanIds]    : null,
-      msg_names:  traceFilterMsgNames  ? [...traceFilterMsgNames]  : null,
-      dir:        traceFilterDir       ? [...traceFilterDir]       : null,
-      dlc_min:    traceFilterDlcMin,
-      dlc_max:    traceFilterDlcMax,
-      cycle_min:  traceFilterCycleMin,
-      cycle_max:  traceFilterCycleMax,
-      data:       traceFilterData,
+      channels: traceFilterChannels ? [...traceFilterChannels] : null,
+      can_ids: traceFilterCanIds ? [...traceFilterCanIds] : null,
+      msg_names: traceFilterMsgNames ? [...traceFilterMsgNames] : null,
+      dir: traceFilterDir ? [...traceFilterDir] : null,
+      dlc_min: traceFilterDlcMin,
+      dlc_max: traceFilterDlcMax,
+      cycle_min: traceFilterCycleMin,
+      cycle_max: traceFilterCycleMax,
+      data: traceFilterData,
       data_format: traceDataFormat,
-      overwrite:  traceMode === "overwrite",
-      max_rows:   traceMaxRows,
+      overwrite: traceMode === "overwrite",
+      max_rows: traceMaxRows,
     },
     window_size_sec: windowSizeSec,
     trace_columns: {
@@ -1690,14 +1691,14 @@ function syncFilteredHeaders() {
 }
 
 function restoreTraceFilters(f: TraceFiltersConfig) {
-  traceFilterChannels  = f.channels  ? new Set(f.channels)        : null;
-  traceFilterCanIds    = f.can_ids   ? new Set(f.can_ids)         : null;
-  traceFilterMsgNames  = f.msg_names ? new Set(f.msg_names)       : null;
-  traceFilterDir       = f.dir       ? new Set(f.dir)             : null;
-  traceFilterDlcMin    = f.dlc_min   ?? null;
-  traceFilterDlcMax    = f.dlc_max   ?? null;
-  traceFilterCycleMin  = f.cycle_min ?? null;
-  traceFilterCycleMax  = f.cycle_max ?? null;
+  traceFilterChannels = f.channels ? new Set(f.channels) : null;
+  traceFilterCanIds = f.can_ids ? new Set(f.can_ids) : null;
+  traceFilterMsgNames = f.msg_names ? new Set(f.msg_names) : null;
+  traceFilterDir = f.dir ? new Set(f.dir) : null;
+  traceFilterDlcMin = f.dlc_min ?? null;
+  traceFilterDlcMax = f.dlc_max ?? null;
+  traceFilterCycleMin = f.cycle_min ?? null;
+  traceFilterCycleMax = f.cycle_max ?? null;
   const savedData = f.data ?? [];
   traceFilterData = Array.from({ length: 8 }, (_, i) => savedData[i] ?? null);
 
@@ -1868,7 +1869,7 @@ function savePreferences() {
   invoke("write_text_file", {
     path: preferencesPath,
     content: JSON.stringify(preferences, null, 2),
-  }).catch(() => {});
+  }).catch(() => { });
 }
 
 // ── Window size (data retention) ─────────────────────────────────────────────
@@ -2048,7 +2049,7 @@ function setupMenuBar() {
   document.addEventListener("keydown", (e) => {
     if (e.ctrlKey && !e.shiftKey && e.key === "o") { e.preventDefault(); handleMenuAction("open-project"); }
     if (e.ctrlKey && !e.shiftKey && e.key === "s") { e.preventDefault(); handleMenuAction("save-project"); }
-    if (e.ctrlKey && e.shiftKey  && e.key === "S") { e.preventDefault(); handleMenuAction("save-as-project"); }
+    if (e.ctrlKey && e.shiftKey && e.key === "S") { e.preventDefault(); handleMenuAction("save-as-project"); }
   });
 
 }
@@ -2059,12 +2060,12 @@ function closeAllMenus() {
 
 function handleMenuAction(action: string) {
   switch (action) {
-    case "open-project":    openProject(); break;
-    case "save-project":    saveProject(); break;
+    case "open-project": openProject(); break;
+    case "save-project": saveProject(); break;
     case "save-as-project": saveProjectAs(); break;
-    case "export-csv":      exportCsv(); break;
+    case "export-csv": exportCsv(); break;
     case "about":
-      invoke<string>("get_version").then(v => { document.getElementById("about-version")!.textContent = v; }).catch(() => {});
+      invoke<string>("get_version").then(v => { document.getElementById("about-version")!.textContent = v; }).catch(() => { });
       (document.getElementById("dialog-about") as HTMLDialogElement).showModal();
       break;
   }
@@ -2093,14 +2094,14 @@ let traceHeaderEls: HTMLTableCellElement[] = [];
 
 interface TraceColDef { key: string; label: string; defaultWidth: number; }
 const TRACE_COL_DEFS: TraceColDef[] = [
-  { key: "ts",      label: "Timestamp",  defaultWidth: 100 },
-  { key: "dir",     label: "Dir",        defaultWidth: 56  },
-  { key: "channel", label: "Channel",    defaultWidth: 80  },
-  { key: "canId",   label: "CAN ID",     defaultWidth: 90  },
-  { key: "msg",     label: "Message",    defaultWidth: 160 },
-  { key: "dlc",     label: "DLC",        defaultWidth: 56  },
-  { key: "data",    label: "Data",       defaultWidth: 0   },
-  { key: "cycle",   label: "Cycle (ms)", defaultWidth: 90  },
+  { key: "ts", label: "Timestamp", defaultWidth: 100 },
+  { key: "dir", label: "Dir", defaultWidth: 56 },
+  { key: "channel", label: "Channel", defaultWidth: 80 },
+  { key: "canId", label: "CAN ID", defaultWidth: 90 },
+  { key: "msg", label: "Message", defaultWidth: 160 },
+  { key: "dlc", label: "DLC", defaultWidth: 56 },
+  { key: "data", label: "Data", defaultWidth: 0 },
+  { key: "cycle", label: "Cycle (ms)", defaultWidth: 90 },
 ];
 let traceColOrder: string[] = TRACE_COL_DEFS.map(d => d.key);
 let traceColHidden = new Set<string>();
@@ -2143,8 +2144,8 @@ function fmtId(canId: number, isExtended: boolean): string {
 
 function fmtData(data: number[]): string {
   switch (traceDataFormat) {
-    case "hex":   return data.map(b => b.toString(16).toUpperCase().padStart(2, "0")).join(" ");
-    case "dec":   return data.map(b => b.toString().padStart(3, " ")).join(" ");
+    case "hex": return data.map(b => b.toString(16).toUpperCase().padStart(2, "0")).join(" ");
+    case "dec": return data.map(b => b.toString().padStart(3, " ")).join(" ");
     case "ascii": return data.map(b => b >= 32 && b < 127 ? String.fromCharCode(b) : ".").join("");
   }
 }
@@ -2232,12 +2233,12 @@ function applyTraceSort() {
   rows.sort((a, b) => {
     let cmp = 0;
     switch (col) {
-      case "ts":      cmp = parseInt(a.dataset.ts ?? "0") - parseInt(b.dataset.ts ?? "0"); break;
-      case "dir":     cmp = (a.dataset.dir ?? "").localeCompare(b.dataset.dir ?? ""); break;
+      case "ts": cmp = parseInt(a.dataset.ts ?? "0") - parseInt(b.dataset.ts ?? "0"); break;
+      case "dir": cmp = (a.dataset.dir ?? "").localeCompare(b.dataset.dir ?? ""); break;
       case "channel": cmp = (a.dataset.channel ?? "").localeCompare(b.dataset.channel ?? ""); break;
-      case "canId":   cmp = parseInt(a.dataset.canid ?? "0") - parseInt(b.dataset.canid ?? "0"); break;
-      case "msg":     cmp = (a.dataset.msg ?? "").localeCompare(b.dataset.msg ?? ""); break;
-      case "dlc":     cmp = parseInt(a.dataset.dlc ?? "0") - parseInt(b.dataset.dlc ?? "0"); break;
+      case "canId": cmp = parseInt(a.dataset.canid ?? "0") - parseInt(b.dataset.canid ?? "0"); break;
+      case "msg": cmp = (a.dataset.msg ?? "").localeCompare(b.dataset.msg ?? ""); break;
+      case "dlc": cmp = parseInt(a.dataset.dlc ?? "0") - parseInt(b.dataset.dlc ?? "0"); break;
       case "data": {
         const ba: number[] = JSON.parse(a.dataset.bytes ?? "[]");
         const bb: number[] = JSON.parse(b.dataset.bytes ?? "[]");
@@ -2265,15 +2266,15 @@ function applyTraceSort() {
 function buildTraceCellHtml(key: string, entry: TraceEntry): string {
   const dirClass = entry.direction === "tx" ? "dir-tx" : "dir-rx";
   switch (key) {
-    case "ts":      return `<td data-col="ts" class="td-ts">${fmtElapsed(entry.timestampMs)}</td>`;
-    case "dir":     return `<td data-col="dir"><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>`;
+    case "ts": return `<td data-col="ts" class="td-ts">${fmtElapsed(entry.timestampMs)}</td>`;
+    case "dir": return `<td data-col="dir"><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>`;
     case "channel": return `<td data-col="channel">${channelDisplayName(entry.channel)}</td>`;
-    case "canId":   return `<td data-col="canId" class="td-canid">${fmtId(entry.canId, entry.isExtended)}</td>`;
-    case "msg":     return `<td data-col="msg"${entry.messageName ? ` title="${entry.messageName}"` : ""}>${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>`;
-    case "dlc":     return `<td data-col="dlc" style="text-align:center">${entry.dlc}</td>`;
-    case "data":    return `<td data-col="data" class="td-data">${fmtData(entry.data)}</td>`;
-    case "cycle":   return `<td data-col="cycle" class="td-cycle">${entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—"}</td>`;
-    default:        return `<td data-col="${key}"></td>`;
+    case "canId": return `<td data-col="canId" class="td-canid">${fmtId(entry.canId, entry.isExtended)}</td>`;
+    case "msg": return `<td data-col="msg"${entry.messageName ? ` title="${entry.messageName}"` : ""}>${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>`;
+    case "dlc": return `<td data-col="dlc" style="text-align:center">${entry.dlc}</td>`;
+    case "data": return `<td data-col="data" class="td-data">${fmtData(entry.data)}</td>`;
+    case "cycle": return `<td data-col="cycle" class="td-cycle">${entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—"}</td>`;
+    default: return `<td data-col="${key}"></td>`;
   }
 }
 
@@ -2442,14 +2443,14 @@ function updateClearFiltersBtn() {
 }
 
 function clearAllFilters() {
-  traceFilterChannels  = null;
-  traceFilterCanIds    = null;
-  traceFilterMsgNames  = null;
-  traceFilterDir       = null;
-  traceFilterDlcMin    = null;
-  traceFilterDlcMax    = null;
-  traceFilterCycleMin  = null;
-  traceFilterCycleMax  = null;
+  traceFilterChannels = null;
+  traceFilterCanIds = null;
+  traceFilterMsgNames = null;
+  traceFilterDir = null;
+  traceFilterDlcMin = null;
+  traceFilterDlcMax = null;
+  traceFilterCycleMin = null;
+  traceFilterCycleMax = null;
   traceFilterData.fill(null);
   syncFilteredHeaders();
   applyTraceFilter();
@@ -3067,7 +3068,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   // Sudo password request from the Rust backend — show dialog once, cache in Rust.
   await listen("request-sudo-password", async () => {
     const pw = await promptSudoPassword();
-    await invoke("provide_sudo_password", { password: pw ?? null }).catch(() => {});
+    await invoke("provide_sudo_password", { password: pw ?? null }).catch(() => { });
   });
 
   // Resolve paths
