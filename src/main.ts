@@ -184,7 +184,7 @@ function applyYRange(pane: PlotPane) {
 function startScrollLoop() {
   if (scrollRafId !== null) return;
   function tick() {
-    if (!appRunning || viewPaused) { scrollRafId = null; return; }
+    if (!appRunning || viewPaused || !plotTabActive) { scrollRafId = null; return; }
     const now = (Date.now() - appStartTime) / 1000;
     for (const pane of plotPanes) {
       if (!pane.zoomed) {
@@ -207,6 +207,7 @@ const dirtyPanes = new Set<PlotPane>();
 let rafPending = false;
 function markPaneDirty(pane: PlotPane, force = false) {
   if (!force && viewPaused) return; // data ingestion is suppressed while paused; force=true for user-driven changes
+  if (!plotTabActive) return; // don't render when plot tab is not visible
   if (scrollRafId !== null) return; // scroll loop redraws every frame
   // Fallback: one-shot update used when the scroll loop is not running
   // (app stopped, or interactive edits while paused).
@@ -232,6 +233,7 @@ function markPaneDirty(pane: PlotPane, force = false) {
 
 let appRunning = false;
 let appStartTime = Date.now();
+let plotTabActive = true; // plot tab is the default active tab
 
 // Middle-mouse pan state
 let midPan: { startX: number; startMin: number; startMax: number; chartWidth: number } | null = null;
@@ -546,9 +548,8 @@ async function addSignalToPane(pane: PlotPane, channel: string, sig: DbcSignal) 
     // are already in series.timestamps (pushed by onSignalValue). Prepend only
     // historical samples that are older than the first live sample.
     try {
-      const sinceMs = Date.now() - windowSizeSec * 1000;
       const history = await invoke<Array<{ timestamp_ms: number; value: number }>>(
-        "get_signal_history", { channelId: channel, signalName: sig.name, sinceMs }
+        "get_signal_history", { channelId: channel, signalName: sig.name, sinceMs: 0 }
       );
       const liveStart = series.timestamps[0] ?? Infinity;
       const toInsert = history.filter(s => s.timestamp_ms < liveStart);
@@ -3085,6 +3086,8 @@ window.addEventListener("DOMContentLoaded", async () => {
       document.querySelectorAll(".tab-content").forEach(c => c.classList.remove("active"));
       btn.classList.add("active");
       document.getElementById(`tab-${btn.dataset.tab}`)!.classList.add("active");
+      plotTabActive = btn.dataset.tab === "plot";
+      if (plotTabActive && appRunning && !viewPaused) startScrollLoop();
       if (btn.dataset.tab === "trace" && appRunning) {
         loadTraceFrames().then(() => applyTraceFilter());
       }
