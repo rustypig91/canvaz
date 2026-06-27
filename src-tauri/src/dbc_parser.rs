@@ -1,5 +1,3 @@
-use std::collections::HashMap;
-
 use can_dbc::{ByteOrder, Dbc, MessageId, NumericValue, ValueType};
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +7,7 @@ use crate::can_frame::{CanFrame, CanSignal, DecodedCanMessage};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedDbc {
     pub path: String,
-    pub messages: HashMap<u32, ParsedMessage>,
+    pub messages: Vec<ParsedMessage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,7 +76,7 @@ impl ParsedDbc {
     pub fn new(path: &str) -> Result<Self, String> {
         let mut dbc = Self {
             path: path.to_string(),
-            messages: HashMap::new(),
+            messages: Vec::new(),
         };
         dbc.reload()?;
 
@@ -89,7 +87,7 @@ impl ParsedDbc {
         let text = std::fs::read_to_string(self.path.as_str()).map_err(|e| format!("Failed to read DBC file: {e}"))?;
         let dbc = Dbc::try_from(text.as_str()).map_err(|e| format!("Failed to parse DBC: {e}"))?;
 
-        let mut messages = HashMap::new();
+        let mut messages = Vec::new();
         for msg in &dbc.messages {
             let raw_id = match msg.id {
                 MessageId::Standard(id) => u32::from(id),
@@ -116,7 +114,7 @@ impl ParsedDbc {
                 })
                 .collect();
 
-            messages.insert(raw_id, ParsedMessage {
+            messages.push(ParsedMessage {
                 id: raw_id,
                 name: msg_name,
                 dlc: msg.size,
@@ -131,13 +129,13 @@ impl ParsedDbc {
 
     pub fn find_signal(&self, signal_name: &str) -> Option<&ParsedSignal> {
         self.messages
-            .values()
+            .iter()
             .flat_map(|m| m.signals.iter())
             .find(|s| s.name == signal_name)
     }
 
     pub fn find_message(&self, frame: &CanFrame) -> Option<&ParsedMessage> {
-        self.messages.get(&frame.can_id)
+        self.messages.iter().find(|m| m.id == frame.can_id)
     }
 
     pub fn parse_frame(&self, frame: &CanFrame) -> Option<DecodedCanMessage> {

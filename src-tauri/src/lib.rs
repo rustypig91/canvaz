@@ -12,7 +12,7 @@ use app_state::AppState;
 
 use backends::Channel;
 use can_frame::{CanFrame, Direction};
-use can_manager::{CanFrameEvent, CanManager, ChannelInfo, DbcState, ManagerState, SubscribedSignals};
+use can_manager::{CanFrameEvent, CanManager, ChannelInfo, ManagerState, SubscribedSignals};
 use project::Project;
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
@@ -22,7 +22,6 @@ use tauri::{Emitter, Manager, State};
 struct TauriState {
     app_state: Arc<AppState>,
     can: ManagerState,
-    dbc: DbcState,
     subscribed: SubscribedSignals,
 }
 
@@ -46,20 +45,20 @@ async fn open_channel(
     backend_name: String,
     channel_name: String,
     bitrate: u32,
+    dbc_path: Option<String>,
     state: State<'_, TauriState>,
 ) -> Result<ChannelInfo, String> {
     let can = Arc::clone(&state.can);
-    let dbc = Arc::clone(&state.dbc);
     let result = tauri::async_runtime::spawn_blocking(move || {
         can.lock()
             .map_err(|e| e.to_string())?
-            .open_channel(backend_name, channel_name, Some(bitrate), dbc)
+            .open_channel(backend_name, channel_name, Some(bitrate), dbc_path.as_deref())
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));
 
     if let Ok(ref info) = result {
-        println!("Opened channel '{}' with baudrate {:?}", info.id, bitrate);
+        println!("Opened channel '{}' with baudrate {}", info.id, bitrate);
     } else {
         println!("Failed to open channel: {}", result.as_ref().err().unwrap());
     }
@@ -68,31 +67,14 @@ async fn open_channel(
 
 #[tauri::command]
 fn close_channel(channel_id: String, state: State<'_, TauriState>) -> Result<(), String> {
-    state
-        .can
-        .lock()
-        .map_err(|e| e.to_string())?
-        .close_channel(&channel_id)?;
-    state
-        .dbc
-        .write()
-        .map_err(|e| e.to_string())?
-        .remove(&channel_id);
-    state
-        .subscribed
-        .write()
-        .map_err(|e| e.to_string())?
-        .remove(&channel_id);
+    state.can.lock().map_err(|e| e.to_string())?.close_channel(&channel_id)?;
+    state.subscribed.write().map_err(|e| e.to_string())?.remove(&channel_id);
     Ok(())
 }
 
 #[tauri::command]
 fn get_open_channels(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>, String> {
-    Ok(state
-        .can
-        .lock()
-        .map_err(|e| e.to_string())?
-        .open_channels_info())
+    Ok(state.can.lock().map_err(|e| e.to_string())?.open_channels_info())
 }
 
 // ── Send commands ─────────────────────────────────────────────────────────────
@@ -113,51 +95,21 @@ struct SendMessageCmd {
 
 #[tauri::command]
 fn send_message(cmd: SendMessageCmd, state: State<'_, TauriState>) -> Result<(), String> {
-    let (data, is_extended) = {
-        let dbc = state.dbc.read().map_err(|e| e.to_string())?;
-        let channel_dbc = dbc
-            .get(&cmd.channel_id)
-            .ok_or_else(|| format!("No DBC for '{}'", cmd.channel_id))?;
-        let msg = channel_dbc
-            .messages
-            .get(&cmd.message_id)
-            .ok_or_else(|| format!("Message 0x{:X} not in DBC", cmd.message_id))?;
-        let mut buf = vec![0u8; msg.dlc as usize];
-        for sig in &msg.signals {
-            if let Some(&v) = cmd.signal_values.get(&sig.name) {
-                dbc_parser::encode(
-                    &mut buf,
-                    v,
-                    sig.start_bit,
-                    sig.length,
-                    sig.little_endian,
-                    sig.factor,
-                    sig.offset,
-                );
-            }
-        }
-        (buf, cmd.message_id > 0x7FF)
-    };
     let ts = now_ms();
-    state.can.lock().map_err(|e| e.to_string())?.send_frame(
-        &cmd.channel_id,
-        CanFrame {
-            can_id: cmd.message_id,
-            is_extended,
-            data: data.clone(),
-            timestamp_ms: ts,
-            direction: Direction::Tx,
-            decoded: None,
-        },
-    )?;
+    let ch_arc = state.can.lock().map_err(|e| e.to_string())?
+        .channel_arc(&cmd.channel_id)
+        .ok_or_else(|| format!("'{}' is not open", cmd.channel_id))?;
+    let frame = ch_arc.lock()
+        .map_err(|_| "Channel lock poisoned".to_string())?
+        .send_dbc_message(cmd.message_id, &cmd.signal_values, ts)?;
     let _ = state.app_state.app.emit(
         "can-frame",
         CanFrameEvent {
             channel_id: cmd.channel_id,
             can_id: cmd.message_id,
-            is_extended,
-            dlc: data.len() as u8,
-            data,
+            is_extended: frame.is_extended,
+            dlc: frame.data.len() as u8,
+            data: frame.data,
             timestamp_ms: ts,
             direction: "tx",
         },
@@ -205,39 +157,10 @@ fn send_raw_frame(cmd: SendRawFrameCmd, state: State<'_, TauriState>) -> Result<
 
 // ── DBC commands ──────────────────────────────────────────────────────────────
 
+/// Parse a DBC file and return its contents. Does not associate with any channel.
 #[tauri::command]
-fn load_dbc(
-    channel_id: String,
-    path: String,
-    state: State<'_, TauriState>,
-) -> Result<dbc_parser::ParsedDbc, String> {
-    let parsed = dbc_parser::parse_dbc(&path)?;
-    state
-        .dbc
-        .write()
-        .map_err(|e| e.to_string())?
-        .insert(channel_id, parsed.clone());
-    Ok(parsed)
-}
-
-#[tauri::command]
-fn get_dbc_for_channel(
-    channel_id: String,
-    state: State<'_, TauriState>,
-) -> Result<Option<dbc_parser::ParsedDbc>, String> {
-    Ok(state
-        .dbc
-        .read()
-        .map_err(|e| e.to_string())?
-        .get(&channel_id)
-        .cloned())
-}
-
-#[tauri::command]
-fn get_all_dbcs(
-    state: State<'_, TauriState>,
-) -> Result<HashMap<String, dbc_parser::ParsedDbc>, String> {
-    Ok(state.dbc.read().map_err(|e| e.to_string())?.clone())
+fn parse_dbc(path: String) -> Result<dbc_parser::ParsedDbc, String> {
+    dbc_parser::parse_dbc(&path)
 }
 
 // ── Signal subscription commands ──────────────────────────────────────────────
@@ -286,8 +209,6 @@ fn get_signal_history(
     since_ms: u64,
     state: State<'_, TauriState>,
 ) -> Result<Vec<SignalSample>, String> {
-    // Get the channel Arc while holding the CanManager lock briefly, then release
-    // it before locking the channel so the reading thread isn't blocked.
     let ch_arc = state
         .can
         .lock()
@@ -298,7 +219,6 @@ fn get_signal_history(
         None => return Ok(vec![]),
     };
 
-    // Lock the channel independently (no CanManager lock held here).
     let ch = ch_arc.lock().map_err(|_| "Channel lock poisoned".to_string())?;
     Ok(ch.frames_since(since_ms)
         .filter_map(|f| {
@@ -313,8 +233,6 @@ fn get_signal_history(
 
 #[tauri::command]
 fn set_window_ms(ms: u64, state: State<'_, TauriState>) -> Result<(), String> {
-    // Collect channel Arcs while holding the CanManager lock briefly, then release
-    // it before locking channels so concurrent Tauri commands aren't blocked.
     let channels: Vec<Arc<Mutex<Channel>>> = state
         .can
         .lock()
@@ -371,18 +289,8 @@ fn save_project(path: String, project: Project) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn load_project(path: String, state: State<'_, TauriState>) -> Result<Project, String> {
-    let project = Project::load(&path)?;
-    let mut dbc_guard = state.dbc.write().map_err(|e| e.to_string())?;
-    for ch in &project.channels {
-        if let Some(ref dbc_path) = ch.dbc_path {
-            if let Ok(parsed) = dbc_parser::parse_dbc(dbc_path) {
-                let channel_id = format!("{}:{}", ch.backend, ch.name);
-                dbc_guard.insert(channel_id, parsed);
-            }
-        }
-    }
-    Ok(project)
+fn load_project(path: String) -> Result<Project, String> {
+    Project::load(&path)
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -400,7 +308,6 @@ pub fn run() {
             app.manage(TauriState {
                 app_state,
                 can: Arc::new(Mutex::new(manager)),
-                dbc: Arc::new(RwLock::new(HashMap::new())),
                 subscribed,
             });
             Ok(())
@@ -419,9 +326,7 @@ pub fn run() {
             get_open_channels,
             send_message,
             send_raw_frame,
-            load_dbc,
-            get_dbc_for_channel,
-            get_all_dbcs,
+            parse_dbc,
             subscribe_signals,
             unsubscribe_signals,
             get_signal_history,

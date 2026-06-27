@@ -8,7 +8,7 @@ use kvaser::{KvaserBackend, KvaserBackendChannel};
 #[cfg(feature = "linux-can")]
 use socketcan::{SocketCanBackend, SocketCanChannel};
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::app_state::AppState;
@@ -110,6 +110,22 @@ impl Channel {
         self.inner.set_bitrate(bitrate)
     }
 
+    pub fn get_dbc(&self) -> Option<&ParsedDbc> {
+        self.parsed_dbc.as_ref()
+    }
+
+    // Receives one frame, decodes it with the channel's DBC, and stores it.
+    pub fn receive_decode_store(&mut self) -> Result<Option<CanFrame>, String> {
+        let Some(mut frame) = self.inner.receive()? else {
+            return Ok(None);
+        };
+        if let Some(dbc) = &self.parsed_dbc {
+            frame.decoded = dbc.parse_frame(&frame);
+        }
+        self.push_frame(frame.clone());
+        Ok(Some(frame))
+    }
+
     // Reads one frame from hardware without storing it. Returns None on timeout.
     pub fn receive(&mut self) -> Result<Option<CanFrame>, String> {
         self.inner.receive()
@@ -130,6 +146,36 @@ impl Channel {
         self.inner.send(frame)?;
         self.push_frame(to_store);
         Ok(())
+    }
+
+    // Encodes a DBC message with the given signal values and sends it.
+    pub fn send_dbc_message(
+        &mut self,
+        msg_id: u32,
+        signal_values: &HashMap<String, f64>,
+        ts: u64,
+    ) -> Result<CanFrame, String> {
+        let dbc = self.parsed_dbc.as_ref()
+            .ok_or_else(|| "No DBC loaded for this channel".to_string())?;
+        let msg = dbc.messages.iter().find(|m| m.id == msg_id)
+            .ok_or_else(|| format!("Message 0x{:X} not in DBC", msg_id))?;
+        let mut buf = vec![0u8; msg.dlc as usize];
+        for sig in &msg.signals {
+            if let Some(&v) = signal_values.get(&sig.name) {
+                encode(&mut buf, v, sig.start_bit, sig.length, sig.little_endian, sig.factor, sig.offset);
+            }
+        }
+        let is_extended = msg_id > 0x7FF;
+        let frame = CanFrame {
+            can_id: msg_id,
+            is_extended,
+            data: buf,
+            timestamp_ms: ts,
+            direction: Direction::Tx,
+            decoded: None,
+        };
+        self.send(frame.clone())?;
+        Ok(frame)
     }
 
     // Changes the time window, reinitialising the buffer with only frames that
@@ -178,16 +224,16 @@ impl Backend {
         }
     }
 
-    pub fn open_channel(&self, name: &str, bitrate: Option<u32>, state: Arc<AppState>) -> Result<Channel, String> {
+    pub fn open_channel(&self, name: &str, bitrate: Option<u32>, state: Arc<AppState>, dbc_path: Option<&str>) -> Result<Channel, String> {
         match self {
             #[cfg(feature = "linux-can")]
             Backend::SocketCan(backend) => backend
                 .open_channel(name, bitrate, state)
-                .map(|c| Channel::new(ChannelInner::SocketCan(c), None)),
+                .map(|c| Channel::new(ChannelInner::SocketCan(c), dbc_path.map(str::to_string))),
             #[cfg(feature = "kvaser")]
             Backend::Kvaser(backend) => backend
                 .open_channel(name, bitrate, state)
-                .map(|c| Channel::new(ChannelInner::Kvaser(c), None)),
+                .map(|c| Channel::new(ChannelInner::Kvaser(c), dbc_path.map(str::to_string))),
         }
     }
 }

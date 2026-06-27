@@ -68,7 +68,7 @@ interface CanFrameEvent {
 
 interface PlotSignalEntry { signal_name: string; channel: string; }
 interface PlotPaneConfig { signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean; }
-interface ChannelInfo { id: string; backend: string; name: string; }
+interface ChannelInfo { id: string; backend: string; name: string; dbc: ParsedDbc | null; }
 interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate?: number | null; }
 interface SimulateEntry { signal_name: string; channel: string; value: number; period_ms: number; }
 
@@ -1025,10 +1025,17 @@ async function openChannel(
   backend: string,
   name: string,
   bitrate: number | null,
+  dbcPath: string | null = null,
 ): Promise<ChannelInfo | null> {
-  console.log(`Opening channel: backend=${backend}, name=${name}, bitrate=${bitrate}`);
   try {
-    const info = await invoke<ChannelInfo>("open_channel", { backendName: backend, channelName: name, bitrate: bitrate });
+    const info = await invoke<ChannelInfo>("open_channel", {
+      backendName: backend,
+      channelName: name,
+      bitrate: bitrate ?? 500000,
+      dbcPath,
+    });
+    // Store the DBC returned by the channel (freshly parsed from disk).
+    if (info.dbc) dbcByChannel.set(info.id, info.dbc);
     // Re-subscribe any signals currently in plots for this channel (Rust clears
     // subscriptions when a channel is closed, so we must restore them on reopen).
     const names: string[] = [];
@@ -1067,7 +1074,7 @@ async function applyChannelDialog() {
 
     if (dialogPendingDbc) {
       try {
-        const dbc = await invoke<ParsedDbc>("load_dbc", { channelId, path: dialogPendingDbc });
+        const dbc = await invoke<ParsedDbc>("parse_dbc", { path: dialogPendingDbc });
         dbcByChannel.set(channelId, dbc);
       } catch (e) { setError(`DBC error: ${e}`); }
     }
@@ -1086,7 +1093,7 @@ async function applyChannelDialog() {
 
     if (dialogPendingDbc) {
       try {
-        const dbc = await invoke<ParsedDbc>("load_dbc", { channelId: id, path: dialogPendingDbc });
+        const dbc = await invoke<ParsedDbc>("parse_dbc", { path: dialogPendingDbc });
         dbcByChannel.set(id, dbc);
       } catch (e) { setError(`DBC error: ${e}`); }
     } else {
@@ -1659,7 +1666,7 @@ async function applyProject(project: Project) {
     channelBitrates.set(channelId, ch.bitrate ?? null);
     if (ch.dbc_path) {
       try {
-        const dbc = await invoke<ParsedDbc>("load_dbc", { channelId, path: ch.dbc_path });
+        const dbc = await invoke<ParsedDbc>("parse_dbc", { path: ch.dbc_path });
         dbcByChannel.set(channelId, dbc);
       } catch { }
     }
@@ -1799,25 +1806,16 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
 
 async function startApp() {
   // Open all configured channels (hardware connects here, not when added).
+  // Each open_channel call parses the DBC fresh from disk and returns it.
   const newOpen: string[] = [];
   for (const ch of configuredChannels) {
-    const info = await openChannel(ch.backend, ch.name, ch.bitrate ?? null);
+    const id = `${ch.backend}:${ch.name}`;
+    const dbcPath = ch.dbc_path ?? dbcByChannel.get(id)?.path ?? null;
+    const info = await openChannel(ch.backend, ch.name, ch.bitrate ?? null, dbcPath);
     if (info) newOpen.push(info.id);
   }
   openChannels = newOpen;
   renderChannelList();
-
-  // Reload DBC files so the latest version on disk is used for this run
-  await Promise.all(openChannels.map(async (id) => {
-    const path = dbcByChannel.get(id)?.path;
-    if (!path) return;
-    try {
-      const dbc = await invoke<ParsedDbc>("load_dbc", { channelId: id, path });
-      dbcByChannel.set(id, dbc);
-    } catch (e) {
-      setError(`DBC reload failed for ${channelDisplayName(id)}: ${e}`);
-    }
-  }));
 
   // Prune simulated message entries whose message no longer exists in the reloaded DBC
   {

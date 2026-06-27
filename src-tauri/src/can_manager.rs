@@ -14,7 +14,6 @@ use crate::dbc_parser::ParsedDbc;
 
 
 pub type ManagerState = Arc<Mutex<CanManager>>;
-pub type DbcState = Arc<RwLock<HashMap<String, ParsedDbc>>>;
 pub type SubscribedSignals = Arc<RwLock<HashMap<String, HashSet<String>>>>;
 
 // ── Channel identity ──────────────────────────────────────────────────────────
@@ -25,17 +24,6 @@ pub struct ChannelInfo {
     pub backend: String,
     pub name: String,
     pub dbc: Option<ParsedDbc>,
-}
-
-impl ChannelInfo {
-    fn new(backend: &str, name: &str) -> Self {
-        Self {
-            id: format!("{backend}:{name}"),
-            backend: backend.to_string(),
-            name: name.to_string(),
-            dbc: None,
-        }
-    }
 }
 
 // ── Wire events ───────────────────────────────────────────────────────────────
@@ -91,7 +79,7 @@ impl CanManager {
         for b in &self.backends {
             let bname = b.name().to_string();
             for ch in b.list_channels()? {
-                out.push(ChannelInfo::new(&bname, &ch));
+                out.push(ChannelInfo { id: format!("{bname}:{ch}"), backend: bname.clone(), name: ch, dbc: None });
             }
         }
         Ok(out)
@@ -102,30 +90,33 @@ impl CanManager {
         backend_name: String,
         channel_name: String,
         bitrate: Option<u32>,
-        dbc: &str,
+        dbc_path: Option<&str>,
     ) -> Result<ChannelInfo, String> {
-        let info = ChannelInfo::new(&backend_name, &channel_name);
-        if self.channels.contains_key(&info.id) {
-            let channel_state = self.channels.get(&info.id).unwrap();
-            let mut channel = channel_state
-                .channel
-                .lock()
-                .map_err(|_| "Channel lock poisoned".to_string())?;
-            let channel_info = channel_state.channel_info.clone();
+        let id = format!("{backend_name}:{channel_name}");
+
+        if self.channels.contains_key(&id) {
+            let cs = &self.channels[&id];
             if let Some(br) = bitrate {
-                channel.set_bitrate(br)?;
+                cs.channel.lock()
+                    .map_err(|_| "Channel lock poisoned".to_string())?
+                    .set_bitrate(br)?;
             }
-            return Ok(channel_info);
+            return Ok(cs.channel_info.clone());
         }
 
-        let backend = self
-            .backends
-            .iter()
+        let backend = self.backends.iter()
             .find(|b| b.name() == backend_name)
             .ok_or_else(|| format!("No backend '{backend_name}'"))?;
 
-        let mut ch = backend.open_channel(&channel_name, bitrate, Arc::clone(&self.state))?;
+        let mut ch = backend.open_channel(&channel_name, bitrate, Arc::clone(&self.state), dbc_path)?;
         ch.open()?;
+
+        let channel_info = ChannelInfo {
+            id: id.clone(),
+            backend: backend_name,
+            name: channel_name,
+            dbc: ch.get_dbc().cloned(),
+        };
 
         let ch = Arc::new(Mutex::new(ch));
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -133,21 +124,18 @@ impl CanManager {
         std::thread::spawn({
             let ch = Arc::clone(&ch);
             let stop = Arc::clone(&stop_flag);
-            let info = info.clone();
+            let info = channel_info.clone();
             let state = Arc::clone(&self.state);
             let subscribed = Arc::clone(&self.subscribed);
-            move || reading_loop(ch, info, state, dbc, subscribed, stop)
+            move || reading_loop(ch, info, state, subscribed, stop)
         });
 
-        self.channels.insert(
-            info.id.clone(),
-            OpenChannelState {
-                stop_flag,
-                channel: ch,
-                channel_info: info.clone(),
-            },
-        );
-        Ok(info)
+        self.channels.insert(id, OpenChannelState {
+            stop_flag,
+            channel: ch,
+            channel_info: channel_info.clone(),
+        });
+        Ok(channel_info)
     }
 
     pub fn close_channel(&mut self, channel_id: &str) -> Result<(), String> {
@@ -158,13 +146,7 @@ impl CanManager {
     }
 
     pub fn open_channels_info(&self) -> Vec<ChannelInfo> {
-        self.channels
-            .keys()
-            .filter_map(|id| {
-                let (backend, name) = id.split_once(':')?;
-                Some(ChannelInfo::new(backend, name))
-            })
-            .collect()
+        self.channels.values().map(|s| s.channel_info.clone()).collect()
     }
 
     pub fn send_frame(&self, channel_id: &str, frame: CanFrame) -> Result<(), String> {
@@ -196,34 +178,21 @@ fn reading_loop(
     channel: Arc<Mutex<Channel>>,
     info: ChannelInfo,
     state: Arc<AppState>,
-    dbc: DbcState,
     subscribed: SubscribedSignals,
     stop: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::Relaxed) {
-        // 1. Receive raw frame from hardware (no store yet).
+        // Receive, decode with channel's own DBC, and store in ring buffer atomically.
         let result = match channel.lock() {
-            Ok(mut ch) => ch.receive(),
+            Ok(mut ch) => ch.receive_decode_store(),
             Err(_) => break,
         };
 
         match result {
-            Ok(Some(mut frame)) => {
+            Ok(Some(frame)) => {
                 let ts = frame.timestamp_ms;
 
-                // 2. Decode with DBC and populate frame.decoded.
-                if let Ok(dbc_guard) = dbc.read() {
-                    if let Some(channel_dbc) = dbc_guard.get(&info.id) {
-                        frame.decoded = channel_dbc.parse_frame(&frame);
-                    }
-                }
-
-                // 3. Store the decoded frame in the ring buffer.
-                if let Ok(mut ch) = channel.lock() {
-                    ch.push_frame(frame.clone());
-                }
-
-                // 4. Emit raw can-frame event.
+                // Emit raw can-frame event.
                 let _ = state.app.emit(
                     "can-frame",
                     CanFrameEvent {
@@ -237,7 +206,7 @@ fn reading_loop(
                     },
                 );
 
-                // 5. Emit signal-value events for subscribed signals.
+                // Emit signal-value events for subscribed signals.
                 let sub_guard = match subscribed.read() {
                     Ok(g) => g,
                     Err(_) => continue,
