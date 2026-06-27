@@ -6,7 +6,7 @@ use socketcan::embedded_can::{ExtendedId, StandardId};
 use socketcan::CanFrame as SocketCanFrame;
 use socketcan::{CanDataFrame, CanSocket, EmbeddedFrame, Frame, Socket};
 
-use super::CanFrame;
+use super::{CanFrame, Direction};
 use crate::app_state::AppState;
 
 // ── Backend ───────────────────────────────────────────────────────────────────
@@ -130,6 +130,8 @@ impl SocketCanChannel {
                 is_extended: df.is_extended(),
                 data: df.data().to_vec(),
                 timestamp_ms: super::now_ms(),
+                direction: Direction::Rx,
+                decoded: None,
             })),
             Ok(_) => Ok(None),
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(None),

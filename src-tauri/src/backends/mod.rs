@@ -14,8 +14,9 @@ use std::sync::Arc;
 
 use crate::app_state::AppState;
 use crate::dbc_parser::*;
-use crate::can_frame::{CanFrame, now_ms};
+use crate::can_frame::{CanFrame, Direction, now_ms};
 
+const DEFAULT_WINDOW_MS: u64 = 30_000;
 
 // ── Channel ───────────────────────────────────────────────────────────────────
 
@@ -27,7 +28,7 @@ enum ChannelInner {
 }
 
 impl ChannelInner {
-    fn open(&mut self, bitrate: u32) -> Result<(), String> {
+    fn open(&mut self) -> Result<(), String> {
         match self {
             #[cfg(feature = "linux-can")]
             ChannelInner::SocketCan(c) => c.open(),
@@ -51,12 +52,20 @@ impl ChannelInner {
             ChannelInner::Kvaser(c) => c.send(frame),
         }
     }
-    fn receive(&self, timeout_ms: u32) -> Result<Option<CanFrame>, String> {
+    fn receive(&self) -> Result<Option<CanFrame>, String> {
         match self {
             #[cfg(feature = "linux-can")]
-            ChannelInner::SocketCan(c) => c.receive(timeout_ms),
+            ChannelInner::SocketCan(c) => c.receive(),
             #[cfg(feature = "kvaser")]
-            ChannelInner::Kvaser(c) => c.receive(timeout_ms),
+            ChannelInner::Kvaser(c) => c.receive(),
+        }
+    }
+    fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "linux-can")]
+            ChannelInner::SocketCan(c) => c.set_bitrate(bitrate),
+            #[cfg(feature = "kvaser")]
+            ChannelInner::Kvaser(c) => c.set_bitrate(bitrate),
         }
     }
 }
@@ -69,32 +78,50 @@ pub struct Channel {
 }
 
 impl Channel {
-    fn new(inner: ChannelInner, dbc_file: Option<String>, window_ms: u64) -> Self {
+    fn new(inner: ChannelInner, dbc_file: Option<String>) -> Self {
         Self {
-            inner: inner,
+            inner,
             frames: VecDeque::new(),
-            window_ms: window_ms,
-            parsed_dbc: dbc_file.as_ref().and_then(|path| ParsedDbc::new(path).ok()),
+            window_ms: DEFAULT_WINDOW_MS,
+            parsed_dbc: dbc_file.and_then(|path| ParsedDbc::new(&path).ok()),
         }
     }
 
-    pub fn open(&mut self, bitrate: u32) -> Result<(), String> {
+    pub fn open(&mut self) -> Result<(), String> {
         self.frames.clear();
         if let Some(dbc) = self.parsed_dbc.as_mut() {
             dbc.reload()?;
         }
-        self.inner.open(bitrate)
+        self.inner.open()
     }
 
     pub fn close(&mut self) -> Result<(), String> {
         self.inner.close()
     }
 
+    pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
+        self.inner.set_bitrate(bitrate)
+    }
+
+    // Reads one frame from hardware without storing it. Returns None on timeout.
+    pub fn receive(&mut self) -> Result<Option<CanFrame>, String> {
+        self.inner.receive()
+    }
+
+    // Stores a (possibly decoded) frame in the ring buffer.
+    pub fn push_frame(&mut self, frame: CanFrame) {
+        let cutoff = frame.timestamp_ms.saturating_sub(self.window_ms);
+        while self.frames.front().map_or(false, |f| f.timestamp_ms < cutoff) {
+            self.frames.pop_front();
+        }
+        self.frames.push_back(frame);
+    }
+
     // Sends a frame to hardware and stores it in the ring buffer.
     pub fn send(&mut self, frame: CanFrame) -> Result<(), String> {
         let to_store = frame.clone();
         self.inner.send(frame)?;
-        self.store(to_store);
+        self.push_frame(to_store);
         Ok(())
     }
 
@@ -114,14 +141,6 @@ impl Channel {
 
     pub fn frame_buffer(&self) -> &VecDeque<CanFrame> {
         &self.frames
-    }
-
-    fn store(&mut self, frame: CanFrame) {
-        let cutoff = frame.timestamp_ms.saturating_sub(self.window_ms);
-        while self.frames.front().map_or(false, |f| f.timestamp_ms < cutoff) {
-            self.frames.pop_front();
-        }
-        self.frames.push_back(frame);
     }
 }
 

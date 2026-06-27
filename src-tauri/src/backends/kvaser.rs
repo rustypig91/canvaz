@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use libloading::Library;
 
-use super::{now_ms, CanFrame};
+use super::{now_ms, CanFrame, Direction};
 use crate::app_state::AppState;
 
 #[cfg(unix)]
@@ -364,6 +364,8 @@ impl KvaserBackendChannel {
                 is_extended: (flags & CAN_MSG_EXT) != 0,
                 data: data[..dlc].to_vec(),
                 timestamp_ms: now_ms(),
+                direction: Direction::Rx,
+                decoded: None,
             }));
         }
     }

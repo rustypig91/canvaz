@@ -8,7 +8,7 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize)]
-enum Direction {
+pub enum Direction {
     Rx = 0,
     Tx = 1,
 }

@@ -4,7 +4,6 @@ mod can_manager;
 mod dbc_parser;
 mod can_frame;
 mod project;
-pub mod signal_codec;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};
@@ -12,6 +11,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use app_state::AppState;
 
 use backends::Channel;
+use can_frame::{CanFrame, Direction};
 use can_manager::{CanFrameEvent, CanManager, ChannelInfo, DbcState, ManagerState, SubscribedSignals};
 use project::Project;
 use serde::{Deserialize, Serialize};
@@ -51,12 +51,9 @@ async fn open_channel(
     let can = Arc::clone(&state.can);
     let dbc = Arc::clone(&state.dbc);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        can.open_channel(
-            backend_name,
-            channel_name,
-            Some(bitrate),
-            dbc,
-        )
+        can.lock()
+            .map_err(|e| e.to_string())?
+            .open_channel(backend_name, channel_name, Some(bitrate), dbc)
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));
@@ -123,13 +120,12 @@ fn send_message(cmd: SendMessageCmd, state: State<'_, TauriState>) -> Result<(),
             .ok_or_else(|| format!("No DBC for '{}'", cmd.channel_id))?;
         let msg = channel_dbc
             .messages
-            .iter()
-            .find(|m| m.id == cmd.message_id)
+            .get(&cmd.message_id)
             .ok_or_else(|| format!("Message 0x{:X} not in DBC", cmd.message_id))?;
         let mut buf = vec![0u8; msg.dlc as usize];
         for sig in &msg.signals {
             if let Some(&v) = cmd.signal_values.get(&sig.name) {
-                signal_codec::encode(
+                dbc_parser::encode(
                     &mut buf,
                     v,
                     sig.start_bit,
@@ -145,11 +141,13 @@ fn send_message(cmd: SendMessageCmd, state: State<'_, TauriState>) -> Result<(),
     let ts = now_ms();
     state.can.lock().map_err(|e| e.to_string())?.send_frame(
         &cmd.channel_id,
-        backends::CanFrame {
+        CanFrame {
             can_id: cmd.message_id,
             is_extended,
             data: data.clone(),
             timestamp_ms: ts,
+            direction: Direction::Tx,
+            decoded: None,
         },
     )?;
     let _ = state.app_state.app.emit(
@@ -181,11 +179,13 @@ fn send_raw_frame(cmd: SendRawFrameCmd, state: State<'_, TauriState>) -> Result<
     let ts = now_ms();
     state.can.lock().map_err(|e| e.to_string())?.send_frame(
         &cmd.channel_id,
-        backends::CanFrame {
+        CanFrame {
             can_id: cmd.can_id,
             is_extended,
             data: cmd.data.clone(),
             timestamp_ms: ts,
+            direction: Direction::Tx,
+            decoded: None,
         },
     )?;
     let _ = state.app_state.app.emit(
@@ -286,19 +286,6 @@ fn get_signal_history(
     since_ms: u64,
     state: State<'_, TauriState>,
 ) -> Result<Vec<SignalSample>, String> {
-    let (message_id, start_bit, length, little_endian, signed, factor, offset) = {
-        let dbc_store = state.dbc.read().map_err(|e| e.to_string())?;
-        let dbc = match dbc_store.get(&channel_id) {
-            Some(d) => d,
-            None => return Ok(vec![]),
-        };
-        let sig = match dbc.find_signal(&signal_name) {
-            Some(s) => s,
-            None => return Ok(vec![]),
-        };
-        (sig.message_id, sig.start_bit, sig.length, sig.little_endian, sig.signed, sig.factor, sig.offset)
-    };
-
     // Get the channel Arc while holding the CanManager lock briefly, then release
     // it before locking the channel so the reading thread isn't blocked.
     let ch_arc = state
@@ -312,19 +299,12 @@ fn get_signal_history(
     };
 
     // Lock the channel independently (no CanManager lock held here).
-    let frames: Vec<(u64, Vec<u8>)> = {
-        let ch = ch_arc.lock().map_err(|_| "Channel lock poisoned".to_string())?;
-        ch.frames_since(since_ms)
-            .filter(|f| f.can_id == message_id)
-            .map(|f| (f.timestamp_ms, f.data.clone()))
-            .collect()
-    };
-
-    Ok(frames
-        .into_iter()
-        .map(|(timestamp_ms, data)| {
-            let value = signal_codec::decode(&data, start_bit, length, little_endian, signed, factor, offset);
-            SignalSample { timestamp_ms, value }
+    let ch = ch_arc.lock().map_err(|_| "Channel lock poisoned".to_string())?;
+    Ok(ch.frames_since(since_ms)
+        .filter_map(|f| {
+            let decoded = f.decoded.as_ref()?;
+            let sig = decoded.signals.iter().find(|s| s.name == signal_name)?;
+            Some(SignalSample { timestamp_ms: f.timestamp_ms, value: sig.physical })
         })
         .collect())
 }

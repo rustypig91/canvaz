@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use tauri::Emitter;
 
 use crate::app_state::AppState;
-use crate::backends::{default_backends, Backend, CanFrame, Channel};
+use crate::backends::{default_backends, Backend, Channel};
+use crate::can_frame::CanFrame;
 use crate::dbc_parser::ParsedDbc;
 
 pub type ManagerState = Arc<Mutex<CanManager>>;
@@ -108,7 +109,9 @@ impl CanManager {
                 .lock()
                 .map_err(|_| "Channel lock poisoned".to_string())?;
             let channel_info = channel_state.channel_info.clone();
-            channel.set_bitrate(bitrate.unwrap_or(0))?;
+            if let Some(br) = bitrate {
+                channel.set_bitrate(br)?;
+            }
             return Ok(channel_info);
         }
 
@@ -195,16 +198,29 @@ fn reading_loop(
     stop: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::Relaxed) {
-        // receive() automatically stores the frame in the channel's ring buffer.
+        // 1. Receive raw frame from hardware (no store yet).
         let result = match channel.lock() {
             Ok(mut ch) => ch.receive(),
             Err(_) => break,
         };
 
         match result {
-            Ok(Some(frame)) => {
+            Ok(Some(mut frame)) => {
                 let ts = frame.timestamp_ms;
 
+                // 2. Decode with DBC and populate frame.decoded.
+                if let Ok(dbc_guard) = dbc.read() {
+                    if let Some(channel_dbc) = dbc_guard.get(&info.id) {
+                        frame.decoded = channel_dbc.parse_frame(&frame);
+                    }
+                }
+
+                // 3. Store the decoded frame in the ring buffer.
+                if let Ok(mut ch) = channel.lock() {
+                    ch.push_frame(frame.clone());
+                }
+
+                // 4. Emit raw can-frame event.
                 let _ = state.app.emit(
                     "can-frame",
                     CanFrameEvent {
@@ -218,7 +234,7 @@ fn reading_loop(
                     },
                 );
 
-                // Decode and emit signal-value events only for subscribed signals.
+                // 5. Emit signal-value events for subscribed signals.
                 let sub_guard = match subscribed.read() {
                     Ok(g) => g,
                     Err(_) => continue,
@@ -227,35 +243,20 @@ fn reading_loop(
                     Some(s) if !s.is_empty() => s,
                     _ => continue,
                 };
-                let dbc_guard = match dbc.read() {
-                    Ok(g) => g,
-                    Err(_) => continue,
-                };
-                if let Some(channel_dbc) = dbc_guard.get(&info.id) {
-                    if let Some(signals) = channel_dbc.signals_for_message(frame.can_id) {
-                        for sig in signals {
-                            if subs.contains(&sig.name) {
-                                let value = crate::signal_codec::decode(
-                                    &frame.data,
-                                    sig.start_bit,
-                                    sig.length,
-                                    sig.little_endian,
-                                    sig.signed,
-                                    sig.factor,
-                                    sig.offset,
-                                );
-                                let _ = state.app.emit(
-                                    "signal-value",
-                                    SignalValueEvent {
-                                        channel_id: info.id.clone(),
-                                        signal_name: sig.name.clone(),
-                                        message_name: sig.message_name.clone(),
-                                        value,
-                                        unit: sig.unit.clone(),
-                                        timestamp_ms: ts,
-                                    },
-                                );
-                            }
+                if let Some(decoded) = &frame.decoded {
+                    for sig in &decoded.signals {
+                        if subs.contains(&sig.name) {
+                            let _ = state.app.emit(
+                                "signal-value",
+                                SignalValueEvent {
+                                    channel_id: info.id.clone(),
+                                    signal_name: sig.name.clone(),
+                                    message_name: decoded.name.clone(),
+                                    value: sig.physical,
+                                    unit: String::new(),
+                                    timestamp_ms: ts,
+                                },
+                            );
                         }
                     }
                 }
