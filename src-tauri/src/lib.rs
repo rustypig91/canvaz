@@ -4,6 +4,7 @@ mod can_frame;
 mod can_manager;
 mod dbc_parser;
 mod project;
+mod logger;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -13,6 +14,9 @@ use can_manager::{CanManager, ChannelInfo, FrameInfo, ManagerState, SignalSample
 use project::Project;
 use serde::Deserialize;
 use tauri::{Manager, State};
+use logger::init;
+
+use log::{info, warn, debug, error};
 
 // ── Tauri managed state ───────────────────────────────────────────────────────
 
@@ -125,6 +129,7 @@ fn get_signal_history(
     since_ms: u64,
     state: State<'_, TauriState>,
 ) -> Result<Vec<SignalSample>, String> {
+    debug!("get_signal_history: channel_id={}, signal_name={}, since_ms={}", channel_id, signal_name, since_ms);
     Ok(state.can.lock().map_err(|e| e.to_string())?
         .get_signal_history(&channel_id, &signal_name, since_ms))
 }
@@ -185,6 +190,9 @@ fn load_project(path: String) -> Result<Project, String> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    logger::init();
+
+    debug!("Starting can-signals-tauri version {}", env!("GIT_VERSION"));
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())

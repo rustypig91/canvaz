@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use log::{info, warn, debug, error};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Project {
@@ -120,7 +121,7 @@ impl Project {
     }
 
     pub fn save(&self, path: &str) -> Result<(), String> {
-        println!("Saving project to '{}'", path);
+        info!("Saving project to '{}'", path);
         let p = std::path::Path::new(path);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("Dir error: {e}"))?;
@@ -131,6 +132,7 @@ impl Project {
     }
 
     pub fn load(path: &str) -> Result<Self, String> {
+        info!("Loading project from '{}'", path);
         let json = std::fs::read_to_string(path)
             .map_err(|e| format!("Read error: {e}"))?;
         serde_json::from_str(&json).map_err(|e| format!("Parse error: {e}"))
