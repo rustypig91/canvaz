@@ -1,5 +1,5 @@
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
-use log::{info, warn, debug, error};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Project {
@@ -29,7 +29,9 @@ pub struct ChannelConfig {
     pub bitrate: u32,
 }
 
-fn default_bitrate() -> u32 { 500_000 }
+fn default_bitrate() -> u32 {
+    500_000
+}
 
 fn default_backend() -> String {
     "socketcan".to_string()
@@ -44,7 +46,9 @@ pub struct PlotPaneConfig {
     pub show_points: bool,
 }
 
-fn is_false(b: &bool) -> bool { !b }
+fn is_false(b: &bool) -> bool {
+    !b
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlotSignalEntry {
@@ -98,8 +102,12 @@ pub struct TraceFiltersConfig {
     pub max_rows: Option<u32>,
 }
 
-fn default_data_format() -> String { "hex".to_string() }
-fn default_true() -> bool { true }
+fn default_data_format() -> String {
+    "hex".to_string()
+}
+fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TraceColumnsConfig {
@@ -126,15 +134,13 @@ impl Project {
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("Dir error: {e}"))?;
         }
-        let json = serde_json::to_string_pretty(self)
-            .map_err(|e| format!("Serialize error: {e}"))?;
+        let json = serde_json::to_string_pretty(self).map_err(|e| format!("Serialize error: {e}"))?;
         std::fs::write(path, json).map_err(|e| format!("Write error: {e}"))
     }
 
     pub fn load(path: &str) -> Result<Self, String> {
         info!("Loading project from '{}'", path);
-        let json = std::fs::read_to_string(path)
-            .map_err(|e| format!("Read error: {e}"))?;
+        let json = std::fs::read_to_string(path).map_err(|e| format!("Read error: {e}"))?;
         serde_json::from_str(&json).map_err(|e| format!("Parse error: {e}"))
     }
 }

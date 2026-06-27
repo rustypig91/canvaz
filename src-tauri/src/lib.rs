@@ -129,13 +129,17 @@ struct AddPeriodicFrameCmd {
 }
 
 #[tauri::command]
-fn add_periodic_frame(cmd: AddPeriodicFrameCmd, state: State<'_, TauriState>) -> Result<(), String> {
+fn add_periodic_frame(cmd: AddPeriodicFrameCmd, state: State<'_, TauriState>) -> Result<u64, String> {
     use crate::can_communication::CanFrame as RawFrame;
-    state
-        .can_manager
-        .lock()
-        .map_err(|e| e.to_string())?
-        .add_periodic_frame(&cmd.channel_id, RawFrame { can_id: cmd.can_id, is_extended: cmd.can_id > 0x7FF, data: cmd.data }, cmd.period_ms)
+    state.can_manager.lock().map_err(|e| e.to_string())?.add_periodic_frame(
+        &cmd.channel_id,
+        RawFrame {
+            can_id: cmd.can_id,
+            is_extended: cmd.can_id > 0x7FF,
+            data: cmd.data,
+        },
+        cmd.period_ms,
+    )
 }
 
 #[derive(Deserialize)]
@@ -147,7 +151,7 @@ struct AddPeriodicMessageCmd {
 }
 
 #[tauri::command]
-fn add_periodic_message(cmd: AddPeriodicMessageCmd, state: State<'_, TauriState>) -> Result<(), String> {
+fn add_periodic_message(cmd: AddPeriodicMessageCmd, state: State<'_, TauriState>) -> Result<u64, String> {
     state
         .can_manager
         .lock()
@@ -156,18 +160,18 @@ fn add_periodic_message(cmd: AddPeriodicMessageCmd, state: State<'_, TauriState>
 }
 
 #[derive(Deserialize)]
-struct RemovePeriodicFrameCmd {
+struct RemovePeriodicCmd {
     channel_id: String,
-    can_id: u32,
+    handle: u64,
 }
 
 #[tauri::command]
-fn remove_periodic_frame(cmd: RemovePeriodicFrameCmd, state: State<'_, TauriState>) -> Result<(), String> {
+fn remove_periodic(cmd: RemovePeriodicCmd, state: State<'_, TauriState>) -> Result<(), String> {
     state
         .can_manager
         .lock()
         .map_err(|e| e.to_string())?
-        .remove_periodic_frame(&cmd.channel_id, cmd.can_id)
+        .remove_periodic(&cmd.channel_id, cmd.handle)
 }
 
 // ── Query commands ────────────────────────────────────────────────────────────
@@ -291,7 +295,7 @@ pub fn run() {
             send_frame,
             add_periodic_frame,
             add_periodic_message,
-            remove_periodic_frame,
+            remove_periodic,
             get_frames,
             get_signal_history,
             set_window_ms,

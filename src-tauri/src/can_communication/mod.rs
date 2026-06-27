@@ -12,7 +12,7 @@ pub use socketcan::SocketCanBackend;
 
 use std::collections::HashMap;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
 };
 use std::thread::JoinHandle;
@@ -42,18 +42,17 @@ pub trait RxHandle: Send + 'static {
 
 pub trait CanBackend: Send + 'static {
     fn list_channels(&self) -> Vec<String>;
-    fn open_channel(
-        &mut self,
-        index: u8,
-        bitrate: u32,
-    ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), String>;
+    fn open_channel(&mut self, index: u8, bitrate: u32) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), String>;
 }
 
 // ── Send queue ────────────────────────────────────────────────────────────────
 
+static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+
 enum SendEntry {
     OneShot(CanFrame),
     Periodic {
+        handle: u64,
         frame: CanFrame,
         period_ms: u64,
         next: Instant,
@@ -121,7 +120,15 @@ impl Can {
             std::thread::spawn(move || tx_loop(tx_handle, queue, stop, channel, on_tx))
         };
 
-        self.channels.insert(channel, OpenChannel { queue, stop, rx_thread, tx_thread });
+        self.channels.insert(
+            channel,
+            OpenChannel {
+                queue,
+                stop,
+                rx_thread,
+                tx_thread,
+            },
+        );
         info!("Opened channel {channel} with baudrate {bitrate}");
         Ok(())
     }
@@ -149,23 +156,35 @@ impl Can {
     }
 
     /// Enqueue a frame to be sent repeatedly every `period_ms` milliseconds.
-    /// First transmission happens immediately. Identified by `can_id` for removal.
-    pub fn add_periodic(&self, channel: u8, frame: CanFrame, period_ms: u64) -> Result<(), String> {
-        debug!("Adding periodic frame on channel {channel}: id=0x{:X}, period={}ms", frame.can_id, period_ms);
+    /// Returns a unique handle that can be passed to `remove_periodic`.
+    pub fn add_periodic(&self, channel: u8, frame: CanFrame, period_ms: u64) -> Result<u64, String> {
+        let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            "Adding periodic frame on channel {channel}: id=0x{:X}, period={}ms, handle={handle}",
+            frame.can_id, period_ms
+        );
         self.queue(channel)?
             .lock()
             .map_err(|_| "Queue lock poisoned".to_string())?
-            .push(SendEntry::Periodic { frame, period_ms, next: Instant::now() });
-        Ok(())
+            .push(SendEntry::Periodic {
+                handle,
+                frame,
+                period_ms,
+                next: Instant::now(),
+            });
+        Ok(handle)
     }
 
-    /// Remove all periodic entries with the given `can_id` from the send queue.
-    pub fn remove_periodic(&self, channel: u8, can_id: u32) -> Result<(), String> {
-        debug!("Removing periodic frame on channel {channel}: id=0x{:X}", can_id);
+    /// Remove the periodic entry identified by `handle`.
+    pub fn remove_periodic(&self, channel: u8, handle: u64) -> Result<(), String> {
+        debug!("Removing periodic frame on channel {channel}: handle={handle}");
         self.queue(channel)?
             .lock()
             .map_err(|_| "Queue lock poisoned".to_string())?
-            .retain(|e| !matches!(e, SendEntry::Periodic { frame, .. } if frame.can_id == can_id));
+            .retain(|e| match e {
+                SendEntry::Periodic { handle: h, .. } => *h != handle,
+                _ => true,
+            });
         Ok(())
     }
 
@@ -233,7 +252,9 @@ fn tx_loop(
                         }
                         // i unchanged — next element has shifted into position i
                     }
-                    SendEntry::Periodic { frame, period_ms, next } => {
+                    SendEntry::Periodic {
+                        frame, period_ms, next, ..
+                    } => {
                         if now >= *next {
                             to_send.push(frame.clone());
                             *next = now + Duration::from_millis(*period_ms);

@@ -35,7 +35,8 @@ type FnClose = unsafe extern "system" fn(i32) -> i32;
 type FnSetBus = unsafe extern "system" fn(i32, c_long, u32, u32, u32, u32, u32) -> i32;
 type FnBusOn = unsafe extern "system" fn(i32) -> i32;
 type FnBusOff = unsafe extern "system" fn(i32) -> i32;
-type FnReadWait = unsafe extern "system" fn(i32, *mut c_long, *mut u8, *mut u32, *mut u32, *mut c_ulong, c_ulong) -> i32;
+type FnReadWait =
+    unsafe extern "system" fn(i32, *mut c_long, *mut u8, *mut u32, *mut u32, *mut c_ulong, c_ulong) -> i32;
 type FnWrite = unsafe extern "system" fn(i32, c_long, *const u8, u32, u32) -> i32;
 type FnWriteSync = unsafe extern "system" fn(i32, c_ulong) -> i32;
 type FnGetChannelData = unsafe extern "system" fn(i32, i32, *mut u8, usize) -> i32;
@@ -308,11 +309,7 @@ impl CanBackend for KvaserBackend {
             .collect()
     }
 
-    fn open_channel(
-        &mut self,
-        index: u8,
-        bitrate: u32,
-    ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), String> {
+    fn open_channel(&mut self, index: u8, bitrate: u32) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), String> {
         let (freq, tseg1, tseg2, sjw) = bitrate_params(bitrate).ok_or_else(|| {
             format!(
                 "Cannot compute CANlib timing for {} bps \
@@ -326,13 +323,19 @@ impl CanBackend for KvaserBackend {
         let rx_handle = match open_handle(&lib, index as i32, freq, tseg1, tseg2, sjw) {
             Ok(h) => h,
             Err(e) => {
-                unsafe { (lib.bus_off)(tx_handle); (lib.close)(tx_handle); }
+                unsafe {
+                    (lib.bus_off)(tx_handle);
+                    (lib.close)(tx_handle);
+                }
                 return Err(e);
             }
         };
 
         Ok((
-            Box::new(KvaserTxHandle { lib: Arc::clone(&lib), handle: tx_handle }),
+            Box::new(KvaserTxHandle {
+                lib: Arc::clone(&lib),
+                handle: tx_handle,
+            }),
             Box::new(KvaserRxHandle { lib, handle: rx_handle }),
         ))
     }

@@ -29,9 +29,7 @@ impl RxHandle for SocketCanRxHandle {
                 data: df.data().to_vec(),
             })),
             Ok(_) => Ok(None),
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
-                Ok(None)
-            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(None),
             Err(e) => Err(e.to_string()),
         }
     }
@@ -54,15 +52,12 @@ impl TxHandle for SocketCanTxHandle {
                     frame.can_id
                 ));
             }
-            let eid = ExtendedId::new(frame.can_id)
-                .ok_or_else(|| format!("Invalid extended CAN ID: {:#x}", frame.can_id))?;
+            let eid =
+                ExtendedId::new(frame.can_id).ok_or_else(|| format!("Invalid extended CAN ID: {:#x}", frame.can_id))?;
             CanDataFrame::new(eid, &frame.data).ok_or("Failed to build extended CAN frame")?
         } else {
             if frame.can_id > 0x7FF {
-                return Err(format!(
-                    "Standard CAN ID must be ≤ 0x7FF, got {:#x}",
-                    frame.can_id
-                ));
+                return Err(format!("Standard CAN ID must be ≤ 0x7FF, got {:#x}", frame.can_id));
             }
             let sid = StandardId::new(frame.can_id as u16)
                 .ok_or_else(|| format!("Invalid standard CAN ID: {:#x}", frame.can_id))?;
@@ -82,7 +77,9 @@ pub struct SocketCanBackend {
 
 impl SocketCanBackend {
     pub fn new(sudo_password: impl Fn() -> Result<String, String> + Send + 'static) -> Self {
-        Self { sudo_password: Box::new(sudo_password) }
+        Self {
+            sudo_password: Box::new(sudo_password),
+        }
     }
 
     fn run_ip_auto(&self, args: &[&str]) -> Result<(), String> {
@@ -107,17 +104,11 @@ impl CanBackend for SocketCanBackend {
             _ => return Vec::new(),
         };
         out.lines()
-            .filter_map(|line| {
-                line.split_whitespace().nth(1)?.strip_suffix(':').map(str::to_string)
-            })
+            .filter_map(|line| line.split_whitespace().nth(1)?.strip_suffix(':').map(str::to_string))
             .collect()
     }
 
-    fn open_channel(
-        &mut self,
-        index: u8,
-        bitrate: u32,
-    ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), String> {
+    fn open_channel(&mut self, index: u8, bitrate: u32) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), String> {
         let channels = self.list_channels();
         let name = channels
             .get(index as usize)
@@ -141,14 +132,15 @@ impl CanBackend for SocketCanBackend {
             }
         }
 
-        let tx_socket = CanSocket::open(&name)
-            .map_err(|e| format!("Failed to open TX socket on '{name}': {e}"))?;
-        let rx_socket = CanSocket::open(&name)
-            .map_err(|e| format!("Failed to open RX socket on '{name}': {e}"))?;
+        let tx_socket = CanSocket::open(&name).map_err(|e| format!("Failed to open TX socket on '{name}': {e}"))?;
+        let rx_socket = CanSocket::open(&name).map_err(|e| format!("Failed to open RX socket on '{name}': {e}"))?;
 
         Ok((
             Box::new(SocketCanTxHandle { socket: tx_socket }),
-            Box::new(SocketCanRxHandle { socket: rx_socket, configured_timeout_ms: 0 }),
+            Box::new(SocketCanRxHandle {
+                socket: rx_socket,
+                configured_timeout_ms: 0,
+            }),
         ))
     }
 }
@@ -187,7 +179,11 @@ fn run_ip(args: &[&str], sudo_password: Option<&str>) -> Result<(), String> {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        Err(if msg.trim().is_empty() { raw.trim().to_string() } else { msg.trim().to_string() })
+        Err(if msg.trim().is_empty() {
+            raw.trim().to_string()
+        } else {
+            msg.trim().to_string()
+        })
     } else {
         let out = std::process::Command::new("ip")
             .args(args)
@@ -197,7 +193,11 @@ fn run_ip(args: &[&str], sudo_password: Option<&str>) -> Result<(), String> {
             return Ok(());
         }
         let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        Err(if is_perm(&msg) { format!("needs-sudo: {msg}") } else { msg })
+        Err(if is_perm(&msg) {
+            format!("needs-sudo: {msg}")
+        } else {
+            msg
+        })
     }
 }
 

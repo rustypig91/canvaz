@@ -1285,6 +1285,7 @@ interface SimMessageEntry {
   signals: { def: DbcSignal; value: number }[];
   periodMs: number;
   running: boolean;
+  periodicHandle: number | null;
 }
 
 interface SimRawEntry {
@@ -1296,6 +1297,7 @@ interface SimRawEntry {
   data: number[];
   periodMs: number;
   running: boolean;
+  periodicHandle: number | null;
 }
 
 type SimEntry = SimMessageEntry | SimRawEntry;
@@ -1462,7 +1464,7 @@ function addSimSignal(channel: string, sig: DbcSignal) {
     kind: "message", channel,
     messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
     signals: msg.signals.map(s => ({ def: s, value: s.min ?? 0 })),
-    periodMs: 100, running: false,
+    periodMs: 100, running: false, periodicHandle: null,
   };
   simEntries.set(key, entry);
   document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
@@ -1477,7 +1479,7 @@ function addRawFrame() {
     channel: configuredChannels.length > 0 ? `${configuredChannels[0].backend}:${configuredChannels[0].name}` : "",
     canId: 0x100, isExtended: false, dlc: 8,
     data: new Array(8).fill(0),
-    periodMs: 100, running: false,
+    periodMs: 100, running: false, periodicHandle: null,
   };
   simEntries.set(key, entry);
   document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
@@ -1499,14 +1501,16 @@ async function startSim(key: string) {
   if (!entry.channel) { setStatus("Select a channel first"); return; }
 
   try {
+    let handle: number;
     if (entry.kind === "message") {
       const signalValues: Record<string, number> = {};
       for (const s of entry.signals) signalValues[s.def.name] = s.value;
-      await invoke("add_periodic_message", { cmd: { channel_id: entry.channel, message_id: entry.messageId, signal_values: signalValues, period_ms: entry.periodMs } });
+      handle = await invoke<number>("add_periodic_message", { cmd: { channel_id: entry.channel, message_id: entry.messageId, signal_values: signalValues, period_ms: entry.periodMs } });
     } else {
-      await invoke("add_periodic_frame", { cmd: { channel_id: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs } });
+      handle = await invoke<number>("add_periodic_frame", { cmd: { channel_id: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs } });
     }
     entry.running = true;
+    entry.periodicHandle = handle;
     const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
     if (btn) { btn.textContent = "Stop"; btn.classList.add("running"); }
   } catch (e) {
@@ -1517,8 +1521,10 @@ async function startSim(key: string) {
 async function stopSim(key: string) {
   const entry = simEntries.get(key);
   if (!entry || !entry.running) return;
-  const canId = entry.kind === "message" ? entry.messageId : entry.canId;
-  try { await invoke("remove_periodic_frame", { cmd: { channel_id: entry.channel, can_id: canId } }); } catch { }
+  if (entry.periodicHandle !== null) {
+    try { await invoke("remove_periodic", { cmd: { channel_id: entry.channel, handle: entry.periodicHandle } }); } catch { }
+    entry.periodicHandle = null;
+  }
   entry.running = false;
   const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
   if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
@@ -1667,7 +1673,7 @@ async function applyProject(project: Project) {
       kind: "raw", channel: raw.channel,
       canId: raw.can_id, isExtended: raw.is_extended,
       dlc: raw.dlc, data: raw.data,
-      periodMs: raw.period_ms, running: false,
+      periodMs: raw.period_ms, running: false, periodicHandle: null,
     };
     simEntries.set(key, entry);
     document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
@@ -1831,7 +1837,7 @@ async function startApp() {
         kind: "message", channel,
         messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
         signals: msg.signals.map(s => ({ def: s, value: values.get(s.name) ?? s.min ?? 0 })),
-        periodMs, running: false,
+        periodMs, running: false, periodicHandle: null,
       };
       simEntries.set(key, simEntry);
       simContainer.appendChild(createSimEntryEl(key, simEntry));
@@ -1860,6 +1866,7 @@ async function stopApp() {
   for (const [key, entry] of simEntries) {
     if (entry.running) {
       entry.running = false;
+      entry.periodicHandle = null;
       const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
       if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
     }
@@ -1925,8 +1932,10 @@ async function exportCsv(): Promise<boolean> {
       if (seen.has(key)) continue;
       seen.add(key);
       for (let i = 0; i < series.timestamps.length; i++) {
-        allSamples.push({ ts: series.timestamps[i], channel: series.channel,
-          signalName: series.signalName, value: series.data[i].y, unit: series.unit });
+        allSamples.push({
+          ts: series.timestamps[i], channel: series.channel,
+          signalName: series.signalName, value: series.data[i].y, unit: series.unit
+        });
       }
     }
   }
@@ -2029,7 +2038,7 @@ function setWindowSize(sec: number) {
   windowSizeSec = Math.max(1, Math.round(sec));
   reflectWindowSize();
   pruneOldData();
-  invoke("set_window_ms", { ms: windowSizeSec * 1000 }).catch(() => {});
+  invoke("set_window_ms", { ms: windowSizeSec * 1000 }).catch(() => { });
 }
 
 // User changed the control: apply and mark the project dirty.
@@ -2478,7 +2487,7 @@ function onCanFrame(ev: CanFrameEvent) {
       const series = pane.series.get(sigKey);
       if (!series) continue;
       if (series.timestamps.length > 0 &&
-          series.timestamps[series.timestamps.length - 1] >= ev.timestamp_ms) continue;
+        series.timestamps[series.timestamps.length - 1] >= ev.timestamp_ms) continue;
       series.timestamps.push(ev.timestamp_ms);
       series.data.push({ x, y: sig.value });
       series.lastValue = sig.value;
