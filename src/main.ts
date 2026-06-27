@@ -237,10 +237,6 @@ let appStartTime = Date.now();
 let midPan: { startX: number; startMin: number; startMax: number; chartWidth: number } | null = null;
 
 
-// Tracks how many plot panes reference each signal (key: plotKey).
-// Used to subscribe/unsubscribe on the Rust side exactly once per signal.
-const signalSubscribeCount = new Map<string, number>();
-
 function plotKey(channel: string, signalName: string) {
   return `${channel}::${signalName}`;
 }
@@ -309,7 +305,6 @@ function snapshotPlotPanes() {
 
 function removeSigFromPane(pane: PlotPane, key: string) {
   if (!pane.series.delete(key)) return;
-  decrementSubscription(key);
   if (pane.series.size === 0) { closePlotPane(pane.id); return; }
   syncDatasets(pane);
   updatePaneTitle(pane);
@@ -507,28 +502,10 @@ function createPlotPane(): PlotPane {
   return pane;
 }
 
-// Decrement the subscription reference count for a signal key. When it reaches
-// zero, tell Rust to stop emitting signal-value events for that signal.
-function decrementSubscription(key: string) {
-  const count = (signalSubscribeCount.get(key) ?? 0) - 1;
-  if (count <= 0) {
-    signalSubscribeCount.delete(key);
-    const sep = key.indexOf("::");
-    invoke("unsubscribe_signals", {
-      channelId: key.substring(0, sep),
-      signalNames: [key.substring(sep + 2)],
-    }).catch(() => {});
-  } else {
-    signalSubscribeCount.set(key, count);
-  }
-}
-
 function closePlotPane(id: string) {
   const idx = plotPanes.findIndex(p => p.id === id);
   if (idx === -1) return;
   const [pane] = plotPanes.splice(idx, 1);
-  // Unsubscribe any signals not present in other panes.
-  for (const key of pane.series.keys()) decrementSubscription(key);
   pane.chart.destroy();
   pane.el.remove();
   updateSignalHighlights();
@@ -545,39 +522,42 @@ async function addSignalToPane(pane: PlotPane, channel: string, sig: DbcSignal) 
     signalName: sig.name, messageName: sig.message_name, unit: sig.unit,
     color, channel, timestamps: [], data: [], lastValue: null, frozenLength: null,
   };
+  // Register the series NOW so live signal-value events are captured immediately
+  // while we await the history fetch below.
   pane.series.set(key, series);
 
-  const prevCount = signalSubscribeCount.get(key) ?? 0;
-  signalSubscribeCount.set(key, prevCount + 1);
+  // If another pane already loaded history for this signal, copy from it to
+  // avoid a redundant backend round-trip.
+  let copiedFromExisting = false;
+  for (const other of plotPanes) {
+    if (other === pane) continue;
+    const existing = other.series.get(key);
+    if (existing && existing.timestamps.length > 0) {
+      series.timestamps = [...existing.timestamps];
+      series.data = [...existing.data];
+      series.lastValue = existing.lastValue;
+      copiedFromExisting = true;
+      break;
+    }
+  }
 
-  if (prevCount === 0) {
-    // First subscriber: fetch history from Rust ring buffer, then subscribe so
-    // live events start flowing. Fetching before subscribing avoids overlap.
+  if (!copiedFromExisting) {
+    // Load history from the backend. Live events that arrived while we awaited
+    // are already in series.timestamps (pushed by onSignalValue). Prepend only
+    // historical samples that are older than the first live sample.
     try {
       const sinceMs = Date.now() - windowSizeSec * 1000;
       const history = await invoke<Array<{ timestamp_ms: number; value: number }>>(
         "get_signal_history", { channelId: channel, signalName: sig.name, sinceMs }
       );
-      for (const sample of history) {
-        series.timestamps.push(sample.timestamp_ms);
-        series.data.push({ x: (sample.timestamp_ms - appStartTime) / 1000, y: sample.value });
+      const liveStart = series.timestamps[0] ?? Infinity;
+      const toInsert = history.filter(s => s.timestamp_ms < liveStart);
+      if (toInsert.length > 0) {
+        series.timestamps = [...toInsert.map(s => s.timestamp_ms), ...series.timestamps];
+        series.data = [...toInsert.map(s => ({ x: (s.timestamp_ms - appStartTime) / 1000, y: s.value })), ...series.data];
       }
       if (series.data.length > 0) series.lastValue = series.data[series.data.length - 1].y;
     } catch { /* channel not open or no DBC yet — data will stream in via events */ }
-    invoke("subscribe_signals", { channelId: channel, signalNames: [sig.name] }).catch(() => {});
-  } else {
-    // Already subscribed in another pane — copy existing data to avoid an extra
-    // round-trip and potential duplicate events from a concurrent history fetch.
-    for (const other of plotPanes) {
-      if (other === pane) continue;
-      const existing = other.series.get(key);
-      if (existing) {
-        series.timestamps.push(...existing.timestamps);
-        series.data.push(...existing.data);
-        series.lastValue = existing.lastValue;
-        break;
-      }
-    }
   }
 
   syncDatasets(pane);
@@ -652,6 +632,8 @@ function onSignalValue(ev: SignalValueEvent) {
     if (!series) continue;
     // Guard against duplicates with pre-loaded history: skip events older than
     // the last stored sample (history is loaded before subscribe is called).
+    // Skip if this sample is not newer than the last recorded one (avoids
+    // duplicates when history is prepended after an async fetch).
     if (series.timestamps.length > 0 &&
         series.timestamps[series.timestamps.length - 1] >= ev.timestamp_ms) continue;
     series.timestamps.push(ev.timestamp_ms);
@@ -1047,15 +1029,6 @@ async function openChannel(
     });
     // Store the DBC returned by the channel (freshly parsed from disk).
     if (info.dbc) dbcByChannel.set(info.id, info.dbc);
-    // Re-subscribe any signals currently in plots for this channel (Rust clears
-    // subscriptions when a channel is closed, so we must restore them on reopen).
-    const names: string[] = [];
-    for (const [key, count] of signalSubscribeCount) {
-      if (count > 0 && key.startsWith(`${info.id}::`)) {
-        names.push(key.substring(info.id.length + 2));
-      }
-    }
-    if (names.length > 0) invoke("subscribe_signals", { channelId: info.id, signalNames: names }).catch(() => {});
     return info;
   } catch (e) {
     const msg = String(e);

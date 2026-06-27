@@ -230,8 +230,6 @@ struct ManagerShared {
     index_to_id: HashMap<(String, u8), String>,
     /// channel_id → (backend_name, hw_index)
     id_to_index: HashMap<String, (String, u8)>,
-    /// channel_id → subscribed signal names
-    subscribed: HashMap<String, HashSet<String>>,
 }
 
 // ── CanManager ────────────────────────────────────────────────────────────────
@@ -249,7 +247,6 @@ impl CanManager {
             channels: HashMap::new(),
             index_to_id: HashMap::new(),
             id_to_index: HashMap::new(),
-            subscribed: HashMap::new(),
         }));
 
         let mut cans: HashMap<String, Can> = HashMap::new();
@@ -360,7 +357,6 @@ impl CanManager {
             lock.index_to_id.insert((backend_name.clone(), hw_index), id.clone());
             lock.id_to_index.insert(id.clone(), (backend_name, hw_index));
             lock.channels.insert(id.clone(), ChannelData::new(info.clone(), dbc));
-            lock.subscribed.insert(id, HashSet::new());
         }
         Ok(info)
     }
@@ -372,7 +368,6 @@ impl CanManager {
                 .ok_or_else(|| format!("'{channel_id}' is not open"))?;
             lock.index_to_id.remove(&(bn.clone(), idx));
             lock.channels.remove(channel_id);
-            lock.subscribed.remove(channel_id);
             (bn, idx)
         };
         self.cans.get_mut(&backend_name)
@@ -446,23 +441,6 @@ impl CanManager {
             .remove_periodic(hw_index, can_id)
     }
 
-    // ── Subscriptions ─────────────────────────────────────────────────────────
-
-    pub fn subscribe(&self, channel_id: &str, signal_names: Vec<String>) -> Result<(), String> {
-        let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
-        let subs = lock.subscribed.entry(channel_id.to_string()).or_insert_with(HashSet::new);
-        for name in signal_names { subs.insert(name); }
-        Ok(())
-    }
-
-    pub fn unsubscribe(&self, channel_id: &str, signal_names: Vec<String>) -> Result<(), String> {
-        let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
-        if let Some(subs) = lock.subscribed.get_mut(channel_id) {
-            for name in signal_names { subs.remove(&name); }
-        }
-        Ok(())
-    }
-
     // ── Queries ───────────────────────────────────────────────────────────────
 
     pub fn get_frames(&self, channel_id: Option<&str>, limit: usize) -> Vec<FrameInfo> {
@@ -530,7 +508,6 @@ fn make_rx_callback(
             };
 
             let window_ms = lock.window_ms;
-            let subscribed = lock.subscribed.get(&channel_id).cloned().unwrap_or_default();
             let dbc = lock.channels.get(&channel_id).and_then(|c| c.dbc.clone());
 
             let signals = dbc.as_ref()
@@ -562,7 +539,6 @@ fn make_rx_callback(
 
             let app = lock.app.clone();
             let events: Vec<SignalValueEvent> = signal_updates.into_iter()
-                .filter(|(name, ..)| subscribed.contains(name))
                 .map(|(signal_name, value, unit, message_name, min, max)| SignalValueEvent {
                     channel_id: channel_id.clone(),
                     signal_name,

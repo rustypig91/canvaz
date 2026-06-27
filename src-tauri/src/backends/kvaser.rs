@@ -210,14 +210,18 @@ impl KvaserRxChannel {
             )
         };
         if s == CAN_ERR_NOMSG {
+            println!("Kvaser receive timeout after {} ms", timeout_ms);
             return Ok(None);
         }
         if s < CAN_OK {
+            println!("Kvaser receive error: {}", canlib_err(s));
             return Err(format!("canReadWait failed: {}", canlib_err(s)));
         }
         if flags & (CAN_MSG_ERROR_FRAME | CAN_MSG_RTR) != 0 {
+            println!("Kvaser received unsupported frame (flags={flags}): ignoring");
             return Ok(None);
         }
+        println!("Kvaser received frame: id={id}, dlc={dlc}, flags={flags}, timestamp={timestamp}");
         let dlc = (dlc as usize).min(8);
         Ok(Some(CanFrame {
             can_id: id as u32,

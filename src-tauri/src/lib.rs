@@ -106,28 +106,6 @@ fn parse_dbc(path: String) -> Result<dbc_parser::ParsedDbc, String> {
     dbc_parser::parse_dbc(&path)
 }
 
-// ── Signal subscription commands ──────────────────────────────────────────────
-
-#[tauri::command]
-fn subscribe_signals(
-    channel_id: String,
-    signal_names: Vec<String>,
-    state: State<'_, TauriState>,
-) -> Result<(), String> {
-    state.can.lock().map_err(|e| e.to_string())?
-        .subscribe(&channel_id, signal_names)
-}
-
-#[tauri::command]
-fn unsubscribe_signals(
-    channel_id: String,
-    signal_names: Vec<String>,
-    state: State<'_, TauriState>,
-) -> Result<(), String> {
-    state.can.lock().map_err(|e| e.to_string())?
-        .unsubscribe(&channel_id, signal_names)
-}
-
 // ── Query commands ────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -235,8 +213,6 @@ pub fn run() {
             send_message,
             send_raw_frame,
             parse_dbc,
-            subscribe_signals,
-            unsubscribe_signals,
             get_frames,
             get_signal_history,
             set_window_ms,
