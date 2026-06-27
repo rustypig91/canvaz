@@ -1,10 +1,14 @@
 mod example_backend;
 #[cfg(feature = "kvaser")]
 mod kvaser;
+#[cfg(feature = "linux-can")]
+mod socketcan;
 
 pub use example_backend::ExampleBackend;
 #[cfg(feature = "kvaser")]
 pub use kvaser::KvaserBackend;
+#[cfg(feature = "linux-can")]
+pub use socketcan::SocketCanBackend;
 
 use std::collections::HashMap;
 use std::sync::{

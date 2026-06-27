@@ -52,8 +52,21 @@ interface SignalValueEvent {
   signal_name: string;
   message_name: string;
   value: number;
+  min: number;
+  max: number;
   unit: string;
   timestamp_ms: number;
+}
+
+interface FrameInfo {
+  channel_id: string;
+  can_id: number;
+  is_extended: boolean;
+  dlc: number;
+  data: number[];
+  timestamp_ms: number;
+  direction: "rx" | "tx";
+  message_name: string | null;
 }
 
 interface CanFrameEvent {
@@ -615,12 +628,10 @@ function onSignalValue(ev: SignalValueEvent) {
   if (!appRunning) return;
   const key = plotKey(ev.channel_id, ev.signal_name);
 
-  // Update sidebar value + min/max
+  // Update sidebar value + min/max (authoritative values come from the backend)
   signalLastValues.set(key, ev.value);
-  const prevMin = signalMinValues.get(key);
-  const prevMax = signalMaxValues.get(key);
-  if (prevMin === undefined || ev.value < prevMin) signalMinValues.set(key, ev.value);
-  if (prevMax === undefined || ev.value > prevMax) signalMaxValues.set(key, ev.value);
+  signalMinValues.set(key, ev.min);
+  signalMaxValues.set(key, ev.max);
 
   const valEl = signalValueEls.get(key);
   if (valEl) {
@@ -2247,7 +2258,7 @@ let traceFilterDir: Set<string> | null = null;
 type TraceSortCol = "ts" | "dir" | "channel" | "canId" | "msg" | "dlc" | "data" | "cycle" | null;
 let traceSortCol: TraceSortCol = null;
 let traceSortDir: "asc" | "desc" = "asc";
-const traceAppendBuffer: TraceEntry[] = [];
+let traceLocalBuffer: TraceEntry[] = [];
 
 function traceKey(channel: string, canId: number, direction: "rx" | "tx") {
   return `${channel}::${canId}::${direction}`;
@@ -2308,7 +2319,7 @@ function applyTraceFilter() {
   if (traceMode === "append") {
     // Rebuild DOM entirely from the in-memory buffer — never keep invisible rows in the DOM.
     tbody.innerHTML = "";
-    for (const entry of traceAppendBuffer) {
+    for (const entry of traceLocalBuffer) {
       if (traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) {
         tbody.appendChild(buildTraceRow(entry));
       }
@@ -2490,11 +2501,6 @@ function onCanFrame(ev: CanFrameEvent) {
     direction,
   };
 
-  if (traceMode === "append") {
-    traceAppendBuffer.unshift(entry);
-    if (traceAppendBuffer.length > traceMaxRows) traceAppendBuffer.pop();
-  }
-
   if (viewPaused) {
     // Accumulate latest state per key; DOM stays frozen until resume.
     if (traceMode === "overwrite") tracePendingOverwrite.set(key, entry);
@@ -2521,6 +2527,32 @@ function onCanFrame(ev: CanFrameEvent) {
   }
 }
 
+async function loadTraceFrames() {
+  const frames = await invoke<FrameInfo[]>("get_frames", { channelId: null, limit: traceMaxRows });
+  const cycleTimes = new Map<string, number>();
+  // Backend returns oldest-first; we want newest-first in traceLocalBuffer.
+  traceLocalBuffer = frames.map(f => {
+    const k = traceKey(f.channel_id, f.can_id, f.direction);
+    const prev = cycleTimes.get(k);
+    const cycleTimeMs = prev != null ? f.timestamp_ms - prev : null;
+    cycleTimes.set(k, f.timestamp_ms);
+    if (f.message_name) traceSeenMsgNames.add(f.message_name);
+    traceSeenChannels.add(f.channel_id);
+    traceSeenCanIds.add(f.can_id);
+    return {
+      channel: f.channel_id,
+      canId: f.can_id,
+      isExtended: f.is_extended,
+      dlc: f.dlc,
+      data: f.data,
+      messageName: f.message_name,
+      timestampMs: f.timestamp_ms,
+      cycleTimeMs,
+      direction: f.direction,
+    };
+  }).reverse();
+}
+
 function clearTrace() {
   (document.getElementById("trace-tbody") as HTMLTableSectionElement).innerHTML = "";
   traceRowEls.clear();
@@ -2530,7 +2562,7 @@ function clearTrace() {
   traceSeenCanIds.clear();
   traceSeenMsgNames.clear();
   traceSeenNoMsg = false;
-  traceAppendBuffer.length = 0;
+  traceLocalBuffer = [];
 }
 
 function refreshTraceFormat() {
@@ -2956,7 +2988,7 @@ function setupTrace() {
 
   document.getElementById("input-trace-max")!.addEventListener("change", (e) => {
     traceMaxRows = parseInt((e.target as HTMLInputElement).value) || 1000;
-    while (traceAppendBuffer.length > traceMaxRows) traceAppendBuffer.pop();
+    while (traceLocalBuffer.length > traceMaxRows) traceLocalBuffer.pop();
     scheduleAutoSave();
   });
 
@@ -2986,18 +3018,20 @@ function resumeFromPause() {
     }
     tracePendingOverwrite.clear();
   } else {
-    // Re-render visible rows from the accumulated buffer (newest first).
-    tbody.innerHTML = "";
-    const frag = document.createDocumentFragment();
-    let count = 0;
-    for (const e of traceAppendBuffer) {
-      if (count >= traceMaxRows) break;
-      if (traceRowVisible(e.channel, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName)) {
-        frag.appendChild(buildTraceRow(e));
-        count++;
+    // Re-render visible rows from the backend (newest first after refresh).
+    loadTraceFrames().then(() => {
+      tbody.innerHTML = "";
+      const frag = document.createDocumentFragment();
+      let count = 0;
+      for (const e of traceLocalBuffer) {
+        if (count >= traceMaxRows) break;
+        if (traceRowVisible(e.channel, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName)) {
+          frag.appendChild(buildTraceRow(e));
+          count++;
+        }
       }
-    }
-    tbody.appendChild(frag); // buffer is newest-first, so newest lands at top
+      tbody.appendChild(frag);
+    });
   }
 
   // Bring all plot panes up to date with accumulated data; clear any zoom.
@@ -3078,6 +3112,9 @@ window.addEventListener("DOMContentLoaded", async () => {
       document.querySelectorAll(".tab-content").forEach(c => c.classList.remove("active"));
       btn.classList.add("active");
       document.getElementById(`tab-${btn.dataset.tab}`)!.classList.add("active");
+      if (btn.dataset.tab === "trace" && appRunning) {
+        loadTraceFrames().then(() => applyTraceFilter());
+      }
     });
   });
 
