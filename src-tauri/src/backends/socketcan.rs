@@ -13,10 +13,17 @@ use crate::app_state::AppState;
 
 pub(crate) struct SocketCanRxChannel {
     socket: CanSocket,
+    configured_timeout_ms: u64,
 }
 
 impl SocketCanRxChannel {
-    pub(super) fn receive(&self) -> Result<Option<CanFrame>, String> {
+    pub(super) fn receive(&mut self, timeout_ms: u64) -> Result<Option<CanFrame>, String> {
+        if self.configured_timeout_ms != timeout_ms {
+            self.socket
+                .set_read_timeout(Duration::from_millis(timeout_ms))
+                .map_err(|e| format!("set_read_timeout failed: {e}"))?;
+            self.configured_timeout_ms = timeout_ms;
+        }
         match self.socket.read_frame() {
             Ok(SocketCanFrame::Data(df)) => Ok(Some(CanFrame {
                 can_id: df.raw_id(),
@@ -78,12 +85,9 @@ impl SocketCanChannel {
 
         let rx_socket = CanSocket::open(&self.name)
             .map_err(|e| format!("Failed to open RX socket on '{}': {e}", self.name))?;
-        rx_socket
-            .set_read_timeout(Duration::from_millis(super::RECV_TIMEOUT_MS))
-            .map_err(|e| format!("Failed to set read timeout on '{}': {e}", self.name))?;
 
         self.socket = Some(tx_socket);
-        Ok(SocketCanRxChannel { socket: rx_socket })
+        Ok(SocketCanRxChannel { socket: rx_socket, configured_timeout_ms: 0 })
     }
 
     pub(super) fn close(&mut self) -> Result<(), String> {

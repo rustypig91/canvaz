@@ -26,7 +26,7 @@ const DEFAULT_WINDOW_MS: u64 = 30_000;
 
 // How long each backend receive() blocks before returning None.
 // Must be short enough to notice a close() promptly.
-pub(crate) const RECV_TIMEOUT_MS: u64 = 50;
+const RECV_TIMEOUT_MS: u64 = 50;
 
 // ── Shared types ──────────────────────────────────────────────────────────────
 
@@ -106,12 +106,12 @@ enum RxChannel {
 }
 
 impl RxChannel {
-    fn receive(&self) -> Result<Option<CanFrame>, String> {
+    fn receive(&mut self, timeout_ms: u64) -> Result<Option<CanFrame>, String> {
         match self {
             #[cfg(feature = "linux-can")]
-            RxChannel::SocketCan(c) => c.receive(),
+            RxChannel::SocketCan(c) => c.receive(timeout_ms),
             #[cfg(feature = "kvaser")]
-            RxChannel::Kvaser(c) => c.receive(),
+            RxChannel::Kvaser(c) => c.receive(timeout_ms),
         }
     }
 }
@@ -274,7 +274,7 @@ impl Channel {
 // ── Receive loop ──────────────────────────────────────────────────────────────
 
 fn recv_loop(
-    rx: RxChannel,
+    mut rx: RxChannel,
     frames: Arc<Mutex<VecDeque<CanFrame>>>,
     window_ms: Arc<AtomicU64>,
     dbc: Option<Arc<ParsedDbc>>,
@@ -284,8 +284,7 @@ fn recv_loop(
     subscribed: SubscribedSignals,
 ) {
     while !stop.load(Ordering::Relaxed) {
-        // receive() blocks for at most RECV_TIMEOUT_MS — no mutex held during the wait
-        let mut frame = match rx.receive() {
+        let mut frame = match rx.receive(RECV_TIMEOUT_MS) {
             Ok(Some(f)) => f,
             Ok(None) => continue,
             Err(e) => {

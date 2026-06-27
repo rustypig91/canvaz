@@ -4,6 +4,7 @@ mod can_manager;
 mod dbc_parser;
 mod can_frame;
 mod project;
+mod can_communication;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, RwLock};

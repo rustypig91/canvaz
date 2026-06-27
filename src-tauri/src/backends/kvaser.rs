@@ -191,7 +191,7 @@ pub(crate) struct KvaserRxChannel {
 unsafe impl Send for KvaserRxChannel {}
 
 impl KvaserRxChannel {
-    pub(super) fn receive(&self) -> Result<Option<CanFrame>, String> {
+    pub(super) fn receive(&self, timeout_ms: u64) -> Result<Option<CanFrame>, String> {
         let mut id: c_long = 0;
         let mut data = [0u8; 8];
         let mut dlc: u32 = 0;
@@ -206,7 +206,7 @@ impl KvaserRxChannel {
                 &mut dlc,
                 &mut flags,
                 &mut timestamp,
-                super::RECV_TIMEOUT_MS as c_ulong,
+                timeout_ms as c_ulong,
             )
         };
         if s == CAN_ERR_NOMSG {
