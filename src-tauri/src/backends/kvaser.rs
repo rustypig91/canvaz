@@ -1,6 +1,5 @@
 use std::os::raw::{c_long, c_ulong};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use libloading::Library;
 
@@ -43,7 +42,7 @@ type FnClose = unsafe extern "system" fn(i32) -> i32;
 type FnSetBus = unsafe extern "system" fn(i32, c_long, u32, u32, u32, u32, u32) -> i32;
 type FnBusOn = unsafe extern "system" fn(i32) -> i32;
 type FnBusOff = unsafe extern "system" fn(i32) -> i32;
-type FnRead = unsafe extern "system" fn(i32, *mut c_long, *mut u8, *mut u32, *mut u32, *mut c_ulong) -> i32;
+type FnReadWait = unsafe extern "system" fn(i32, *mut c_long, *mut u8, *mut u32, *mut u32, *mut c_ulong, c_ulong) -> i32;
 type FnWrite = unsafe extern "system" fn(i32, c_long, *const u8, u32, u32) -> i32;
 type FnWriteSync = unsafe extern "system" fn(i32, c_ulong) -> i32;
 type FnGetChannelData = unsafe extern "system" fn(i32, i32, *mut u8, usize) -> i32;
@@ -57,7 +56,7 @@ struct CanLib {
     set_bus: FnSetBus,
     bus_on: FnBusOn,
     bus_off: FnBusOff,
-    read: FnRead,
+    read_wait: FnReadWait,
     write: FnWrite,
     write_sync: FnWriteSync,
 }
@@ -87,7 +86,7 @@ impl CanLib {
                 set_bus: sym!(b"canSetBusParams\0", FnSetBus),
                 bus_on: sym!(b"canBusOn\0", FnBusOn),
                 bus_off: sym!(b"canBusOff\0", FnBusOff),
-                read: sym!(b"canRead\0", FnRead),
+                read_wait: sym!(b"canReadWait\0", FnReadWait),
                 write: sym!(b"canWrite\0", FnWrite),
                 write_sync: sym!(b"canWriteSync\0", FnWriteSync),
                 _lib: lib,
@@ -331,39 +330,42 @@ impl KvaserBackendChannel {
 
     pub(super) fn receive(&self) -> Result<Option<CanFrame>, String> {
         let (lib, handle) = self.lib_and_handle()?;
-        let deadline = Instant::now() + Duration::from_millis(100);
-        loop {
-            let mut id: c_long = 0;
-            let mut data = [0u8; 8];
-            let mut dlc: u32 = 0;
-            let mut flags: u32 = 0;
-            let mut timestamp: c_ulong = 0;
-            // SAFETY: handle is valid; all out-pointers point to valid stack locations
-            let s = unsafe { (lib.read)(handle, &mut id, data.as_mut_ptr(), &mut dlc, &mut flags, &mut timestamp) };
-            if s == CAN_ERR_NOMSG {
-                if Instant::now() >= deadline {
-                    return Ok(None);
-                }
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
-            }
-            if s < CAN_OK {
-                return Err(format!("canRead failed: {}", canlib_err(s)));
-            }
-            // Skip error frames and RTR frames — they are not data frames
-            if flags & (CAN_MSG_ERROR_FRAME | CAN_MSG_RTR) != 0 {
-                continue;
-            }
-            let dlc = (dlc as usize).min(8);
-            return Ok(Some(CanFrame {
-                can_id: id as u32,
-                is_extended: (flags & CAN_MSG_EXT) != 0,
-                data: data[..dlc].to_vec(),
-                timestamp_ms: now_ms(),
-                direction: Direction::Rx,
-                decoded: None,
-            }));
+        let mut id: c_long = 0;
+        let mut data = [0u8; 8];
+        let mut dlc: u32 = 0;
+        let mut flags: u32 = 0;
+        let mut timestamp: c_ulong = 0;
+        // SAFETY: handle is valid; all out-pointers point to valid stack locations
+        let s = unsafe {
+            (lib.read_wait)(
+                handle,
+                &mut id,
+                data.as_mut_ptr(),
+                &mut dlc,
+                &mut flags,
+                &mut timestamp,
+                super::RECV_TIMEOUT_MS as c_ulong,
+            )
+        };
+        if s == CAN_ERR_NOMSG {
+            return Ok(None);
         }
+        if s < CAN_OK {
+            return Err(format!("canReadWait failed: {}", canlib_err(s)));
+        }
+        // Skip error frames and RTR frames — they carry no payload data
+        if flags & (CAN_MSG_ERROR_FRAME | CAN_MSG_RTR) != 0 {
+            return Ok(None);
+        }
+        let dlc = (dlc as usize).min(8);
+        Ok(Some(CanFrame {
+            can_id: id as u32,
+            is_extended: (flags & CAN_MSG_EXT) != 0,
+            data: data[..dlc].to_vec(),
+            timestamp_ms: now_ms(),
+            direction: Direction::Rx,
+            decoded: None,
+        }))
     }
 
     pub(super) fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {

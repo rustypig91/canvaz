@@ -88,7 +88,7 @@ impl SocketCanChannel {
 
         let socket = CanSocket::open(&self.name).map_err(|e| format!("Failed to open '{}': {e}", self.name))?;
         socket
-            .set_read_timeout(Duration::from_millis(100))
+            .set_read_timeout(Duration::from_millis(super::RECV_TIMEOUT_MS))
             .map_err(|e| format!("Failed to set read timeout on '{}': {e}", self.name))?;
         self.socket = Some(socket);
         Ok(())

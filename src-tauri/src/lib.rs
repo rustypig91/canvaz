@@ -221,6 +221,7 @@ fn get_signal_history(
 
     let ch = ch_arc.lock().map_err(|_| "Channel lock poisoned".to_string())?;
     Ok(ch.frames_since(since_ms)
+        .into_iter()
         .filter_map(|f| {
             let decoded = f.decoded.as_ref()?;
             let sig = decoded.signals.iter().find(|s| s.name == signal_name)?;

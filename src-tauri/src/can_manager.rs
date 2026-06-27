@@ -1,20 +1,17 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex, RwLock,
-};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
 
 use crate::app_state::AppState;
 use crate::backends::{default_backends, Backend, Channel};
 use crate::can_frame::CanFrame;
 use crate::dbc_parser::ParsedDbc;
 
+// Re-export so lib.rs import lines stay unchanged.
+pub use crate::backends::{CanFrameEvent, SubscribedSignals};
 
 pub type ManagerState = Arc<Mutex<CanManager>>;
-pub type SubscribedSignals = Arc<RwLock<HashMap<String, HashSet<String>>>>;
 
 // ── Channel identity ──────────────────────────────────────────────────────────
 
@@ -26,33 +23,9 @@ pub struct ChannelInfo {
     pub dbc: Option<ParsedDbc>,
 }
 
-// ── Wire events ───────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize)]
-pub struct CanFrameEvent {
-    pub channel_id: String,
-    pub can_id: u32,
-    pub is_extended: bool,
-    pub dlc: u8,
-    pub data: Vec<u8>,
-    pub timestamp_ms: u64,
-    pub direction: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SignalValueEvent {
-    pub channel_id: String,
-    pub signal_name: String,
-    pub message_name: String,
-    pub value: f64,
-    pub unit: String,
-    pub timestamp_ms: u64,
-}
-
 // ── Manager internals ─────────────────────────────────────────────────────────
 
 struct OpenChannelState {
-    stop_flag: Arc<AtomicBool>,
     channel: Arc<Mutex<Channel>>,
     channel_info: ChannelInfo,
 }
@@ -108,8 +81,15 @@ impl CanManager {
             .find(|b| b.name() == backend_name)
             .ok_or_else(|| format!("No backend '{backend_name}'"))?;
 
-        let mut ch = backend.open_channel(&channel_name, bitrate, Arc::clone(&self.state), dbc_path)?;
-        ch.open()?;
+        let mut ch = backend.open_channel(
+            &channel_name,
+            bitrate,
+            Arc::clone(&self.state),
+            dbc_path,
+            id.clone(),
+            Arc::clone(&self.subscribed),
+        )?;
+        ch.open()?; // opens hardware and spawns the receive thread
 
         let channel_info = ChannelInfo {
             id: id.clone(),
@@ -118,31 +98,23 @@ impl CanManager {
             dbc: ch.get_dbc().cloned(),
         };
 
-        let ch = Arc::new(Mutex::new(ch));
-        let stop_flag = Arc::new(AtomicBool::new(false));
-
-        std::thread::spawn({
-            let ch = Arc::clone(&ch);
-            let stop = Arc::clone(&stop_flag);
-            let info = channel_info.clone();
-            let state = Arc::clone(&self.state);
-            let subscribed = Arc::clone(&self.subscribed);
-            move || reading_loop(ch, info, state, subscribed, stop)
-        });
-
         self.channels.insert(id, OpenChannelState {
-            stop_flag,
-            channel: ch,
+            channel: Arc::new(Mutex::new(ch)),
             channel_info: channel_info.clone(),
         });
         Ok(channel_info)
     }
 
     pub fn close_channel(&mut self, channel_id: &str) -> Result<(), String> {
-        self.channels
+        let state = self.channels
             .remove(channel_id)
-            .map(|s| s.stop_flag.store(true, Ordering::Relaxed))
-            .ok_or_else(|| format!("'{channel_id}' is not open"))
+            .ok_or_else(|| format!("'{channel_id}' is not open"))?;
+        let ch_arc = Arc::clone(&state.channel);
+        drop(state);
+        let result = ch_arc.lock()
+            .map_err(|_| "Channel lock poisoned".to_string())?
+            .close();
+        result
     }
 
     pub fn open_channels_info(&self) -> Vec<ChannelInfo> {
@@ -169,79 +141,5 @@ impl CanManager {
     /// lock before locking individual channels.
     pub fn all_channel_arcs(&self) -> Vec<Arc<Mutex<Channel>>> {
         self.channels.values().map(|s| Arc::clone(&s.channel)).collect()
-    }
-}
-
-// ── Reading thread ────────────────────────────────────────────────────────────
-
-fn reading_loop(
-    channel: Arc<Mutex<Channel>>,
-    info: ChannelInfo,
-    state: Arc<AppState>,
-    subscribed: SubscribedSignals,
-    stop: Arc<AtomicBool>,
-) {
-    while !stop.load(Ordering::Relaxed) {
-        // Receive, decode with channel's own DBC, and store in ring buffer atomically.
-        let result = match channel.lock() {
-            Ok(mut ch) => ch.receive_decode_store(),
-            Err(_) => break,
-        };
-
-        match result {
-            Ok(Some(frame)) => {
-                let ts = frame.timestamp_ms;
-
-                // Emit raw can-frame event.
-                let _ = state.app.emit(
-                    "can-frame",
-                    CanFrameEvent {
-                        channel_id: info.id.clone(),
-                        can_id: frame.can_id,
-                        is_extended: frame.is_extended,
-                        dlc: frame.data.len() as u8,
-                        data: frame.data.clone(),
-                        timestamp_ms: ts,
-                        direction: "rx",
-                    },
-                );
-
-                // Emit signal-value events for subscribed signals.
-                let sub_guard = match subscribed.read() {
-                    Ok(g) => g,
-                    Err(_) => continue,
-                };
-                let subs = match sub_guard.get(&info.id) {
-                    Some(s) if !s.is_empty() => s,
-                    _ => continue,
-                };
-                if let Some(decoded) = &frame.decoded {
-                    for sig in &decoded.signals {
-                        if subs.contains(&sig.name) {
-                            let _ = state.app.emit(
-                                "signal-value",
-                                SignalValueEvent {
-                                    channel_id: info.id.clone(),
-                                    signal_name: sig.name.clone(),
-                                    message_name: decoded.name.clone(),
-                                    value: sig.physical,
-                                    unit: String::new(),
-                                    timestamp_ms: ts,
-                                },
-                            );
-                        }
-                    }
-                }
-            }
-            Ok(None) => {}
-            Err(e) => {
-                log::warn!("CAN read error on '{}': {e}", info.id);
-                break;
-            }
-        }
-    }
-
-    if let Ok(mut ch) = channel.lock() {
-        let _ = ch.close();
     }
 }
