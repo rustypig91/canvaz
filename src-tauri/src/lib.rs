@@ -52,7 +52,7 @@ async fn open_channel(
     let result = tauri::async_runtime::spawn_blocking(move || {
         can.lock()
             .map_err(|e| e.to_string())?
-            .open_channel(backend_name, channel_name, Some(bitrate), dbc_path.as_deref())
+            .open_channel(backend_name, channel_name, bitrate, dbc_path.as_deref())
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));

@@ -67,12 +67,12 @@ enum TxChannel {
 
 impl TxChannel {
     // Opens the TX side and returns a ready-to-use RX handle for the receive thread.
-    fn open(&mut self) -> Result<RxChannel, String> {
+    fn open(&mut self, bitrate: u32) -> Result<RxChannel, String> {
         match self {
             #[cfg(feature = "linux-can")]
-            TxChannel::SocketCan(c) => c.open().map(RxChannel::SocketCan),
+            TxChannel::SocketCan(c) => c.open(bitrate).map(RxChannel::SocketCan),
             #[cfg(feature = "kvaser")]
-            TxChannel::Kvaser(c) => c.open().map(RxChannel::Kvaser),
+            TxChannel::Kvaser(c) => c.open(bitrate).map(RxChannel::Kvaser),
         }
     }
 
@@ -91,15 +91,6 @@ impl TxChannel {
             TxChannel::SocketCan(c) => c.send(frame),
             #[cfg(feature = "kvaser")]
             TxChannel::Kvaser(c) => c.send(frame),
-        }
-    }
-
-    fn set_bitrate(&mut self, bitrate: u32) {
-        match self {
-            #[cfg(feature = "linux-can")]
-            TxChannel::SocketCan(c) => c.set_bitrate(bitrate),
-            #[cfg(feature = "kvaser")]
-            TxChannel::Kvaser(c) => c.set_bitrate(bitrate),
         }
     }
 }
@@ -129,6 +120,7 @@ impl RxChannel {
 
 pub struct Channel {
     tx: TxChannel,
+    bitrate: u32,
     frames: Arc<Mutex<VecDeque<CanFrame>>>,
     window_ms: Arc<AtomicU64>,
     parsed_dbc: Option<Arc<ParsedDbc>>,
@@ -145,6 +137,7 @@ pub struct Channel {
 impl Channel {
     fn new(
         tx: TxChannel,
+        bitrate: u32,
         dbc_path: Option<String>,
         app_state: Arc<AppState>,
         channel_id: String,
@@ -155,6 +148,7 @@ impl Channel {
             .map(Arc::new);
         Self {
             tx,
+            bitrate,
             frames: Arc::new(Mutex::new(VecDeque::new())),
             window_ms: Arc::new(AtomicU64::new(DEFAULT_WINDOW_MS)),
             parsed_dbc,
@@ -169,7 +163,8 @@ impl Channel {
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
-    pub fn open(&mut self) -> Result<(), String> {
+    pub fn open(&mut self, bitrate: u32) -> Result<(), String> {
+        self.bitrate = bitrate;
         self.frames.lock().map_err(|_| "Lock poisoned".to_string())?.clear();
         if let Some(path) = &self.dbc_path {
             self.parsed_dbc = ParsedDbc::new(path).ok().map(Arc::new);
@@ -182,14 +177,14 @@ impl Channel {
     }
 
     pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
+        self.bitrate = bitrate;
         self.stop_and_close()?;
-        self.tx.set_bitrate(bitrate);
         self.start()
     }
 
     // Opens the TX side, spawns the receive thread with the RX side.
     fn start(&mut self) -> Result<(), String> {
-        let rx = self.tx.open()?;
+        let rx = self.tx.open(self.bitrate)?;
         self.stop_flag.store(false, Ordering::Relaxed);
 
         let frames = Arc::clone(&self.frames);
@@ -389,7 +384,7 @@ impl Backend {
     pub fn open_channel(
         &self,
         name: &str,
-        bitrate: Option<u32>,
+        bitrate: u32,
         state: Arc<AppState>,
         dbc_path: Option<&str>,
         channel_id: String,
@@ -398,13 +393,13 @@ impl Backend {
         match self {
             #[cfg(feature = "linux-can")]
             Backend::SocketCan(backend) => {
-                let tx = backend.open_channel(name, bitrate, Arc::clone(&state))?;
-                Ok(Channel::new(TxChannel::SocketCan(tx), dbc_path.map(str::to_string), state, channel_id, subscribed))
+                let tx = backend.open_channel(name, Arc::clone(&state))?;
+                Ok(Channel::new(TxChannel::SocketCan(tx), bitrate, dbc_path.map(str::to_string), state, channel_id, subscribed))
             }
             #[cfg(feature = "kvaser")]
             Backend::Kvaser(backend) => {
-                let tx = backend.open_channel(name, bitrate, Arc::clone(&state))?;
-                Ok(Channel::new(TxChannel::Kvaser(tx), dbc_path.map(str::to_string), state, channel_id, subscribed))
+                let tx = backend.open_channel(name, Arc::clone(&state))?;
+                Ok(Channel::new(TxChannel::Kvaser(tx), bitrate, dbc_path.map(str::to_string), state, channel_id, subscribed))
             }
         }
     }

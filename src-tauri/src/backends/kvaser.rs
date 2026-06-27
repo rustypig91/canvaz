@@ -244,7 +244,6 @@ impl Drop for KvaserRxChannel {
 
 pub(crate) struct KvaserBackendChannel {
     channel_index: i32,
-    bitrate: u32,
     lib: Option<Arc<CanLib>>,
     handle: Option<i32>,
 }
@@ -255,12 +254,12 @@ unsafe impl Send for KvaserBackendChannel {}
 impl KvaserBackendChannel {
     /// Opens the TX handle and returns a ready-to-use RX handle for the receive thread.
     /// The two handles are independent — no coordination needed between them.
-    pub(super) fn open(&mut self) -> Result<KvaserRxChannel, String> {
-        let (freq, tseg1, tseg2, sjw) = bitrate_params(self.bitrate).ok_or_else(|| {
+    pub(super) fn open(&mut self, bitrate: u32) -> Result<KvaserRxChannel, String> {
+        let (freq, tseg1, tseg2, sjw) = bitrate_params(bitrate).ok_or_else(|| {
             format!(
                 "Cannot compute CANlib timing for {} bps \
                  (bitrate must evenly divide 80 MHz Kvaser clock)",
-                self.bitrate
+                bitrate
             )
         })?;
         let lib = CanLib::load()?;
@@ -304,10 +303,6 @@ impl KvaserBackendChannel {
             return Err(format!("canWriteSync failed: {}", canlib_err(s)));
         }
         Ok(())
-    }
-
-    pub(super) fn set_bitrate(&mut self, bitrate: u32) {
-        self.bitrate = bitrate;
     }
 
     fn lib_and_handle(&self) -> Result<(&Arc<CanLib>, i32), String> {
@@ -355,7 +350,6 @@ impl KvaserBackend {
     pub(super) fn open_channel(
         &self,
         name: &str,
-        bitrate: Option<u32>,
         _state: Arc<AppState>,
     ) -> Result<KvaserBackendChannel, String> {
         let lib = CanLib::load()?;
@@ -371,7 +365,6 @@ impl KvaserBackend {
 
         Ok(KvaserBackendChannel {
             channel_index: index,
-            bitrate: bitrate.unwrap_or(500_000),
             lib: None,
             handle: None,
         })

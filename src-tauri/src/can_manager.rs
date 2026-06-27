@@ -62,18 +62,16 @@ impl CanManager {
         &mut self,
         backend_name: String,
         channel_name: String,
-        bitrate: Option<u32>,
+        bitrate: u32,
         dbc_path: Option<&str>,
     ) -> Result<ChannelInfo, String> {
         let id = format!("{backend_name}:{channel_name}");
 
         if self.channels.contains_key(&id) {
             let cs = &self.channels[&id];
-            if let Some(br) = bitrate {
-                cs.channel.lock()
-                    .map_err(|_| "Channel lock poisoned".to_string())?
-                    .set_bitrate(br)?;
-            }
+            cs.channel.lock()
+                .map_err(|_| "Channel lock poisoned".to_string())?
+                .set_bitrate(bitrate)?;
             return Ok(cs.channel_info.clone());
         }
 
@@ -89,7 +87,7 @@ impl CanManager {
             id.clone(),
             Arc::clone(&self.subscribed),
         )?;
-        ch.open()?; // opens hardware and spawns the receive thread
+        ch.open(bitrate)?;
 
         let channel_info = ChannelInfo {
             id: id.clone(),

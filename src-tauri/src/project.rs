@@ -24,9 +24,11 @@ pub struct ChannelConfig {
     #[serde(default = "default_backend")]
     pub backend: String,
     pub dbc_path: Option<String>,
-    #[serde(default)]
-    pub bitrate: Option<u32>,
+    #[serde(default = "default_bitrate")]
+    pub bitrate: u32,
 }
+
+fn default_bitrate() -> u32 { 500_000 }
 
 fn default_backend() -> String {
     "socketcan".to_string()

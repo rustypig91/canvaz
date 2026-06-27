@@ -37,7 +37,6 @@ impl SocketCanRxChannel {
 
 pub(crate) struct SocketCanChannel {
     name: String,
-    bitrate: Option<u32>,
     socket: Option<CanSocket>,
     state: Arc<AppState>,
 }
@@ -61,17 +60,15 @@ impl SocketCanChannel {
     /// Opens the TX socket and returns a separate RX socket for the receive thread.
     /// Both sockets bind to the same interface; the kernel delivers a copy of every
     /// incoming frame to all bound sockets independently.
-    pub(super) fn open(&mut self) -> Result<SocketCanRxChannel, String> {
-        if !already_up(&self.name, self.bitrate) {
+    pub(super) fn open(&mut self, bitrate: u32) -> Result<SocketCanRxChannel, String> {
+        if !already_up(&self.name, bitrate) {
             if self.is_virtual() {
                 let _ = self.run_ip_auto(&["link", "add", "dev", &self.name, "type", "vcan"]);
                 self.run_ip_auto(&["link", "set", &self.name, "up"])?;
             } else {
                 let _ = self.run_ip_auto(&["link", "set", &self.name, "down"]);
-                if let Some(baud) = self.bitrate {
-                    let baud_s = baud.to_string();
-                    self.run_ip_auto(&["link", "set", &self.name, "type", "can", "bitrate", &baud_s])?;
-                }
+                let baud_s = bitrate.to_string();
+                self.run_ip_auto(&["link", "set", &self.name, "type", "can", "bitrate", &baud_s])?;
                 self.run_ip_auto(&["link", "set", &self.name, "up"])?;
             }
         }
@@ -117,10 +114,6 @@ impl SocketCanChannel {
         socket.write_frame(&df).map_err(|e| format!("Write failed: {e}"))
     }
 
-    pub(super) fn set_bitrate(&mut self, bitrate: u32) {
-        self.bitrate = Some(bitrate);
-        // Interface reconfiguration happens in open() via already_up() check.
-    }
 }
 
 // ── Backend ───────────────────────────────────────────────────────────────────
@@ -148,12 +141,10 @@ impl SocketCanBackend {
     pub(super) fn open_channel(
         &self,
         name: &str,
-        bitrate: Option<u32>,
         state: Arc<AppState>,
     ) -> Result<SocketCanChannel, String> {
         Ok(SocketCanChannel {
             name: name.to_string(),
-            bitrate,
             socket: None,
             state,
         })
@@ -216,7 +207,7 @@ fn run_ip(args: &[&str], sudo_password: Option<&str>) -> Result<(), String> {
     }
 }
 
-fn already_up(name: &str, bitrate: Option<u32>) -> bool {
+fn already_up(name: &str, bitrate: u32) -> bool {
     let out = match std::process::Command::new("ip")
         .args(["-det", "link", "show", name])
         .output()
@@ -230,12 +221,10 @@ fn already_up(name: &str, bitrate: Option<u32>) -> bool {
     if name.starts_with("vcan") {
         return true;
     }
-    if let Some(requested) = bitrate {
-        for line in out.lines() {
-            if let Some(rest) = line.trim().strip_prefix("bitrate ") {
-                if let Ok(current) = rest.split_whitespace().next().unwrap_or("").parse::<u32>() {
-                    return current == requested;
-                }
+    for line in out.lines() {
+        if let Some(rest) = line.trim().strip_prefix("bitrate ") {
+            if let Ok(current) = rest.split_whitespace().next().unwrap_or("").parse::<u32>() {
+                return current == bitrate;
             }
         }
     }
