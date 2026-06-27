@@ -20,6 +20,16 @@ pub type ManagerState = Arc<Mutex<CanManager>>;
 // ── Public event / query types ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
+struct DecodedSignal {
+    name: String,
+    message_name: String,
+    value: f64,
+    unit: String,
+    min: f64,
+    max: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct CanFrameEvent {
     channel_id: String,
     can_id: u32,
@@ -28,18 +38,8 @@ struct CanFrameEvent {
     data: Vec<u8>,
     timestamp_ms: u64,
     direction: &'static str,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct SignalValueEvent {
-    pub channel_id: String,
-    pub signal_name: String,
-    pub message_name: String,
-    pub value: f64,
-    pub min: f64,
-    pub max: f64,
-    pub unit: String,
-    pub timestamp_ms: u64,
+    message_name: Option<String>,
+    signals: Vec<DecodedSignal>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -510,7 +510,7 @@ fn make_rx_callback(
 
         // Hold the lock for the minimum time needed to decode and update state,
         // collecting events to emit after releasing.
-        let (app, channel_id, events) = {
+        let (app, frame_event) = {
             let mut lock = match shared.lock() { Ok(l) => l, Err(_) => return };
 
             let channel_id = match lock.index_to_id.get(&(backend.clone(), hw_index)).cloned() {
@@ -549,34 +549,31 @@ fn make_rx_callback(
                 .unwrap_or_default();
 
             let app = lock.app.clone();
-            let events: Vec<SignalValueEvent> = signal_updates.into_iter()
-                .map(|(signal_name, value, unit, message_name, min, max)| SignalValueEvent {
-                    channel_id: channel_id.clone(),
-                    signal_name,
-                    message_name,
+            let decoded: Vec<DecodedSignal> = signal_updates.into_iter()
+                .map(|(sig_name, value, unit, msg_name, min, max)| DecodedSignal {
+                    name: sig_name,
+                    message_name: msg_name,
                     value,
+                    unit,
                     min,
                     max,
-                    unit,
-                    timestamp_ms: ts,
                 })
                 .collect();
 
-            (app, channel_id, events)
+            (app, CanFrameEvent {
+                channel_id,
+                can_id: raw.can_id,
+                is_extended: raw.is_extended,
+                dlc: raw.data.len() as u8,
+                data: raw.data,
+                timestamp_ms: ts,
+                direction: "rx",
+                message_name,
+                signals: decoded,
+            })
         };
 
-        let _ = app.emit("can-frame", &CanFrameEvent {
-            channel_id,
-            can_id: raw.can_id,
-            is_extended: raw.is_extended,
-            dlc: raw.data.len() as u8,
-            data: raw.data,
-            timestamp_ms: ts,
-            direction: "rx",
-        });
-        for event in events {
-            let _ = app.emit("signal-value", &event);
-        }
+        let _ = app.emit("can-frame", &frame_event);
     }
 }
 
@@ -593,19 +590,41 @@ fn make_tx_callback(
                 None => return,
             };
             let window_ms = lock.window_ms;
+            let dbc = lock.channels.get(&channel_id).and_then(|c| c.dbc.clone());
+            let raw_signals = dbc.as_ref()
+                .and_then(|d| decode_frame(d, raw.can_id, &raw.data))
+                .unwrap_or_default();
+            let message_name = raw_signals.first().and_then(|_| {
+                dbc.as_ref()
+                    .and_then(|d| d.messages.iter().find(|m| m.id == raw.can_id))
+                    .map(|m| m.name.clone())
+            });
             let stored = StoredFrame {
                 can_id: raw.can_id,
                 is_extended: raw.is_extended,
                 data: raw.data.clone(),
                 timestamp_ms: ts,
                 direction: "tx",
-                message_name: None,
-                signals: Vec::new(),
+                message_name: message_name.clone(),
+                signals: raw_signals.iter().map(|(n, v, u)| StoredSignal {
+                    name: n.clone(), value: *v, unit: u.clone(),
+                }).collect(),
             };
-            if let Some(ch) = lock.channels.get_mut(&channel_id) {
-                ch.push(stored, window_ms);
-            }
-            (lock.app.clone(), CanFrameEvent {
+            let signal_updates = lock.channels.get_mut(&channel_id)
+                .map(|ch| ch.push(stored, window_ms))
+                .unwrap_or_default();
+            let app = lock.app.clone();
+            let decoded: Vec<DecodedSignal> = signal_updates.into_iter()
+                .map(|(sig_name, value, unit, msg_name, min, max)| DecodedSignal {
+                    name: sig_name,
+                    message_name: msg_name,
+                    value,
+                    unit,
+                    min,
+                    max,
+                })
+                .collect();
+            (app, CanFrameEvent {
                 channel_id,
                 can_id: raw.can_id,
                 is_extended: raw.is_extended,
@@ -613,6 +632,8 @@ fn make_tx_callback(
                 data: raw.data,
                 timestamp_ms: ts,
                 direction: "tx",
+                message_name,
+                signals: decoded,
             })
         };
         let _ = app.emit("can-frame", &frame_event);

@@ -47,17 +47,6 @@ interface ParsedDbc {
   messages: DbcMessage[];
 }
 
-interface SignalValueEvent {
-  channel_id: string;
-  signal_name: string;
-  message_name: string;
-  value: number;
-  min: number;
-  max: number;
-  unit: string;
-  timestamp_ms: number;
-}
-
 interface FrameInfo {
   channel_id: string;
   can_id: number;
@@ -69,6 +58,15 @@ interface FrameInfo {
   message_name: string | null;
 }
 
+interface DecodedSignal {
+  name: string;
+  message_name: string;
+  value: number;
+  unit: string;
+  min: number;
+  max: number;
+}
+
 interface CanFrameEvent {
   channel_id: string;
   can_id: number;
@@ -77,6 +75,8 @@ interface CanFrameEvent {
   data: number[];
   timestamp_ms: number;
   direction: "rx" | "tx";
+  message_name: string | null;
+  signals: DecodedSignal[];
 }
 
 interface PlotSignalEntry { signal_name: string; channel: string; }
@@ -607,46 +607,6 @@ function syncDatasets(pane: PlotPane) {
   markPaneDirty(pane, true);
 }
 
-// ── Signal value events ───────────────────────────────────────────────────────
-
-function onSignalValue(ev: SignalValueEvent) {
-  if (!appRunning) return;
-  const key = plotKey(ev.channel_id, ev.signal_name);
-
-  // Update sidebar value + min/max (authoritative values come from the backend)
-  signalLastValues.set(key, ev.value);
-  signalMinValues.set(key, ev.min);
-  signalMaxValues.set(key, ev.max);
-
-  const valEl = signalValueEls.get(key);
-  if (valEl) {
-    valEl.textContent = formatSigValue(ev.value, ev.unit);
-    valEl.classList.remove("sig-value--empty");
-  }
-  const rangeEl = signalRangeEls.get(key);
-  if (rangeEl) {
-    const mn = signalMinValues.get(key)!;
-    const mx = signalMaxValues.get(key)!;
-    rangeEl.textContent = `↓${formatSigValue(mn, "")} ↑${formatSigValue(mx, "")}`;
-    rangeEl.classList.remove("sig-value--empty");
-  }
-
-  const x = (ev.timestamp_ms - appStartTime) / 1000;
-  for (const pane of plotPanes) {
-    const series = pane.series.get(key);
-    if (!series) continue;
-    // Guard against duplicates with pre-loaded history: skip events older than
-    // the last stored sample (history is loaded before subscribe is called).
-    // Skip if this sample is not newer than the last recorded one (avoids
-    // duplicates when history is prepended after an async fetch).
-    if (series.timestamps.length > 0 &&
-        series.timestamps[series.timestamps.length - 1] >= ev.timestamp_ms) continue;
-    series.timestamps.push(ev.timestamp_ms);
-    series.data.push({ x, y: ev.value });
-    series.lastValue = ev.value;
-    markPaneDirty(pane); // no-op while viewPaused; data accumulates in series
-  }
-}
 
 // ── Signal highlights in DBC tree ─────────────────────────────────────────────
 
@@ -2453,11 +2413,10 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
 function onCanFrame(ev: CanFrameEvent) {
   if (!appRunning) return;
 
-  // Always update seen sets (for filter autocomplete) and cycle timing.
+  // Update seen sets (for filter autocomplete) and cycle timing.
   traceSeenChannels.add(ev.channel_id);
   traceSeenCanIds.add(ev.can_id);
-  const msgNameForFrame = dbcByChannel.get(ev.channel_id)?.messages.find(m => m.id === ev.can_id)?.name ?? null;
-  if (msgNameForFrame) traceSeenMsgNames.add(msgNameForFrame);
+  if (ev.message_name) traceSeenMsgNames.add(ev.message_name);
   else traceSeenNoMsg = true;
 
   const direction = ev.direction ?? "rx";
@@ -2466,8 +2425,34 @@ function onCanFrame(ev: CanFrameEvent) {
   const cycleTime = prev != null ? ev.timestamp_ms - prev : null;
   traceLastTs.set(key, ev.timestamp_ms);
 
-  const dbc = dbcByChannel.get(ev.channel_id);
-  const msg = dbc?.messages.find(m => m.id === ev.can_id) ?? null;
+  // Process decoded signals — update sidebar and plot series regardless of pause state.
+  const x = (ev.timestamp_ms - appStartTime) / 1000;
+  for (const sig of ev.signals) {
+    const sigKey = plotKey(ev.channel_id, sig.name);
+    signalLastValues.set(sigKey, sig.value);
+    signalMinValues.set(sigKey, sig.min);
+    signalMaxValues.set(sigKey, sig.max);
+    const valEl = signalValueEls.get(sigKey);
+    if (valEl) {
+      valEl.textContent = formatSigValue(sig.value, sig.unit);
+      valEl.classList.remove("sig-value--empty");
+    }
+    const rangeEl = signalRangeEls.get(sigKey);
+    if (rangeEl) {
+      rangeEl.textContent = `↓${formatSigValue(sig.min, "")} ↑${formatSigValue(sig.max, "")}`;
+      rangeEl.classList.remove("sig-value--empty");
+    }
+    for (const pane of plotPanes) {
+      const series = pane.series.get(sigKey);
+      if (!series) continue;
+      if (series.timestamps.length > 0 &&
+          series.timestamps[series.timestamps.length - 1] >= ev.timestamp_ms) continue;
+      series.timestamps.push(ev.timestamp_ms);
+      series.data.push({ x, y: sig.value });
+      series.lastValue = sig.value;
+      markPaneDirty(pane); // no-op while viewPaused; data accumulates in series
+    }
+  }
 
   const entry: TraceEntry = {
     channel: ev.channel_id,
@@ -2475,7 +2460,7 @@ function onCanFrame(ev: CanFrameEvent) {
     isExtended: ev.is_extended,
     dlc: ev.dlc,
     data: ev.data,
-    messageName: msg?.name ?? null,
+    messageName: ev.message_name ?? null,
     timestampMs: ev.timestamp_ms,
     cycleTimeMs: cycleTime,
     direction,
@@ -3201,7 +3186,6 @@ window.addEventListener("DOMContentLoaded", async () => {
   setupTrace();
 
   // Events
-  await listen<SignalValueEvent>("signal-value", (event) => onSignalValue(event.payload));
   await listen<CanFrameEvent>("can-frame", (event) => onCanFrame(event.payload));
 
   // Sudo password request from the Rust backend — show dialog once, cache in Rust.
