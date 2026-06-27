@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc, Mutex, RwLock,
@@ -13,6 +13,7 @@ use crate::dbc_parser::ParsedDbc;
 
 pub type ManagerState = Arc<Mutex<CanManager>>;
 pub type DbcState = Arc<RwLock<HashMap<String, ParsedDbc>>>;
+pub type SubscribedSignals = Arc<RwLock<HashMap<String, HashSet<String>>>>;
 
 // ── Channel identity ──────────────────────────────────────────────────────────
 
@@ -68,14 +69,16 @@ pub struct CanManager {
     state: Arc<AppState>,
     backends: Vec<Backend>,
     channels: HashMap<String, OpenChannelState>,
+    subscribed: SubscribedSignals,
 }
 
 impl CanManager {
-    pub fn new(state: Arc<AppState>) -> Self {
+    pub fn new(state: Arc<AppState>, subscribed: SubscribedSignals) -> Self {
         Self {
             state,
             backends: default_backends(),
             channels: HashMap::new(),
+            subscribed,
         }
     }
 
@@ -126,7 +129,8 @@ impl CanManager {
             let stop = Arc::clone(&stop_flag);
             let info = info.clone();
             let state = Arc::clone(&self.state);
-            move || reading_loop(ch, info, state, dbc, stop)
+            let subscribed = Arc::clone(&self.subscribed);
+            move || reading_loop(ch, info, state, dbc, subscribed, stop)
         });
 
         self.channels.insert(
@@ -157,7 +161,6 @@ impl CanManager {
             .collect()
     }
 
-    // Hot path — avoid allocation, HashMap lookup is O(1).
     pub fn send_frame(&self, channel_id: &str, frame: CanFrame) -> Result<(), String> {
         self.channels
             .get(channel_id)
@@ -166,6 +169,18 @@ impl CanManager {
             .lock()
             .map_err(|_| "Channel lock poisoned".to_string())?
             .send(frame)
+    }
+
+    /// Returns an Arc to the channel so callers can release the CanManager lock
+    /// before locking the channel, avoiding lock stacking on busy buses.
+    pub fn channel_arc(&self, channel_id: &str) -> Option<Arc<Mutex<Channel>>> {
+        self.channels.get(channel_id).map(|s| Arc::clone(&s.channel))
+    }
+
+    /// Returns Arcs for all open channels so callers can release the CanManager
+    /// lock before locking individual channels.
+    pub fn all_channel_arcs(&self) -> Vec<Arc<Mutex<Channel>>> {
+        self.channels.values().map(|s| Arc::clone(&s.channel)).collect()
     }
 }
 
@@ -176,17 +191,20 @@ fn reading_loop(
     info: ChannelInfo,
     state: Arc<AppState>,
     dbc: DbcState,
+    subscribed: SubscribedSignals,
     stop: Arc<AtomicBool>,
 ) {
     while !stop.load(Ordering::Relaxed) {
+        // receive() automatically stores the frame in the channel's ring buffer.
         let result = match channel.lock() {
-            Ok(ch) => ch.receive(),
+            Ok(mut ch) => ch.receive(),
             Err(_) => break,
         };
 
         match result {
             Ok(Some(frame)) => {
                 let ts = frame.timestamp_ms;
+
                 let _ = state.app.emit(
                     "can-frame",
                     CanFrameEvent {
@@ -199,10 +217,24 @@ fn reading_loop(
                         direction: "rx",
                     },
                 );
-                if let Ok(guard) = dbc.read() {
-                    if let Some(channel_dbc) = guard.get(&info.id) {
-                        if let Some(signals) = channel_dbc.signals_for_message(frame.can_id) {
-                            for sig in signals {
+
+                // Decode and emit signal-value events only for subscribed signals.
+                let sub_guard = match subscribed.read() {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+                let subs = match sub_guard.get(&info.id) {
+                    Some(s) if !s.is_empty() => s,
+                    _ => continue,
+                };
+                let dbc_guard = match dbc.read() {
+                    Ok(g) => g,
+                    Err(_) => continue,
+                };
+                if let Some(channel_dbc) = dbc_guard.get(&info.id) {
+                    if let Some(signals) = channel_dbc.signals_for_message(frame.can_id) {
+                        for sig in signals {
+                            if subs.contains(&sig.name) {
                                 let value = crate::signal_codec::decode(
                                     &frame.data,
                                     sig.start_bit,

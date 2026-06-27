@@ -224,8 +224,9 @@ let appStartTime = Date.now();
 let midPan: { startX: number; startMin: number; startMax: number; chartWidth: number } | null = null;
 
 
-interface SignalSample { ts: number; value: number; unit: string; }
-const signalHistory = new Map<string, SignalSample[]>();
+// Tracks how many plot panes reference each signal (key: plotKey).
+// Used to subscribe/unsubscribe on the Rust side exactly once per signal.
+const signalSubscribeCount = new Map<string, number>();
 
 function plotKey(channel: string, signalName: string) {
   return `${channel}::${signalName}`;
@@ -295,6 +296,7 @@ function snapshotPlotPanes() {
 
 function removeSigFromPane(pane: PlotPane, key: string) {
   if (!pane.series.delete(key)) return;
+  decrementSubscription(key);
   if (pane.series.size === 0) { closePlotPane(pane.id); return; }
   syncDatasets(pane);
   updatePaneTitle(pane);
@@ -492,10 +494,28 @@ function createPlotPane(): PlotPane {
   return pane;
 }
 
+// Decrement the subscription reference count for a signal key. When it reaches
+// zero, tell Rust to stop emitting signal-value events for that signal.
+function decrementSubscription(key: string) {
+  const count = (signalSubscribeCount.get(key) ?? 0) - 1;
+  if (count <= 0) {
+    signalSubscribeCount.delete(key);
+    const sep = key.indexOf("::");
+    invoke("unsubscribe_signals", {
+      channelId: key.substring(0, sep),
+      signalNames: [key.substring(sep + 2)],
+    }).catch(() => {});
+  } else {
+    signalSubscribeCount.set(key, count);
+  }
+}
+
 function closePlotPane(id: string) {
   const idx = plotPanes.findIndex(p => p.id === id);
   if (idx === -1) return;
   const [pane] = plotPanes.splice(idx, 1);
+  // Unsubscribe any signals not present in other panes.
+  for (const key of pane.series.keys()) decrementSubscription(key);
   pane.chart.destroy();
   pane.el.remove();
   updateSignalHighlights();
@@ -504,7 +524,7 @@ function closePlotPane(id: string) {
 
 // ── Signal → pane ─────────────────────────────────────────────────────────────
 
-function addSignalToPane(pane: PlotPane, channel: string, sig: DbcSignal) {
+async function addSignalToPane(pane: PlotPane, channel: string, sig: DbcSignal) {
   const key = plotKey(channel, sig.name);
   if (pane.series.has(key)) return;
   const color = PLOT_COLORS[pane.series.size % PLOT_COLORS.length];
@@ -512,16 +532,41 @@ function addSignalToPane(pane: PlotPane, channel: string, sig: DbcSignal) {
     signalName: sig.name, messageName: sig.message_name, unit: sig.unit,
     color, channel, timestamps: [], data: [], lastValue: null, frozenLength: null,
   };
-
-  // Pre-populate from global history
-  const hist = signalHistory.get(key) ?? [];
-  for (const sample of hist) {
-    series.timestamps.push(sample.ts);
-    series.data.push({ x: (sample.ts - appStartTime) / 1000, y: sample.value });
-  }
-  if (series.data.length > 0) series.lastValue = series.data[series.data.length - 1].y;
-
   pane.series.set(key, series);
+
+  const prevCount = signalSubscribeCount.get(key) ?? 0;
+  signalSubscribeCount.set(key, prevCount + 1);
+
+  if (prevCount === 0) {
+    // First subscriber: fetch history from Rust ring buffer, then subscribe so
+    // live events start flowing. Fetching before subscribing avoids overlap.
+    try {
+      const sinceMs = Date.now() - windowSizeSec * 1000;
+      const history = await invoke<Array<{ timestamp_ms: number; value: number }>>(
+        "get_signal_history", { channelId: channel, signalName: sig.name, sinceMs }
+      );
+      for (const sample of history) {
+        series.timestamps.push(sample.timestamp_ms);
+        series.data.push({ x: (sample.timestamp_ms - appStartTime) / 1000, y: sample.value });
+      }
+      if (series.data.length > 0) series.lastValue = series.data[series.data.length - 1].y;
+    } catch { /* channel not open or no DBC yet — data will stream in via events */ }
+    invoke("subscribe_signals", { channelId: channel, signalNames: [sig.name] }).catch(() => {});
+  } else {
+    // Already subscribed in another pane — copy existing data to avoid an extra
+    // round-trip and potential duplicate events from a concurrent history fetch.
+    for (const other of plotPanes) {
+      if (other === pane) continue;
+      const existing = other.series.get(key);
+      if (existing) {
+        series.timestamps.push(...existing.timestamps);
+        series.data.push(...existing.data);
+        series.lastValue = existing.lastValue;
+        break;
+      }
+    }
+  }
+
   syncDatasets(pane);
   updatePaneTitle(pane);
   updateSignalHighlights();
@@ -570,11 +615,6 @@ function onSignalValue(ev: SignalValueEvent) {
   if (!appRunning) return;
   const key = plotKey(ev.channel_id, ev.signal_name);
 
-  // Store every signal in history; samples older than the window are discarded
-  // periodically by pruneOldData() to bound memory usage.
-  let hist = signalHistory.get(key);
-  if (!hist) { hist = []; signalHistory.set(key, hist); }
-  hist.push({ ts: ev.timestamp_ms, value: ev.value, unit: ev.unit });
   // Update sidebar value + min/max
   signalLastValues.set(key, ev.value);
   const prevMin = signalMinValues.get(key);
@@ -599,6 +639,10 @@ function onSignalValue(ev: SignalValueEvent) {
   for (const pane of plotPanes) {
     const series = pane.series.get(key);
     if (!series) continue;
+    // Guard against duplicates with pre-loaded history: skip events older than
+    // the last stored sample (history is loaded before subscribe is called).
+    if (series.timestamps.length > 0 &&
+        series.timestamps[series.timestamps.length - 1] >= ev.timestamp_ms) continue;
     series.timestamps.push(ev.timestamp_ms);
     series.data.push({ x, y: ev.value });
     series.lastValue = ev.value;
@@ -973,7 +1017,17 @@ async function openChannel(
 ): Promise<ChannelInfo | null> {
   console.log(`Opening channel: backend=${backend}, name=${name}, bitrate=${bitrate}`);
   try {
-    return await invoke<ChannelInfo>("open_channel", { backendName: backend, channelName: name, bitrate: bitrate });
+    const info = await invoke<ChannelInfo>("open_channel", { backendName: backend, channelName: name, bitrate: bitrate });
+    // Re-subscribe any signals currently in plots for this channel (Rust clears
+    // subscriptions when a channel is closed, so we must restore them on reopen).
+    const names: string[] = [];
+    for (const [key, count] of signalSubscribeCount) {
+      if (count > 0 && key.startsWith(`${info.id}::`)) {
+        names.push(key.substring(info.id.length + 2));
+      }
+    }
+    if (names.length > 0) invoke("subscribe_signals", { channelId: info.id, signalNames: names }).catch(() => {});
+    return info;
   } catch (e) {
     const msg = String(e);
     if (msg === "Sudo authentication cancelled") {
@@ -1766,7 +1820,6 @@ async function startApp() {
 
   appRunning = true;
   appStartTime = Date.now();
-  signalHistory.clear();
   signalLastValues.clear();
   signalMinValues.clear();
   signalMaxValues.clear();
@@ -1809,7 +1862,8 @@ function stopApp() {
 
 /** Exports the signal history to CSV. Returns true if a file was saved. */
 async function exportCsv(): Promise<boolean> {
-  if (signalHistory.size === 0) { setStatus("No data to export"); return false; }
+  const hasData = plotPanes.some(p => [...p.series.values()].some(s => s.data.length > 0));
+  if (!hasData) { setStatus("No data to export"); return false; }
   const path = await dialogSave({
     defaultPath: "canvaz.csv",
     filters: [{ name: "CSV Files", extensions: ["csv"] }],
@@ -1819,11 +1873,17 @@ async function exportCsv(): Promise<boolean> {
   const rows: string[] = ["timestamp_ms,elapsed_s,channel,signal_name,value,unit"];
   const allSamples: Array<{ ts: number; channel: string; signalName: string; value: number; unit: string }> = [];
 
-  for (const [key, samples] of signalHistory) {
-    const sep = key.indexOf("::");
-    const channel = key.substring(0, sep);
-    const signalName = key.substring(sep + 2);
-    for (const s of samples) allSamples.push({ ts: s.ts, channel, signalName, value: s.value, unit: s.unit });
+  // Each signal may appear in multiple panes; export it only once.
+  const seen = new Set<string>();
+  for (const pane of plotPanes) {
+    for (const [key, series] of pane.series) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      for (let i = 0; i < series.timestamps.length; i++) {
+        allSamples.push({ ts: series.timestamps[i], channel: series.channel,
+          signalName: series.signalName, value: series.data[i].y, unit: series.unit });
+      }
+    }
   }
   allSamples.sort((a, b) => a.ts - b.ts);
 
@@ -1881,14 +1941,8 @@ const DEFAULT_WINDOW_SEC = 60;
 let windowSizeSec = DEFAULT_WINDOW_SEC;
 
 function pruneOldData() {
-  const cutoff = Date.now() - windowSizeSec * 1000;
-  for (const [key, samples] of signalHistory) {
-    let i = 0;
-    while (i < samples.length && samples[i].ts < cutoff) i++;
-    if (i > 0) samples.splice(0, i);
-    if (samples.length === 0) signalHistory.delete(key);
-  }
   if (!appRunning || viewPaused) return; // leave a stopped / frozen chart untouched
+  const cutoff = Date.now() - windowSizeSec * 1000;
   for (const pane of plotPanes) {
     for (const s of pane.series.values()) {
       let i = 0;
@@ -1930,6 +1984,7 @@ function setWindowSize(sec: number) {
   windowSizeSec = Math.max(1, Math.round(sec));
   reflectWindowSize();
   pruneOldData();
+  invoke("set_window_ms", { ms: windowSizeSec * 1000 }).catch(() => {});
 }
 
 // User changed the control: apply and mark the project dirty.

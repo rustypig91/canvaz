@@ -3,67 +3,125 @@ mod kvaser;
 #[cfg(feature = "linux-can")]
 mod socketcan;
 
+
 #[cfg(feature = "kvaser")]
 use kvaser::{KvaserBackend, KvaserBackendChannel};
 #[cfg(feature = "linux-can")]
 use socketcan::{SocketCanBackend, SocketCanChannel};
 
-use crate::app_state::AppState;
-use serde::Serialize;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
-// ── Frame ─────────────────────────────────────────────────────────────────────
+use crate::app_state::AppState;
+use crate::dbc_parser::*;
+use crate::can_frame::{CanFrame, now_ms};
 
-#[derive(Debug, Clone, Serialize)]
-pub struct CanFrame {
-    pub can_id: u32,
-    pub is_extended: bool,
-    pub data: Vec<u8>,
-    pub timestamp_ms: u64,
-}
-
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 // ── Channel ───────────────────────────────────────────────────────────────────
 
-pub enum Channel {
+enum ChannelInner {
     #[cfg(feature = "linux-can")]
     SocketCan(SocketCanChannel),
     #[cfg(feature = "kvaser")]
     Kvaser(KvaserBackendChannel),
 }
 
-macro_rules! dispatch {
-    ($self:expr, $method:ident $(, $arg:expr)*) => {
-        match $self {
+impl ChannelInner {
+    fn open(&mut self, bitrate: u32) -> Result<(), String> {
+        match self {
             #[cfg(feature = "linux-can")]
-            Channel::SocketCan(c) => c.$method($($arg),*),
+            ChannelInner::SocketCan(c) => c.open(),
             #[cfg(feature = "kvaser")]
-            Channel::Kvaser(c) => c.$method($($arg),*),
+            ChannelInner::Kvaser(c) => c.open(),
         }
-    };
+    }
+    fn close(&mut self) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "linux-can")]
+            ChannelInner::SocketCan(c) => c.close(),
+            #[cfg(feature = "kvaser")]
+            ChannelInner::Kvaser(c) => c.close(),
+        }
+    }
+    fn send(&self, frame: CanFrame) -> Result<(), String> {
+        match self {
+            #[cfg(feature = "linux-can")]
+            ChannelInner::SocketCan(c) => c.send(frame),
+            #[cfg(feature = "kvaser")]
+            ChannelInner::Kvaser(c) => c.send(frame),
+        }
+    }
+    fn receive(&self, timeout_ms: u32) -> Result<Option<CanFrame>, String> {
+        match self {
+            #[cfg(feature = "linux-can")]
+            ChannelInner::SocketCan(c) => c.receive(timeout_ms),
+            #[cfg(feature = "kvaser")]
+            ChannelInner::Kvaser(c) => c.receive(timeout_ms),
+        }
+    }
+}
+
+pub struct Channel {
+    inner: ChannelInner,
+    frames: VecDeque<CanFrame>,
+    window_ms: u64,
+    parsed_dbc: Option<ParsedDbc>
 }
 
 impl Channel {
-    pub fn open(&mut self) -> Result<(), String> {
-        dispatch!(self, open)
+    fn new(inner: ChannelInner, dbc_file: Option<String>, window_ms: u64) -> Self {
+        Self {
+            inner: inner,
+            frames: VecDeque::new(),
+            window_ms: window_ms,
+            parsed_dbc: dbc_file.as_ref().and_then(|path| ParsedDbc::new(path).ok()),
+        }
     }
+
+    pub fn open(&mut self, bitrate: u32) -> Result<(), String> {
+        self.frames.clear();
+        if let Some(dbc) = self.parsed_dbc.as_mut() {
+            dbc.reload()?;
+        }
+        self.inner.open(bitrate)
+    }
+
     pub fn close(&mut self) -> Result<(), String> {
-        dispatch!(self, close)
+        self.inner.close()
     }
-    pub fn send(&self, frame: CanFrame) -> Result<(), String> {
-        dispatch!(self, send, frame)
+
+    // Sends a frame to hardware and stores it in the ring buffer.
+    pub fn send(&mut self, frame: CanFrame) -> Result<(), String> {
+        let to_store = frame.clone();
+        self.inner.send(frame)?;
+        self.store(to_store);
+        Ok(())
     }
-    pub fn receive(&self) -> Result<Option<CanFrame>, String> {
-        dispatch!(self, receive)
+
+    // Changes the time window, reinitialising the buffer with only frames that
+    // still fall within the new window.
+    pub fn set_window_ms(&mut self, ms: u64) {
+        self.window_ms = ms;
+        let cutoff = now_ms().saturating_sub(ms);
+        let fresh: VecDeque<CanFrame> =
+            self.frames.drain(..).filter(|f| f.timestamp_ms >= cutoff).collect();
+        self.frames = fresh;
     }
-    pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
-        dispatch!(self, set_bitrate, bitrate)
+
+    pub fn frames_since(&self, since_ms: u64) -> impl Iterator<Item = &CanFrame> {
+        self.frames.iter().filter(move |f| f.timestamp_ms >= since_ms)
+    }
+
+    pub fn frame_buffer(&self) -> &VecDeque<CanFrame> {
+        &self.frames
+    }
+
+    fn store(&mut self, frame: CanFrame) {
+        let cutoff = frame.timestamp_ms.saturating_sub(self.window_ms);
+        while self.frames.front().map_or(false, |f| f.timestamp_ms < cutoff) {
+            self.frames.pop_front();
+        }
+        self.frames.push_back(frame);
     }
 }
 
@@ -98,9 +156,13 @@ impl Backend {
     pub fn open_channel(&self, name: &str, bitrate: Option<u32>, state: Arc<AppState>) -> Result<Channel, String> {
         match self {
             #[cfg(feature = "linux-can")]
-            Backend::SocketCan(backend) => backend.open_channel(name, bitrate, state).map(Channel::SocketCan),
+            Backend::SocketCan(backend) => backend
+                .open_channel(name, bitrate, state)
+                .map(|c| Channel::new(ChannelInner::SocketCan(c), None)),
             #[cfg(feature = "kvaser")]
-            Backend::Kvaser(backend) => backend.open_channel(name, bitrate, state).map(Channel::Kvaser),
+            Backend::Kvaser(backend) => backend
+                .open_channel(name, bitrate, state)
+                .map(|c| Channel::new(ChannelInner::Kvaser(c), None)),
         }
     }
 }
