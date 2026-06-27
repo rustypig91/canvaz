@@ -42,7 +42,7 @@
         </div>
 
       </nav>
-      <button id="btn-app-run" class="running" title="Pause live capture">■ Stop</button>
+      <button id="btn-app-run" title="Start live capture">▶ Start</button>
       <button id="btn-pause-view" class="btn btn-sm" title="Freeze the current view; data continues in the background">Pause</button>
       <div id="window-size-ctrl" title="Discard signal data older than this">
         <span>Window</span>
@@ -201,6 +201,15 @@
           <button type="submit" class="btn btn-primary">Authenticate</button>
         </div>
       </form>
+    </dialog>
+
+    <!-- Confirm dialog -->
+    <dialog id="dialog-confirm">
+      <p id="dialog-confirm-msg"></p>
+      <div class="dialog-actions">
+        <button type="button" id="btn-confirm-cancel" class="btn">Cancel</button>
+        <button type="button" id="btn-confirm-ok" class="btn btn-primary">Stop &amp; Continue</button>
+      </div>
     </dialog>
 
     <!-- About dialog -->

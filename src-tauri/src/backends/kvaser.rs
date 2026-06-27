@@ -177,19 +177,13 @@ fn canlib_err(status: i32) -> String {
 
 fn kvaser_channel_name(lib: &CanLib, index: i32) -> Option<String> {
     let mut buf = [0u8; 256];
-    let s = unsafe {
-        (lib.get_channel_data)(
-            index,
-            CANLIB_CHANNEL_DATA_NAME,
-            buf.as_mut_ptr(),
-            buf.len(),
-        )
-    };
-    if s != CAN_OK { return None; }
+    let s = unsafe { (lib.get_channel_data)(index, CANLIB_CHANNEL_DATA_NAME, buf.as_mut_ptr(), buf.len()) };
+    if s != CAN_OK {
+        return None;
+    }
     let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8(buf[..len].to_vec()).ok()
 }
-
 
 pub(crate) struct KvaserBackend;
 
@@ -207,8 +201,7 @@ impl KvaserBackend {
         }
         let mut names = Vec::new();
         for i in 0..n.max(0) as i32 {
-            let ch_name = kvaser_channel_name(&lib, i)
-                .unwrap_or_else(|| format!("Channel {i}"));
+            let ch_name = kvaser_channel_name(&lib, i).unwrap_or_else(|| format!("Channel {i}"));
             names.push(ch_name);
         }
         Ok(names)
@@ -226,8 +219,7 @@ impl KvaserBackend {
 
         let index = (0..n.max(0) as i32)
             .find(|&i| {
-                let ch_name = kvaser_channel_name(&lib, i)
-                    .unwrap_or_else(|| format!("Channel {i}"));
+                let ch_name = kvaser_channel_name(&lib, i).unwrap_or_else(|| format!("Channel {i}"));
                 ch_name == name
             })
             .ok_or_else(|| format!("Kvaser channel '{name}' not found"))?;
@@ -256,6 +248,10 @@ pub(crate) struct KvaserBackendChannel {
 unsafe impl Send for KvaserBackendChannel {}
 
 impl KvaserBackendChannel {
+    pub(super) fn name(&self) -> &str {
+        &self.name
+    }
+
     pub(super) fn open(&mut self) -> Result<(), String> {
         let (freq, tseg1, tseg2, sjw) = bitrate_params(self.bitrate).ok_or_else(|| {
             format!(
@@ -390,12 +386,5 @@ impl KvaserBackendChannel {
             (Some(lib), Some(h)) => Ok((Arc::clone(lib), h)),
             _ => Err("Channel is not open".to_string()),
         }
-    }
-}
-
-#[allow(dead_code)]
-impl KvaserBackendChannel {
-    fn name(&self) -> &str {
-        &self.name
     }
 }

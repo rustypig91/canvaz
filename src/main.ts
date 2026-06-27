@@ -217,7 +217,7 @@ function markPaneDirty(pane: PlotPane, force = false) {
   }
 }
 
-let appRunning = true;
+let appRunning = false;
 let appStartTime = Date.now();
 
 // Middle-mouse pan state
@@ -853,7 +853,6 @@ const channelBitrates = new Map<string, number | null>(); // channel_id → bitr
 const interfaceBackends = new Map<string, string>();      // from list_can_interfaces: name → backend
 
 function channelDisplayName(id: string) { return id.includes(':') ? id.split(':')[1] : id; }
-function channelBackend(id: string) { return id.includes(':') ? id.split(':')[0] : ""; }
 const signalLastValues = new Map<string, number>();
 const signalMinValues = new Map<string, number>();
 const signalMaxValues = new Map<string, number>();
@@ -879,6 +878,8 @@ function scheduleAutoSave() {
   }, 1000);
 }
 let openChannels: string[] = [];
+// Channels the user has configured (not necessarily open; hardware opens on Start).
+let configuredChannels: ChannelConfig[] = [];
 let projectPath: string | null = null;
 let lastProjectIndexPath: string | null = null;
 
@@ -949,9 +950,19 @@ async function openChannelDialog(mode: DialogMode, channelName?: string) {
     interfaceBackends.clear();
     for (const i of ifaces) interfaceBackends.set(i.name, i.backend);
 
-    // Group interfaces by backend into <optgroup> elements
+    // Filter out interfaces already present in configuredChannels
+    const configured = new Set(configuredChannels.map(c => `${c.backend}:${c.name}`));
+    const available = ifaces.filter(i => !configured.has(`${i.backend}:${i.name}`));
+
+    if (available.length === 0) {
+      setStatus("All detected interfaces are already added.");
+      dialog.close();
+      return;
+    }
+
+    // Group remaining interfaces by backend into <optgroup> elements
     const byBackend = new Map<string, string[]>();
-    for (const i of ifaces) {
+    for (const i of available) {
       const group = byBackend.get(i.backend) ?? [];
       group.push(i.name);
       byBackend.set(i.backend, group);
@@ -961,8 +972,8 @@ async function openChannelDialog(mode: DialogMode, channelName?: string) {
         `<optgroup label="${backend}">${names.map(n => `<option value="${n}">${n}</option>`).join("")}</optgroup>`
       ).join("");
 
-    // Auto-detect vcan from first item
-    if (ifaces[0]?.name.startsWith("vcan")) setBitrateInDialog(null, true);
+    // Auto-detect vcan from first available item
+    if (available[0]?.name.startsWith("vcan")) setBitrateInDialog(null, true);
   } else {
     const id = channelName!;
     const displayName = channelDisplayName(id);
@@ -1048,47 +1059,42 @@ async function applyChannelDialog() {
     const name = custom || (document.getElementById("select-iface") as HTMLSelectElement).value;
     if (!name) return;
     const backend = interfaceBackends.get(name) ?? "socketcan";
+    const channelId = `${backend}:${name}`;
 
-    const info = await openChannel(backend, name, bitrate);
-    if (!info) {
-      console.error("Failed to open channel: ", name);
-      dialog.close();
-      return;
-    }
-    channelBitrates.set(info.id, bitrate);
+    // Add to configured list without opening hardware (hardware opens on Start).
+    configuredChannels.push({ name, backend, dbc_path: dialogPendingDbc, bitrate });
+    channelBitrates.set(channelId, bitrate);
 
     if (dialogPendingDbc) {
       try {
-        const dbc = await invoke<ParsedDbc>("load_dbc", { channelId: info.id, path: dialogPendingDbc });
-        dbcByChannel.set(info.id, dbc);
+        const dbc = await invoke<ParsedDbc>("load_dbc", { channelId, path: dialogPendingDbc });
+        dbcByChannel.set(channelId, dbc);
       } catch (e) { setError(`DBC error: ${e}`); }
     }
 
-    await refreshChannelList();
-    setStatus(`Opened channel: ${name}`);
+    refreshChannelList();
+    setStatus(`Added channel: ${name}`);
     scheduleAutoSave();
   } else {
     const id = dialogEditTarget!;
     const name = channelDisplayName(id);
-    const backend = channelBackend(id);
-    const wasOpen = openChannels.includes(id);
 
-    if (wasOpen) {
-      try { await invoke("close_channel", { channelId: id }); dbcByChannel.delete(id); } catch { }
-    }
-    const info = await openChannel(backend, name, bitrate);
-    if (!info) { dialog.close(); return; }
-    channelBitrates.set(info.id, bitrate);
+    // Update config entry in-place.
+    const idx = configuredChannels.findIndex(c => `${c.backend}:${c.name}` === id);
+    if (idx >= 0) configuredChannels[idx] = { ...configuredChannels[idx], dbc_path: dialogPendingDbc, bitrate };
+    channelBitrates.set(id, bitrate);
 
     if (dialogPendingDbc) {
       try {
-        const dbc = await invoke<ParsedDbc>("load_dbc", { channelId: info.id, path: dialogPendingDbc });
-        dbcByChannel.set(info.id, dbc);
+        const dbc = await invoke<ParsedDbc>("load_dbc", { channelId: id, path: dialogPendingDbc });
+        dbcByChannel.set(id, dbc);
       } catch (e) { setError(`DBC error: ${e}`); }
+    } else {
+      dbcByChannel.delete(id);
     }
 
-    await refreshChannelList();
-    if (selectedChannel === info.id) renderDbcTree();
+    refreshChannelList();
+    if (selectedChannel === id) renderDbcTree();
     setStatus(`Updated channel: ${name}`);
     scheduleAutoSave();
   }
@@ -1255,13 +1261,10 @@ function selectChannel(name: string | null) {
   renderDbcTree((document.getElementById("signal-search") as HTMLInputElement).value);
 }
 
-async function refreshChannelList() {
-  try {
-    const infos = await invoke<ChannelInfo[]>("get_open_channels");
-    openChannels = infos.map(i => i.id);
-  } catch { openChannels = []; }
-  if (selectedChannel && !openChannels.includes(selectedChannel)) selectChannel(openChannels[0] ?? null);
-  else if (!selectedChannel && openChannels.length > 0) selectChannel(openChannels[0]);
+function refreshChannelList() {
+  const allIds = configuredChannels.map(ch => `${ch.backend}:${ch.name}`);
+  if (selectedChannel && !allIds.includes(selectedChannel)) selectChannel(allIds[0] ?? null);
+  else if (!selectedChannel && allIds.length > 0) selectChannel(allIds[0]);
   renderChannelList();
   renderSimEntries();
 }
@@ -1269,55 +1272,60 @@ async function refreshChannelList() {
 function renderChannelList() {
   const list = document.getElementById("channel-list")!;
   list.innerHTML = "";
-  for (const id of openChannels) {
+  for (const ch of configuredChannels) {
+    const id = `${ch.backend}:${ch.name}`;
+    const isOpen = openChannels.includes(id);
     const dbc = dbcByChannel.get(id);
     const bitrate = channelBitrates.get(id);
-    const name = channelDisplayName(id);
-    const backend = channelBackend(id);
+    const name = ch.name;
+    const backend = ch.backend;
     const isSelected = id === selectedChannel;
     const bitrateLabel = name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
     const item = document.createElement("div");
     item.className = `channel-item${isSelected ? " selected" : ""}`;
     item.dataset.channel = id;
     item.innerHTML = `
-      <span class="dot"></span>
+      <span class="dot${isOpen ? "" : " closed"}"></span>
       <span class="ch-name" title="${name}">${name}<span class="ch-backend label-muted"> ${backend}</span></span>
       <span class="ch-dbc"${dbc ? ` title="${dbc.path}"` : ""}>${dbc ? dbc.path.replace(/.*[/\\]/, "") : "No DBC"}</span>
       <span class="ch-baud label-muted">${bitrateLabel}</span>
-      <button class="btn-close-ch" title="Close channel">×</button>
+      <button class="btn-close-ch" title="Remove channel">×</button>
     `;
     item.addEventListener("click", (e) => {
       if ((e.target as HTMLElement).closest(".btn-close-ch")) return;
       selectChannel(id);
     });
-    item.addEventListener("contextmenu", (e) => {
+    item.addEventListener("contextmenu", async (e) => {
       e.preventDefault();
       showContextMenu(e.clientX, e.clientY, [
-        { label: "Configure…", action: () => openChannelDialog("edit", id) },
         {
-          label: "Close Channel", danger: true, action: async () => {
-            try {
-              await invoke("close_channel", { channelId: id });
-              dbcByChannel.delete(id);
-              channelBitrates.delete(id);
-              if (selectedChannel === id) selectChannel(null);
-              await refreshChannelList();
-              scheduleAutoSave();
-            } catch (err) { setError(`Close error: ${err}`); }
+          label: "Configure…", action: async () => {
+            if (!await confirmAndStop(`Stop live capture to configure "${name}"?`)) return;
+            openChannelDialog("edit", id);
+          }
+        },
+        {
+          label: "Remove Channel", danger: true, action: async () => {
+            if (!await confirmAndStop(`Stop live capture and remove "${name}"?`)) return;
+            configuredChannels = configuredChannels.filter(c => `${c.backend}:${c.name}` !== id);
+            dbcByChannel.delete(id);
+            channelBitrates.delete(id);
+            if (selectedChannel === id) selectChannel(null);
+            renderChannelList();
+            scheduleAutoSave();
           }
         },
       ]);
     });
     item.querySelector(".btn-close-ch")!.addEventListener("click", async (e) => {
       e.stopPropagation();
-      try {
-        await invoke("close_channel", { channelId: id });
-        dbcByChannel.delete(id);
-        channelBitrates.delete(id);
-        if (selectedChannel === id) selectChannel(null);
-        await refreshChannelList();
-        scheduleAutoSave();
-      } catch (err) { setError(`Close error: ${err}`); }
+      if (!await confirmAndStop(`Stop live capture and remove "${name}"?`)) return;
+      configuredChannels = configuredChannels.filter(c => `${c.backend}:${c.name}` !== id);
+      dbcByChannel.delete(id);
+      channelBitrates.delete(id);
+      if (selectedChannel === id) selectChannel(null);
+      renderChannelList();
+      scheduleAutoSave();
     });
     list.appendChild(item);
   }
@@ -1399,7 +1407,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
       <div class="sim-group-header">
         <span class="sim-kind-badge kind-raw">RAW</span>
         <select class="sim-channel-sel">
-          ${openChannels.map(ch => `<option value="${ch}"${ch === entry.channel ? " selected" : ""}>${ch}</option>`).join("")}
+          ${configuredChannels.map(ch => `${ch.backend}:${ch.name}`).map(id => `<option value="${id}"${id === entry.channel ? " selected" : ""}>${id}</option>`).join("")}
         </select>
         <span class="label-muted">ID</span>
         <input type="text" class="sim-canid-input small-input" value="${idHex}" maxlength="8" placeholder="hex">
@@ -1496,7 +1504,7 @@ function addRawFrame() {
   const key = `raw::${++rawEntryCounter}`;
   const entry: SimRawEntry = {
     kind: "raw",
-    channel: openChannels[0] ?? "",
+    channel: configuredChannels.length > 0 ? `${configuredChannels[0].backend}:${configuredChannels[0].name}` : "",
     canId: 0x100, isExtended: false, dlc: 8,
     data: new Array(8).fill(0),
     periodMs: 100, timerId: null,
@@ -1552,11 +1560,11 @@ function stopSim(key: string) {
 function buildProject(): Project {
   return {
     version: 1,
-    channels: openChannels.map(id => ({
-      name: channelDisplayName(id),
-      backend: channelBackend(id),
-      dbc_path: dbcByChannel.get(id)?.path ?? null,
-      bitrate: channelBitrates.get(id) ?? null,
+    channels: configuredChannels.map(ch => ({
+      name: ch.name,
+      backend: ch.backend,
+      dbc_path: dbcByChannel.get(`${ch.backend}:${ch.name}`)?.path ?? null,
+      bitrate: channelBitrates.get(`${ch.backend}:${ch.name}`) ?? null,
     })),
     plot_panes: plotPanes.map(pane => ({
       signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: s.channel })),
@@ -1638,18 +1646,26 @@ async function openProject() {
 }
 
 async function applyProject(project: Project) {
+  // Stop any active capture before applying a new project.
+  if (appRunning) await stopApp();
+
+  configuredChannels = [];
+  openChannels = [];
+
   for (const ch of project.channels) {
     const backend = ch.backend ?? "socketcan";
-    const info = await openChannel(backend, ch.name, ch.bitrate ?? null);
-    if (info) channelBitrates.set(info.id, ch.bitrate ?? null);
+    const channelId = `${backend}:${ch.name}`;
+    configuredChannels.push({ name: ch.name, backend, dbc_path: ch.dbc_path, bitrate: ch.bitrate ?? null });
+    channelBitrates.set(channelId, ch.bitrate ?? null);
+    if (ch.dbc_path) {
+      try {
+        const dbc = await invoke<ParsedDbc>("load_dbc", { channelId, path: ch.dbc_path });
+        dbcByChannel.set(channelId, dbc);
+      } catch { }
+    }
   }
-  await refreshChannelList();
 
-  try {
-    const all = await invoke<Record<string, ParsedDbc>>("get_all_dbcs");
-    for (const [id, dbc] of Object.entries(all)) dbcByChannel.set(id, dbc);
-  } catch { }
-  renderChannelList();
+  refreshChannelList();
   if (selectedChannel) renderDbcTree();
 
   // Remove existing panes, restore saved ones
@@ -1782,6 +1798,15 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
 // ── App recording start / stop ────────────────────────────────────────────────
 
 async function startApp() {
+  // Open all configured channels (hardware connects here, not when added).
+  const newOpen: string[] = [];
+  for (const ch of configuredChannels) {
+    const info = await openChannel(ch.backend, ch.name, ch.bitrate ?? null);
+    if (info) newOpen.push(info.id);
+  }
+  openChannels = newOpen;
+  renderChannelList();
+
   // Reload DBC files so the latest version on disk is used for this run
   await Promise.all(openChannels.map(async (id) => {
     const path = dbcByChannel.get(id)?.path;
@@ -1851,13 +1876,52 @@ async function startApp() {
   setStatus("Live capture started");
 }
 
-function stopApp() {
+async function stopApp() {
   appRunning = false;
+  // Close hardware connections; they will reopen on the next Start.
+  for (const id of openChannels) {
+    try { await invoke("close_channel", { channelId: id }); } catch { }
+  }
+  openChannels = [];
+  renderChannelList();
   const btn = document.getElementById("btn-app-run")!;
   btn.textContent = "▶ Start";
   btn.classList.remove("running");
-  btn.title = "Resume live capture";
-  setStatus("Live capture paused");
+  btn.title = "Start live capture";
+  setStatus("Stopped");
+}
+
+function showConfirm(message: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const dialog = document.getElementById("dialog-confirm") as HTMLDialogElement;
+    document.getElementById("dialog-confirm-msg")!.textContent = message;
+
+    const ok = document.getElementById("btn-confirm-ok")!;
+    const cancel = document.getElementById("btn-confirm-cancel")!;
+
+    const done = (result: boolean) => {
+      ok.removeEventListener("click", onOk);
+      cancel.removeEventListener("click", onCancel);
+      dialog.removeEventListener("cancel", onCancel);
+      dialog.close();
+      resolve(result);
+    };
+    const onOk = () => done(true);
+    const onCancel = () => done(false);
+
+    ok.addEventListener("click", onOk);
+    cancel.addEventListener("click", onCancel);
+    dialog.addEventListener("cancel", onCancel); // Escape key
+    dialog.showModal();
+  });
+}
+
+// Shows a confirm dialog if running, stops capture, then returns true so the caller can proceed.
+async function confirmAndStop(prompt: string): Promise<boolean> {
+  if (!appRunning) return true;
+  if (!await showConfirm(prompt)) return false;
+  await stopApp();
+  return true;
 }
 
 /** Exports the signal history to CSV. Returns true if a file was saved. */
@@ -3034,7 +3098,10 @@ window.addEventListener("DOMContentLoaded", async () => {
 
   // Channel dialog
   const chanDialog = document.getElementById("dialog-channel") as HTMLDialogElement;
-  document.getElementById("btn-add-channel")!.addEventListener("click", () => openChannelDialog("add"));
+  document.getElementById("btn-add-channel")!.addEventListener("click", async () => {
+    if (!await confirmAndStop("Stop live capture to add a channel?")) return;
+    openChannelDialog("add");
+  });
   document.getElementById("btn-channel-cancel")!.addEventListener("click", () => chanDialog.close());
   document.getElementById("form-channel")!.addEventListener("submit", async (e) => { e.preventDefault(); await applyChannelDialog(); });
 
@@ -3061,8 +3128,8 @@ window.addEventListener("DOMContentLoaded", async () => {
   document.getElementById("btn-add-raw-frame")!.addEventListener("click", addRawFrame);
 
   // Play / Stop
-  document.getElementById("btn-app-run")!.addEventListener("click", () => {
-    if (appRunning) stopApp(); else startApp();
+  document.getElementById("btn-app-run")!.addEventListener("click", async () => {
+    if (appRunning) await stopApp(); else await startApp();
   });
 
   document.getElementById("btn-pause-view")!.addEventListener("click", () => {
@@ -3159,10 +3226,13 @@ window.addEventListener("DOMContentLoaded", async () => {
     sessionFilePath = sess;
     // No previous session — start fresh with one empty pane
     createPlotPane();
-    await refreshChannelList();
+    refreshChannelList();
     renderDbcTree();
   }
 
-  // App launches in running state — kick off the scroll loop immediately.
-  startScrollLoop();
+  // Auto-start only when at least one channel has been configured.
+  if (configuredChannels.length > 0) {
+    await startApp();
+  }
+  // Otherwise the app stays in stopped state; user adds channels then presses Start.
 });

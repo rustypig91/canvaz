@@ -12,6 +12,7 @@ use crate::backends::{default_backends, Backend, Channel};
 use crate::can_frame::CanFrame;
 use crate::dbc_parser::ParsedDbc;
 
+
 pub type ManagerState = Arc<Mutex<CanManager>>;
 pub type DbcState = Arc<RwLock<HashMap<String, ParsedDbc>>>;
 pub type SubscribedSignals = Arc<RwLock<HashMap<String, HashSet<String>>>>;
@@ -23,6 +24,7 @@ pub struct ChannelInfo {
     pub id: String,
     pub backend: String,
     pub name: String,
+    pub dbc: Option<ParsedDbc>,
 }
 
 impl ChannelInfo {
@@ -31,6 +33,7 @@ impl ChannelInfo {
             id: format!("{backend}:{name}"),
             backend: backend.to_string(),
             name: name.to_string(),
+            dbc: None,
         }
     }
 }
@@ -99,7 +102,7 @@ impl CanManager {
         backend_name: String,
         channel_name: String,
         bitrate: Option<u32>,
-        dbc: DbcState,
+        dbc: &str,
     ) -> Result<ChannelInfo, String> {
         let info = ChannelInfo::new(&backend_name, &channel_name);
         if self.channels.contains_key(&info.id) {

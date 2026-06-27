@@ -3,7 +3,6 @@ mod kvaser;
 #[cfg(feature = "linux-can")]
 mod socketcan;
 
-
 #[cfg(feature = "kvaser")]
 use kvaser::{KvaserBackend, KvaserBackendChannel};
 #[cfg(feature = "linux-can")]
@@ -13,8 +12,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::app_state::AppState;
+use crate::can_frame::{now_ms, CanFrame, Direction};
 use crate::dbc_parser::*;
-use crate::can_frame::{CanFrame, Direction, now_ms};
 
 const DEFAULT_WINDOW_MS: u64 = 30_000;
 
@@ -28,6 +27,14 @@ enum ChannelInner {
 }
 
 impl ChannelInner {
+    fn name(&self) -> &str {
+        match self {
+            #[cfg(feature = "linux-can")]
+            ChannelInner::SocketCan(c) => c.name(),
+            #[cfg(feature = "kvaser")]
+            ChannelInner::Kvaser(c) => c.name(),
+        }
+    }
     fn open(&mut self) -> Result<(), String> {
         match self {
             #[cfg(feature = "linux-can")]
@@ -74,7 +81,7 @@ pub struct Channel {
     inner: ChannelInner,
     frames: VecDeque<CanFrame>,
     window_ms: u64,
-    parsed_dbc: Option<ParsedDbc>
+    parsed_dbc: Option<ParsedDbc>,
 }
 
 impl Channel {
@@ -130,8 +137,7 @@ impl Channel {
     pub fn set_window_ms(&mut self, ms: u64) {
         self.window_ms = ms;
         let cutoff = now_ms().saturating_sub(ms);
-        let fresh: VecDeque<CanFrame> =
-            self.frames.drain(..).filter(|f| f.timestamp_ms >= cutoff).collect();
+        let fresh: VecDeque<CanFrame> = self.frames.drain(..).filter(|f| f.timestamp_ms >= cutoff).collect();
         self.frames = fresh;
     }
 
