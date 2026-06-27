@@ -4,9 +4,9 @@ mod kvaser;
 mod socketcan;
 
 #[cfg(feature = "kvaser")]
-use kvaser::{KvaserBackend, KvaserBackendChannel};
+use kvaser::{KvaserBackend, KvaserBackendChannel, KvaserRxChannel};
 #[cfg(feature = "linux-can")]
-use socketcan::{SocketCanBackend, SocketCanChannel};
+use socketcan::{SocketCanBackend, SocketCanChannel, SocketCanRxChannel};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{
@@ -24,8 +24,8 @@ use crate::dbc_parser::*;
 
 const DEFAULT_WINDOW_MS: u64 = 30_000;
 
-// How long each backend receive() call blocks before returning None.
-// Must be small enough to notice a close() promptly.
+// How long each backend receive() blocks before returning None.
+// Must be short enough to notice a close() promptly.
 pub(crate) const RECV_TIMEOUT_MS: u64 = 50;
 
 // ── Shared types ──────────────────────────────────────────────────────────────
@@ -55,60 +55,72 @@ pub struct SignalValueEvent {
     pub timestamp_ms: u64,
 }
 
-// ── ChannelInner ──────────────────────────────────────────────────────────────
+// ── TX half — stays in Channel, owned by the main thread ─────────────────────
+// No mutex required: the outer Arc<Mutex<Channel>> serialises access here.
 
-enum ChannelInner {
+enum TxChannel {
     #[cfg(feature = "linux-can")]
     SocketCan(SocketCanChannel),
     #[cfg(feature = "kvaser")]
     Kvaser(KvaserBackendChannel),
 }
 
-impl ChannelInner {
-    fn open(&mut self) -> Result<(), String> {
+impl TxChannel {
+    // Opens the TX side and returns a ready-to-use RX handle for the receive thread.
+    fn open(&mut self) -> Result<RxChannel, String> {
         match self {
             #[cfg(feature = "linux-can")]
-            ChannelInner::SocketCan(c) => c.open(),
+            TxChannel::SocketCan(c) => c.open().map(RxChannel::SocketCan),
             #[cfg(feature = "kvaser")]
-            ChannelInner::Kvaser(c) => c.open(),
+            TxChannel::Kvaser(c) => c.open().map(RxChannel::Kvaser),
         }
     }
 
     fn close(&mut self) -> Result<(), String> {
         match self {
             #[cfg(feature = "linux-can")]
-            ChannelInner::SocketCan(c) => c.close(),
+            TxChannel::SocketCan(c) => c.close(),
             #[cfg(feature = "kvaser")]
-            ChannelInner::Kvaser(c) => c.close(),
+            TxChannel::Kvaser(c) => c.close(),
         }
     }
 
     fn send(&self, frame: CanFrame) -> Result<(), String> {
         match self {
             #[cfg(feature = "linux-can")]
-            ChannelInner::SocketCan(c) => c.send(frame),
+            TxChannel::SocketCan(c) => c.send(frame),
             #[cfg(feature = "kvaser")]
-            ChannelInner::Kvaser(c) => c.send(frame),
+            TxChannel::Kvaser(c) => c.send(frame),
         }
     }
 
-    // Blocking receive with a bounded timeout (≤ RECV_TIMEOUT_MS).
-    // Returns None on timeout so callers can check stop flags promptly.
+    fn set_bitrate(&mut self, bitrate: u32) {
+        match self {
+            #[cfg(feature = "linux-can")]
+            TxChannel::SocketCan(c) => c.set_bitrate(bitrate),
+            #[cfg(feature = "kvaser")]
+            TxChannel::Kvaser(c) => c.set_bitrate(bitrate),
+        }
+    }
+}
+
+// ── RX half — handed exclusively to the receive thread ───────────────────────
+// No mutex required: only the receive thread ever touches this.
+
+enum RxChannel {
+    #[cfg(feature = "linux-can")]
+    SocketCan(SocketCanRxChannel),
+    #[cfg(feature = "kvaser")]
+    Kvaser(KvaserRxChannel),
+}
+
+impl RxChannel {
     fn receive(&self) -> Result<Option<CanFrame>, String> {
         match self {
             #[cfg(feature = "linux-can")]
-            ChannelInner::SocketCan(c) => c.receive(),
+            RxChannel::SocketCan(c) => c.receive(),
             #[cfg(feature = "kvaser")]
-            ChannelInner::Kvaser(c) => c.receive(),
-        }
-    }
-
-    fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
-        match self {
-            #[cfg(feature = "linux-can")]
-            ChannelInner::SocketCan(c) => c.set_bitrate(bitrate),
-            #[cfg(feature = "kvaser")]
-            ChannelInner::Kvaser(c) => c.set_bitrate(bitrate),
+            RxChannel::Kvaser(c) => c.receive(),
         }
     }
 }
@@ -116,9 +128,7 @@ impl ChannelInner {
 // ── Channel ───────────────────────────────────────────────────────────────────
 
 pub struct Channel {
-    // Shared with the receive thread so send() and receive() can interleave.
-    inner: Arc<Mutex<ChannelInner>>,
-    // Shared with the receive thread for frame storage.
+    tx: TxChannel,
     frames: Arc<Mutex<VecDeque<CanFrame>>>,
     window_ms: Arc<AtomicU64>,
     parsed_dbc: Option<Arc<ParsedDbc>>,
@@ -126,7 +136,7 @@ pub struct Channel {
     // Thread management
     stop_flag: Arc<AtomicBool>,
     recv_thread: Option<JoinHandle<()>>,
-    // For event emission from the receive thread
+    // Passed to the receive thread for event emission
     app_state: Arc<AppState>,
     channel_id: String,
     subscribed: SubscribedSignals,
@@ -134,7 +144,7 @@ pub struct Channel {
 
 impl Channel {
     fn new(
-        inner: ChannelInner,
+        tx: TxChannel,
         dbc_path: Option<String>,
         app_state: Arc<AppState>,
         channel_id: String,
@@ -144,7 +154,7 @@ impl Channel {
             .and_then(|p| ParsedDbc::new(p).ok())
             .map(Arc::new);
         Self {
-            inner: Arc::new(Mutex::new(inner)),
+            tx,
             frames: Arc::new(Mutex::new(VecDeque::new())),
             window_ms: Arc::new(AtomicU64::new(DEFAULT_WINDOW_MS)),
             parsed_dbc,
@@ -157,19 +167,31 @@ impl Channel {
         }
     }
 
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
+
     pub fn open(&mut self) -> Result<(), String> {
         self.frames.lock().map_err(|_| "Lock poisoned".to_string())?.clear();
-        // Re-parse DBC from path on each open to pick up file changes.
         if let Some(path) = &self.dbc_path {
             self.parsed_dbc = ParsedDbc::new(path).ok().map(Arc::new);
         }
-        self.inner.lock()
-            .map_err(|_| "Lock poisoned".to_string())?
-            .open()?;
+        self.start()
+    }
 
+    pub fn close(&mut self) -> Result<(), String> {
+        self.stop_and_close()
+    }
+
+    pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
+        self.stop_and_close()?;
+        self.tx.set_bitrate(bitrate);
+        self.start()
+    }
+
+    // Opens the TX side, spawns the receive thread with the RX side.
+    fn start(&mut self) -> Result<(), String> {
+        let rx = self.tx.open()?;
         self.stop_flag.store(false, Ordering::Relaxed);
 
-        let inner = Arc::clone(&self.inner);
         let frames = Arc::clone(&self.frames);
         let window_ms = Arc::clone(&self.window_ms);
         let dbc = self.parsed_dbc.clone();
@@ -179,36 +201,30 @@ impl Channel {
         let subscribed = Arc::clone(&self.subscribed);
 
         self.recv_thread = Some(std::thread::spawn(move || {
-            recv_loop(inner, frames, window_ms, dbc, stop, app_state, channel_id, subscribed);
+            recv_loop(rx, frames, window_ms, dbc, stop, app_state, channel_id, subscribed);
         }));
 
         Ok(())
     }
 
-    pub fn close(&mut self) -> Result<(), String> {
+    // Signals the receive thread to stop, waits for it to exit, then closes TX.
+    fn stop_and_close(&mut self) -> Result<(), String> {
         self.stop_flag.store(true, Ordering::Relaxed);
         if let Some(t) = self.recv_thread.take() {
             let _ = t.join();
         }
-        self.inner.lock()
-            .map_err(|_| "Lock poisoned".to_string())?
-            .close()
+        self.tx.close()
     }
 
-    pub fn set_bitrate(&mut self, bitrate: u32) -> Result<(), String> {
-        self.inner.lock()
-            .map_err(|_| "Lock poisoned".to_string())?
-            .set_bitrate(bitrate)
-    }
+    // ── Data path ─────────────────────────────────────────────────────────────
 
     pub fn get_dbc(&self) -> Option<&ParsedDbc> {
         self.parsed_dbc.as_deref()
     }
 
     pub fn send(&mut self, frame: CanFrame) -> Result<(), String> {
-        self.inner.lock()
-            .map_err(|_| "Lock poisoned".to_string())?
-            .send(frame.clone())?;
+        // No mutex on TX — the outer Arc<Mutex<Channel>> already serialises this.
+        self.tx.send(frame.clone())?;
         push_to_ring(&self.frames, frame, self.window_ms.load(Ordering::Relaxed));
         Ok(())
     }
@@ -260,10 +276,10 @@ impl Channel {
     }
 }
 
-// ── Receive loop (runs inside Channel's background thread) ────────────────────
+// ── Receive loop ──────────────────────────────────────────────────────────────
 
 fn recv_loop(
-    inner: Arc<Mutex<ChannelInner>>,
+    rx: RxChannel,
     frames: Arc<Mutex<VecDeque<CanFrame>>>,
     window_ms: Arc<AtomicU64>,
     dbc: Option<Arc<ParsedDbc>>,
@@ -273,12 +289,8 @@ fn recv_loop(
     subscribed: SubscribedSignals,
 ) {
     while !stop.load(Ordering::Relaxed) {
-        let result = match inner.lock() {
-            Ok(ch) => ch.receive(),
-            Err(_) => break,
-        };
-
-        let mut frame = match result {
+        // receive() blocks for at most RECV_TIMEOUT_MS — no mutex held during the wait
+        let mut frame = match rx.receive() {
             Ok(Some(f)) => f,
             Ok(None) => continue,
             Err(e) => {
@@ -333,6 +345,7 @@ fn recv_loop(
             }
         }
     }
+    // rx is dropped here, which closes the RX handle/socket via Drop.
 }
 
 fn push_to_ring(frames: &Mutex<VecDeque<CanFrame>>, frame: CanFrame, window_ms: u64) {
@@ -385,13 +398,13 @@ impl Backend {
         match self {
             #[cfg(feature = "linux-can")]
             Backend::SocketCan(backend) => {
-                let inner = backend.open_channel(name, bitrate, Arc::clone(&state))?;
-                Ok(Channel::new(ChannelInner::SocketCan(inner), dbc_path.map(str::to_string), state, channel_id, subscribed))
+                let tx = backend.open_channel(name, bitrate, Arc::clone(&state))?;
+                Ok(Channel::new(TxChannel::SocketCan(tx), dbc_path.map(str::to_string), state, channel_id, subscribed))
             }
             #[cfg(feature = "kvaser")]
             Backend::Kvaser(backend) => {
-                let inner = backend.open_channel(name, bitrate, Arc::clone(&state))?;
-                Ok(Channel::new(ChannelInner::Kvaser(inner), dbc_path.map(str::to_string), state, channel_id, subscribed))
+                let tx = backend.open_channel(name, bitrate, Arc::clone(&state))?;
+                Ok(Channel::new(TxChannel::Kvaser(tx), dbc_path.map(str::to_string), state, channel_id, subscribed))
             }
         }
     }
