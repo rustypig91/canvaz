@@ -235,6 +235,10 @@ let appRunning = false;
 let appStartTime = Date.now();
 let plotTabActive = true; // plot tab is the default active tab
 
+// Signals/sim entries to restore into panes after the next startApp (DBC comes from open_channel)
+let pendingPaneSignals: PlotSignalEntry[][] = [];
+let pendingSimSignals: SimulateEntry[] = [];
+
 // Middle-mouse pan state
 let midPan: { startX: number; startMin: number; startMax: number; chartWidth: number } | null = null;
 
@@ -974,8 +978,8 @@ async function openChannelDialog(mode: DialogMode, channelName?: string) {
     title.textContent = `Channel: ${displayName}`;
     applyBtn.textContent = "Apply";
     ifaceRow.style.display = "none";
-    const dbc = dbcByChannel.get(id);
-    dialogPendingDbc = dbc?.path ?? null;
+    const cfg = configuredChannels.find(c => `${c.backend}:${c.name}` === id);
+    dialogPendingDbc = cfg?.dbc_path ?? null;
     setDbcLabel(dialogPendingDbc);
     setBitrateInDialog(channelBitrates.get(id) ?? null, displayName.startsWith("vcan"));
     selectChannel(id);
@@ -1057,13 +1061,6 @@ async function applyChannelDialog() {
     configuredChannels.push({ name, backend, dbc_path: dialogPendingDbc, bitrate });
     channelBitrates.set(channelId, bitrate);
 
-    if (dialogPendingDbc) {
-      try {
-        const dbc = await invoke<ParsedDbc>("parse_dbc", { path: dialogPendingDbc });
-        dbcByChannel.set(channelId, dbc);
-      } catch (e) { setError(`DBC error: ${e}`); }
-    }
-
     refreshChannelList();
     setStatus(`Added channel: ${name}`);
     scheduleAutoSave();
@@ -1076,14 +1073,7 @@ async function applyChannelDialog() {
     if (idx >= 0) configuredChannels[idx] = { ...configuredChannels[idx], dbc_path: dialogPendingDbc, bitrate };
     channelBitrates.set(id, bitrate);
 
-    if (dialogPendingDbc) {
-      try {
-        const dbc = await invoke<ParsedDbc>("parse_dbc", { path: dialogPendingDbc });
-        dbcByChannel.set(id, dbc);
-      } catch (e) { setError(`DBC error: ${e}`); }
-    } else {
-      dbcByChannel.delete(id);
-    }
+    if (!dialogPendingDbc) dbcByChannel.delete(id);
 
     refreshChannelList();
     if (selectedChannel === id) renderDbcTree();
@@ -1268,6 +1258,7 @@ function renderChannelList() {
     const id = `${ch.backend}:${ch.name}`;
     const isOpen = openChannels.includes(id);
     const dbc = dbcByChannel.get(id);
+    const dbcPath = dbc?.path ?? ch.dbc_path ?? null;
     const bitrate = channelBitrates.get(id);
     const name = ch.name;
     const backend = ch.backend;
@@ -1279,7 +1270,7 @@ function renderChannelList() {
     item.innerHTML = `
       <span class="dot${isOpen ? "" : " closed"}"></span>
       <span class="ch-name" title="${name}">${name}<span class="ch-backend label-muted"> ${backend}</span></span>
-      <span class="ch-dbc"${dbc ? ` title="${dbc.path}"` : ""}>${dbc ? dbc.path.replace(/.*[/\\]/, "") : "No DBC"}</span>
+      <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
       <span class="ch-baud label-muted">${bitrateLabel}</span>
       <button class="btn-close-ch" title="Remove channel">×</button>
     `;
@@ -1643,25 +1634,22 @@ async function applyProject(project: Project) {
 
   configuredChannels = [];
   openChannels = [];
+  dbcByChannel.clear();
 
   for (const ch of project.channels) {
     const backend = ch.backend ?? "socketcan";
     const channelId = `${backend}:${ch.name}`;
     configuredChannels.push({ name: ch.name, backend, dbc_path: ch.dbc_path, bitrate: ch.bitrate ?? null });
     channelBitrates.set(channelId, ch.bitrate ?? null);
-    if (ch.dbc_path) {
-      try {
-        const dbc = await invoke<ParsedDbc>("parse_dbc", { path: ch.dbc_path });
-        dbcByChannel.set(channelId, dbc);
-      } catch { }
-    }
   }
 
   refreshChannelList();
-  if (selectedChannel) renderDbcTree();
+  renderDbcTree();
 
-  // Remove existing panes, restore saved ones
+  // Remove existing panes and create blank placeholders with correct settings.
+  // Signals are added after startApp opens channels and the DBC is available.
   while (plotPanes.length) closePlotPane(plotPanes[0].id);
+  pendingPaneSignals = [];
 
   for (const paneConfig of project.plot_panes) {
     const pane = createPlotPane();
@@ -1675,11 +1663,7 @@ async function applyProject(project: Project) {
       btn.classList.add("active");
       btn.title = "Show data points: on";
     }
-    for (const entry of paneConfig.signals) {
-      const dbc = dbcByChannel.get(entry.channel);
-      const sig = dbc?.messages.flatMap(m => m.signals).find(s => s.name === entry.signal_name);
-      if (sig) addSignalToPane(pane, entry.channel, sig);
-    }
+    pendingPaneSignals.push(paneConfig.signals);
   }
 
   setWindowSize(project.window_size_sec ?? DEFAULT_WINDOW_SEC);
@@ -1688,29 +1672,10 @@ async function applyProject(project: Project) {
   simEntries.clear();
   document.getElementById("sim-entries")!.innerHTML = "";
 
-  // Group saved signal entries by message so each message becomes one card
-  const msgMap = new Map<string, { channel: string; msg: DbcMessage; periodMs: number; values: Map<string, number> }>();
-  for (const entry of project.simulate_signals) {
-    const dbc = dbcByChannel.get(entry.channel);
-    const msg = dbc?.messages.find(m => m.signals.some(s => s.name === entry.signal_name));
-    if (!msg) continue;
-    const key = `msg::${entry.channel}::${msg.id}`;
-    if (!msgMap.has(key)) msgMap.set(key, { channel: entry.channel, msg, periodMs: entry.period_ms, values: new Map() });
-    msgMap.get(key)!.values.set(entry.signal_name, entry.value);
-  }
-  const container = document.getElementById("sim-entries")!;
-  for (const [key, { channel, msg, periodMs, values }] of msgMap) {
-    const simEntry: SimMessageEntry = {
-      kind: "message", channel,
-      messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
-      signals: msg.signals.map(s => ({ def: s, value: values.get(s.name) ?? s.min ?? 0 })),
-      periodMs, timerId: null,
-    };
-    simEntries.set(key, simEntry);
-    container.appendChild(createSimEntryEl(key, simEntry));
-  }
+  // Save sim signal entries for restoration after startApp opens channels and loads DBCs.
+  pendingSimSignals = project.simulate_signals ?? [];
 
-  // Restore raw sim frames
+  // Restore raw sim frames immediately (they don't need a DBC).
   for (const raw of project.simulate_raw_frames ?? []) {
     const key = `raw::${++rawEntryCounter}`;
     const entry: SimRawEntry = {
@@ -1720,7 +1685,7 @@ async function applyProject(project: Project) {
       periodMs: raw.period_ms, timerId: null,
     };
     simEntries.set(key, entry);
-    container.appendChild(createSimEntryEl(key, entry));
+    document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
   }
 
   // Restore trace column layout
@@ -1847,6 +1812,47 @@ async function startApp() {
     xScale.min = 0;
     xScale.max = windowSizeSec;
     pane.chart.update();
+  }
+
+  // Restore pane signals deferred from applyProject (DBC is now available from open_channel).
+  if (pendingPaneSignals.length > 0) {
+    const toRestore = pendingPaneSignals;
+    pendingPaneSignals = [];
+    for (let i = 0; i < Math.min(plotPanes.length, toRestore.length); i++) {
+      for (const entry of toRestore[i]) {
+        const dbc = dbcByChannel.get(entry.channel);
+        const sig = dbc?.messages.flatMap(m => m.signals).find(s => s.name === entry.signal_name);
+        if (sig) await addSignalToPane(plotPanes[i], entry.channel, sig);
+      }
+    }
+  }
+
+  // Restore sim signal entries deferred from applyProject.
+  if (pendingSimSignals.length > 0) {
+    const toRestore = pendingSimSignals;
+    pendingSimSignals = [];
+    const msgMap = new Map<string, { channel: string; msg: DbcMessage; periodMs: number; values: Map<string, number> }>();
+    for (const entry of toRestore) {
+      const dbc = dbcByChannel.get(entry.channel);
+      const msg = dbc?.messages.find(m => m.signals.some(s => s.name === entry.signal_name));
+      if (!msg) continue;
+      const key = `msg::${entry.channel}::${msg.id}`;
+      if (!msgMap.has(key)) msgMap.set(key, { channel: entry.channel, msg, periodMs: entry.period_ms, values: new Map() });
+      msgMap.get(key)!.values.set(entry.signal_name, entry.value);
+    }
+    const simContainer = document.getElementById("sim-entries")!;
+    for (const [key, { channel, msg, periodMs, values }] of msgMap) {
+      if (simEntries.has(key)) continue;
+      const simEntry: SimMessageEntry = {
+        kind: "message", channel,
+        messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
+        signals: msg.signals.map(s => ({ def: s, value: values.get(s.name) ?? s.min ?? 0 })),
+        periodMs, timerId: null,
+      };
+      simEntries.set(key, simEntry);
+      simContainer.appendChild(createSimEntryEl(key, simEntry));
+    }
+    renderSimEntries();
   }
 
   clearTrace();
