@@ -1284,7 +1284,7 @@ interface SimMessageEntry {
   dlc: number;
   signals: { def: DbcSignal; value: number }[];
   periodMs: number;
-  timerId: ReturnType<typeof setInterval> | null;
+  running: boolean;
 }
 
 interface SimRawEntry {
@@ -1295,7 +1295,7 @@ interface SimRawEntry {
   dlc: number;
   data: number[];
   periodMs: number;
-  timerId: ReturnType<typeof setInterval> | null;
+  running: boolean;
 }
 
 type SimEntry = SimMessageEntry | SimRawEntry;
@@ -1321,7 +1321,8 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         <span class="label-muted">Period</span>
         <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
         <span class="label-muted">ms</span>
-        <button class="btn btn-sm sim-toggle">Start</button>
+        <button class="btn btn-sm sim-send-once">Send</button>
+        <button class="btn btn-sm sim-toggle${entry.running ? " running" : ""}">${entry.running ? "Stop" : "Start"}</button>
         <button class="btn btn-sm btn-danger sim-remove">✕</button>
       </div>
       <div class="sim-group-body">
@@ -1333,15 +1334,22 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
           </div>`).join("")}
       </div>`;
 
-    el.querySelector<HTMLInputElement>(".sim-period")!.addEventListener("input", (e) => {
+    el.querySelector<HTMLInputElement>(".sim-period")!.addEventListener("input", async (e) => {
       const p = parseInt((e.target as HTMLInputElement).value) || 100;
-      if (entry.timerId != null) { stopSim(key); entry.periodMs = p; startSim(key); }
+      if (entry.running) { await stopSim(key); entry.periodMs = p; await startSim(key); }
       else entry.periodMs = p;
     });
     el.querySelectorAll<HTMLInputElement>(".sim-value-input").forEach(inp => {
-      inp.addEventListener("input", () => {
+      inp.addEventListener("input", async () => {
         entry.signals[parseInt(inp.dataset.idx ?? "0")].value = parseFloat(inp.value) || 0;
+        if (entry.running) { await stopSim(key); await startSim(key); }
       });
+    });
+    el.querySelector(".sim-send-once")!.addEventListener("click", async () => {
+      const signalValues: Record<string, number> = {};
+      for (const s of entry.signals) signalValues[s.def.name] = s.value;
+      try { await invoke("send_message", { cmd: { channel_id: entry.channel, message_id: entry.messageId, signal_values: signalValues } }); }
+      catch (e) { setError(`Send error: ${e}`); }
     });
 
   } else {
@@ -1362,7 +1370,8 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         <span class="label-muted">Period</span>
         <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
         <span class="label-muted">ms</span>
-        <button class="btn btn-sm sim-toggle">Start</button>
+        <button class="btn btn-sm sim-send-once">Send</button>
+        <button class="btn btn-sm sim-toggle${entry.running ? " running" : ""}">${entry.running ? "Stop" : "Start"}</button>
         <button class="btn btn-sm btn-danger sim-remove">✕</button>
       </div>
       <div class="sim-group-body">
@@ -1374,41 +1383,53 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         </div>
       </div>`;
 
-    el.querySelector<HTMLSelectElement>(".sim-channel-sel")!.addEventListener("change", (e) => {
+    el.querySelector<HTMLSelectElement>(".sim-channel-sel")!.addEventListener("change", async (e) => {
+      const wasRunning = entry.running;
+      if (wasRunning) await stopSim(key);
       entry.channel = (e.target as HTMLSelectElement).value;
+      if (wasRunning) await startSim(key);
     });
-    el.querySelector<HTMLInputElement>(".sim-canid-input")!.addEventListener("input", (e) => {
+    el.querySelector<HTMLInputElement>(".sim-canid-input")!.addEventListener("input", async (e) => {
+      const wasRunning = entry.running;
+      if (wasRunning) await stopSim(key);
       entry.canId = parseInt((e.target as HTMLInputElement).value, 16) || 0;
+      if (wasRunning) await startSim(key);
     });
     el.querySelector<HTMLInputElement>(".sim-ext-cb")!.addEventListener("change", (e) => {
       entry.isExtended = (e.target as HTMLInputElement).checked;
     });
-    el.querySelector<HTMLSelectElement>(".sim-dlc-sel")!.addEventListener("change", (e) => {
+    el.querySelector<HTMLSelectElement>(".sim-dlc-sel")!.addEventListener("change", async (e) => {
       entry.dlc = parseInt((e.target as HTMLSelectElement).value);
       el.querySelectorAll<HTMLInputElement>(".sim-byte").forEach((inp, i) => {
         inp.disabled = i >= entry.dlc;
       });
+      if (entry.running) { await stopSim(key); await startSim(key); }
     });
-    el.querySelector<HTMLInputElement>(".sim-period")!.addEventListener("input", (e) => {
+    el.querySelector<HTMLInputElement>(".sim-period")!.addEventListener("input", async (e) => {
       const p = parseInt((e.target as HTMLInputElement).value) || 100;
-      if (entry.timerId != null) { stopSim(key); entry.periodMs = p; startSim(key); }
+      if (entry.running) { await stopSim(key); entry.periodMs = p; await startSim(key); }
       else entry.periodMs = p;
     });
     el.querySelectorAll<HTMLInputElement>(".sim-byte").forEach(inp => {
-      inp.addEventListener("input", () => {
+      inp.addEventListener("input", async () => {
         entry.data[parseInt(inp.dataset.idx ?? "0")] = parseInt(inp.value, 16) || 0;
+        if (entry.running) { await stopSim(key); await startSim(key); }
       });
       inp.addEventListener("blur", () => {
         const i = parseInt(inp.dataset.idx ?? "0");
         inp.value = entry.data[i].toString(16).toUpperCase().padStart(2, "0");
       });
     });
+    el.querySelector(".sim-send-once")!.addEventListener("click", async () => {
+      try { await invoke("send_frame", { cmd: { channel_id: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc) } }); }
+      catch (e) { setError(`Send error: ${e}`); }
+    });
   }
 
-  el.querySelector(".sim-toggle")!.addEventListener("click", () => {
-    entry.timerId != null ? stopSim(key) : startSim(key);
+  el.querySelector(".sim-toggle")!.addEventListener("click", async () => {
+    entry.running ? await stopSim(key) : await startSim(key);
   });
-  el.querySelector(".sim-remove")!.addEventListener("click", () => removeSimEntry(key));
+  el.querySelector(".sim-remove")!.addEventListener("click", () => { removeSimEntry(key); });
   return el;
 }
 
@@ -1435,7 +1456,7 @@ function addSimSignal(channel: string, sig: DbcSignal) {
     kind: "message", channel,
     messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
     signals: msg.signals.map(s => ({ def: s, value: s.min ?? 0 })),
-    periodMs: 100, timerId: null,
+    periodMs: 100, running: false,
   };
   simEntries.set(key, entry);
   document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
@@ -1450,50 +1471,49 @@ function addRawFrame() {
     channel: configuredChannels.length > 0 ? `${configuredChannels[0].backend}:${configuredChannels[0].name}` : "",
     canId: 0x100, isExtended: false, dlc: 8,
     data: new Array(8).fill(0),
-    periodMs: 100, timerId: null,
+    periodMs: 100, running: false,
   };
   simEntries.set(key, entry);
   document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
   scheduleAutoSave();
 }
 
-function removeSimEntry(key: string) {
+async function removeSimEntry(key: string) {
   const entry = simEntries.get(key);
-  if (entry?.timerId != null) clearInterval(entry.timerId);
+  if (entry?.running) await stopSim(key);
   simEntries.delete(key);
   document.querySelector(`[data-sim-key="${key}"]`)?.remove();
   updateSignalHighlights();
   scheduleAutoSave();
 }
 
-function startSim(key: string) {
+async function startSim(key: string) {
   const entry = simEntries.get(key);
-  if (!entry || entry.timerId != null) return;
+  if (!entry || entry.running) return;
   if (!entry.channel) { setStatus("Select a channel first"); return; }
 
-  if (entry.kind === "message") {
-    entry.timerId = setInterval(async () => {
+  try {
+    if (entry.kind === "message") {
       const signalValues: Record<string, number> = {};
       for (const s of entry.signals) signalValues[s.def.name] = s.value;
-      try { await invoke("send_message", { cmd: { channel_id: entry.channel, message_id: entry.messageId, signal_values: signalValues } }); }
-      catch (e) { setError(`Send error: ${e}`); }
-    }, entry.periodMs);
-  } else {
-    entry.timerId = setInterval(async () => {
-      try { await invoke("send_raw_frame", { cmd: { channel_id: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc) } }); }
-      catch (e) { setError(`Send error: ${e}`); }
-    }, entry.periodMs);
+      await invoke("add_periodic_message", { cmd: { channel_id: entry.channel, message_id: entry.messageId, signal_values: signalValues, period_ms: entry.periodMs } });
+    } else {
+      await invoke("add_periodic_frame", { cmd: { channel_id: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs } });
+    }
+    entry.running = true;
+    const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
+    if (btn) { btn.textContent = "Stop"; btn.classList.add("running"); }
+  } catch (e) {
+    setError(`Sim start error: ${e}`);
   }
-
-  const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
-  if (btn) { btn.textContent = "Stop"; btn.classList.add("running"); }
 }
 
-function stopSim(key: string) {
+async function stopSim(key: string) {
   const entry = simEntries.get(key);
-  if (!entry || entry.timerId == null) return;
-  clearInterval(entry.timerId);
-  entry.timerId = null;
+  if (!entry || !entry.running) return;
+  const canId = entry.kind === "message" ? entry.messageId : entry.canId;
+  try { await invoke("remove_periodic_frame", { cmd: { channel_id: entry.channel, can_id: canId } }); } catch { }
+  entry.running = false;
   const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
   if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
 }
@@ -1628,7 +1648,6 @@ async function applyProject(project: Project) {
 
   setWindowSize(project.window_size_sec ?? DEFAULT_WINDOW_SEC);
 
-  for (const entry of simEntries.values()) { if (entry.timerId != null) clearInterval(entry.timerId); }
   simEntries.clear();
   document.getElementById("sim-entries")!.innerHTML = "";
 
@@ -1642,7 +1661,7 @@ async function applyProject(project: Project) {
       kind: "raw", channel: raw.channel,
       canId: raw.can_id, isExtended: raw.is_extended,
       dlc: raw.dlc, data: raw.data,
-      periodMs: raw.period_ms, timerId: null,
+      periodMs: raw.period_ms, running: false,
     };
     simEntries.set(key, entry);
     document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
@@ -1734,7 +1753,6 @@ async function startApp() {
       if (entry.kind !== "message") continue;
       const msg = dbcByChannel.get(entry.channel)?.messages.find(m => m.id === entry.messageId);
       if (!msg) {
-        if (entry.timerId != null) clearInterval(entry.timerId);
         simEntries.delete(key);
         simContainer.querySelector(`[data-sim-key="${key}"]`)?.remove();
       }
@@ -1807,7 +1825,7 @@ async function startApp() {
         kind: "message", channel,
         messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
         signals: msg.signals.map(s => ({ def: s, value: values.get(s.name) ?? s.min ?? 0 })),
-        periodMs, timerId: null,
+        periodMs, running: false,
       };
       simEntries.set(key, simEntry);
       simContainer.appendChild(createSimEntryEl(key, simEntry));
@@ -1832,6 +1850,14 @@ async function stopApp() {
     try { await invoke("close_channel", { channelId: id }); } catch { }
   }
   openChannels = [];
+  // Channels are closed so backend periodics are stopped; just reset UI state.
+  for (const [key, entry] of simEntries) {
+    if (entry.running) {
+      entry.running = false;
+      const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
+      if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
+    }
+  }
   renderChannelList();
   const btn = document.getElementById("btn-app-run")!;
   btn.textContent = "▶ Start";

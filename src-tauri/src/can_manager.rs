@@ -13,6 +13,8 @@ use crate::can_communication::KvaserBackend;
 #[cfg(feature = "linux-can")]
 use crate::can_communication::SocketCanBackend;
 
+use log::{debug, error, info, warn};
+
 const DEFAULT_WINDOW_MS: u64 = 30_000;
 
 pub type ManagerState = Arc<Mutex<CanManager>>;
@@ -435,7 +437,7 @@ impl CanManager {
         can.send_once(hw_index, RawFrame { can_id: msg_id, is_extended: msg_id > 0x7FF, data: buf })
     }
 
-    pub fn add_periodic(
+    pub fn add_periodic_frame(
         &self,
         channel_id: &str,
         frame: RawFrame,
@@ -446,10 +448,37 @@ impl CanManager {
             .add_periodic(hw_index, frame, period_ms)
     }
 
-    pub fn remove_periodic(&self, channel_id: &str, can_id: u32) -> Result<(), String> {
+    pub fn remove_periodic_frame(&self, channel_id: &str, can_id: u32) -> Result<(), String> {
         let (backend_name, hw_index) = self.backend_index(channel_id)?;
         self.cans.get(&backend_name).ok_or("Backend not found")?
             .remove_periodic(hw_index, can_id)
+    }
+
+    pub fn add_periodic_message(
+        &self,
+        channel_id: &str,
+        msg_id: u32,
+        signal_values: &HashMap<String, f64>,
+        period_ms: u64,
+    ) -> Result<(), String> {
+        let (backend_name, hw_index) = self.backend_index(channel_id)?;
+        let dbc = {
+            let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
+            lock.channels.get(channel_id)
+                .and_then(|c| c.dbc.clone())
+                .ok_or_else(|| "No DBC loaded for this channel".to_string())?
+        };
+        let msg = dbc.messages.iter()
+            .find(|m| m.id == msg_id)
+            .ok_or_else(|| format!("Message 0x{:X} not in DBC", msg_id))?;
+        let mut buf = vec![0u8; msg.dlc as usize];
+        for sig in &msg.signals {
+            if let Some(&v) = signal_values.get(&sig.name) {
+                encode(&mut buf, v, sig.start_bit, sig.length, sig.little_endian, sig.factor, sig.offset);
+            }
+        }
+        self.cans.get(&backend_name).ok_or("Backend not found")?
+            .add_periodic(hw_index, RawFrame { can_id: msg_id, is_extended: msg_id > 0x7FF, data: buf }, period_ms)
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────

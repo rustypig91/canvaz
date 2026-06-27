@@ -1,10 +1,10 @@
-mod example_backend;
 #[cfg(feature = "kvaser")]
 mod kvaser;
 #[cfg(feature = "linux-can")]
 mod socketcan;
 
-pub use example_backend::ExampleBackend;
+use log::{debug, error, info, warn};
+
 #[cfg(feature = "kvaser")]
 pub use kvaser::KvaserBackend;
 #[cfg(feature = "linux-can")]
@@ -122,6 +122,7 @@ impl Can {
         };
 
         self.channels.insert(channel, OpenChannel { queue, stop, rx_thread, tx_thread });
+        info!("Opened channel {channel} with baudrate {bitrate}");
         Ok(())
     }
 
@@ -133,11 +134,13 @@ impl Can {
         state.stop.store(true, Ordering::Relaxed);
         let _ = state.rx_thread.join();
         let _ = state.tx_thread.join();
+        info!("Closed channel {channel}");
         Ok(())
     }
 
     /// Enqueue a frame to be sent exactly once.
     pub fn send_once(&self, channel: u8, frame: CanFrame) -> Result<(), String> {
+        debug!("Enqueuing one-shot frame on channel {channel}: id=0x{:X}", frame.can_id);
         self.queue(channel)?
             .lock()
             .map_err(|_| "Queue lock poisoned".to_string())?
@@ -148,6 +151,7 @@ impl Can {
     /// Enqueue a frame to be sent repeatedly every `period_ms` milliseconds.
     /// First transmission happens immediately. Identified by `can_id` for removal.
     pub fn add_periodic(&self, channel: u8, frame: CanFrame, period_ms: u64) -> Result<(), String> {
+        debug!("Adding periodic frame on channel {channel}: id=0x{:X}, period={}ms", frame.can_id, period_ms);
         self.queue(channel)?
             .lock()
             .map_err(|_| "Queue lock poisoned".to_string())?
@@ -157,6 +161,7 @@ impl Can {
 
     /// Remove all periodic entries with the given `can_id` from the send queue.
     pub fn remove_periodic(&self, channel: u8, can_id: u32) -> Result<(), String> {
+        debug!("Removing periodic frame on channel {channel}: id=0x{:X}", can_id);
         self.queue(channel)?
             .lock()
             .map_err(|_| "Queue lock poisoned".to_string())?
@@ -195,7 +200,7 @@ fn rx_loop(
             Ok(Some(frame)) => on_rx(channel, frame),
             Ok(None) => {}
             Err(e) => {
-                eprintln!("RX error on channel {channel}: {e}");
+                error!("RX error on channel {channel}: {e}");
                 break;
             }
         }
