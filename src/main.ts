@@ -1321,9 +1321,11 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         <span class="label-muted">Period</span>
         <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
         <span class="label-muted">ms</span>
-        <button class="btn btn-sm sim-send-once">Send</button>
-        <button class="btn btn-sm sim-toggle${entry.running ? " running" : ""}">${entry.running ? "Stop" : "Start"}</button>
-        <button class="btn btn-sm btn-danger sim-remove">✕</button>
+        <div class="sim-actions">
+          <button class="btn btn-sm sim-send-once">Send</button>
+          <button class="btn btn-sm sim-toggle${entry.running ? " running" : ""}">${entry.running ? "Stop" : "Start"}</button>
+          <button class="btn btn-sm btn-danger sim-remove">✕</button>
+        </div>
       </div>
       <div class="sim-group-body">
         ${entry.signals.map((s, i) => `
@@ -1360,22 +1362,26 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         <select class="sim-channel-sel">
           ${configuredChannels.map(ch => `${ch.backend}:${ch.name}`).map(id => `<option value="${id}"${id === entry.channel ? " selected" : ""}>${id}</option>`).join("")}
         </select>
-        <span class="label-muted">ID</span>
-        <input type="text" class="sim-canid-input small-input" value="${idHex}" maxlength="8" placeholder="hex">
-        <label class="sim-ext-label label-muted"><input type="checkbox" class="sim-ext-cb"${entry.isExtended ? " checked" : ""}> Ext</label>
-        <span class="label-muted">DLC</span>
-        <select class="sim-dlc-sel">
-          ${[1, 2, 3, 4, 5, 6, 7, 8].map(n => `<option value="${n}"${n === entry.dlc ? " selected" : ""}>${n}</option>`).join("")}
-        </select>
         <span class="label-muted">Period</span>
         <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
         <span class="label-muted">ms</span>
-        <button class="btn btn-sm sim-send-once">Send</button>
-        <button class="btn btn-sm sim-toggle${entry.running ? " running" : ""}">${entry.running ? "Stop" : "Start"}</button>
-        <button class="btn btn-sm btn-danger sim-remove">✕</button>
+        <div class="sim-actions">
+          <button class="btn btn-sm sim-send-once">Send</button>
+          <button class="btn btn-sm sim-toggle${entry.running ? " running" : ""}">${entry.running ? "Stop" : "Start"}</button>
+          <button class="btn btn-sm btn-danger sim-remove">✕</button>
+        </div>
       </div>
       <div class="sim-group-body">
         <div class="sim-raw-data-row">
+          <span class="label-muted">ID</span>
+          <input type="text" class="sim-canid-input small-input" value="${idHex}" maxlength="8" placeholder="hex">
+          <label class="sim-ext-label label-muted"><input type="checkbox" class="sim-ext-cb"${entry.isExtended ? " checked" : ""}> Ext</label>
+        </div>
+        <div class="sim-raw-data-row">
+          <span class="label-muted">DLC</span>
+          <select class="sim-dlc-sel">
+            ${[1, 2, 3, 4, 5, 6, 7, 8].map(n => `<option value="${n}"${n === entry.dlc ? " selected" : ""}>${n}</option>`).join("")}
+          </select>
           <span class="label-muted">Data</span>
           <div class="sim-bytes">
             ${entry.data.map((b, i) => `<input type="text" class="sim-byte" data-idx="${i}" value="${b.toString(16).toUpperCase().padStart(2, "0")}" maxlength="2"${i >= entry.dlc ? " disabled" : ""}>`).join("")}

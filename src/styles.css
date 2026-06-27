@@ -663,6 +663,7 @@ body.resizing {
   border: 1px solid var(--border);
   border-radius: 6px;
   overflow: hidden;
+  flex-shrink: 0;
 }
 
 .sim-group-header {
@@ -671,7 +672,15 @@ body.resizing {
   gap: 8px;
   padding: 6px 10px;
   background: var(--bg3);
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
+}
+
+.sim-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
 }
 
 .sim-kind-badge {
