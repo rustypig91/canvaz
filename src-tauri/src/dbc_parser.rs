@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use can_dbc::{ByteOrder, Dbc, MessageId, NumericValue, ValueType};
 use serde::{Deserialize, Serialize};
 
-use crate::backends::CanFrame;
+use crate::can_frame::{CanSignal, CanFrame, DecodedCanMessage};
 
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,7 +21,7 @@ pub struct ParsedMessage {
 }
 
 impl ParsedMessage {
-    pub fn decode_frame(&self, frame: &CanFrame) -> Result<Vec<(String, f64)>, String> {
+    pub fn decode_frame(&self, frame: &CanFrame) -> Result<DecodedCanMessage, String> {
         if frame.can_id != self.id {
             return Err(format!(
                 "Frame CAN ID {} does not match message ID {}",
@@ -40,9 +40,18 @@ impl ParsedMessage {
                 sig.factor,
                 sig.offset,
             );
-            decoded_signals.push((sig.name.clone(), value));
+            decoded_signals.push(CanSignal {
+                name: sig.name.clone(),
+                physical: value,
+                raw: 0,
+                dlc: 0,
+                signals: Vec::new(),
+            });
         }
-        Ok(decoded_signals)
+        Ok(DecodedCanMessage {
+            name: self.name.clone(),
+            signals: decoded_signals,
+        })
     }
 }
 
@@ -136,5 +145,10 @@ impl ParsedDbc {
 
     pub fn find_message(&self, frame: &CanFrame) -> Option<&ParsedMessage> {
         self.messages.get(&frame.can_id)
+    }
+
+    pub fn parse_frame(&self, frame: &CanFrame) -> Option<DecodedCanMessage> {
+        self.find_message(frame)
+            .and_then(|msg| msg.decode_frame(frame).ok())
     }
 }
