@@ -46,7 +46,7 @@ fn create_channel(
     channel_name: String,
     dbc_path: Option<String>,
     state: State<'_, TauriState>,
-) -> Result<String, String> {
+) -> Result<u32, String> {
     state
         .can_manager
         .lock()
@@ -56,52 +56,40 @@ fn create_channel(
 
 #[tauri::command]
 async fn open_channel(
-    backend_name: String,
-    channel_name: String,
+    handle: u32,
     bitrate: u32,
-    dbc_path: Option<String>,
     state: State<'_, TauriState>,
 ) -> Result<ChannelInfo, String> {
     let can_manager = Arc::clone(&state.can_manager);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        let mut mgr = can_manager.lock().map_err(|e| e.to_string())?;
-        let channel_id = mgr.create_channel(&backend_name, &channel_name, dbc_path.as_deref())?;
-        mgr.open_channel(&channel_id, bitrate)
+        can_manager.lock().map_err(|e| e.to_string())?.open_channel(handle, bitrate)
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));
 
     if let Ok(ref info) = result {
-        info!("Opened channel '{}' with baudrate {}", info.id, bitrate);
+        info!("Opened channel '{}' (handle {}) with baudrate {}", info.id, handle, bitrate);
     } else {
-        error!("Failed to open channel: {}", result.as_ref().err().unwrap());
+        error!("Failed to open channel {handle}: {}", result.as_ref().err().unwrap());
     }
     result
 }
 
 #[tauri::command]
-fn close_channel(channel_id: String, state: State<'_, TauriState>) -> Result<(), String> {
-    state
-        .can_manager
-        .lock()
-        .map_err(|e| e.to_string())?
-        .close_channel(&channel_id)
+fn close_channel(handle: u32, state: State<'_, TauriState>) -> Result<(), String> {
+    state.can_manager.lock().map_err(|e| e.to_string())?.close_channel(handle)
 }
 
 #[tauri::command]
 fn get_open_channels(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>, String> {
-    Ok(state
-        .can_manager
-        .lock()
-        .map_err(|e| e.to_string())?
-        .open_channels_info())
+    Ok(state.can_manager.lock().map_err(|e| e.to_string())?.open_channels_info())
 }
 
 // ── Send commands ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 struct SendMessageCmd {
-    channel_id: String,
+    channel_handle: u32,
     message_id: u32,
     signal_values: HashMap<String, f64>,
 }
@@ -109,7 +97,7 @@ struct SendMessageCmd {
 #[tauri::command]
 fn send_message(cmd: SendMessageCmd, state: State<'_, TauriState>) -> Result<(), String> {
     state.can_manager.lock().map_err(|e| e.to_string())?.send_message(
-        &cmd.channel_id,
+        cmd.channel_handle,
         cmd.message_id,
         &cmd.signal_values,
     )
@@ -117,23 +105,19 @@ fn send_message(cmd: SendMessageCmd, state: State<'_, TauriState>) -> Result<(),
 
 #[derive(Deserialize)]
 struct SendFrameCmd {
-    channel_id: String,
+    channel_handle: u32,
     can_id: u32,
     data: Vec<u8>,
 }
 
 #[tauri::command]
 fn send_frame(cmd: SendFrameCmd, state: State<'_, TauriState>) -> Result<(), String> {
-    state
-        .can_manager
-        .lock()
-        .map_err(|e| e.to_string())?
-        .send_raw(&cmd.channel_id, cmd.can_id, cmd.data)
+    state.can_manager.lock().map_err(|e| e.to_string())?.send_raw(cmd.channel_handle, cmd.can_id, cmd.data)
 }
 
 #[derive(Deserialize)]
 struct AddPeriodicFrameCmd {
-    channel_id: String,
+    channel_handle: u32,
     can_id: u32,
     data: Vec<u8>,
     period_ms: u64,
@@ -143,19 +127,15 @@ struct AddPeriodicFrameCmd {
 fn add_periodic_frame(cmd: AddPeriodicFrameCmd, state: State<'_, TauriState>) -> Result<u64, String> {
     use crate::can_communication::CanFrame as RawFrame;
     state.can_manager.lock().map_err(|e| e.to_string())?.add_periodic_frame(
-        &cmd.channel_id,
-        RawFrame {
-            can_id: cmd.can_id,
-            is_extended: cmd.can_id > 0x7FF,
-            data: cmd.data,
-        },
+        cmd.channel_handle,
+        RawFrame { can_id: cmd.can_id, is_extended: cmd.can_id > 0x7FF, data: cmd.data },
         cmd.period_ms,
     )
 }
 
 #[derive(Deserialize)]
 struct AddPeriodicMessageCmd {
-    channel_id: String,
+    channel_handle: u32,
     message_id: u32,
     signal_values: HashMap<String, f64>,
     period_ms: u64,
@@ -163,59 +143,45 @@ struct AddPeriodicMessageCmd {
 
 #[tauri::command]
 fn add_periodic_message(cmd: AddPeriodicMessageCmd, state: State<'_, TauriState>) -> Result<u64, String> {
-    state
-        .can_manager
-        .lock()
-        .map_err(|e| e.to_string())?
-        .add_periodic_message(&cmd.channel_id, cmd.message_id, &cmd.signal_values, cmd.period_ms)
+    state.can_manager.lock().map_err(|e| e.to_string())?.add_periodic_message(
+        cmd.channel_handle,
+        cmd.message_id,
+        &cmd.signal_values,
+        cmd.period_ms,
+    )
 }
 
 #[derive(Deserialize)]
 struct RemovePeriodicCmd {
-    channel_id: String,
-    handle: u64,
+    channel_handle: u32,
+    periodic_handle: u64,
 }
 
 #[tauri::command]
 fn remove_periodic(cmd: RemovePeriodicCmd, state: State<'_, TauriState>) -> Result<(), String> {
-    state
-        .can_manager
-        .lock()
-        .map_err(|e| e.to_string())?
-        .remove_periodic(&cmd.channel_id, cmd.handle)
+    state.can_manager.lock().map_err(|e| e.to_string())?.remove_periodic(cmd.channel_handle, cmd.periodic_handle)
 }
 
 // ── Query commands ────────────────────────────────────────────────────────────
 
 #[tauri::command]
 fn get_frames(
-    channel_id: Option<String>,
+    handle: Option<u32>,
     limit: Option<usize>,
     state: State<'_, TauriState>,
 ) -> Result<Vec<FrameInfo>, String> {
-    Ok(state
-        .can_manager
-        .lock()
-        .map_err(|e| e.to_string())?
-        .get_frames(channel_id.as_deref(), limit.unwrap_or(100)))
+    Ok(state.can_manager.lock().map_err(|e| e.to_string())?.get_frames(handle, limit.unwrap_or(100)))
 }
 
 #[tauri::command]
 fn get_signal_history(
-    channel_id: String,
+    handle: u32,
     signal_name: String,
     since_ms: u64,
     state: State<'_, TauriState>,
 ) -> Result<Vec<SignalSample>, String> {
-    debug!(
-        "get_signal_history: channel_id={}, signal_name={}, since_ms={}",
-        channel_id, signal_name, since_ms
-    );
-    Ok(state
-        .can_manager
-        .lock()
-        .map_err(|e| e.to_string())?
-        .get_signal_history(&channel_id, &signal_name, since_ms))
+    debug!("get_signal_history: handle={handle}, signal_name={signal_name}, since_ms={since_ms}");
+    Ok(state.can_manager.lock().map_err(|e| e.to_string())?.get_signal_history(handle, &signal_name, since_ms))
 }
 
 #[tauri::command]
@@ -299,10 +265,10 @@ pub fn run() {
             #[cfg(target_os = "linux")]
             provide_sudo_password,
             list_can_interfaces,
+            create_channel,
             open_channel,
             close_channel,
             get_open_channels,
-            create_channel,
             send_message,
             send_frame,
             add_periodic_frame,

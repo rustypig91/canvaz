@@ -1,5 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU32, Ordering},
+    Arc, Mutex,
+};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
@@ -19,6 +22,8 @@ const DEFAULT_WINDOW_MS: u64 = 30_000;
 
 pub type ManagerState = Arc<Mutex<CanManager>>;
 
+static NEXT_CHANNEL_HANDLE: AtomicU32 = AtomicU32::new(1);
+
 // ── Public event / query types ────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize)]
@@ -33,7 +38,7 @@ struct DecodedSignal {
 
 #[derive(Debug, Clone, Serialize)]
 struct CanFrameEvent {
-    channel_id: String,
+    channel_handle: u32,
     can_id: u32,
     is_extended: bool,
     dlc: u8,
@@ -46,7 +51,7 @@ struct CanFrameEvent {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FrameInfo {
-    pub channel_id: String,
+    pub channel_handle: u32,
     pub can_id: u32,
     pub is_extended: bool,
     pub dlc: u8,
@@ -64,6 +69,7 @@ pub struct SignalSample {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelInfo {
+    pub handle: u32,
     pub id: String,
     pub backend: String,
     pub name: String,
@@ -225,13 +231,13 @@ impl ChannelData {
         }
     }
 
-    fn get_frames(&self, limit: usize) -> Vec<FrameInfo> {
+    fn get_frames(&self, handle: u32, limit: usize) -> Vec<FrameInfo> {
         let skip = self.frames.len().saturating_sub(limit);
         self.frames
             .iter()
             .skip(skip)
             .map(|f| FrameInfo {
-                channel_id: self.info.id.clone(),
+                channel_handle: handle,
                 can_id: f.can_id,
                 is_extended: f.is_extended,
                 dlc: f.data.len() as u8,
@@ -262,11 +268,11 @@ impl ChannelData {
 struct ManagerShared {
     app: AppHandle,
     window_ms: u64,
-    channels: HashMap<String, ChannelData>,
-    /// (backend_name, hw_index) → channel_id
-    index_to_id: HashMap<(String, u8), String>,
-    /// channel_id → (backend_name, hw_index)
-    id_to_index: HashMap<String, (String, u8)>,
+    channels: HashMap<u32, ChannelData>,
+    /// (backend_name, hw_index) → channel handle
+    index_to_handle: HashMap<(String, u8), u32>,
+    /// channel handle → (backend_name, hw_index)
+    handle_to_index: HashMap<u32, (String, u8)>,
 }
 
 // ── CanManager ────────────────────────────────────────────────────────────────
@@ -283,8 +289,8 @@ impl CanManager {
             app: app_state.app.clone(),
             window_ms: DEFAULT_WINDOW_MS,
             channels: HashMap::new(),
-            index_to_id: HashMap::new(),
-            id_to_index: HashMap::new(),
+            index_to_handle: HashMap::new(),
+            handle_to_index: HashMap::new(),
         }));
 
         let mut cans: HashMap<String, Can> = HashMap::new();
@@ -322,11 +328,14 @@ impl CanManager {
 
     // ── Channel lifecycle ─────────────────────────────────────────────────────
 
+    /// List hardware channels available on all backends. The returned `ChannelInfo`
+    /// items have `handle: 0` — they are not yet registered.
     pub fn list_channels(&self) -> Result<Vec<ChannelInfo>, String> {
         let mut out = Vec::new();
         for (backend_name, can) in &self.cans {
             for ch in can.list_channels() {
                 out.push(ChannelInfo {
+                    handle: 0,
                     id: format!("{backend_name}:{ch}"),
                     backend: backend_name.clone(),
                     name: ch,
@@ -336,18 +345,18 @@ impl CanManager {
         }
         Ok(out)
     }
+
     /// Register a channel (load DBC, allocate data stores) without opening the
-    /// hardware. Returns the `channel_id` handle used for all subsequent calls.
-    /// Calling `create_channel` again for the same channel updates the DBC.
+    /// hardware. Returns a `u32` handle used for all subsequent calls.
+    /// Calling `create_channel` again for the same channel updates its DBC.
     pub fn create_channel(
         &mut self,
         backend_name: &str,
         channel_name: &str,
         dbc_path: Option<&str>,
-    ) -> Result<String, String> {
+    ) -> Result<u32, String> {
         let channel_id = format!("{backend_name}:{channel_name}");
 
-        // Find the hardware index first (cheap, no lock needed).
         let hw_index = self
             .cans
             .get(backend_name)
@@ -361,100 +370,78 @@ impl CanManager {
 
         let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
 
-        if lock.id_to_index.contains_key(&channel_id) {
-            // Already registered — update DBC if a new path was given.
-            if let (Some(d), Some(ch)) = (dbc, lock.channels.get_mut(&channel_id)) {
-                ch.info.dbc = Some((*d).clone());
-                ch.dbc = Some(d);
+        // Already registered — update DBC and return existing handle.
+        if let Some(&handle) = lock.index_to_handle.get(&(backend_name.to_string(), hw_index)) {
+            if let Some(d) = dbc {
+                if let Some(ch) = lock.channels.get_mut(&handle) {
+                    ch.info.dbc = Some((*d).clone());
+                    ch.dbc = Some(d);
+                }
             }
-        } else {
-            let info = ChannelInfo {
-                id: channel_id.clone(),
-                backend: backend_name.to_string(),
-                name: channel_name.to_string(),
-                dbc: dbc.as_deref().cloned(),
-            };
-            lock.index_to_id.insert((backend_name.to_string(), hw_index), channel_id.clone());
-            lock.id_to_index.insert(channel_id.clone(), (backend_name.to_string(), hw_index));
-            lock.channels.insert(channel_id.clone(), ChannelData::new(info, dbc));
+            return Ok(handle);
         }
 
-        Ok(channel_id)
+        let handle = NEXT_CHANNEL_HANDLE.fetch_add(1, Ordering::Relaxed);
+        let info = ChannelInfo {
+            handle,
+            id: channel_id,
+            backend: backend_name.to_string(),
+            name: channel_name.to_string(),
+            dbc: dbc.as_deref().cloned(),
+        };
+        lock.index_to_handle.insert((backend_name.to_string(), hw_index), handle);
+        lock.handle_to_index.insert(handle, (backend_name.to_string(), hw_index));
+        lock.channels.insert(handle, ChannelData::new(info, dbc));
+        Ok(handle)
     }
 
-    /// Open the hardware for a channel that was previously registered with
-    /// `create_channel`. If the channel is already open it is closed first.
-    /// On Linux, if the backend requires elevated privileges the call blocks
-    /// until the frontend provides a sudo password (via `provide_sudo_password`).
-    pub fn open_channel(&mut self, channel_id: &str, bitrate: u32) -> Result<ChannelInfo, String> {
-        let (backend_name, hw_index) = self.backend_index(channel_id)?;
+    /// Open the hardware for a channel registered with `create_channel`.
+    /// Closes and reopens if already open. Requests a sudo password from the
+    /// frontend on Linux if the backend requires elevated privileges.
+    pub fn open_channel(&mut self, handle: u32, bitrate: u32) -> Result<ChannelInfo, String> {
+        let (backend_name, hw_index) = self.backend_index(handle)?;
 
-        // Close if already open so we can reopen with new settings.
         {
             let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
             can.close(hw_index).ok();
         }
-
-        // Clear stale frame / signal data for this channel.
         {
             let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
-            if let Some(ch) = lock.channels.get_mut(channel_id) {
+            if let Some(ch) = lock.channels.get_mut(&handle) {
                 ch.frames.clear();
                 ch.signals.clear();
             }
         }
 
-        // First attempt: no password.
         {
             let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
             match can.open(hw_index, bitrate, None) {
-                Ok(()) => return self.channel_info(channel_id),
+                Ok(()) => return self.channel_info(handle),
                 Err(crate::can_communication::CanOpenError::PasswordRequired) => {}
                 Err(e) => return Err(e.to_string()),
             }
         }
 
-        // Second attempt: request password from the frontend and retry.
         let pw = self.get_admin_password()?;
         {
             let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
             can.open(hw_index, bitrate, Some(&pw)).map_err(|e| e.to_string())?;
         }
-        self.channel_info(channel_id)
+        self.channel_info(handle)
     }
 
-    fn channel_info(&self, channel_id: &str) -> Result<ChannelInfo, String> {
-        self.shared
-            .lock()
-            .map_err(|_| "Lock poisoned".to_string())?
-            .channels
-            .get(channel_id)
-            .map(|ch| ch.info.clone())
-            .ok_or_else(|| format!("'{channel_id}' not found"))
-    }
-
-    fn get_admin_password(&self) -> Result<String, String> {
-        #[cfg(target_os = "linux")]
-        return self.app_state.get_sudo_password();
-        #[cfg(not(target_os = "linux"))]
-        Err("Administrator privileges are not supported on this platform".to_string())
-    }
-
-    pub fn close_channel(&mut self, channel_id: &str) -> Result<(), String> {
+    pub fn close_channel(&mut self, handle: u32) -> Result<(), String> {
         let (backend_name, hw_index) = {
             let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
             let (bn, idx) = lock
-                .id_to_index
-                .remove(channel_id)
-                .ok_or_else(|| format!("'{channel_id}' is not open"))?;
-            lock.index_to_id.remove(&(bn.clone(), idx));
-            lock.channels.remove(channel_id);
+                .handle_to_index
+                .remove(&handle)
+                .ok_or_else(|| format!("channel handle {handle} not found"))?;
+            lock.index_to_handle.remove(&(bn.clone(), idx));
+            lock.channels.remove(&handle);
             (bn, idx)
         };
-        self.cans
-            .get_mut(&backend_name)
-            .ok_or("Backend not found")?
-            .close(hw_index)
+        self.cans.get_mut(&backend_name).ok_or("Backend not found")?.close(hw_index)
     }
 
     pub fn open_channels_info(&self) -> Vec<ChannelInfo> {
@@ -466,154 +453,97 @@ impl CanManager {
 
     // ── Send ──────────────────────────────────────────────────────────────────
 
-    pub fn send_raw(&self, channel_id: &str, can_id: u32, data: Vec<u8>) -> Result<(), String> {
-        let (backend_name, hw_index) = self.backend_index(channel_id)?;
-        let can = self.cans.get(&backend_name).ok_or("Backend not found")?;
-        can.send_once(
+    pub fn send_raw(&self, handle: u32, can_id: u32, data: Vec<u8>) -> Result<(), String> {
+        let (backend_name, hw_index) = self.backend_index(handle)?;
+        self.cans.get(&backend_name).ok_or("Backend not found")?.send_once(
             hw_index,
-            RawFrame {
-                can_id,
-                is_extended: can_id > 0x7FF,
-                data,
-            },
+            RawFrame { can_id, is_extended: can_id > 0x7FF, data },
         )
     }
 
-    pub fn send_message(
-        &self,
-        channel_id: &str,
-        msg_id: u32,
-        signal_values: &HashMap<String, f64>,
-    ) -> Result<(), String> {
-        let (backend_name, hw_index) = self.backend_index(channel_id)?;
-
+    pub fn send_message(&self, handle: u32, msg_id: u32, signal_values: &HashMap<String, f64>) -> Result<(), String> {
+        let (backend_name, hw_index) = self.backend_index(handle)?;
         let dbc = {
             let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
-            lock.channels
-                .get(channel_id)
-                .and_then(|c| c.dbc.clone())
+            lock.channels.get(&handle).and_then(|c| c.dbc.clone())
                 .ok_or_else(|| "No DBC loaded for this channel".to_string())?
         };
-
-        let msg = dbc
-            .messages
-            .iter()
-            .find(|m| m.id == msg_id)
+        let msg = dbc.messages.iter().find(|m| m.id == msg_id)
             .ok_or_else(|| format!("Message 0x{:X} not in DBC", msg_id))?;
-
         let mut buf = vec![0u8; msg.dlc as usize];
         for sig in &msg.signals {
             if let Some(&v) = signal_values.get(&sig.name) {
-                encode(
-                    &mut buf,
-                    v,
-                    sig.start_bit,
-                    sig.length,
-                    sig.little_endian,
-                    sig.factor,
-                    sig.offset,
-                );
+                encode(&mut buf, v, sig.start_bit, sig.length, sig.little_endian, sig.factor, sig.offset);
             }
         }
-
-        let can = self.cans.get(&backend_name).ok_or("Backend not found")?;
-        can.send_once(
+        self.cans.get(&backend_name).ok_or("Backend not found")?.send_once(
             hw_index,
-            RawFrame {
-                can_id: msg_id,
-                is_extended: msg_id > 0x7FF,
-                data: buf,
-            },
+            RawFrame { can_id: msg_id, is_extended: msg_id > 0x7FF, data: buf },
         )
     }
 
-    pub fn add_periodic_frame(&self, channel_id: &str, frame: RawFrame, period_ms: u64) -> Result<u64, String> {
-        let (backend_name, hw_index) = self.backend_index(channel_id)?;
-        self.cans
-            .get(&backend_name)
-            .ok_or("Backend not found")?
-            .add_periodic(hw_index, frame, period_ms)
+    pub fn add_periodic_frame(&self, handle: u32, frame: RawFrame, period_ms: u64) -> Result<u64, String> {
+        let (backend_name, hw_index) = self.backend_index(handle)?;
+        self.cans.get(&backend_name).ok_or("Backend not found")?.add_periodic(hw_index, frame, period_ms)
     }
 
-    pub fn remove_periodic(&self, channel_id: &str, handle: u64) -> Result<(), String> {
-        let (backend_name, hw_index) = self.backend_index(channel_id)?;
-        self.cans
-            .get(&backend_name)
-            .ok_or("Backend not found")?
-            .remove_periodic(hw_index, handle)
+    pub fn remove_periodic(&self, handle: u32, periodic_handle: u64) -> Result<(), String> {
+        let (backend_name, hw_index) = self.backend_index(handle)?;
+        self.cans.get(&backend_name).ok_or("Backend not found")?.remove_periodic(hw_index, periodic_handle)
     }
 
     pub fn add_periodic_message(
         &self,
-        channel_id: &str,
+        handle: u32,
         msg_id: u32,
         signal_values: &HashMap<String, f64>,
         period_ms: u64,
     ) -> Result<u64, String> {
-        let (backend_name, hw_index) = self.backend_index(channel_id)?;
+        let (backend_name, hw_index) = self.backend_index(handle)?;
         let dbc = {
             let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
-            lock.channels
-                .get(channel_id)
-                .and_then(|c| c.dbc.clone())
+            lock.channels.get(&handle).and_then(|c| c.dbc.clone())
                 .ok_or_else(|| "No DBC loaded for this channel".to_string())?
         };
-        let msg = dbc
-            .messages
-            .iter()
-            .find(|m| m.id == msg_id)
+        let msg = dbc.messages.iter().find(|m| m.id == msg_id)
             .ok_or_else(|| format!("Message 0x{:X} not in DBC", msg_id))?;
         let mut buf = vec![0u8; msg.dlc as usize];
         for sig in &msg.signals {
             if let Some(&v) = signal_values.get(&sig.name) {
-                encode(
-                    &mut buf,
-                    v,
-                    sig.start_bit,
-                    sig.length,
-                    sig.little_endian,
-                    sig.factor,
-                    sig.offset,
-                );
+                encode(&mut buf, v, sig.start_bit, sig.length, sig.little_endian, sig.factor, sig.offset);
             }
         }
         self.cans.get(&backend_name).ok_or("Backend not found")?.add_periodic(
             hw_index,
-            RawFrame {
-                can_id: msg_id,
-                is_extended: msg_id > 0x7FF,
-                data: buf,
-            },
+            RawFrame { can_id: msg_id, is_extended: msg_id > 0x7FF, data: buf },
             period_ms,
         )
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
 
-    pub fn get_frames(&self, channel_id: Option<&str>, limit: usize) -> Vec<FrameInfo> {
+    pub fn get_frames(&self, handle: Option<u32>, limit: usize) -> Vec<FrameInfo> {
         let lock = match self.shared.lock() {
             Ok(l) => l,
             Err(_) => return Vec::new(),
         };
-        if let Some(id) = channel_id {
-            lock.channels.get(id).map(|c| c.get_frames(limit)).unwrap_or_default()
+        if let Some(h) = handle {
+            lock.channels.get(&h).map(|c| c.get_frames(h, limit)).unwrap_or_default()
         } else {
-            let mut all: Vec<FrameInfo> = lock.channels.values().flat_map(|c| c.get_frames(limit)).collect();
+            let mut all: Vec<FrameInfo> = lock.channels.iter().flat_map(|(&h, c)| c.get_frames(h, limit)).collect();
             all.sort_unstable_by_key(|f| f.timestamp_ms);
             let skip = all.len().saturating_sub(limit);
             all[skip..].to_vec()
         }
     }
 
-    pub fn get_signal_history(&self, channel_id: &str, signal_name: &str, since_ms: u64) -> Vec<SignalSample> {
-        let lock = match self.shared.lock() {
-            Ok(l) => l,
-            Err(_) => return Vec::new(),
-        };
-        lock.channels
-            .get(channel_id)
-            .map(|c| c.get_signal_history(signal_name, since_ms))
-            .unwrap_or_default()
+    pub fn get_signal_history(&self, handle: u32, signal_name: &str, since_ms: u64) -> Vec<SignalSample> {
+        match self.shared.lock() {
+            Ok(lock) => lock.channels.get(&handle)
+                .map(|c| c.get_signal_history(signal_name, since_ms))
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        }
     }
 
     pub fn set_window_ms(&self, ms: u64) -> Result<(), String> {
@@ -626,14 +556,31 @@ impl CanManager {
         Ok(())
     }
 
-    fn backend_index(&self, channel_id: &str) -> Result<(String, u8), String> {
+    fn backend_index(&self, handle: u32) -> Result<(String, u8), String> {
         self.shared
             .lock()
             .map_err(|_| "Lock poisoned".to_string())?
-            .id_to_index
-            .get(channel_id)
+            .handle_to_index
+            .get(&handle)
             .cloned()
-            .ok_or_else(|| format!("'{channel_id}' is not open"))
+            .ok_or_else(|| format!("channel handle {handle} not found; call create_channel first"))
+    }
+
+    fn channel_info(&self, handle: u32) -> Result<ChannelInfo, String> {
+        self.shared
+            .lock()
+            .map_err(|_| "Lock poisoned".to_string())?
+            .channels
+            .get(&handle)
+            .map(|ch| ch.info.clone())
+            .ok_or_else(|| format!("channel handle {handle} not found"))
+    }
+
+    fn get_admin_password(&self) -> Result<String, String> {
+        #[cfg(target_os = "linux")]
+        return self.app_state.get_sudo_password();
+        #[cfg(not(target_os = "linux"))]
+        Err("Administrator privileges are not supported on this platform".to_string())
     }
 }
 
@@ -654,13 +601,16 @@ fn make_rx_callback(
                 Err(_) => return,
             };
 
-            let channel_id = match lock.index_to_id.get(&(backend.clone(), hw_index)).cloned() {
-                Some(id) => id,
+            let handle = match lock.index_to_handle.get(&(backend.clone(), hw_index)).cloned() {
+                Some(h) => h,
                 None => return,
             };
 
             let window_ms = lock.window_ms;
-            let dbc = lock.channels.get(&channel_id).and_then(|c| c.dbc.clone());
+            let (channel_id, dbc) = match lock.channels.get(&handle) {
+                Some(ch) => (ch.info.id.clone(), ch.dbc.clone()),
+                None => return,
+            };
 
             let signals = dbc
                 .as_ref()
@@ -693,7 +643,7 @@ fn make_rx_callback(
 
             let signal_updates = lock
                 .channels
-                .get_mut(&channel_id)
+                .get_mut(&handle)
                 .map(|ch| ch.push(stored, window_ms))
                 .unwrap_or_default();
 
@@ -713,7 +663,7 @@ fn make_rx_callback(
             (
                 app,
                 CanFrameEvent {
-                    channel_id,
+                    channel_handle: handle,
                     can_id: raw.can_id,
                     is_extended: raw.is_extended,
                     dlc: raw.data.len() as u8,
@@ -741,12 +691,15 @@ fn make_tx_callback(
                 Ok(l) => l,
                 Err(_) => return,
             };
-            let channel_id = match lock.index_to_id.get(&(backend.clone(), hw_index)).cloned() {
-                Some(id) => id,
+            let handle = match lock.index_to_handle.get(&(backend.clone(), hw_index)).cloned() {
+                Some(h) => h,
                 None => return,
             };
             let window_ms = lock.window_ms;
-            let dbc = lock.channels.get(&channel_id).and_then(|c| c.dbc.clone());
+            let (channel_id, dbc) = match lock.channels.get(&handle) {
+                Some(ch) => (ch.info.id.clone(), ch.dbc.clone()),
+                None => return,
+            };
             let raw_signals = dbc
                 .as_ref()
                 .and_then(|d| decode_frame(d, raw.can_id, &raw.data))
@@ -774,7 +727,7 @@ fn make_tx_callback(
             };
             let signal_updates = lock
                 .channels
-                .get_mut(&channel_id)
+                .get_mut(&handle)
                 .map(|ch| ch.push(stored, window_ms))
                 .unwrap_or_default();
             let app = lock.app.clone();
@@ -792,7 +745,7 @@ fn make_tx_callback(
             (
                 app,
                 CanFrameEvent {
-                    channel_id,
+                    channel_handle: handle,
                     can_id: raw.can_id,
                     is_extended: raw.is_extended,
                     dlc: raw.data.len() as u8,
