@@ -1113,6 +1113,7 @@ function showContextMenu(x: number, y: number, items: { label: string; danger?: 
 
 document.addEventListener("click", () => { if (ctxMenu) { ctxMenu.remove(); ctxMenu = null; } });
 document.addEventListener("keydown", (e) => { if (e.key === "Escape" && ctxMenu) { ctxMenu.remove(); ctxMenu = null; } });
+if (!(import.meta as any).env?.DEV) document.addEventListener("contextmenu", (e) => e.preventDefault());
 
 document.addEventListener("mousemove", (e) => {
     if (!midPan) return;
