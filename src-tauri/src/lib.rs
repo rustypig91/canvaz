@@ -43,11 +43,7 @@ fn list_can_interfaces(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>,
 }
 
 #[tauri::command]
-fn create_channel(
-    backend_name: String,
-    channel_name: String,
-    state: State<'_, TauriState>,
-) -> Result<u32, String> {
+fn create_channel(backend_name: String, channel_name: String, state: State<'_, TauriState>) -> Result<u32, String> {
     state
         .can_manager
         .lock()
@@ -56,10 +52,7 @@ fn create_channel(
 }
 
 #[tauri::command]
-fn remove_channel(
-    channel_handle: u32,
-    state: State<'_, TauriState>,
-) -> Result<(), String> {
+fn remove_channel(channel_handle: u32, state: State<'_, TauriState>) -> Result<(), String> {
     state.can_manager.lock().map_err(|e| e.to_string())?.remove_channel(channel_handle)
 }
 
@@ -124,11 +117,11 @@ struct SendMessageCmd {
 
 #[tauri::command]
 fn send_message(cmd: SendMessageCmd, state: State<'_, TauriState>) -> Result<(), String> {
-    state.can_manager.lock().map_err(|e| e.to_string())?.send_message(
-        cmd.channel_handle,
-        cmd.message_id,
-        &cmd.signal_values,
-    )
+    state
+        .can_manager
+        .lock()
+        .map_err(|e| e.to_string())?
+        .send_message(cmd.channel_handle, cmd.message_id, &cmd.signal_values)
 }
 
 #[derive(Deserialize)]
@@ -140,7 +133,11 @@ struct SendFrameCmd {
 
 #[tauri::command]
 fn send_frame(cmd: SendFrameCmd, state: State<'_, TauriState>) -> Result<(), String> {
-    state.can_manager.lock().map_err(|e| e.to_string())?.send_frame(cmd.channel_handle, cmd.can_id, cmd.data)
+    state
+        .can_manager
+        .lock()
+        .map_err(|e| e.to_string())?
+        .send_frame(cmd.channel_handle, cmd.can_id, cmd.data)
 }
 
 #[derive(Deserialize)]
@@ -156,7 +153,11 @@ fn add_periodic_frame(cmd: AddPeriodicFrameCmd, state: State<'_, TauriState>) ->
     use crate::can_communication::CanFrame as RawFrame;
     state.can_manager.lock().map_err(|e| e.to_string())?.add_periodic_frame(
         cmd.channel_handle,
-        RawFrame { can_id: cmd.can_id, is_extended: cmd.can_id > 0x7FF, data: cmd.data },
+        RawFrame {
+            can_id: cmd.can_id,
+            is_extended: cmd.can_id > 0x7FF,
+            data: cmd.data,
+        },
         cmd.period_ms,
     )
 }
@@ -187,29 +188,32 @@ struct RemovePeriodicCmd {
 
 #[tauri::command]
 fn remove_periodic(cmd: RemovePeriodicCmd, state: State<'_, TauriState>) -> Result<(), String> {
-    state.can_manager.lock().map_err(|e| e.to_string())?.remove_periodic(cmd.channel_handle, cmd.periodic_handle)
+    state
+        .can_manager
+        .lock()
+        .map_err(|e| e.to_string())?
+        .remove_periodic(cmd.channel_handle, cmd.periodic_handle)
 }
 
 // ── Query commands ────────────────────────────────────────────────────────────
 
 #[tauri::command]
-fn get_frames(
-    handle: Option<u32>,
-    limit: Option<usize>,
-    state: State<'_, TauriState>,
-) -> Result<Vec<FrameInfo>, String> {
-    Ok(state.can_manager.lock().map_err(|e| e.to_string())?.get_frames(handle, limit.unwrap_or(100)))
+fn get_frames(handle: Option<u32>, limit: Option<usize>, state: State<'_, TauriState>) -> Result<Vec<FrameInfo>, String> {
+    Ok(state
+        .can_manager
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get_frames(handle, limit.unwrap_or(100)))
 }
 
 #[tauri::command]
-fn get_signal_history(
-    handle: u32,
-    signal_name: String,
-    since_ms: u64,
-    state: State<'_, TauriState>,
-) -> Result<Vec<SignalSample>, String> {
+fn get_signal_history(handle: u32, signal_name: String, since_ms: u64, state: State<'_, TauriState>) -> Result<Vec<SignalSample>, String> {
     debug!("get_signal_history: handle={handle}, signal_name={signal_name}, since_ms={since_ms}");
-    Ok(state.can_manager.lock().map_err(|e| e.to_string())?.get_signal_history(handle, &signal_name, since_ms))
+    Ok(state
+        .can_manager
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get_signal_history(handle, &signal_name, since_ms))
 }
 
 #[tauri::command]
@@ -219,12 +223,20 @@ fn set_window_ms(ms: u64, state: State<'_, TauriState>) -> Result<(), String> {
 
 #[tauri::command]
 fn export_frames_csv(path: String, start_ms: u64, state: State<'_, TauriState>) -> Result<usize, String> {
-    state.can_manager.lock().map_err(|e| e.to_string())?.export_frames_csv(&path, start_ms)
+    state
+        .can_manager
+        .lock()
+        .map_err(|e| e.to_string())?
+        .export_frames_csv(&path, start_ms)
 }
 
 #[tauri::command]
 fn export_signals_csv(path: String, start_ms: u64, state: State<'_, TauriState>) -> Result<usize, String> {
-    state.can_manager.lock().map_err(|e| e.to_string())?.export_signals_csv(&path, start_ms)
+    state
+        .can_manager
+        .lock()
+        .map_err(|e| e.to_string())?
+        .export_signals_csv(&path, start_ms)
 }
 
 // ── Version ───────────────────────────────────────────────────────────────────

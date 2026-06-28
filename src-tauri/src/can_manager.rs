@@ -179,14 +179,7 @@ impl ChannelData {
                 .and_modify(|s| s.update(sig.value))
                 .or_insert_with(|| SignalStats::new(sig.value));
             let s = &self.signals[&sig.name];
-            events.push((
-                sig.name.clone(),
-                sig.value,
-                sig.unit.clone(),
-                msg_name.clone(),
-                s.min,
-                s.max,
-            ));
+            events.push((sig.name.clone(), sig.value, sig.unit.clone(), msg_name.clone(), s.min, s.max));
         }
         events
     }
@@ -320,11 +313,7 @@ impl CanManager {
             );
         }
 
-        Self {
-            app_state,
-            shared,
-            cans,
-        }
+        Self { app_state, shared, cans }
     }
 
     // ── Channel lifecycle ─────────────────────────────────────────────────────
@@ -349,14 +338,14 @@ impl CanManager {
     /// later by `open_channel`. Calling `create_channel` again for the same
     /// channel returns the existing handle.
     pub fn create_channel(&mut self, backend_name: &str, channel_name: &str) -> Result<u32, String> {
-        let hw_index =
-            self.cans
-                .get(backend_name)
-                .ok_or_else(|| format!("No backend '{backend_name}'"))?
-                .list_channels()
-                .iter()
-                .position(|n| n == channel_name)
-                .ok_or_else(|| format!("Channel '{channel_name}' not found in '{backend_name}'"))? as u8;
+        let hw_index = self
+            .cans
+            .get(backend_name)
+            .ok_or_else(|| format!("No backend '{backend_name}'"))?
+            .list_channels()
+            .iter()
+            .position(|n| n == channel_name)
+            .ok_or_else(|| format!("Channel '{channel_name}' not found in '{backend_name}'"))? as u8;
 
         let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
 
@@ -370,10 +359,8 @@ impl CanManager {
             backend: backend_name.to_string(),
             name: channel_name.to_string(),
         };
-        lock.index_to_handle
-            .insert((backend_name.to_string(), hw_index), handle);
-        lock.handle_to_index
-            .insert(handle, (backend_name.to_string(), hw_index));
+        lock.index_to_handle.insert((backend_name.to_string(), hw_index), handle);
+        lock.handle_to_index.insert(handle, (backend_name.to_string(), hw_index));
         lock.channels.insert(handle, ChannelData::new(info));
         info!("Created {backend_name} channel {channel_name} (handle: {handle})");
         Ok(handle)
@@ -415,12 +402,7 @@ impl CanManager {
     /// Open the hardware for a channel registered with `create_channel`, loading
     /// the given DBC (parsed fresh from disk) for decode/encode. Returns the
     /// parsed DBC so the frontend can populate its signal tree.
-    pub fn open_channel(
-        &mut self,
-        handle: u32,
-        bitrate: u32,
-        dbc_path: Option<&str>,
-    ) -> Result<Option<ParsedDbc>, String> {
+    pub fn open_channel(&mut self, handle: u32, bitrate: u32, dbc_path: Option<&str>) -> Result<Option<ParsedDbc>, String> {
         let (backend_name, hw_index) = self.backend_index(handle)?;
 
         // Parse the DBC before touching hardware so a bad path fails fast.
@@ -453,10 +435,7 @@ impl CanManager {
     /// on the next Start. Unregistering the handle is `remove_channel`'s job.
     pub fn close_channel(&mut self, handle: u32) -> Result<(), String> {
         let (backend_name, hw_index) = self.backend_index(handle)?;
-        self.cans
-            .get_mut(&backend_name)
-            .ok_or("Backend not found")?
-            .close(hw_index)
+        self.cans.get_mut(&backend_name).ok_or("Backend not found")?.close(hw_index)
     }
 
     /// Close all open hardware and drop every channel registration/data store.
@@ -573,16 +552,9 @@ impl CanManager {
             Err(_) => return Vec::new(),
         };
         if let Some(h) = handle {
-            lock.channels
-                .get(&h)
-                .map(|c| c.get_frames(h, limit))
-                .unwrap_or_default()
+            lock.channels.get(&h).map(|c| c.get_frames(h, limit)).unwrap_or_default()
         } else {
-            let mut all: Vec<FrameInfo> = lock
-                .channels
-                .iter()
-                .flat_map(|(&h, c)| c.get_frames(h, limit))
-                .collect();
+            let mut all: Vec<FrameInfo> = lock.channels.iter().flat_map(|(&h, c)| c.get_frames(h, limit)).collect();
             all.sort_unstable_by_key(|f| f.timestamp_ms);
             let skip = all.len().saturating_sub(limit);
             all[skip..].to_vec()
@@ -610,75 +582,88 @@ impl CanManager {
         Ok(())
     }
 
-    /// Write all buffered frames across all channels to a CSV file.
-    /// Frames are sorted by timestamp. The lock is released before the file write.
+    /// Write all buffered frames across all channels to a CSV file, line by line.
+    /// Frames are sorted by timestamp before writing.
     pub fn export_frames_csv(&self, path: &str, start_ms: u64) -> Result<usize, String> {
-        use std::fmt::Write as FmtWrite;
+        use std::io::{BufWriter, Write};
 
-        let (csv, count) = {
-            let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
+        let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
 
-            let mut frames: Vec<(u64, &str, &StoredFrame)> = lock
-                .channels
-                .values()
-                .flat_map(|ch| ch.frames.iter().map(move |f| (f.timestamp_ms, ch.info.name.as_str(), f)))
-                .collect();
-            frames.sort_unstable_by_key(|r| r.0);
+        let mut frames: Vec<(u64, &str, &StoredFrame)> = lock
+            .channels
+            .values()
+            .flat_map(|ch| ch.frames.iter().map(move |f| (f.timestamp_ms, ch.info.name.as_str(), f)))
+            .collect();
+        frames.sort_unstable_by_key(|r| r.0);
 
-            let count = frames.len();
-            let mut csv = String::with_capacity(count * 80 + 64);
-            csv.push_str("timestamp_ms,elapsed_s,channel,can_id,direction,dlc,data,message\n");
+        let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        let mut writer = BufWriter::new(file);
 
-            for (ts, ch_name, f) in &frames {
-                let elapsed = (*ts as f64 - start_ms as f64) / 1000.0;
-                let id_str = if f.is_extended {
-                    format!("{:08X}", f.can_id)
-                } else {
-                    format!("{:03X}", f.can_id)
-                };
-                let data_str = f.data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
-                let msg_str = f.message_name.as_deref().unwrap_or("").replace('"', "\"\"");
-                let _ = writeln!(csv, "{},{:.3},{},{},{},{},\"{}\",\"{}\"",
-                    ts, elapsed, ch_name, id_str, f.direction, f.data.len(), data_str, msg_str);
-            }
-            (csv, count)
-        };
+        writeln!(writer, "timestamp_ms,elapsed_s,channel,can_id,direction,dlc,data,message").map_err(|e| e.to_string())?;
 
-        std::fs::write(path, csv.as_bytes()).map_err(|e| e.to_string())?;
-        Ok(count)
+        for (ts, ch_name, f) in &frames {
+            let elapsed = (*ts as f64 - start_ms as f64) / 1000.0;
+            let id_str = if f.is_extended {
+                format!("{:08X}", f.can_id)
+            } else {
+                format!("{:03X}", f.can_id)
+            };
+            let data_str = f.data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+            let msg_str = f.message_name.as_deref().unwrap_or("").replace('"', "\"\"");
+            writeln!(
+                writer,
+                "{},{:.3},{},{},{},{},\"{}\",\"{}\"",
+                ts,
+                elapsed,
+                ch_name,
+                id_str,
+                f.direction,
+                f.data.len(),
+                data_str,
+                msg_str
+            )
+            .map_err(|e| e.to_string())?;
+        }
+
+        writer.flush().map_err(|e| e.to_string())?;
+        Ok(frames.len())
     }
 
-    /// Write all buffered signal samples across all channels to a CSV file.
-    /// Samples are sorted by timestamp. The lock is released before the file write.
+    /// Write all buffered signal samples across all channels to a CSV file, line by line.
+    /// Samples are sorted by timestamp before writing.
     pub fn export_signals_csv(&self, path: &str, start_ms: u64) -> Result<usize, String> {
-        use std::fmt::Write as FmtWrite;
+        use std::io::{BufWriter, Write};
 
-        let (csv, count) = {
-            let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
+        let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
 
-            let mut rows: Vec<(u64, &str, &str, f64, &str)> = Vec::new();
-            for ch in lock.channels.values() {
-                for f in &ch.frames {
-                    for sig in &f.signals {
-                        rows.push((f.timestamp_ms, ch.info.name.as_str(), sig.name.as_str(), sig.value, sig.unit.as_str()));
-                    }
+        let mut rows: Vec<(u64, &str, &str, f64, &str)> = Vec::new();
+        for ch in lock.channels.values() {
+            for f in &ch.frames {
+                for sig in &f.signals {
+                    rows.push((
+                        f.timestamp_ms,
+                        ch.info.name.as_str(),
+                        sig.name.as_str(),
+                        sig.value,
+                        sig.unit.as_str(),
+                    ));
                 }
             }
-            rows.sort_unstable_by_key(|r| r.0);
+        }
+        rows.sort_unstable_by_key(|r| r.0);
 
-            let count = rows.len();
-            let mut csv = String::with_capacity(count * 60 + 48);
-            csv.push_str("timestamp_ms,elapsed_s,channel,signal_name,value,unit\n");
+        let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
+        let mut writer = BufWriter::new(file);
 
-            for (ts, ch_name, sig_name, value, unit) in &rows {
-                let elapsed = (*ts as f64 - start_ms as f64) / 1000.0;
-                let _ = writeln!(csv, "{},{:.3},{},{},{},{}", ts, elapsed, ch_name, sig_name, value, unit);
-            }
-            (csv, count)
-        };
+        writeln!(writer, "timestamp_ms,elapsed_s,channel,signal_name,value,unit").map_err(|e| e.to_string())?;
 
-        std::fs::write(path, csv.as_bytes()).map_err(|e| e.to_string())?;
-        Ok(count)
+        for (ts, ch_name, sig_name, value, unit) in &rows {
+            let elapsed = (*ts as f64 - start_ms as f64) / 1000.0;
+            writeln!(writer, "{},{:.3},{},{},{},{}", ts, elapsed, ch_name, sig_name, value, unit).map_err(|e| e.to_string())?;
+        }
+
+        writer.flush().map_err(|e| e.to_string())?;
+        Ok(rows.len())
     }
 
     fn backend_index(&self, handle: u32) -> Result<(String, u8), String> {
@@ -694,10 +679,7 @@ impl CanManager {
 
 // ── Callback factories ────────────────────────────────────────────────────────
 
-fn make_rx_callback(
-    backend: String,
-    shared: Arc<Mutex<ManagerShared>>,
-) -> impl Fn(u8, CanFrame) + Send + Sync + 'static {
+fn make_rx_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl Fn(u8, CanFrame) + Send + Sync + 'static {
     move |hw_index, raw| {
         let ts = now_ms();
 
@@ -783,10 +765,7 @@ fn make_rx_callback(
     }
 }
 
-fn make_tx_callback(
-    backend: String,
-    shared: Arc<Mutex<ManagerShared>>,
-) -> impl Fn(u8, CanFrame) + Send + Sync + 'static {
+fn make_tx_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl Fn(u8, CanFrame) + Send + Sync + 'static {
     move |hw_index, raw| {
         let ts = now_ms();
         let (app, frame_event) = {

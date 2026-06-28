@@ -53,10 +53,7 @@ pub struct DecodedCanMessage {
 impl ParsedMessage {
     pub fn decode_frame(&self, frame: &CanFrame) -> Result<DecodedCanMessage, String> {
         if frame.can_id != self.id {
-            return Err(format!(
-                "Frame CAN ID {} does not match message ID {}",
-                frame.can_id, self.id
-            ));
+            return Err(format!("Frame CAN ID {} does not match message ID {}", frame.can_id, self.id));
         }
 
         let mut decoded_signals = Vec::new();
@@ -89,15 +86,7 @@ impl ParsedMessage {
         let mut buf = vec![0u8; self.dlc as usize];
         for sig in &self.signals {
             if let Some(&v) = signal_values.get(&sig.name) {
-                encode(
-                    &mut buf,
-                    v,
-                    sig.start_bit,
-                    sig.length,
-                    sig.little_endian,
-                    sig.factor,
-                    sig.offset,
-                );
+                encode(&mut buf, v, sig.start_bit, sig.length, sig.little_endian, sig.factor, sig.offset);
             }
         }
         buf
@@ -164,9 +153,7 @@ impl ParsedDbc {
 
     /// Decode a raw frame against the matching message, if one exists.
     pub fn decode_frame(&self, frame: &CanFrame) -> Option<DecodedCanMessage> {
-        self.messages
-            .get(&frame.can_id)
-            .and_then(|msg| msg.decode_frame(frame).ok())
+        self.messages.get(&frame.can_id).and_then(|msg| msg.decode_frame(frame).ok())
     }
 
     /// Encode signal values for `msg_id` into a data buffer.
@@ -178,15 +165,7 @@ impl ParsedDbc {
     }
 }
 
-fn decode(
-    data: &[u8],
-    start_bit: u64,
-    length: u64,
-    little_endian: bool,
-    signed: bool,
-    factor: f64,
-    offset: f64,
-) -> f64 {
+fn decode(data: &[u8], start_bit: u64, length: u64, little_endian: bool, signed: bool, factor: f64, offset: f64) -> f64 {
     let raw = extract_bits(data, start_bit, length, little_endian);
     apply_scaling(raw, length, signed, factor, offset)
 }

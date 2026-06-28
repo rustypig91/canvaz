@@ -14,13 +14,14 @@ fn main() {
                 .unwrap_or_default()
         });
 
-    let git_version = if git_version.is_empty() { "unknown".to_string() } else { git_version };
+    let git_version = if git_version.is_empty() {
+        "unknown".to_string()
+    } else {
+        git_version
+    };
 
     // Drop the tag prefix so the in-app version reads "0.1.0", not "canvaz-v0.1.0".
-    let git_version = git_version
-        .strip_prefix("canvaz-v")
-        .map(str::to_string)
-        .unwrap_or(git_version);
+    let git_version = git_version.strip_prefix("canvaz-v").map(str::to_string).unwrap_or(git_version);
 
     println!("cargo:rustc-env=GIT_VERSION={git_version}");
     println!("cargo:rerun-if-env-changed=CANVAZ_VERSION");
@@ -32,7 +33,7 @@ fn main() {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     match target_os.as_str() {
         "windows" => println!("cargo:rustc-cfg=feature=\"kvaser\""),
-        "linux"   => println!("cargo:rustc-cfg=feature=\"linux-can\""),
+        "linux" => println!("cargo:rustc-cfg=feature=\"linux-can\""),
         _ => {}
     }
 
