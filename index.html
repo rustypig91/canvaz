@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>CAN Signals</title>
+    <title>Canvaz</title>
     <link rel="stylesheet" href="/src/styles.css" />
     <script type="module" src="/src/main.ts" defer></script>
   </head>
@@ -22,8 +22,15 @@
               Save Project <kbd>Ctrl+S</kbd>
             </button>
             <button class="menu-action" data-action="save-as-project">
-              Save As… <kbd>Ctrl+Shift+S</kbd>
+              Save Project As… <kbd>Ctrl+Shift+S</kbd>
             </button>
+          </div>
+        </div>
+
+        <div class="menu-item" id="menu-data">
+          <button class="menu-trigger">Data</button>
+          <div class="menu-dropdown">
+            <button class="menu-action" data-action="export-csv">Export Signal Values as CSV…</button>
           </div>
         </div>
 
@@ -35,8 +42,33 @@
         </div>
 
       </nav>
-      <span id="status-bar" class="label-muted"></span>
+      <button id="btn-app-run" title="Start live capture">▶ Start</button>
+      <button id="btn-pause-view" class="btn btn-sm" title="Freeze the current view; data continues in the background">Pause</button>
+      <div id="window-size-ctrl" title="Discard signal data older than this">
+        <span>Window</span>
+        <select id="select-window">
+          <option value="30">30 s</option>
+          <option value="60">1 min</option>
+          <option value="300">5 min</option>
+          <option value="900">15 min</option>
+          <option value="1800">30 min</option>
+          <option value="custom">Custom…</option>
+        </select>
+        <input id="input-window-custom" type="number" min="1" placeholder="sec" />
+      </div>
+      <span id="status-bar"></span>
+      <button id="btn-show-log" title="View message log">Log</button>
     </header>
+
+    <!-- Message log panel -->
+    <div id="log-panel" hidden>
+      <div id="log-panel-header">
+        <span>Message Log</span>
+        <button id="btn-clear-log" class="btn btn-sm">Clear</button>
+        <button id="btn-close-log" class="btn-icon" title="Close">✕</button>
+      </div>
+      <div id="log-entries"></div>
+    </div>
 
     <!-- Main layout -->
     <div id="layout">
@@ -55,29 +87,28 @@
         <section class="sidebar-section sidebar-dbc">
           <div class="section-header">
             <span>DBC Signals</span>
+            <button id="btn-expand-all" class="btn-icon" title="Expand all">+</button>
+            <button id="btn-collapse-all" class="btn-icon" title="Collapse all">−</button>
             <input id="signal-search" type="text" placeholder="Filter…" class="search-input" />
           </div>
           <div id="dbc-tree"></div>
         </section>
       </aside>
 
+      <!-- Drag handle to resize the sidebar -->
+      <div id="sidebar-resizer" title="Drag to resize · double-click to reset"></div>
+
       <!-- Main content -->
       <main id="content">
         <!-- Tab bar -->
         <nav id="tab-bar">
-          <button class="tab-btn active" data-tab="plot">Plot</button>
+          <button class="tab-btn active" data-tab="trace">Trace</button>
+          <button class="tab-btn" data-tab="plot">Plot</button>
           <button class="tab-btn" data-tab="simulate">Simulate</button>
-          <button class="tab-btn" data-tab="trace">Trace</button>
         </nav>
 
         <!-- Plot tab -->
-        <div id="tab-plot" class="tab-content active">
-          <div id="plot-toolbar">
-            <button id="btn-clear-plot" class="btn btn-sm">Clear all</button>
-            <label class="label-muted">Max points:</label>
-            <input id="input-max-points" type="number" value="500" min="50" max="5000" step="50" class="small-input" />
-            <button id="btn-pause-plot" class="btn btn-sm">Pause</button>
-          </div>
+        <div id="tab-plot" class="tab-content">
           <div id="plot-panes-container">
             <!-- plot panes injected here by JS -->
             <div id="drop-zone-new" class="drop-zone">
@@ -89,63 +120,28 @@
         <!-- Simulate tab -->
         <div id="tab-simulate" class="tab-content">
           <div id="sim-toolbar">
-            <span class="hint">Drag or double-click DBC signal to add to simulation</span>
+            <button id="btn-add-raw-frame" class="btn btn-sm">+ Raw Frame</button>
+            <span class="hint">Drag or double-click a DBC signal to add its entire message</span>
           </div>
           <div id="drop-zone-sim" class="drop-zone">
-            <span>↓ Drop signal here to simulate</span>
+            <span>↓ Drop signal here to add its message</span>
           </div>
-          <table id="sim-table">
-            <thead>
-              <tr>
-                <th>Signal</th>
-                <th>Message</th>
-                <th>Channel</th>
-                <th>Value</th>
-                <th>Period (ms)</th>
-                <th>Actions</th>
-              </tr>
-            </thead>
-            <tbody id="sim-tbody"></tbody>
-          </table>
+          <div id="sim-entries"></div>
         </div>
         <!-- Trace tab -->
-        <div id="tab-trace" class="tab-content">
+        <div id="tab-trace" class="tab-content active">
           <div id="trace-toolbar">
             <button id="btn-clear-trace" class="btn btn-sm">Clear</button>
-            <label class="label-muted">Data:</label>
-            <select id="select-trace-format">
-              <option value="hex" selected>Hex</option>
-              <option value="dec">Dec</option>
-              <option value="ascii">ASCII</option>
-            </select>
-            <div class="trace-mode-group">
-              <label class="trace-mode-label">
-                <input type="radio" name="trace-mode" value="overwrite" checked /> Overwrite
-              </label>
-              <label class="trace-mode-label">
-                <input type="radio" name="trace-mode" value="append" /> Append
-              </label>
-            </div>
+            <button id="btn-trace-overwrite" class="btn btn-sm active" title="Toggle overwrite mode">Overwrite</button>
             <label class="label-muted">Max rows:</label>
             <input id="input-trace-max" type="number" value="1000" min="100" max="10000" step="100" class="small-input" />
-            <button id="btn-pause-trace" class="btn btn-sm">Pause</button>
+            <button id="btn-trace-cols" class="btn btn-sm" title="Show/hide columns">Columns ▾</button>
+            <button id="btn-clear-filters" class="btn btn-sm" title="Clear all column filters" style="margin-left:auto;display:none">Clear filters</button>
           </div>
           <div id="trace-container">
             <table id="trace-table">
-              <colgroup>
-                <col /><col /><col /><col /><col /><col /><col />
-              </colgroup>
-              <thead>
-                <tr>
-                  <th>Timestamp</th>
-                  <th>Channel</th>
-                  <th>CAN ID</th>
-                  <th>Message</th>
-                  <th>DLC</th>
-                  <th>Data</th>
-                  <th>Cycle (ms)</th>
-                </tr>
-              </thead>
+              <colgroup></colgroup>
+              <thead><tr></tr></thead>
               <tbody id="trace-tbody"></tbody>
             </table>
           </div>
@@ -207,20 +203,24 @@
       </form>
     </dialog>
 
+    <!-- Confirm dialog -->
+    <dialog id="dialog-confirm">
+      <p id="dialog-confirm-msg"></p>
+      <div class="dialog-actions">
+        <button type="button" id="btn-confirm-cancel" class="btn">Cancel</button>
+        <button type="button" id="btn-confirm-ok" class="btn btn-primary">Stop &amp; Continue</button>
+      </div>
+    </dialog>
+
     <!-- About dialog -->
     <dialog id="dialog-about">
       <div class="about-content">
-        <h2>CAN Signals</h2>
-        <p class="about-version">Version 0.1.0</p>
-        <p>Desktop application for viewing and simulating CAN bus traffic using DBC files.</p>
-        <ul class="about-features">
-          <li>Load DBC files per channel</li>
-          <li>Real-time signal plotting</li>
-          <li>CAN frame simulation</li>
-          <li>Project save &amp; restore</li>
-          <li>Linux SocketCAN support</li>
-        </ul>
-        <div class="dialog-actions">
+        <img class="about-icon" src="/icon.png" alt="Canvaz icon" />
+        <h2>Canvaz</h2>
+        <p class="about-version">Version <span id="about-version">…</span></p>
+        <p>View and simulate CAN bus traffic using DBC files.</p>
+        <div class="about-footer">
+          <button id="btn-github" class="btn btn-sm about-github">GitHub ↗</button>
           <button id="btn-about-close" class="btn btn-primary">Close</button>
         </div>
       </div>

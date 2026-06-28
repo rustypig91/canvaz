@@ -1,6 +1,9 @@
 use can_dbc::{ByteOrder, Dbc, MessageId, NumericValue, ValueType};
 use serde::{Deserialize, Serialize};
 
+use crate::can_frame::{CanFrame, CanSignal, DecodedCanMessage};
+
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedDbc {
     pub path: String,
@@ -13,6 +16,34 @@ pub struct ParsedMessage {
     pub name: String,
     pub dlc: u64,
     pub signals: Vec<ParsedSignal>,
+}
+
+impl ParsedMessage {
+    pub fn decode_frame(&self, frame: &CanFrame) -> Result<DecodedCanMessage, String> {
+        if frame.can_id != self.id {
+            return Err(format!(
+                "Frame CAN ID {} does not match message ID {}",
+                frame.can_id, self.id
+            ));
+        }
+
+        let mut decoded_signals = Vec::new();
+        for sig in &self.signals {
+            let raw = extract_bits(&frame.data, sig.start_bit, sig.length, sig.little_endian);
+            let physical = apply_scaling(raw, sig.length, sig.signed, sig.factor, sig.offset);
+            decoded_signals.push(CanSignal {
+                name: sig.name.clone(),
+                physical,
+                raw,
+                dlc: 0,
+                signals: Vec::new(),
+            });
+        }
+        Ok(DecodedCanMessage {
+            name: self.name.clone(),
+            signals: decoded_signals,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -31,6 +62,7 @@ pub struct ParsedSignal {
     pub unit: String,
 }
 
+
 fn numeric_to_f64(v: NumericValue) -> f64 {
     match v {
         NumericValue::Uint(n) => n as f64,
@@ -39,64 +71,62 @@ fn numeric_to_f64(v: NumericValue) -> f64 {
     }
 }
 
-pub fn parse_dbc(path: &str) -> Result<ParsedDbc, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("Failed to read DBC file: {e}"))?;
-
-    // DBC files may be UTF-8 or Windows-1252 encoded
-    let text = match String::from_utf8(bytes.clone()) {
-        Ok(s) => s,
-        Err(_) => can_dbc::decode_cp1252(&bytes)
-            .map(|cow| cow.into_owned())
-            .ok_or("Failed to decode DBC file as UTF-8 or CP1252")?,
-    };
-
-    let dbc = Dbc::try_from(text.as_str())
-        .map_err(|e| format!("Failed to parse DBC: {e}"))?;
-
-    let mut messages = Vec::new();
-    for msg in &dbc.messages {
-        let raw_id = match msg.id {
-            MessageId::Standard(id) => u32::from(id),
-            MessageId::Extended(id) => id,
+#[allow(dead_code)]
+impl ParsedDbc {
+    pub fn new(path: &str) -> Result<Self, String> {
+        let mut dbc = Self {
+            path: path.to_string(),
+            messages: Vec::new(),
         };
-        let msg_name = msg.name.clone();
+        dbc.reload()?;
 
-        let signals = msg
-            .signals
-            .iter()
-            .map(|sig| ParsedSignal {
-                name: sig.name.clone(),
-                message_id: raw_id,
-                message_name: msg_name.clone(),
-                start_bit: sig.start_bit,
-                length: sig.size,
-                little_endian: sig.byte_order == ByteOrder::LittleEndian,
-                signed: sig.value_type == ValueType::Signed,
-                factor: sig.factor,
-                offset: sig.offset,
-                min: numeric_to_f64(sig.min),
-                max: numeric_to_f64(sig.max),
-                unit: sig.unit.clone(),
-            })
-            .collect();
-
-        messages.push(ParsedMessage {
-            id: raw_id,
-            name: msg_name,
-            dlc: msg.size,
-            signals,
-        });
+        Ok(dbc)
     }
 
-    messages.sort_by_key(|m| m.id);
+    pub fn reload(&mut self) -> Result<(), String> {
+        let text = std::fs::read_to_string(self.path.as_str()).map_err(|e| format!("Failed to read DBC file: {e}"))?;
+        let dbc = Dbc::try_from(text.as_str()).map_err(|e| format!("Failed to parse DBC: {e}"))?;
 
-    Ok(ParsedDbc {
-        path: path.to_string(),
-        messages,
-    })
-}
+        let mut messages = Vec::new();
+        for msg in &dbc.messages {
+            let raw_id = match msg.id {
+                MessageId::Standard(id) => u32::from(id),
+                MessageId::Extended(id) => id,
+            };
+            let msg_name = msg.name.clone();
 
-impl ParsedDbc {
+            let signals = msg
+                .signals
+                .iter()
+                .map(|sig| ParsedSignal {
+                    name: sig.name.clone(),
+                    message_id: raw_id,
+                    message_name: msg_name.clone(),
+                    start_bit: sig.start_bit,
+                    length: sig.size,
+                    little_endian: sig.byte_order == ByteOrder::LittleEndian,
+                    signed: sig.value_type == ValueType::Signed,
+                    factor: sig.factor,
+                    offset: sig.offset,
+                    min: numeric_to_f64(sig.min),
+                    max: numeric_to_f64(sig.max),
+                    unit: sig.unit.clone(),
+                })
+                .collect();
+
+            messages.push(ParsedMessage {
+                id: raw_id,
+                name: msg_name,
+                dlc: msg.size,
+                signals,
+            });
+        }
+
+        self.messages = messages;
+
+        Ok(())
+    }
+
     pub fn find_signal(&self, signal_name: &str) -> Option<&ParsedSignal> {
         self.messages
             .iter()
@@ -104,10 +134,116 @@ impl ParsedDbc {
             .find(|s| s.name == signal_name)
     }
 
-    pub fn signals_for_message(&self, can_id: u32) -> Option<&[ParsedSignal]> {
-        self.messages
-            .iter()
-            .find(|m| m.id == can_id)
-            .map(|m| m.signals.as_slice())
+    pub fn find_message(&self, frame: &CanFrame) -> Option<&ParsedMessage> {
+        self.messages.iter().find(|m| m.id == frame.can_id)
+    }
+
+    pub fn parse_frame(&self, frame: &CanFrame) -> Option<DecodedCanMessage> {
+        self.find_message(frame)
+            .and_then(|msg| msg.decode_frame(frame).ok())
+    }
+}
+
+pub fn parse_dbc(path: &str) -> Result<ParsedDbc, String> {
+    ParsedDbc::new(path)
+}
+
+pub fn decode(
+    data: &[u8],
+    start_bit: u64,
+    length: u64,
+    little_endian: bool,
+    signed: bool,
+    factor: f64,
+    offset: f64,
+) -> f64 {
+    let raw = extract_bits(data, start_bit, length, little_endian);
+    apply_scaling(raw, length, signed, factor, offset)
+}
+
+pub fn encode(data: &mut [u8], value: f64, start_bit: u64, length: u64, little_endian: bool, factor: f64, offset: f64) {
+    let raw = ((value - offset) / factor).round() as i64;
+    let mask = if length >= 64 { u64::MAX } else { (1u64 << length) - 1 };
+    let raw_u64 = (raw as u64) & mask;
+    pack_bits(data, raw_u64, start_bit, length, little_endian);
+}
+
+fn apply_scaling(raw: u64, length: u64, signed: bool, factor: f64, offset: f64) -> f64 {
+    let physical = if signed && length > 0 {
+        let msb_mask = 1u64 << (length - 1);
+        if raw & msb_mask != 0 {
+            let sign_extended = raw | !((1u64 << length) - 1);
+            sign_extended as i64 as f64
+        } else {
+            raw as f64
+        }
+    } else {
+        raw as f64
+    };
+    physical * factor + offset
+}
+
+fn extract_bits(data: &[u8], start_bit: u64, length: u64, little_endian: bool) -> u64 {
+    let mut raw = 0u64;
+    if little_endian {
+        for i in 0..length {
+            let bit_pos = start_bit + i;
+            let byte_idx = (bit_pos / 8) as usize;
+            let bit_in_byte = (bit_pos % 8) as u32;
+            if byte_idx < data.len() {
+                raw |= (((data[byte_idx] >> bit_in_byte) & 1) as u64) << i;
+            }
+        }
+    } else {
+        // Motorola/Big-endian: start_bit is MSB in DBC bit numbering
+        let mut bit_pos = start_bit;
+        for i in 0..length {
+            let byte_idx = (bit_pos / 8) as usize;
+            let bit_in_byte = (bit_pos % 8) as u32;
+            if byte_idx < data.len() {
+                raw |= (((data[byte_idx] >> bit_in_byte) & 1) as u64) << (length - 1 - i);
+            }
+            if bit_pos % 8 == 0 {
+                bit_pos = bit_pos.saturating_add(15);
+            } else {
+                bit_pos -= 1;
+            }
+        }
+    }
+    raw
+}
+
+fn pack_bits(data: &mut [u8], raw: u64, start_bit: u64, length: u64, little_endian: bool) {
+    if little_endian {
+        for i in 0..length {
+            let bit_pos = start_bit + i;
+            let byte_idx = (bit_pos / 8) as usize;
+            let bit_in_byte = (bit_pos % 8) as u32;
+            if byte_idx < data.len() {
+                if (raw >> i) & 1 == 1 {
+                    data[byte_idx] |= 1 << bit_in_byte;
+                } else {
+                    data[byte_idx] &= !(1u8 << bit_in_byte);
+                }
+            }
+        }
+    } else {
+        let mut bit_pos = start_bit;
+        for i in 0..length {
+            let byte_idx = (bit_pos / 8) as usize;
+            let bit_in_byte = (bit_pos % 8) as u32;
+            if byte_idx < data.len() {
+                if (raw >> (length - 1 - i)) & 1 == 1 {
+                    data[byte_idx] |= 1 << bit_in_byte;
+                } else {
+                    data[byte_idx] &= !(1u8 << bit_in_byte);
+                }
+            }
+            if bit_pos % 8 == 0 {
+                bit_pos = bit_pos.saturating_add(15);
+            } else {
+                bit_pos -= 1;
+            }
+        }
     }
 }

@@ -1,12 +1,12 @@
 [package]
-name = "can_signals"
+name = "canvaz"
 version = "0.1.0"
-description = "CAN Bus Signal Viewer and Simulator"
+description = "CAN bus signal viewer and simulator"
 authors = ["Christoffer Zakrisson"]
 edition = "2021"
 
 [lib]
-name = "can_signals_lib"
+name = "canvaz_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
@@ -21,12 +21,23 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 can-dbc = "9"
 socketcan = { version = "3", optional = true }
+libloading = { version = "0.8", optional = true }
 thiserror = "1"
 log = "0.4"
 
+# Platform defaults: on each target the crate is non-optional so it compiles
+# without requiring --features. The feature flags are still used in cfg() guards
+# and can be activated manually (e.g. --features kvaser on Linux).
+[target.'cfg(windows)'.dependencies]
+libloading = { version = "0.8" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socketcan = { version = "3" }
+
 [features]
-default = ["linux-can"]
-linux-can = ["socketcan"]
+default = ["kvaser"]
+kvaser = ["dep:libloading"]
+linux-can = ["dep:socketcan"]
 
 [profile.release]
 codegen-units = 1
