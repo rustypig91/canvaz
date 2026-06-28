@@ -44,7 +44,8 @@ interface DbcMessage {
 
 interface ParsedDbc {
     path: string;
-    messages: DbcMessage[];
+    // Keyed by CAN id (matches the Rust HashMap serialization).
+    messages: Record<number, DbcMessage>;
 }
 
 interface FrameInfo {
@@ -653,7 +654,8 @@ function renderDbcTree(filter = "") {
 
     const lc = filter.toLowerCase();
 
-    for (const msg of dbc.messages) {
+    const sortedMessages = Object.values(dbc.messages).sort((a, b) => a.name.localeCompare(b.name));
+    for (const msg of sortedMessages) {
         const visibleSignals = msg.signals.filter(s =>
             !lc || s.name.toLowerCase().includes(lc) || msg.name.toLowerCase().includes(lc)
         );
@@ -982,6 +984,20 @@ function promptSudoPassword(): Promise<string | null> {
     });
 }
 
+// Parse the channel's configured DBC into its `dbc` field so the signal tree is
+// available before the channel is opened. No-op (clears dbc) when no DBC is set.
+async function loadChannelDbc(handle: number): Promise<void> {
+    const ch = channels.get(handle);
+    if (!ch) return;
+    if (!ch.config.dbc_path) { ch.dbc = null; return; }
+    try {
+        ch.dbc = await invoke<ParsedDbc>("parse_dbc", { path: ch.config.dbc_path });
+    } catch (e) {
+        ch.dbc = null;
+        setError(`Failed to parse DBC: ${e}`);
+    }
+}
+
 // Open a channel by its u32 handle. If root is required the Rust side emits
 // "request-admin-password", the global listener shows the dialog, and open_channel
 // unblocks automatically.
@@ -1039,8 +1055,10 @@ async function applyChannelDialog() {
             dbc: null,
             open: false,
         });
+        await loadChannelDbc(handle);
 
         refreshChannelList();
+        if (selectedChannel === handle) renderDbcTree();
         setStatus(`Added channel: ${name}`);
         scheduleAutoSave();
     } else {
@@ -1048,12 +1066,12 @@ async function applyChannelDialog() {
         const ch = channels.get(h);
         const name = ch?.info.name ?? String(h);
 
-        // Update config in place. The DBC path takes effect on the next open;
-        // drop the stale parsed tree so the sidebar reflects the change.
+        // Update config in place and reparse the DBC so the signal tree reflects
+        // the change immediately (a fresh copy is also loaded on the next open).
         if (ch) {
             ch.config.dbc_path = dialogPendingDbc;
             ch.config.bitrate = bitrate;
-            ch.dbc = null;
+            await loadChannelDbc(h);
         }
 
         refreshChannelList();
@@ -1480,7 +1498,7 @@ function renderSimEntries() {
 function addSimSignal(handle: number, sig: DbcSignal) {
     const dbc = channels.get(handle)?.dbc;
     if (!dbc) { setStatus("No DBC loaded for this channel"); return; }
-    const msg = dbc.messages.find((m: DbcMessage) => m.signals.some((s: DbcSignal) => s.name === sig.name));
+    const msg = Object.values(dbc.messages).find((m: DbcMessage) => m.signals.some((s: DbcSignal) => s.name === sig.name));
     if (!msg) return;
 
     const key = `msg::${handle}::${msg.id}`;
@@ -1677,6 +1695,7 @@ async function applyProject(project: Project) {
                 dbc: null,
                 open: false,
             });
+            await loadChannelDbc(handle);
         }
         else {
             setError(`Failed to create channel ${ch.name} (${backend})`);
@@ -1811,7 +1830,7 @@ async function startApp() {
         const simContainer = document.getElementById("sim-entries")!;
         for (const [key, entry] of [...simEntries]) {
             if (entry.kind !== "message") continue;
-            const msg = channels.get(entry.channel)?.dbc?.messages.find((m: DbcMessage) => m.id === entry.messageId);
+            const msg = channels.get(entry.channel)?.dbc?.messages[entry.messageId];
             if (!msg) {
                 simEntries.delete(key);
                 simContainer.querySelector(`[data-sim-key="${key}"]`)?.remove();
@@ -1821,7 +1840,7 @@ async function startApp() {
 
     // Prune message names from filter that no longer exist in any DBC
     if (traceFilterMsgNames !== null) {
-        const validNames = new Set([...channels.values()].flatMap(m => m.dbc?.messages.map(msg => msg.name) ?? []));
+        const validNames = new Set([...channels.values()].flatMap(m => m.dbc ? Object.values(m.dbc.messages).map(msg => msg.name) : []));
         for (const name of [...traceFilterMsgNames]) {
             if (name !== "" && !validNames.has(name)) traceFilterMsgNames.delete(name);
         }
@@ -1861,7 +1880,7 @@ async function startApp() {
                 const handle = idToHandle(entry.channel);
                 if (handle === undefined) continue;
                 const dbc = channels.get(handle)?.dbc;
-                const sig = dbc?.messages.flatMap((m: DbcMessage) => m.signals).find((s: DbcSignal) => s.name === entry.signal_name);
+                const sig = dbc && Object.values(dbc.messages).flatMap((m: DbcMessage) => m.signals).find((s: DbcSignal) => s.name === entry.signal_name);
                 if (sig) await addSignalToPane(plotPanes[i], handle, sig);
             }
         }
@@ -1876,7 +1895,7 @@ async function startApp() {
             const handle = idToHandle(entry.channel);
             if (handle === undefined) continue;
             const dbc = channels.get(handle)?.dbc;
-            const msg = dbc?.messages.find((m: DbcMessage) => m.signals.some((s: DbcSignal) => s.name === entry.signal_name));
+            const msg = dbc && Object.values(dbc.messages).find((m: DbcMessage) => m.signals.some((s: DbcSignal) => s.name === entry.signal_name));
             if (!msg) continue;
             const key = `msg::${handle}::${msg.id}`;
             if (!msgMap.has(key)) msgMap.set(key, { handle, msg, periodMs: entry.period_ms, values: new Map() });
@@ -2487,7 +2506,7 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     // Refresh open expansion row with updated signal values + current min/max
     const next = tr.nextElementSibling as HTMLTableRowElement | null;
     if (next?.dataset.expand) {
-        const msg = channels.get(entry.channelHandle)?.dbc?.messages.find((m: DbcMessage) => m.id === entry.canId);
+        const msg = channels.get(entry.channelHandle)?.dbc?.messages[entry.canId];
         if (msg) {
             const valCells = next.querySelectorAll<HTMLElement>(".te-val");
             const minCells = next.querySelectorAll<HTMLElement>(".te-min");
@@ -3009,7 +3028,7 @@ function setupTrace() {
         const trHandle = parseInt(tr.dataset.channelHandle ?? "0");
         const canId = parseInt(tr.dataset.canid ?? "0");
         const bytes: number[] = JSON.parse(tr.dataset.bytes ?? "[]");
-        const msg = channels.get(trHandle)?.dbc?.messages.find((m: DbcMessage) => m.id === canId);
+        const msg = channels.get(trHandle)?.dbc?.messages[canId];
         if (!msg) return;
 
         const expandTr = document.createElement("tr");

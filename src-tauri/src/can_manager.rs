@@ -9,14 +9,14 @@ use tauri::{AppHandle, Emitter};
 
 use crate::app_state::AppState;
 use crate::can_communication::{Can, CanFrame};
-use crate::dbc_parser::{encode, ParsedDbc};
+use crate::dbc_parser::ParsedDbc;
 
 #[cfg(feature = "kvaser")]
 use crate::can_communication::KvaserBackend;
 #[cfg(feature = "linux-can")]
 use crate::can_communication::SocketCanBackend;
 
-use log::{debug, error, info, warn};
+use log::*;
 
 const DEFAULT_WINDOW_MS: u64 = 30_000;
 
@@ -348,11 +348,7 @@ impl CanManager {
     /// Returns a `u32` handle used for all subsequent calls. The DBC is loaded
     /// later by `open_channel`. Calling `create_channel` again for the same
     /// channel returns the existing handle.
-    pub fn create_channel(
-        &mut self,
-        backend_name: &str,
-        channel_name: &str,
-    ) -> Result<u32, String> {
+    pub fn create_channel(&mut self, backend_name: &str, channel_name: &str) -> Result<u32, String> {
         let hw_index =
             self.cans
                 .get(backend_name)
@@ -399,10 +395,7 @@ impl CanManager {
             .ok_or_else(|| format!("channel handle {handle} not found"))?
             .1;
 
-        let can = self
-            .cans
-            .get_mut(&backend_name)
-            .ok_or("Backend not found")?;
+        let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
 
         if can.is_open(hw_index) {
             return Err(format!(
@@ -410,8 +403,7 @@ impl CanManager {
             ));
         }
 
-        lock.index_to_handle
-            .remove(&(backend_name.clone(), hw_index));
+        lock.index_to_handle.remove(&(backend_name.clone(), hw_index));
         lock.handle_to_index.remove(&handle);
         lock.channels.remove(&handle);
 
@@ -519,31 +511,13 @@ impl CanManager {
                 .and_then(|c| c.dbc.clone())
                 .ok_or_else(|| "No DBC loaded for this channel".to_string())?
         };
-        let msg = dbc
-            .messages
-            .iter()
-            .find(|m| m.id == msg_id)
-            .ok_or_else(|| format!("Message 0x{:X} not in DBC", msg_id))?;
-        let mut buf = vec![0u8; msg.dlc as usize];
-        for sig in &msg.signals {
-            if let Some(&v) = signal_values.get(&sig.name) {
-                encode(
-                    &mut buf,
-                    v,
-                    sig.start_bit,
-                    sig.length,
-                    sig.little_endian,
-                    sig.factor,
-                    sig.offset,
-                );
-            }
-        }
+        let data = dbc.encode_message(msg_id, signal_values)?;
         self.cans.get(&backend_name).ok_or("Backend not found")?.send_once(
             hw_index,
             CanFrame {
                 can_id: msg_id,
                 is_extended: msg_id > 0x7FF,
-                data: buf,
+                data,
             },
         )
     }
@@ -579,31 +553,13 @@ impl CanManager {
                 .and_then(|c| c.dbc.clone())
                 .ok_or_else(|| "No DBC loaded for this channel".to_string())?
         };
-        let msg = dbc
-            .messages
-            .iter()
-            .find(|m| m.id == msg_id)
-            .ok_or_else(|| format!("Message 0x{:X} not in DBC", msg_id))?;
-        let mut buf = vec![0u8; msg.dlc as usize];
-        for sig in &msg.signals {
-            if let Some(&v) = signal_values.get(&sig.name) {
-                encode(
-                    &mut buf,
-                    v,
-                    sig.start_bit,
-                    sig.length,
-                    sig.little_endian,
-                    sig.factor,
-                    sig.offset,
-                );
-            }
-        }
+        let data = dbc.encode_message(msg_id, signal_values)?;
         self.cans.get(&backend_name).ok_or("Backend not found")?.add_periodic(
             hw_index,
             CanFrame {
                 can_id: msg_id,
                 is_extended: msg_id > 0x7FF,
-                data: buf,
+                data,
             },
             period_ms,
         )
@@ -663,23 +619,6 @@ impl CanManager {
             .cloned()
             .ok_or_else(|| format!("channel handle {handle} not found; call create_channel first"))
     }
-
-    fn channel_info(&self, handle: u32) -> Result<ChannelInfo, String> {
-        self.shared
-            .lock()
-            .map_err(|_| "Lock poisoned".to_string())?
-            .channels
-            .get(&handle)
-            .map(|ch| ch.info.clone())
-            .ok_or_else(|| format!("channel handle {handle} not found"))
-    }
-
-    fn get_admin_password(&self) -> Result<String, String> {
-        #[cfg(target_os = "linux")]
-        return self.app_state.get_admin_password();
-        #[cfg(not(target_os = "linux"))]
-        Err("Administrator privileges are not supported on this platform".to_string())
-    }
 }
 
 // ── Callback factories ────────────────────────────────────────────────────────
@@ -710,17 +649,8 @@ fn make_rx_callback(
                 None => return,
             };
 
-            let signals = dbc
-                .as_ref()
-                .and_then(|d| decode_frame(d, raw.can_id, &raw.data))
-                .unwrap_or_default();
-
-            let message_name = signals.first().map(|_| {
-                dbc.as_ref()
-                    .and_then(|d| d.messages.iter().find(|m| m.id == raw.can_id))
-                    .map(|m| m.name.clone())
-                    .unwrap_or_default()
-            });
+            let decoded_msg = dbc.as_ref().and_then(|d| d.decode_frame(&raw));
+            let message_name = decoded_msg.as_ref().map(|m| m.name.clone());
 
             let stored = StoredFrame {
                 can_id: raw.can_id,
@@ -729,14 +659,18 @@ fn make_rx_callback(
                 timestamp_ms: ts,
                 direction: "rx",
                 message_name: message_name.clone(),
-                signals: signals
-                    .iter()
-                    .map(|(n, v, u)| StoredSignal {
-                        name: n.clone(),
-                        value: *v,
-                        unit: u.clone(),
+                signals: decoded_msg
+                    .map(|m| {
+                        m.signals
+                            .into_iter()
+                            .map(|s| StoredSignal {
+                                name: s.name,
+                                value: s.physical,
+                                unit: s.unit,
+                            })
+                            .collect()
                     })
-                    .collect(),
+                    .unwrap_or_default(),
             };
 
             let signal_updates = lock
@@ -798,15 +732,8 @@ fn make_tx_callback(
                 Some(ch) => ch.dbc.clone(),
                 None => return,
             };
-            let raw_signals = dbc
-                .as_ref()
-                .and_then(|d| decode_frame(d, raw.can_id, &raw.data))
-                .unwrap_or_default();
-            let message_name = raw_signals.first().and_then(|_| {
-                dbc.as_ref()
-                    .and_then(|d| d.messages.iter().find(|m| m.id == raw.can_id))
-                    .map(|m| m.name.clone())
-            });
+            let decoded_msg = dbc.as_ref().and_then(|d| d.decode_frame(&raw));
+            let message_name = decoded_msg.as_ref().map(|m| m.name.clone());
             let stored = StoredFrame {
                 can_id: raw.can_id,
                 is_extended: raw.is_extended,
@@ -814,14 +741,18 @@ fn make_tx_callback(
                 timestamp_ms: ts,
                 direction: "tx",
                 message_name: message_name.clone(),
-                signals: raw_signals
-                    .iter()
-                    .map(|(n, v, u)| StoredSignal {
-                        name: n.clone(),
-                        value: *v,
-                        unit: u.clone(),
+                signals: decoded_msg
+                    .map(|m| {
+                        m.signals
+                            .into_iter()
+                            .map(|s| StoredSignal {
+                                name: s.name,
+                                value: s.physical,
+                                unit: s.unit,
+                            })
+                            .collect()
                     })
-                    .collect(),
+                    .unwrap_or_default(),
             };
             let signal_updates = lock
                 .channels
@@ -860,28 +791,6 @@ fn make_tx_callback(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
-
-/// Decode all signals in a frame. Returns (signal_name, physical_value, unit) tuples.
-fn decode_frame(dbc: &ParsedDbc, can_id: u32, data: &[u8]) -> Option<Vec<(String, f64, String)>> {
-    let msg = dbc.messages.iter().find(|m| m.id == can_id)?;
-    let signals = msg
-        .signals
-        .iter()
-        .map(|sig| {
-            let v = crate::dbc_parser::decode(
-                data,
-                sig.start_bit,
-                sig.length,
-                sig.little_endian,
-                sig.signed,
-                sig.factor,
-                sig.offset,
-            );
-            (sig.name.clone(), v, sig.unit.clone())
-        })
-        .collect();
-    Some(signals)
-}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
