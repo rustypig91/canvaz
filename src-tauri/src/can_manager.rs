@@ -71,8 +71,6 @@ pub struct SignalSample {
 pub struct ChannelInfo {
     pub backend: String,
     pub name: String,
-    pub bitrate: Option<u32>,
-    pub dbc: Option<ParsedDbc>,
 }
 
 // ── Internal signal stats ──────────────────────────────────────────────────────
@@ -138,11 +136,11 @@ struct ChannelData {
 }
 
 impl ChannelData {
-    fn new(info: ChannelInfo, dbc: Option<Arc<ParsedDbc>>) -> Self {
+    fn new(info: ChannelInfo) -> Self {
         Self {
             frames: VecDeque::new(),
             signals: HashMap::new(),
-            dbc,
+            dbc: None,
             info,
         }
     }
@@ -340,22 +338,20 @@ impl CanManager {
                 out.push(ChannelInfo {
                     backend: backend_name.clone(),
                     name: ch,
-                    bitrate: None,
-                    dbc: None,
                 });
             }
         }
         Ok(out)
     }
 
-    /// Register a channel (load DBC, allocate data stores) without opening the
-    /// hardware. Returns a `u32` handle used for all subsequent calls.
-    /// Calling `create_channel` again for the same channel updates its DBC.
+    /// Register a channel (allocate data stores) without opening the hardware.
+    /// Returns a `u32` handle used for all subsequent calls. The DBC is loaded
+    /// later by `open_channel`. Calling `create_channel` again for the same
+    /// channel returns the existing handle.
     pub fn create_channel(
         &mut self,
         backend_name: &str,
         channel_name: &str,
-        dbc_path: Option<&str>,
     ) -> Result<u32, String> {
         let hw_index =
             self.cans
@@ -366,18 +362,10 @@ impl CanManager {
                 .position(|n| n == channel_name)
                 .ok_or_else(|| format!("Channel '{channel_name}' not found in '{backend_name}'"))? as u8;
 
-        let dbc = dbc_path.map(|p| ParsedDbc::new(p).map(Arc::new)).transpose()?;
-
         let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
 
-        // Already registered — update DBC and return existing handle.
+        // Already registered — return existing handle.
         if let Some(&handle) = lock.index_to_handle.get(&(backend_name.to_string(), hw_index)) {
-            if let Some(d) = dbc {
-                if let Some(ch) = lock.channels.get_mut(&handle) {
-                    ch.info.dbc = Some((*d).clone());
-                    ch.dbc = Some(d);
-                }
-            }
             return Ok(handle);
         }
 
@@ -385,14 +373,12 @@ impl CanManager {
         let info = ChannelInfo {
             backend: backend_name.to_string(),
             name: channel_name.to_string(),
-            bitrate: None,
-            dbc: dbc.as_deref().cloned(),
         };
         lock.index_to_handle
             .insert((backend_name.to_string(), hw_index), handle);
         lock.handle_to_index
             .insert(handle, (backend_name.to_string(), hw_index));
-        lock.channels.insert(handle, ChannelData::new(info, dbc));
+        lock.channels.insert(handle, ChannelData::new(info));
         info!("Created {backend_name} channel {channel_name} (handle: {handle})");
         Ok(handle)
     }
@@ -434,30 +420,41 @@ impl CanManager {
         Ok(())
     }
 
-    /// Open the hardware for a channel registered with `create_channel`.
-    pub fn open_channel(&mut self, handle: u32, bitrate: u32) -> Result<(), String> {
+    /// Open the hardware for a channel registered with `create_channel`, loading
+    /// the given DBC (parsed fresh from disk) for decode/encode. Returns the
+    /// parsed DBC so the frontend can populate its signal tree.
+    pub fn open_channel(
+        &mut self,
+        handle: u32,
+        bitrate: u32,
+        dbc_path: Option<&str>,
+    ) -> Result<Option<ParsedDbc>, String> {
         let (backend_name, hw_index) = self.backend_index(handle)?;
 
-        let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
+        // Parse the DBC before touching hardware so a bad path fails fast.
+        let dbc = dbc_path.map(|p| ParsedDbc::new(p).map(Arc::new)).transpose()?;
 
-        let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
-        if let Some(ch) = lock.channels.get_mut(&handle) {
-            ch.frames.clear();
-            ch.signals.clear();
+        {
+            let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
+            if let Some(ch) = lock.channels.get_mut(&handle) {
+                ch.frames.clear();
+                ch.signals.clear();
+                ch.dbc = dbc.clone();
+            }
         }
 
+        let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
         match can.open(hw_index, bitrate, None) {
-            Ok(()) => {
-                return Ok(());
-            }
+            Ok(()) => {}
             Err(crate::can_communication::CanOpenError::PasswordRequired) => {
                 info!("Backend '{backend_name}' requires admin password to open channel {handle}");
                 let pw = self.app_state.get_admin_password()?;
                 can.open(hw_index, bitrate, Some(&pw)).map_err(|e| e.to_string())?;
-                return Ok(());
             }
             Err(e) => return Err(e.to_string()),
         }
+
+        Ok(dbc.map(|d| (*d).clone()))
     }
 
     pub fn close_channel(&mut self, handle: u32) -> Result<(), String> {

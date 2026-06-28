@@ -81,8 +81,15 @@ interface CanFrameEvent {
 
 interface PlotSignalEntry { signal_name: string; channel: string; }
 interface PlotPaneConfig { signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean; }
-interface ChannelInfo { backend: string; name: string; bitrate: number | null; dbc: ParsedDbc | null; }
-interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate?: number | null; handle: number; }
+interface ChannelInfo { backend: string; name: string; }
+interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate: number | null; }
+// Everything the app tracks about one channel, keyed by its u32 handle in `channels`.
+interface Channel {
+    info: ChannelInfo;       // backend + hardware name (immutable identity)
+    config: ChannelConfig;   // user settings: DBC path + bitrate
+    dbc: ParsedDbc | null;   // DBC tree, parsed by open_channel; null until opened
+    open: boolean;           // hardware currently open?
+}
 interface SimulateEntry { signal_name: string; channel: string; value: number; period_ms: number; }
 
 interface SimRawFrameConfig {
@@ -806,13 +813,13 @@ function setupSimDrop() {
 
 // ── App state ─────────────────────────────────────────────────────────────────
 
-// Single map from u32 handle → channel runtime info (DBC, bitrate, backend, name).
-const channels = new Map<number, ChannelInfo>();
+// Single source of truth: u32 handle → everything we track about that channel.
+const channels = new Map<number, Channel>();
 // Available hardware interfaces populated when the "Add Channel" dialog opens.
 let availableIfaces: ChannelInfo[] = [];
 
 function channelName(handle: number): string {
-    return channels.get(handle)?.name ?? String(handle);
+    return channels.get(handle)?.info.name ?? String(handle);
 }
 const signalLastValues = new Map<string, number>();
 const signalMinValues = new Map<string, number>();
@@ -838,9 +845,6 @@ function scheduleAutoSave() {
         catch { /* silent — auto-save failures should not interrupt the user */ }
     }, 1000);
 }
-let openChannels: number[] = [];
-// Channels the user has configured (not necessarily open; hardware opens on Start).
-let configuredChannels: ChannelConfig[] = [];
 let projectPath: string | null = null;
 let lastProjectIndexPath: string | null = null;
 
@@ -910,8 +914,8 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         const ifaces = await invoke<ChannelInfo[]>("list_can_interfaces").catch(() => [] as ChannelInfo[]);
         availableIfaces = ifaces;
 
-        // Filter out interfaces already present in configuredChannels
-        const configured = new Set(configuredChannels.map(c => `${c.backend}:${c.name}`));
+        // Filter out interfaces already configured.
+        const configured = new Set([...channels.values()].map(c => `${c.info.backend}:${c.info.name}`));
         const available = ifaces.filter(i => !configured.has(`${i.backend}:${i.name}`));
 
         if (available.length === 0) {
@@ -935,15 +939,14 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         // Auto-detect vcan from first available item
         if (available[0]?.name.startsWith("vcan")) setBitrateInDialog(null, true);
     } else {
-        const meta = channels.get(handle!);
-        const displayName = meta?.name ?? String(handle!);
+        const ch = channels.get(handle!);
+        const displayName = ch?.info.name ?? String(handle!);
         title.textContent = `Channel: ${displayName}`;
         applyBtn.textContent = "Apply";
         ifaceRow.style.display = "none";
-        const cfg = configuredChannels.find(c => c.handle === handle);
-        dialogPendingDbc = cfg?.dbc_path ?? meta?.dbc?.path ?? null;
+        dialogPendingDbc = ch?.config.dbc_path ?? null;
         setDbcLabel(dialogPendingDbc);
-        setBitrateInDialog(meta?.bitrate ?? null, displayName.startsWith("vcan"));
+        setBitrateInDialog(ch?.config.bitrate ?? null, displayName.startsWith("vcan"));
         selectChannel(handle!);
     }
 
@@ -982,18 +985,20 @@ function promptSudoPassword(): Promise<string | null> {
 // Open a channel by its u32 handle. If root is required the Rust side emits
 // "request-admin-password", the global listener shows the dialog, and open_channel
 // unblocks automatically.
-async function openChannelByHandle(
-    handle: number,
-    bitrate: number | null,
-): Promise<void> {
+async function openChannelByHandle(handle: number): Promise<boolean> {
+    const ch = channels.get(handle);
+    if (!ch) return false;
     try {
-        await invoke<void>("open_channel", {
+        // open_channel opens the hardware (using the channel's configured bitrate
+        // and DBC path) and returns the DBC it parsed fresh from disk.
+        const dbc = await invoke<ParsedDbc | null>("open_channel", {
             channelHandle: handle,
-            bitrate: bitrate ?? 500000,
+            bitrate: ch.config.bitrate ?? 500000,
+            dbcPath: ch.config.dbc_path ?? null,
         });
-        // Store the DBC returned by the channel (freshly parsed from disk).
-        const info = channels.get(handle);
-        if (info?.dbc) { const m = channels.get(handle); if (m) m.dbc = info.dbc; }
+        ch.dbc = dbc ?? null;
+        ch.open = true;
+        return true;
     } catch (e) {
         const msg = String(e);
         if (msg === "Sudo authentication cancelled") {
@@ -1001,7 +1006,7 @@ async function openChannelByHandle(
         } else {
             setError(`Channel error: ${msg}`);
         }
-        return;
+        return false;
     }
 }
 
@@ -1017,38 +1022,38 @@ async function applyChannelDialog() {
             return;
         };
         const backend = availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
-        // Register channel with backend (allocates handle, loads DBC); hardware opens on Start.
+        // Register channel with backend (allocates handle); hardware opens (and the
+        // DBC is loaded) on Start.
         let handle: number;
         try {
-            handle = await invoke<number>("create_channel", { backendName: backend, channelName: name, dbcPath: dialogPendingDbc });
+            handle = await invoke<number>("create_channel", { backendName: backend, channelName: name });
         } catch (e) {
             const msg = String(e);
             setError(`Failed to create channel: ${msg}`);
             return;
         }
 
-        channels.set(handle, { backend, name, bitrate, dbc: null });
-        configuredChannels.push({ name, backend, dbc_path: dialogPendingDbc, bitrate, handle: handle });
+        channels.set(handle, {
+            info: { backend, name },
+            config: { name, backend, dbc_path: dialogPendingDbc, bitrate },
+            dbc: null,
+            open: false,
+        });
 
         refreshChannelList();
         setStatus(`Added channel: ${name}`);
         scheduleAutoSave();
     } else {
         const h = dialogEditTarget!;
-        const meta = channels.get(h);
-        const name = meta?.name ?? String(h);
+        const ch = channels.get(h);
+        const name = ch?.info.name ?? String(h);
 
-        // Update config entry in-place, and update DBC registration on backend.
-        const idx = configuredChannels.findIndex(c => c.handle === h);
-        if (idx >= 0) {
-            const ch = configuredChannels[idx];
-            configuredChannels[idx] = { ...ch, dbc_path: dialogPendingDbc, bitrate, handle: h };
-            const updatedHandle = await invoke<number>("create_channel", { backendName: ch.backend, channelName: ch.name, dbcPath: dialogPendingDbc }).catch(() => null);
-            if (updatedHandle !== null) {
-                const existing = channels.get(updatedHandle);
-                if (existing) { existing.bitrate = bitrate; if (!dialogPendingDbc) existing.dbc = null; }
-                else channels.set(updatedHandle, { backend: ch.backend, name: ch.name, bitrate, dbc: null });
-            }
+        // Update config in place. The DBC path takes effect on the next open;
+        // drop the stale parsed tree so the sidebar reflects the change.
+        if (ch) {
+            ch.config.dbc_path = dialogPendingDbc;
+            ch.config.bitrate = bitrate;
+            ch.dbc = null;
         }
 
         refreshChannelList();
@@ -1220,9 +1225,9 @@ function selectChannel(handle: number | null) {
 }
 
 function refreshChannelList() {
-    const firstHandle = configuredChannels.find(ch => ch.handle !== undefined)?.handle ?? null;
-    if (selectedChannel !== null && !configuredChannels.some(ch => ch.handle === selectedChannel)) {
-        selectChannel(firstHandle ?? null);
+    const firstHandle = channels.size ? channels.keys().next().value as number : null;
+    if (selectedChannel !== null && !channels.has(selectedChannel)) {
+        selectChannel(firstHandle);
     } else if (selectedChannel === null && firstHandle !== null) {
         selectChannel(firstHandle);
     }
@@ -1234,21 +1239,18 @@ async function renderChannelList() {
     const list = document.getElementById("channel-list")!;
 
     list.innerHTML = "";
-    for (const ch of configuredChannels) {
-        const h = ch.handle;
-        const info = h !== undefined ? channels.get(h) : undefined;
-        const isOpen = h !== undefined && openChannels.includes(h);
-        const dbcPath = info?.dbc?.path ?? ch.dbc_path ?? null;
-        const bitrate = info?.bitrate ?? ch.bitrate ?? undefined;
-        const name = ch.name;
-        const backend = ch.backend;
-        const isSelected = h !== undefined && h === selectedChannel;
+    for (const [h, ch] of channels) {
+        const dbcPath = ch.config.dbc_path;
+        const bitrate = ch.config.bitrate ?? undefined;
+        const name = ch.info.name;
+        const backend = ch.info.backend;
+        const isSelected = h === selectedChannel;
         const bitrateLabel = name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
         const item = document.createElement("div");
         item.className = `channel-item${isSelected ? " selected" : ""}`;
-        if (h !== undefined) item.dataset.channelHandle = String(h);
+        item.dataset.channelHandle = String(h);
         item.innerHTML = `
-      <span class="dot${isOpen ? "" : " closed"}"></span>
+      <span class="dot${ch.open ? "" : " closed"}"></span>
       <span class="ch-name" title="${name}">${name}<span class="ch-backend label-muted"> ${backend}</span></span>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
       <span class="ch-baud label-muted">${bitrateLabel}</span>
@@ -1256,7 +1258,7 @@ async function renderChannelList() {
     `;
         item.addEventListener("click", (e) => {
             if ((e.target as HTMLElement).closest(".btn-close-ch")) return;
-            if (h !== undefined) selectChannel(h);
+            selectChannel(h);
         });
         item.addEventListener("contextmenu", async (e) => {
             e.preventDefault();
@@ -1264,14 +1266,13 @@ async function renderChannelList() {
                 {
                     label: "Configure…", action: async () => {
                         if (!await confirmAndStop(`Stop live capture to configure "${name}"?`)) return;
-                        if (h !== undefined) openChannelDialog("edit", h);
+                        openChannelDialog("edit", h);
                     }
                 },
                 {
                     label: "Remove Channel", danger: true, action: async () => {
                         if (!await confirmAndStop(`Stop live capture and remove "${name}"?`)) return;
-                        configuredChannels = configuredChannels.filter(c => c !== ch);
-                        if (h !== undefined) channels.delete(h);
+                        channels.delete(h);
                         if (selectedChannel === h) selectChannel(null);
                         renderChannelList();
                         scheduleAutoSave();
@@ -1283,19 +1284,12 @@ async function renderChannelList() {
             e.stopPropagation();
             if (!await confirmAndStop(`Stop live capture and remove "${name}"?`)) return;
 
-            configuredChannels = configuredChannels.filter(c => c !== ch);
-            if (h !== undefined) {
-                try { await invoke("remove_channel", { channelHandle: h }); }
-                catch (e) {
-                    setError(`Remove channel error: ${e}`);
-                    return;
-                }
-                channels.delete(h);
-            }
-            else {
-                setError(`Channel "${name}" has no handle; cannot remove from backend`);
+            try { await invoke("remove_channel", { channelHandle: h }); }
+            catch (e) {
+                setError(`Remove channel error: ${e}`);
                 return;
             }
+            channels.delete(h);
 
             if (selectedChannel === h) selectChannel(null);
 
@@ -1394,7 +1388,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
       <div class="sim-group-header">
         <span class="sim-kind-badge kind-raw">RAW</span>
         <select class="sim-channel-sel">
-          ${configuredChannels.filter(ch => ch.handle !== undefined).map(ch => `<option value="${ch.handle}"${ch.handle === entry.channel ? " selected" : ""}>${ch.name}</option>`).join("")}
+          ${[...channels].map(([h, ch]) => `<option value="${h}"${h === entry.channel ? " selected" : ""}>${ch.info.name}</option>`).join("")}
         </select>
         <span class="label-muted">Period</span>
         <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
@@ -1508,7 +1502,7 @@ function addRawFrame() {
     const key = `raw::${++rawEntryCounter}`;
     const entry: SimRawEntry = {
         kind: "raw",
-        channel: configuredChannels.find(ch => ch.handle !== undefined)?.handle ?? 0,
+        channel: channels.size ? channels.keys().next().value as number : 0,
         canId: 0x100, isExtended: false, dlc: 8,
         data: new Array(8).fill(0),
         periodMs: 100, running: false, periodicHandle: null,
@@ -1564,20 +1558,28 @@ async function stopSim(key: string) {
 
 // ── Project ───────────────────────────────────────────────────────────────────
 
+// Channels are persisted by a stable "backend:name" id, since the u32 handle is
+// ephemeral (reassigned each session). These convert at the persistence boundary.
 function handleToId(handle: number): string {
-    const info = channels.get(handle);
-    return info ? `${info.backend}:${info.name}` : String(handle);
+    const ch = channels.get(handle);
+    return ch ? `${ch.info.backend}:${ch.info.name}` : String(handle);
+}
+
+function idToHandle(id: string): number | undefined {
+    for (const [h, ch] of channels) {
+        if (`${ch.info.backend}:${ch.info.name}` === id) return h;
+    }
+    return undefined;
 }
 
 function buildProject(): Project {
     return {
         version: 1,
-        channels: configuredChannels.map(ch => ({
-            name: ch.name,
-            backend: ch.backend,
-            dbc_path: (ch.handle !== undefined ? channels.get(ch.handle)?.dbc?.path : undefined) ?? ch.dbc_path ?? null,
-            bitrate: (ch.handle !== undefined ? channels.get(ch.handle)?.bitrate : undefined) ?? ch.bitrate ?? null,
-            handle: ch.handle
+        channels: [...channels.values()].map(ch => ({
+            name: ch.info.name,
+            backend: ch.info.backend,
+            dbc_path: ch.config.dbc_path,
+            bitrate: ch.config.bitrate,
         })),
         plot_panes: plotPanes.map(pane => ({
             signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: handleToId(s.channel) })),
@@ -1593,7 +1595,7 @@ function buildProject(): Project {
             .filter((e): e is SimRawEntry => e.kind === "raw")
             .map(e => ({ channel: handleToId(e.channel), can_id: e.canId, is_extended: e.isExtended, dlc: e.dlc, data: e.data, period_ms: e.periodMs })),
         trace_filters: {
-            channels: traceFilterChannels ? [...traceFilterChannels] : null,
+            channels: traceFilterChannels ? [...traceFilterChannels].map(handleToId) : null,
             can_ids: traceFilterCanIds ? [...traceFilterCanIds] : null,
             msg_names: traceFilterMsgNames ? [...traceFilterMsgNames] : null,
             dir: traceFilterDir ? [...traceFilterDir] : null,
@@ -1662,19 +1664,19 @@ async function applyProject(project: Project) {
     // Stop any active capture before applying a new project.
     if (appRunning) await stopApp();
 
-    configuredChannels = [];
-    openChannels = [];
     channels.clear();
 
     for (const ch of project.channels) {
         const backend = ch.backend ?? "socketcan";
         const bitrate = ch.bitrate ?? null;
-        const entry: ChannelConfig = { name: ch.name, backend, dbc_path: ch.dbc_path, bitrate, handle: 0 };
-        configuredChannels.push(entry);
-        const handle = await invoke<number>("create_channel", { backendName: backend, channelName: ch.name, dbcPath: ch.dbc_path ?? null }).catch(() => null);
+        const handle = await invoke<number>("create_channel", { backendName: backend, channelName: ch.name }).catch(() => null);
         if (handle !== null) {
-            channels.set(handle, { backend, name: ch.name, bitrate, dbc: null });
-            entry.handle = handle;
+            channels.set(handle, {
+                info: { backend, name: ch.name },
+                config: { name: ch.name, backend, dbc_path: ch.dbc_path ?? null, bitrate },
+                dbc: null,
+                open: false,
+            });
         }
         else {
             setError(`Failed to create channel ${ch.name} (${backend})`);
@@ -1715,7 +1717,7 @@ async function applyProject(project: Project) {
     // Restore raw sim frames immediately (they don't need a DBC).
     for (const raw of project.simulate_raw_frames ?? []) {
         const key = `raw::${++rawEntryCounter}`;
-        const rawHandle = configuredChannels.find(c => `${c.backend}:${c.name}` === raw.channel)?.handle ?? 0;
+        const rawHandle = idToHandle(raw.channel) ?? 0;
         const entry: SimRawEntry = {
             kind: "raw", channel: rawHandle,
             canId: raw.can_id, isExtended: raw.is_extended,
@@ -1756,7 +1758,11 @@ function syncFilteredHeaders() {
 }
 
 function restoreTraceFilters(f: TraceFiltersConfig) {
-    traceFilterChannels = f.channels ? new Set(f.channels) : null;
+    // Channels are persisted as stable "backend:name" ids; map back to handles
+    // (channels are already created by this point in applyProject).
+    traceFilterChannels = f.channels
+        ? new Set(f.channels.map(idToHandle).filter((h): h is number => h !== undefined))
+        : null;
     traceFilterCanIds = f.can_ids ? new Set(f.can_ids) : null;
     traceFilterMsgNames = f.msg_names ? new Set(f.msg_names) : null;
     traceFilterDir = f.dir ? new Set(f.dir) : null;
@@ -1795,20 +1801,9 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
 async function startApp() {
     // Open all configured channels (hardware connects here, not when added).
     // Each open_channel call parses the DBC fresh from disk and returns it.
-    const newOpen: number[] = [];
-    for (const ch of configuredChannels) {
-        let handle = ch.handle;
-        if (handle === undefined) {
-            const h = await invoke<number>("create_channel", { backendName: ch.backend, channelName: ch.name, dbcPath: ch.dbc_path ?? null }).catch(() => null);
-            if (h === null) continue;
-            channels.set(h, { backend: ch.backend, name: ch.name, bitrate: ch.bitrate ?? null, dbc: null });
-            ch.handle = h;
-            handle = h;
-        }
-        const info = await openChannelByHandle(handle, ch.bitrate ?? null);
-        if (info) newOpen.push(handle);
+    for (const handle of channels.keys()) {
+        await openChannelByHandle(handle);
     }
-    openChannels = newOpen;
     renderChannelList();
 
     // Prune simulated message entries whose message no longer exists in the reloaded DBC
@@ -1863,7 +1858,7 @@ async function startApp() {
         pendingPaneSignals = [];
         for (let i = 0; i < Math.min(plotPanes.length, toRestore.length); i++) {
             for (const entry of toRestore[i]) {
-                const handle = configuredChannels.find(c => `${c.backend}:${c.name}` === entry.channel)?.handle;
+                const handle = idToHandle(entry.channel);
                 if (handle === undefined) continue;
                 const dbc = channels.get(handle)?.dbc;
                 const sig = dbc?.messages.flatMap((m: DbcMessage) => m.signals).find((s: DbcSignal) => s.name === entry.signal_name);
@@ -1878,7 +1873,7 @@ async function startApp() {
         pendingSimSignals = [];
         const msgMap = new Map<string, { handle: number; msg: DbcMessage; periodMs: number; values: Map<string, number> }>();
         for (const entry of toRestore) {
-            const handle = configuredChannels.find(c => `${c.backend}:${c.name}` === entry.channel)?.handle;
+            const handle = idToHandle(entry.channel);
             if (handle === undefined) continue;
             const dbc = channels.get(handle)?.dbc;
             const msg = dbc?.messages.find((m: DbcMessage) => m.signals.some((s: DbcSignal) => s.name === entry.signal_name));
@@ -1915,10 +1910,11 @@ async function startApp() {
 async function stopApp() {
     appRunning = false;
     // Close hardware connections; they will reopen on the next Start.
-    for (const handle of openChannels) {
+    for (const [handle, ch] of channels) {
+        if (!ch.open) continue;
         try { await invoke("close_channel", { channelHandle: handle }); } catch { }
+        ch.open = false;
     }
-    openChannels = [];
     // Channels are closed so backend periodics are stopped; just reset UI state.
     for (const [key, entry] of simEntries) {
         if (entry.running) {
@@ -2240,7 +2236,6 @@ function handleMenuAction(action: string) {
 // ── Trace tab ─────────────────────────────────────────────────────────────────
 
 interface TraceEntry {
-    channel: string;      // display string e.g. "socketcan:vcan0"
     channelHandle: number;
     canId: number;
     isExtended: boolean;
@@ -2281,11 +2276,11 @@ let colDropIndicator: HTMLDivElement | null = null;
 const traceLastTs = new Map<string, number>();
 const traceRowEls = new Map<string, HTMLTableRowElement>();
 const tracePendingOverwrite = new Map<string, TraceEntry>(); // accumulates overwrite updates while viewPaused
-const traceSeenChannels = new Set<string>();
+const traceSeenChannels = new Set<number>();
 const traceSeenCanIds = new Set<number>();
 const traceSeenMsgNames = new Set<string>();
 let traceSeenNoMsg = false;
-let traceFilterChannels: Set<string> | null = null;
+let traceFilterChannels: Set<number> | null = null;
 let traceFilterCanIds: Set<number> | null = null;
 let traceFilterMsgNames: Set<string> | null = null;
 let traceFilterData: (number | null)[] = new Array(8).fill(null);
@@ -2336,8 +2331,8 @@ function parseByte(s: string): number | null {
     return (isNaN(n) || n < 0 || n > 255) ? null : n;
 }
 
-function traceRowVisible(channel: string, canId: number, bytes: number[], dir: string, cycleMs: number | null, dlc: number, msgName: string | null = null): boolean {
-    if (traceFilterChannels !== null && !traceFilterChannels.has(channel)) return false;
+function traceRowVisible(channelHandle: number, canId: number, bytes: number[], dir: string, cycleMs: number | null, dlc: number, msgName: string | null = null): boolean {
+    if (traceFilterChannels !== null && !traceFilterChannels.has(channelHandle)) return false;
     if (traceFilterCanIds !== null && !traceFilterCanIds.has(canId)) return false;
     if (traceFilterDir !== null && !traceFilterDir.has(dir)) return false;
     if (traceFilterMsgNames !== null && !traceFilterMsgNames.has(msgName ?? "")) return false;
@@ -2359,7 +2354,7 @@ function applyTraceFilter() {
         // Rebuild DOM entirely from the in-memory buffer — never keep invisible rows in the DOM.
         tbody.innerHTML = "";
         for (const entry of traceLocalBuffer) {
-            if (traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) {
+            if (traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) {
                 tbody.appendChild(buildTraceRow(entry));
             }
         }
@@ -2368,7 +2363,7 @@ function applyTraceFilter() {
     // Overwrite mode: toggle visibility on the fixed set of rows.
     for (const tr of Array.from(tbody.rows) as HTMLTableRowElement[]) {
         if ((tr as HTMLTableRowElement).dataset.expand) continue;
-        const ch = tr.dataset.channel ?? "";
+        const ch = parseInt(tr.dataset.channelHandle ?? "0");
         const id = parseInt(tr.dataset.canid ?? "0");
         const bytes: number[] = JSON.parse(tr.dataset.bytes ?? "[]");
         const dir = tr.dataset.dir ?? "";
@@ -2402,7 +2397,7 @@ function applyTraceSort() {
         switch (col) {
             case "ts": cmp = parseInt(a.dataset.ts ?? "0") - parseInt(b.dataset.ts ?? "0"); break;
             case "dir": cmp = (a.dataset.dir ?? "").localeCompare(b.dataset.dir ?? ""); break;
-            case "channel": cmp = (a.dataset.channel ?? "").localeCompare(b.dataset.channel ?? ""); break;
+            case "channel": cmp = channelName(parseInt(a.dataset.channelHandle ?? "0")).localeCompare(channelName(parseInt(b.dataset.channelHandle ?? "0"))); break;
             case "canId": cmp = parseInt(a.dataset.canid ?? "0") - parseInt(b.dataset.canid ?? "0"); break;
             case "msg": cmp = (a.dataset.msg ?? "").localeCompare(b.dataset.msg ?? ""); break;
             case "dlc": cmp = parseInt(a.dataset.dlc ?? "0") - parseInt(b.dataset.dlc ?? "0"); break;
@@ -2448,7 +2443,6 @@ function buildTraceCellHtml(key: string, entry: TraceEntry): string {
 function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
     return {
         data: JSON.parse(tr.dataset.bytes ?? "[]"),
-        channel: tr.dataset.channel ?? "",
         channelHandle: parseInt(tr.dataset.channelHandle ?? "0"),
         canId: parseInt(tr.dataset.canid ?? "0"),
         isExtended: tr.dataset.ext === "1",
@@ -2463,7 +2457,6 @@ function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
 function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
     const tr = document.createElement("tr");
     tr.dataset.bytes = JSON.stringify(entry.data);
-    tr.dataset.channel = entry.channel;
     tr.dataset.channelHandle = String(entry.channelHandle);
     tr.dataset.canid = String(entry.canId);
     tr.dataset.ext = entry.isExtended ? "1" : "0";
@@ -2473,7 +2466,7 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
     tr.dataset.dlc = String(entry.dlc);
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
     if (entry.messageName) tr.classList.add("dbc-match");
-    if (!traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) tr.style.display = "none";
+    if (!traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) tr.style.display = "none";
     const visible = traceColOrder.filter(k => !traceColHidden.has(k));
     tr.innerHTML = visible.map(k => buildTraceCellHtml(k, entry)).join("");
     return tr;
@@ -2484,7 +2477,7 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     tr.dataset.ts = String(entry.timestampMs);
     tr.dataset.dlc = String(entry.dlc);
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
-    tr.style.display = traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName) ? "" : "none";
+    tr.style.display = traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName) ? "" : "none";
     const gc = (k: string) => tr.querySelector<HTMLTableCellElement>(`[data-col="${k}"]`);
     const tsCell = gc("ts"); if (tsCell) tsCell.textContent = fmtElapsed(entry.timestampMs);
     const dlcCell = gc("dlc"); if (dlcCell) dlcCell.textContent = String(entry.dlc);
@@ -2514,11 +2507,8 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
 function onCanFrame(ev: CanFrameEvent) {
     if (!appRunning) return;
 
-    const meta = channels.get(ev.channel_handle);
-    const channelId = meta ? `${meta.backend}:${meta.name}` : String(ev.channel_handle);
-
     // Update seen sets (for filter autocomplete) and cycle timing.
-    traceSeenChannels.add(channelId);
+    traceSeenChannels.add(ev.channel_handle);
     traceSeenCanIds.add(ev.can_id);
     if (ev.message_name) traceSeenMsgNames.add(ev.message_name);
     else traceSeenNoMsg = true;
@@ -2559,7 +2549,6 @@ function onCanFrame(ev: CanFrameEvent) {
     }
 
     const entry: TraceEntry = {
-        channel: channelId,
         channelHandle: ev.channel_handle,
         canId: ev.can_id,
         isExtended: ev.is_extended,
@@ -2589,7 +2578,7 @@ function onCanFrame(ev: CanFrameEvent) {
             tbody.appendChild(tr);
         }
     } else {
-        if (traceRowVisible(entry.channel, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) {
+        if (traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) {
             const tr = buildTraceRow(entry);
             tbody.insertBefore(tr, tbody.firstChild);
             while (tbody.rows.length > traceMaxRows) tbody.deleteRow(-1);
@@ -2602,17 +2591,14 @@ async function loadTraceFrames() {
     const cycleTimes = new Map<string, number>();
     // Backend returns oldest-first; we want newest-first in traceLocalBuffer.
     traceLocalBuffer = frames.map(f => {
-        const fmeta = channels.get(f.channel_handle);
-        const channelId = fmeta ? `${fmeta.backend}:${fmeta.name}` : String(f.channel_handle);
         const k = traceKey(f.channel_handle, f.can_id, f.direction);
         const prev = cycleTimes.get(k);
         const cycleTimeMs = prev != null ? f.timestamp_ms - prev : null;
         cycleTimes.set(k, f.timestamp_ms);
         if (f.message_name) traceSeenMsgNames.add(f.message_name);
-        traceSeenChannels.add(channelId);
+        traceSeenChannels.add(f.channel_handle);
         traceSeenCanIds.add(f.can_id);
         return {
-            channel: channelId,
             channelHandle: f.channel_handle,
             canId: f.can_id,
             isExtended: f.is_extended,
@@ -2846,11 +2832,14 @@ function setupTraceHeaders() {
         } else if (key === "channel") {
             th.addEventListener("contextmenu", (e) => {
                 e.preventDefault();
-                const items = [...traceSeenChannels].sort().map(ch => ({ label: ch.split(":").pop() ?? ch, key: ch }));
+                const items = [...traceSeenChannels].sort((a, b) => a - b).map(h => ({ label: channelName(h), key: String(h) }));
                 if (!items.length) return;
-                showFilterMenu(e.clientX, e.clientY, items, traceFilterChannels, (active) => {
-                    traceFilterChannels = active; syncFilteredHeaders(); applyTraceFilter();
-                });
+                showFilterMenu(e.clientX, e.clientY, items,
+                    traceFilterChannels !== null ? new Set([...traceFilterChannels].map(String)) : null,
+                    (active) => {
+                        traceFilterChannels = active !== null ? new Set([...active].map(Number)) : null;
+                        syncFilteredHeaders(); applyTraceFilter();
+                    });
             });
         } else if (key === "canId") {
             th.addEventListener("contextmenu", (e) => {
@@ -3098,7 +3087,7 @@ function resumeFromPause() {
             let count = 0;
             for (const e of traceLocalBuffer) {
                 if (count >= traceMaxRows) break;
-                if (traceRowVisible(e.channel, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName)) {
+                if (traceRowVisible(e.channelHandle, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName)) {
                     frag.appendChild(buildTraceRow(e));
                     count++;
                 }
@@ -3340,7 +3329,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
 
     // Auto-start only when at least one channel has been configured.
-    if (configuredChannels.length > 0) {
+    if (channels.size > 0) {
         await startApp();
     }
     // Otherwise the app stays in stopped state; user adds channels then presses Start.

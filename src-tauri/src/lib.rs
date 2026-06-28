@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use app_state::AppState;
 use can_manager::{CanManager, ChannelInfo, FrameInfo, ManagerState, SignalSample};
+use dbc_parser::ParsedDbc;
 use logger::init;
 use project::Project;
 use serde::Deserialize;
@@ -43,14 +44,13 @@ fn list_can_interfaces(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>,
 fn create_channel(
     backend_name: String,
     channel_name: String,
-    dbc_path: Option<String>,
     state: State<'_, TauriState>,
 ) -> Result<u32, String> {
     state
         .can_manager
         .lock()
         .map_err(|e| e.to_string())?
-        .create_channel(&backend_name, &channel_name, dbc_path.as_deref())
+        .create_channel(&backend_name, &channel_name)
 }
 
 #[tauri::command]
@@ -70,19 +70,22 @@ fn created_channels(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>, St
 async fn open_channel(
     channel_handle: u32,
     bitrate: u32,
+    dbc_path: Option<String>,
     state: State<'_, TauriState>,
-) -> Result<(), String> {
+) -> Result<Option<ParsedDbc>, String> {
     let can_manager = Arc::clone(&state.can_manager);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        can_manager.lock().map_err(|e| e.to_string())?.open_channel(channel_handle, bitrate)
+        can_manager
+            .lock()
+            .map_err(|e| e.to_string())?
+            .open_channel(channel_handle, bitrate, dbc_path.as_deref())
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));
 
-    if let Ok(()) = result {
-        info!("Opened channel (handle {}) with baudrate {}", channel_handle, bitrate);
-    } else {
-        error!("Failed to open channel {channel_handle}: {}", result.as_ref().err().unwrap());
+    match &result {
+        Ok(_) => info!("Opened channel (handle {}) with baudrate {}", channel_handle, bitrate),
+        Err(e) => error!("Failed to open channel {channel_handle}: {e}"),
     }
     result
 }
