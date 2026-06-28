@@ -47,20 +47,15 @@ impl TxHandle for SocketCanTxHandle {
     fn send(&mut self, frame: &CanFrame) -> Result<(), String> {
         let df: CanDataFrame = if frame.is_extended {
             if frame.can_id > 0x1FFF_FFFF {
-                return Err(format!(
-                    "Extended CAN ID must be ≤ 0x1FFF_FFFF, got {:#x}",
-                    frame.can_id
-                ));
+                return Err(format!("Extended CAN ID must be ≤ 0x1FFF_FFFF, got {:#x}", frame.can_id));
             }
-            let eid =
-                ExtendedId::new(frame.can_id).ok_or_else(|| format!("Invalid extended CAN ID: {:#x}", frame.can_id))?;
+            let eid = ExtendedId::new(frame.can_id).ok_or_else(|| format!("Invalid extended CAN ID: {:#x}", frame.can_id))?;
             CanDataFrame::new(eid, &frame.data).ok_or("Failed to build extended CAN frame")?
         } else {
             if frame.can_id > 0x7FF {
                 return Err(format!("Standard CAN ID must be ≤ 0x7FF, got {:#x}", frame.can_id));
             }
-            let sid = StandardId::new(frame.can_id as u16)
-                .ok_or_else(|| format!("Invalid standard CAN ID: {:#x}", frame.can_id))?;
+            let sid = StandardId::new(frame.can_id as u16).ok_or_else(|| format!("Invalid standard CAN ID: {:#x}", frame.can_id))?;
             CanDataFrame::new(sid, &frame.data).ok_or("Failed to build CAN frame")?
         };
         self.socket.write_frame(&df).map_err(|e| format!("Write failed: {e}"))
@@ -97,10 +92,7 @@ impl CanBackend for SocketCanBackend {
         let name = channels
             .get(index as usize)
             .ok_or_else(|| {
-                CanOpenError::ChannelIndexOutOfRange(format!(
-                    "SocketCAN channel index {index} out of range ({} found)",
-                    channels.len()
-                ))
+                CanOpenError::ChannelIndexOutOfRange(format!("SocketCAN channel index {index} out of range ({} found)", channels.len()))
             })?
             .clone();
 
@@ -116,10 +108,8 @@ impl CanBackend for SocketCanBackend {
             }
         }
 
-        let tx_socket =
-            CanSocket::open(&name).map_err(|e| CanOpenError::Other(format!("Failed to open TX socket on '{name}': {e}")))?;
-        let rx_socket =
-            CanSocket::open(&name).map_err(|e| CanOpenError::Other(format!("Failed to open RX socket on '{name}': {e}")))?;
+        let tx_socket = CanSocket::open(&name).map_err(|e| CanOpenError::Other(format!("Failed to open TX socket on '{name}': {e}")))?;
+        let rx_socket = CanSocket::open(&name).map_err(|e| CanOpenError::Other(format!("Failed to open RX socket on '{name}': {e}")))?;
 
         Ok((
             Box::new(SocketCanTxHandle { socket: tx_socket }),
@@ -179,7 +169,11 @@ fn run_ip(args: &[&str], sudo_password: Option<&str>) -> Result<(), String> {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        Err(if msg.trim().is_empty() { raw.trim().to_string() } else { msg.trim().to_string() })
+        Err(if msg.trim().is_empty() {
+            raw.trim().to_string()
+        } else {
+            msg.trim().to_string()
+        })
     } else {
         let out = std::process::Command::new("ip")
             .args(args)
@@ -194,10 +188,7 @@ fn run_ip(args: &[&str], sudo_password: Option<&str>) -> Result<(), String> {
 }
 
 fn already_up(name: &str, bitrate: u32) -> bool {
-    let out = match std::process::Command::new("ip")
-        .args(["-det", "link", "show", name])
-        .output()
-    {
+    let out = match std::process::Command::new("ip").args(["-det", "link", "show", name]).output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
         _ => return false,
     };

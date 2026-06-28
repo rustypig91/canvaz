@@ -270,8 +270,7 @@ kbd {
   color: var(--text);
   font-size: 11px;
   font-family: inherit;
-  padding: 1px 4px;
-  height: calc(var(--menubar-height) - 8px);
+  padding: 2px 4px;
 }
 #window-size-ctrl input { width: 60px; }
 

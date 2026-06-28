@@ -154,9 +154,7 @@ impl Can {
             self.admin_password = Some(admin_password.unwrap().to_string());
         }
 
-        let (tx_handle, rx_handle) = self
-            .backend
-            .open_channel(channel, bitrate, self.admin_password.as_deref())?;
+        let (tx_handle, rx_handle) = self.backend.open_channel(channel, bitrate, self.admin_password.as_deref())?;
 
         let queue: SendQueue = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -266,12 +264,7 @@ impl Drop for Can {
 
 // ── Thread loops ──────────────────────────────────────────────────────────────
 
-fn rx_loop(
-    mut rx: Box<dyn RxHandle>,
-    stop: Arc<AtomicBool>,
-    channel: u8,
-    on_rx: Arc<dyn Fn(u8, CanFrame) + Send + Sync>,
-) {
+fn rx_loop(mut rx: Box<dyn RxHandle>, stop: Arc<AtomicBool>, channel: u8, on_rx: Arc<dyn Fn(u8, CanFrame) + Send + Sync>) {
     while !stop.load(Ordering::Relaxed) {
         match rx.receive(50) {
             Ok(Some(frame)) => on_rx(channel, frame),
