@@ -1638,6 +1638,43 @@ function buildProject(): Project {
     };
 }
 
+async function newProject() {
+    if (projectDirty) {
+        if (!await showConfirm("Discard unsaved changes and start a new project?")) return;
+    }
+    if (appRunning) await stopApp();
+
+    for (const h of [...channels.keys()]) {
+        try { await invoke("remove_channel", { channelHandle: h }); } catch { }
+    }
+    channels.clear();
+
+    while (plotPanes.length) closePlotPane(plotPanes[0].id);
+    pendingPaneSignals = [];
+    pendingSimSignals = [];
+
+    for (const [key, entry] of simEntries) {
+        if (entry.running) {
+            try { await invoke("remove_periodic", { cmd: { channel_handle: entry.channel, periodic_handle: entry.periodicHandle } }); } catch { }
+        }
+        simEntries.delete(key);
+    }
+    document.getElementById("sim-entries")!.innerHTML = "";
+
+    clearTrace();
+    signalLastValues.clear();
+    signalMinValues.clear();
+    signalMaxValues.clear();
+
+    projectPath = null;
+    projectDirty = false;
+    sessionFilePath = null;
+    updateWindowTitle();
+    refreshChannelList();
+    renderDbcTree();
+    setStatus("New project");
+}
+
 async function saveProject() {
     if (projectPath) {
         try {
@@ -1988,46 +2025,28 @@ async function confirmAndStop(prompt: string): Promise<boolean> {
     return true;
 }
 
-/** Exports the signal history to CSV. Returns true if a file was saved. */
-async function exportCsv(): Promise<boolean> {
-    const hasData = plotPanes.some(p => [...p.series.values()].some(s => s.data.length > 0));
-    if (!hasData) { setStatus("No data to export"); return false; }
+async function exportCsv() {
     const path = await dialogSave({
-        defaultPath: "canvaz.csv",
+        defaultPath: "signals.csv",
         filters: [{ name: "CSV Files", extensions: ["csv"] }],
     });
-    if (!path) return false;
-
-    const rows: string[] = ["timestamp_ms,elapsed_s,channel,signal_name,value,unit"];
-    const allSamples: Array<{ ts: number; channel: string; signalName: string; value: number; unit: string }> = [];
-
-    // Each signal may appear in multiple panes; export it only once.
-    const seen = new Set<string>();
-    for (const pane of plotPanes) {
-        for (const [key, series] of pane.series) {
-            if (seen.has(key)) continue;
-            seen.add(key);
-            for (let i = 0; i < series.timestamps.length; i++) {
-                allSamples.push({
-                    ts: series.timestamps[i], channel: handleToId(series.channel),
-                    signalName: series.signalName, value: series.data[i].y, unit: series.unit
-                });
-            }
-        }
-    }
-    allSamples.sort((a, b) => a.ts - b.ts);
-
-    for (const s of allSamples) {
-        const elapsed = ((s.ts - appStartTime) / 1000).toFixed(3);
-        const unitSafe = s.unit.includes(",") ? `"${s.unit}"` : s.unit;
-        rows.push(`${s.ts},${elapsed},${s.channel},${s.signalName},${s.value},${unitSafe}`);
-    }
-
+    if (!path) return;
     try {
-        await invoke("write_text_file", { path, content: rows.join("\n") });
-        setStatus(`Exported ${allSamples.length} samples to CSV`);
-        return true;
-    } catch (e) { setError(`Export error: ${e}`); return false; }
+        const count = await invoke<number>("export_signals_csv", { path, startMs: appStartTime });
+        setStatus(count > 0 ? `Exported ${count} signal samples to CSV` : "No signal data to export");
+    } catch (e) { setError(`Export error: ${e}`); }
+}
+
+async function exportTraceCsv() {
+    const path = await dialogSave({
+        defaultPath: "trace.csv",
+        filters: [{ name: "CSV Files", extensions: ["csv"] }],
+    });
+    if (!path) return;
+    try {
+        const count = await invoke<number>("export_frames_csv", { path, startMs: appStartTime });
+        setStatus(count > 0 ? `Exported ${count} frames to CSV` : "No trace data to export");
+    } catch (e) { setError(`Export error: ${e}`); }
 }
 
 // ── Preferences ─────────────────────────────────────────────────────────────
@@ -2362,10 +2381,13 @@ function closeAllMenus() {
 
 function handleMenuAction(action: string) {
     switch (action) {
+        case "new-project": newProject(); break;
         case "open-project": openProject(); break;
         case "save-project": saveProject(); break;
         case "save-as-project": saveProjectAs(); break;
+        case "reload": location.reload(); break;
         case "export-csv": exportCsv(); break;
+        case "export-trace-csv": exportTraceCsv(); break;
         case "about":
             invoke<string>("get_version").then(v => { document.getElementById("about-version")!.textContent = v; }).catch(() => { });
             (document.activeElement as HTMLElement)?.blur();
@@ -3191,7 +3213,7 @@ function setupTrace() {
     });
 
     document.getElementById("input-trace-max")!.addEventListener("change", (e) => {
-        traceMaxRows = parseInt((e.target as HTMLInputElement).value) || 1000;
+        traceMaxRows = parseInt((e.target as HTMLInputElement).value) || 100;
         while (traceLocalBuffer.length > traceMaxRows) traceLocalBuffer.pop();
         scheduleAutoSave();
     });

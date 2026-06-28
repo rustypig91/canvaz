@@ -217,6 +217,16 @@ fn set_window_ms(ms: u64, state: State<'_, TauriState>) -> Result<(), String> {
     state.can_manager.lock().map_err(|e| e.to_string())?.set_window_ms(ms)
 }
 
+#[tauri::command]
+fn export_frames_csv(path: String, start_ms: u64, state: State<'_, TauriState>) -> Result<usize, String> {
+    state.can_manager.lock().map_err(|e| e.to_string())?.export_frames_csv(&path, start_ms)
+}
+
+#[tauri::command]
+fn export_signals_csv(path: String, start_ms: u64, state: State<'_, TauriState>) -> Result<usize, String> {
+    state.can_manager.lock().map_err(|e| e.to_string())?.export_signals_csv(&path, start_ms)
+}
+
 // ── Version ───────────────────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -307,6 +317,8 @@ pub fn run() {
             get_frames,
             get_signal_history,
             set_window_ms,
+            export_frames_csv,
+            export_signals_csv,
             save_project,
             load_project,
         ])

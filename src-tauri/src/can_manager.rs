@@ -610,6 +610,77 @@ impl CanManager {
         Ok(())
     }
 
+    /// Write all buffered frames across all channels to a CSV file.
+    /// Frames are sorted by timestamp. The lock is released before the file write.
+    pub fn export_frames_csv(&self, path: &str, start_ms: u64) -> Result<usize, String> {
+        use std::fmt::Write as FmtWrite;
+
+        let (csv, count) = {
+            let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
+
+            let mut frames: Vec<(u64, &str, &StoredFrame)> = lock
+                .channels
+                .values()
+                .flat_map(|ch| ch.frames.iter().map(move |f| (f.timestamp_ms, ch.info.name.as_str(), f)))
+                .collect();
+            frames.sort_unstable_by_key(|r| r.0);
+
+            let count = frames.len();
+            let mut csv = String::with_capacity(count * 80 + 64);
+            csv.push_str("timestamp_ms,elapsed_s,channel,can_id,direction,dlc,data,message\n");
+
+            for (ts, ch_name, f) in &frames {
+                let elapsed = (*ts as f64 - start_ms as f64) / 1000.0;
+                let id_str = if f.is_extended {
+                    format!("{:08X}", f.can_id)
+                } else {
+                    format!("{:03X}", f.can_id)
+                };
+                let data_str = f.data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
+                let msg_str = f.message_name.as_deref().unwrap_or("").replace('"', "\"\"");
+                let _ = writeln!(csv, "{},{:.3},{},{},{},{},\"{}\",\"{}\"",
+                    ts, elapsed, ch_name, id_str, f.direction, f.data.len(), data_str, msg_str);
+            }
+            (csv, count)
+        };
+
+        std::fs::write(path, csv.as_bytes()).map_err(|e| e.to_string())?;
+        Ok(count)
+    }
+
+    /// Write all buffered signal samples across all channels to a CSV file.
+    /// Samples are sorted by timestamp. The lock is released before the file write.
+    pub fn export_signals_csv(&self, path: &str, start_ms: u64) -> Result<usize, String> {
+        use std::fmt::Write as FmtWrite;
+
+        let (csv, count) = {
+            let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
+
+            let mut rows: Vec<(u64, &str, &str, f64, &str)> = Vec::new();
+            for ch in lock.channels.values() {
+                for f in &ch.frames {
+                    for sig in &f.signals {
+                        rows.push((f.timestamp_ms, ch.info.name.as_str(), sig.name.as_str(), sig.value, sig.unit.as_str()));
+                    }
+                }
+            }
+            rows.sort_unstable_by_key(|r| r.0);
+
+            let count = rows.len();
+            let mut csv = String::with_capacity(count * 60 + 48);
+            csv.push_str("timestamp_ms,elapsed_s,channel,signal_name,value,unit\n");
+
+            for (ts, ch_name, sig_name, value, unit) in &rows {
+                let elapsed = (*ts as f64 - start_ms as f64) / 1000.0;
+                let _ = writeln!(csv, "{},{:.3},{},{},{},{}", ts, elapsed, ch_name, sig_name, value, unit);
+            }
+            (csv, count)
+        };
+
+        std::fs::write(path, csv.as_bytes()).map_err(|e| e.to_string())?;
+        Ok(count)
+    }
+
     fn backend_index(&self, handle: u32) -> Result<(String, u8), String> {
         self.shared
             .lock()
