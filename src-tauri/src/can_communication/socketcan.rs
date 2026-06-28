@@ -108,15 +108,15 @@ impl CanBackend for SocketCanBackend {
             .collect()
     }
 
-    fn open_channel(&mut self, index: u8, bitrate: u32) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), String> {
+    fn open_channel(&mut self, index: u8, bitrate: u32) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
         let channels = self.list_channels();
         let name = channels
             .get(index as usize)
             .ok_or_else(|| {
-                format!(
+                CanOpenError::ChannelIndexOutOfRange(format!(
                     "SocketCAN channel index {index} out of range ({} found)",
                     channels.len()
-                )
+                ))
             })?
             .clone();
 

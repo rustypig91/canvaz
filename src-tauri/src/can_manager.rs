@@ -343,6 +343,24 @@ impl CanManager {
         }
         Ok(out)
     }
+    fn open_channel_with_password_if_required(
+        &mut self,
+        backend_name: String,
+        channel_name: String,
+        bitrate: u32,
+        admin_password: Option<&str>,
+    ) -> Result<(Box<dyn crate::can_communication::TxHandle>, Box<dyn crate::can_communication::RxHandle>), String> {
+        let can = self
+            .cans
+            .get_mut(&backend_name)
+            .ok_or_else(|| format!("No backend '{backend_name}'"))?;
+        let hw_index = can
+            .list_channels()
+            .iter()
+            .position(|n| n == &channel_name)
+            .ok_or_else(|| format!("Channel '{channel_name}' not found in '{backend_name}'"))? as u8;
+        can.open(hw_index, bitrate, admin_password)
+    }
 
     pub fn open_channel(
         &mut self,
@@ -401,7 +419,7 @@ impl CanManager {
             dbc: dbc.as_deref().cloned(),
         };
 
-        can.open(hw_index, bitrate)?;
+        can.open(hw_index, bitrate, None)?;
 
         {
             let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;

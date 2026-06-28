@@ -27,6 +27,14 @@ pub struct CanFrame {
     pub data: Vec<u8>,
 }
 
+// ── Error ─────────────────────────────────────────────────────────────────────
+
+enum CanOpenError {
+    AlreadyOpen(String),
+    ChannelIndexOutOfRange(String),
+    PasswordRequired,
+}
+
 // ── Backend traits ────────────────────────────────────────────────────────────
 
 pub trait TxHandle: Send + 'static {
@@ -42,7 +50,12 @@ pub trait RxHandle: Send + 'static {
 
 pub trait CanBackend: Send + 'static {
     fn list_channels(&self) -> Vec<String>;
-    fn open_channel(&mut self, index: u8, bitrate: u32) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), String>;
+    fn open_channel(
+        &mut self,
+        index: u8,
+        bitrate: u32,
+        admin_password: Option<&str>,
+    ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError>;
 }
 
 // ── Send queue ────────────────────────────────────────────────────────────────
@@ -77,6 +90,7 @@ pub struct Can {
     channels: HashMap<u8, OpenChannel>,
     on_rx: Arc<dyn Fn(u8, CanFrame) + Send + Sync + 'static>,
     on_tx: Arc<dyn Fn(u8, CanFrame) + Send + Sync + 'static>,
+    admin_password: Option<String>,
 }
 
 impl Can {
@@ -90,6 +104,7 @@ impl Can {
             channels: HashMap::new(),
             on_rx: Arc::new(on_rx),
             on_tx: Arc::new(on_tx),
+            admin_password: None,
         }
     }
 
@@ -97,12 +112,18 @@ impl Can {
         self.backend.list_channels()
     }
 
-    pub fn open(&mut self, channel: u8, bitrate: u32) -> Result<(), String> {
+    pub fn open(&mut self, channel: u8, bitrate: u32, admin_password: Option<&str>) -> Result<(), CanOpenError> {
         if self.channels.contains_key(&channel) {
-            return Err(format!("Channel {channel} is already open"));
+            return Err(CanOpenError::AlreadyOpen(format!("Channel {channel} is already open")));
         }
 
-        let (tx_handle, rx_handle) = self.backend.open_channel(channel, bitrate)?;
+        if self.admin_password.is_none() && admin_password.is_some() {
+            self.admin_password = Some(admin_password.unwrap().to_string());
+        }
+
+        let (tx_handle, rx_handle) = self
+            .backend
+            .open_channel(channel, bitrate, self.admin_password.as_deref())?;
 
         let queue: SendQueue = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
