@@ -68,7 +68,7 @@ async fn open_channel(
     .unwrap_or_else(|e| Err(e.to_string()));
 
     if let Ok(ref info) = result {
-        info!("Opened channel '{}' (handle {}) with baudrate {}", info.id, handle, bitrate);
+        info!("Opened channel '{}:{}' (handle {}) with baudrate {}", info.backend, info.name, handle, bitrate);
     } else {
         error!("Failed to open channel {handle}: {}", result.as_ref().err().unwrap());
     }

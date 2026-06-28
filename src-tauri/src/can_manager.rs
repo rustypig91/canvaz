@@ -71,6 +71,7 @@ pub struct SignalSample {
 pub struct ChannelInfo {
     pub backend: String,
     pub name: String,
+    pub bitrate: Option<u32>,
     pub dbc: Option<ParsedDbc>,
 }
 
@@ -335,6 +336,7 @@ impl CanManager {
                 out.push(ChannelInfo {
                     backend: backend_name.clone(),
                     name: ch,
+                    bitrate: None,
                     dbc: None,
                 });
             }
@@ -380,6 +382,7 @@ impl CanManager {
         let info = ChannelInfo {
             backend: backend_name.to_string(),
             name: channel_name.to_string(),
+            bitrate: None,
             dbc: dbc.as_deref().cloned(),
         };
         lock.index_to_handle.insert((backend_name.to_string(), hw_index), handle);
@@ -425,7 +428,10 @@ impl CanManager {
         {
             let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
             match can.open(hw_index, bitrate, None) {
-                Ok(()) => return self.channel_info(handle),
+                Ok(()) => {
+                    self.set_channel_bitrate(handle, bitrate);
+                    return self.channel_info(handle);
+                }
                 Err(crate::can_communication::CanOpenError::PasswordRequired) => {}
                 Err(e) => return Err(e.to_string()),
             }
@@ -436,6 +442,7 @@ impl CanManager {
             let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
             can.open(hw_index, bitrate, Some(&pw)).map_err(|e| e.to_string())?;
         }
+        self.set_channel_bitrate(handle, bitrate);
         self.channel_info(handle)
     }
 
@@ -575,6 +582,14 @@ impl CanManager {
             .ok_or_else(|| format!("channel handle {handle} not found; call create_channel first"))
     }
 
+    fn set_channel_bitrate(&self, handle: u32, bitrate: u32) {
+        if let Ok(mut lock) = self.shared.lock() {
+            if let Some(ch) = lock.channels.get_mut(&handle) {
+                ch.info.bitrate = Some(bitrate);
+            }
+        }
+    }
+
     fn channel_info(&self, handle: u32) -> Result<ChannelInfo, String> {
         self.shared
             .lock()
@@ -616,8 +631,8 @@ fn make_rx_callback(
             };
 
             let window_ms = lock.window_ms;
-            let (channel_id, dbc) = match lock.channels.get(&handle) {
-                Some(ch) => (ch.info.id.clone(), ch.dbc.clone()),
+            let dbc = match lock.channels.get(&handle) {
+                Some(ch) => ch.dbc.clone(),
                 None => return,
             };
 
@@ -705,8 +720,8 @@ fn make_tx_callback(
                 None => return,
             };
             let window_ms = lock.window_ms;
-            let (channel_id, dbc) = match lock.channels.get(&handle) {
-                Some(ch) => (ch.info.id.clone(), ch.dbc.clone()),
+            let dbc = match lock.channels.get(&handle) {
+                Some(ch) => ch.dbc.clone(),
                 None => return,
             };
             let raw_signals = dbc
