@@ -80,8 +80,6 @@ interface CanFrameEvent {
 }
 
 interface ChannelMeta {
-  handle: number;
-  id: string;
   backend: string;
   name: string;
   bitrate: number | null;
@@ -90,7 +88,7 @@ interface ChannelMeta {
 
 interface PlotSignalEntry { signal_name: string; channel: string; }
 interface PlotPaneConfig { signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean; }
-interface ChannelInfo { handle: number; id: string; backend: string; name: string; dbc: ParsedDbc | null; }
+interface ChannelInfo { backend: string; name: string; dbc: ParsedDbc | null; }
 interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate?: number | null; }
 interface SimulateEntry { signal_name: string; channel: string; value: number; period_ms: number; }
 
@@ -821,11 +819,12 @@ const channels = new Map<number, ChannelMeta>();
 let availableIfaces: ChannelInfo[] = [];
 
 function metaById(id: string): ChannelMeta | undefined {
-  for (const meta of channels.values()) if (meta.id === id) return meta;
+  for (const meta of channels.values()) if (`${meta.backend}:${meta.name}` === id) return meta;
   return undefined;
 }
 function handleFor(id: string): number | undefined {
-  return metaById(id)?.handle;
+  for (const [h, meta] of channels) if (`${meta.backend}:${meta.name}` === id) return h;
+  return undefined;
 }
 
 function channelDisplayName(id: string) { return id.includes(':') ? id.split(':')[1] : id; }
@@ -1029,11 +1028,9 @@ async function applyChannelDialog() {
     const name = custom || (document.getElementById("select-iface") as HTMLSelectElement).value;
     if (!name) return;
     const backend = availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
-    const channelId = `${backend}:${name}`;
-
     // Register channel with backend (allocates handle, loads DBC); hardware opens on Start.
     const handle = await invoke<number>("create_channel", { backendName: backend, channelName: name, dbcPath: dialogPendingDbc }).catch(() => null);
-    if (handle !== null) channels.set(handle, { handle, id: channelId, backend, name, bitrate, dbc: null });
+    if (handle !== null) channels.set(handle, { backend, name, bitrate, dbc: null });
     configuredChannels.push({ name, backend, dbc_path: dialogPendingDbc, bitrate });
 
     refreshChannelList();
@@ -1052,7 +1049,7 @@ async function applyChannelDialog() {
       if (updatedHandle !== null) {
         const existing = channels.get(updatedHandle);
         if (existing) { existing.bitrate = bitrate; if (!dialogPendingDbc) existing.dbc = null; }
-        else channels.set(updatedHandle, { handle: updatedHandle, id, backend: ch.backend, name: ch.name, bitrate, dbc: null });
+        else channels.set(updatedHandle, { backend: ch.backend, name: ch.name, bitrate, dbc: null });
       }
     }
 
@@ -1649,11 +1646,10 @@ async function applyProject(project: Project) {
 
   for (const ch of project.channels) {
     const backend = ch.backend ?? "socketcan";
-    const channelId = `${backend}:${ch.name}`;
     const bitrate = ch.bitrate ?? null;
     configuredChannels.push({ name: ch.name, backend, dbc_path: ch.dbc_path, bitrate });
     const handle = await invoke<number>("create_channel", { backendName: backend, channelName: ch.name, dbcPath: ch.dbc_path ?? null }).catch(() => null);
-    if (handle !== null) channels.set(handle, { handle, id: channelId, backend, name: ch.name, bitrate, dbc: null });
+    if (handle !== null) channels.set(handle, { backend, name: ch.name, bitrate, dbc: null });
   }
 
   refreshChannelList();
@@ -1776,7 +1772,7 @@ async function startApp() {
     if (handle === undefined) {
       const h = await invoke<number>("create_channel", { backendName: ch.backend, channelName: ch.name, dbcPath: ch.dbc_path ?? null }).catch(() => null);
       if (h === null) continue;
-      channels.set(h, { handle: h, id, backend: ch.backend, name: ch.name, bitrate: ch.bitrate ?? null, dbc: null });
+      channels.set(h, { backend: ch.backend, name: ch.name, bitrate: ch.bitrate ?? null, dbc: null });
       handle = h;
     }
     const info = await openChannelByHandle(handle, ch.bitrate ?? null);
@@ -2271,8 +2267,8 @@ let traceSortCol: TraceSortCol = null;
 let traceSortDir: "asc" | "desc" = "asc";
 let traceLocalBuffer: TraceEntry[] = [];
 
-function traceKey(channel: string, canId: number, direction: "rx" | "tx") {
-  return `${channel}::${canId}::${direction}`;
+function traceKey(handle: number, canId: number, direction: "rx" | "tx") {
+  return `${handle}::${canId}::${direction}`;
 }
 
 function fmtId(canId: number, isExtended: boolean): string {
@@ -2484,7 +2480,8 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
 function onCanFrame(ev: CanFrameEvent) {
   if (!appRunning) return;
 
-  const channelId = channels.get(ev.channel_handle)?.id ?? String(ev.channel_handle);
+  const meta = channels.get(ev.channel_handle);
+  const channelId = meta ? `${meta.backend}:${meta.name}` : String(ev.channel_handle);
 
   // Update seen sets (for filter autocomplete) and cycle timing.
   traceSeenChannels.add(channelId);
@@ -2493,7 +2490,7 @@ function onCanFrame(ev: CanFrameEvent) {
   else traceSeenNoMsg = true;
 
   const direction = ev.direction ?? "rx";
-  const key = traceKey(channelId, ev.can_id, direction);
+  const key = traceKey(ev.channel_handle, ev.can_id, direction);
   const prev = traceLastTs.get(key);
   const cycleTime = prev != null ? ev.timestamp_ms - prev : null;
   traceLastTs.set(key, ev.timestamp_ms);
@@ -2570,8 +2567,9 @@ async function loadTraceFrames() {
   const cycleTimes = new Map<string, number>();
   // Backend returns oldest-first; we want newest-first in traceLocalBuffer.
   traceLocalBuffer = frames.map(f => {
-    const channelId = channels.get(f.channel_handle)?.id ?? String(f.channel_handle);
-    const k = traceKey(channelId, f.can_id, f.direction);
+    const fmeta = channels.get(f.channel_handle);
+    const channelId = fmeta ? `${fmeta.backend}:${fmeta.name}` : String(f.channel_handle);
+    const k = traceKey(f.channel_handle, f.can_id, f.direction);
     const prev = cycleTimes.get(k);
     const cycleTimeMs = prev != null ? f.timestamp_ms - prev : null;
     cycleTimes.set(k, f.timestamp_ms);

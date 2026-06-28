@@ -69,8 +69,6 @@ pub struct SignalSample {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelInfo {
-    pub handle: u32,
-    pub id: String,
     pub backend: String,
     pub name: String,
     pub dbc: Option<ParsedDbc>,
@@ -335,8 +333,6 @@ impl CanManager {
         for (backend_name, can) in &self.cans {
             for ch in can.list_channels() {
                 out.push(ChannelInfo {
-                    handle: 0,
-                    id: format!("{backend_name}:{ch}"),
                     backend: backend_name.clone(),
                     name: ch,
                     dbc: None,
@@ -355,7 +351,6 @@ impl CanManager {
         channel_name: &str,
         dbc_path: Option<&str>,
     ) -> Result<u32, String> {
-        let channel_id = format!("{backend_name}:{channel_name}");
 
         let hw_index = self
             .cans
@@ -383,8 +378,6 @@ impl CanManager {
 
         let handle = NEXT_CHANNEL_HANDLE.fetch_add(1, Ordering::Relaxed);
         let info = ChannelInfo {
-            handle,
-            id: channel_id,
             backend: backend_name.to_string(),
             name: channel_name.to_string(),
             dbc: dbc.as_deref().cloned(),
@@ -392,7 +385,23 @@ impl CanManager {
         lock.index_to_handle.insert((backend_name.to_string(), hw_index), handle);
         lock.handle_to_index.insert(handle, (backend_name.to_string(), hw_index));
         lock.channels.insert(handle, ChannelData::new(info, dbc));
+        info!("Created {backend_name} channel {channel_name} (handle: {handle})");
         Ok(handle)
+    }
+
+    pub fn remove_channel(&mut self, handle: u32) -> Result<(), String> {
+        let (backend_name, hw_index) = {
+            let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
+            let (bn, idx) = lock
+                .handle_to_index
+                .remove(&handle)
+                .ok_or_else(|| format!("channel handle {handle} not found"))?;
+            lock.index_to_handle.remove(&(bn.clone(), idx));
+            lock.channels.remove(&handle);
+            (bn, idx)
+        };
+        info!("Removed channel with handle {handle}");
+        self.cans.get_mut(&backend_name).ok_or("Backend not found")?.close(hw_index)
     }
 
     /// Open the hardware for a channel registered with `create_channel`.
