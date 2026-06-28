@@ -82,7 +82,7 @@ interface CanFrameEvent {
 interface PlotSignalEntry { signal_name: string; channel: string; }
 interface PlotPaneConfig { signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean; }
 interface ChannelInfo { backend: string; name: string; bitrate: number | null; dbc: ParsedDbc | null; }
-interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate?: number | null; handle?: number; }
+interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate?: number | null; handle: number; }
 interface SimulateEntry { signal_name: string; channel: string; value: number; period_ms: number; }
 
 interface SimRawFrameConfig {
@@ -980,19 +980,20 @@ function promptSudoPassword(): Promise<string | null> {
 }
 
 // Open a channel by its u32 handle. If root is required the Rust side emits
-// "request-sudo-password", the global listener shows the dialog, and open_channel
+// "request-admin-password", the global listener shows the dialog, and open_channel
 // unblocks automatically.
 async function openChannelByHandle(
     handle: number,
     bitrate: number | null,
-): Promise<ChannelInfo | null> {
+): Promise<> {
     try {
-        const info = await invoke<ChannelInfo>("open_channel", {
-            handle,
+        await invoke<void>("open_channel", {
+            channelHandle: handle,
             bitrate: bitrate ?? 500000,
         });
         // Store the DBC returned by the channel (freshly parsed from disk).
-        if (info.dbc) { const m = channels.get(handle); if (m) m.dbc = info.dbc; }
+        const info = channels.get(handle);
+        if (info?.dbc) { const m = channels.get(handle); if (m) m.dbc = info.dbc; }
         return info;
     } catch (e) {
         const msg = String(e);
@@ -1012,12 +1013,23 @@ async function applyChannelDialog() {
     if (dialogMode === "add") {
         const custom = (document.getElementById("input-iface-custom") as HTMLInputElement).value.trim();
         const name = custom || (document.getElementById("select-iface") as HTMLSelectElement).value;
-        if (!name) return;
+        if (!name) {
+            setError("Channel name not set");
+            return;
+        };
         const backend = availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
         // Register channel with backend (allocates handle, loads DBC); hardware opens on Start.
-        const handle = await invoke<number>("create_channel", { backendName: backend, channelName: name, dbcPath: dialogPendingDbc }).catch(() => null);
-        if (handle !== null) channels.set(handle, { backend, name, bitrate, dbc: null });
-        configuredChannels.push({ name, backend, dbc_path: dialogPendingDbc, bitrate });
+        let handle: number;
+        try {
+            handle = await invoke<number>("create_channel", { backendName: backend, channelName: name, dbcPath: dialogPendingDbc });
+        } catch (e) {
+            const msg = String(e);
+            setError(`Failed to create channel: ${msg}`);
+            return;
+        }
+
+        channels.set(handle, { backend, name, bitrate, dbc: null });
+        configuredChannels.push({ name, backend, dbc_path: dialogPendingDbc, bitrate, handle: handle });
 
         refreshChannelList();
         setStatus(`Added channel: ${name}`);
@@ -1219,8 +1231,9 @@ function refreshChannelList() {
     renderSimEntries();
 }
 
-function renderChannelList() {
+async function renderChannelList() {
     const list = document.getElementById("channel-list")!;
+
     list.innerHTML = "";
     for (const ch of configuredChannels) {
         const h = ch.handle;
@@ -1270,9 +1283,23 @@ function renderChannelList() {
         item.querySelector(".btn-close-ch")!.addEventListener("click", async (e) => {
             e.stopPropagation();
             if (!await confirmAndStop(`Stop live capture and remove "${name}"?`)) return;
+
             configuredChannels = configuredChannels.filter(c => c !== ch);
-            if (h !== undefined) channels.delete(h);
+            if (h !== undefined) {
+                try { await invoke("remove_channel", { channelHandle: h }); }
+                catch (e) {
+                    setError(`Remove channel error: ${e}`);
+                    return;
+                }
+                channels.delete(h);
+            }
+            else {
+                setError(`Channel "${name}" has no handle; cannot remove from backend`);
+                return;
+            }
+
             if (selectedChannel === h) selectChannel(null);
+
             renderChannelList();
             scheduleAutoSave();
         });
@@ -1551,6 +1578,7 @@ function buildProject(): Project {
             backend: ch.backend,
             dbc_path: (ch.handle !== undefined ? channels.get(ch.handle)?.dbc?.path : undefined) ?? ch.dbc_path ?? null,
             bitrate: (ch.handle !== undefined ? channels.get(ch.handle)?.bitrate : undefined) ?? ch.bitrate ?? null,
+            handle: ch.handle
         })),
         plot_panes: plotPanes.map(pane => ({
             signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: handleToId(s.channel) })),
@@ -1642,12 +1670,15 @@ async function applyProject(project: Project) {
     for (const ch of project.channels) {
         const backend = ch.backend ?? "socketcan";
         const bitrate = ch.bitrate ?? null;
-        const entry: ChannelConfig = { name: ch.name, backend, dbc_path: ch.dbc_path, bitrate };
+        const entry: ChannelConfig = { name: ch.name, backend, dbc_path: ch.dbc_path, bitrate, handle: 0 };
         configuredChannels.push(entry);
         const handle = await invoke<number>("create_channel", { backendName: backend, channelName: ch.name, dbcPath: ch.dbc_path ?? null }).catch(() => null);
         if (handle !== null) {
             channels.set(handle, { backend, name: ch.name, bitrate, dbc: null });
             entry.handle = handle;
+        }
+        else {
+            setError(`Failed to create channel ${ch.name} (${backend})`);
         }
     }
 
@@ -1886,7 +1917,7 @@ async function stopApp() {
     appRunning = false;
     // Close hardware connections; they will reopen on the next Start.
     for (const handle of openChannels) {
-        try { await invoke("close_channel", { handle }); } catch { }
+        try { await invoke("close_channel", { channelHandle: handle }); } catch { }
     }
     openChannels = [];
     // Channels are closed so backend periodics are stopped; just reset UI state.
@@ -3267,9 +3298,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     await listen<CanFrameEvent>("can-frame", (event) => onCanFrame(event.payload));
 
     // Sudo password request from the Rust backend — show dialog once, cache in Rust.
-    await listen("request-sudo-password", async () => {
+    await listen("request-admin-password", async () => {
         const pw = await promptSudoPassword();
-        await invoke("provide_sudo_password", { password: pw ?? null }).catch(() => { });
+        await invoke("provide_admin_password", { password: pw ?? null }).catch(() => { });
     });
 
     // Resolve paths

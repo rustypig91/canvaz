@@ -27,10 +27,9 @@ struct TauriState {
 
 // ── Sudo ──────────────────────────────────────────────────────────────────────
 
-#[cfg(target_os = "linux")]
 #[tauri::command]
-fn provide_sudo_password(password: Option<String>, state: State<'_, TauriState>) {
-    state.app_state.provide_sudo_password(password);
+fn provide_admin_password(password: Option<String>, state: State<'_, TauriState>) {
+    state.app_state.provide_admin_password(password);
 }
 
 // ── CAN channel commands ──────────────────────────────────────────────────────
@@ -55,34 +54,43 @@ fn create_channel(
 }
 
 #[tauri::command]
+fn remove_channel(
+    channel_handle: u32,
+    state: State<'_, TauriState>,
+) -> Result<(), String> {
+    state.can_manager.lock().map_err(|e| e.to_string())?.remove_channel(channel_handle)
+}
+
+#[tauri::command]
+fn created_channels(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>, String> {
+    Ok(state.can_manager.lock().map_err(|e| e.to_string())?.created_channels_info())
+}
+
+#[tauri::command]
 async fn open_channel(
-    handle: u32,
+    channel_handle: u32,
     bitrate: u32,
     state: State<'_, TauriState>,
-) -> Result<ChannelInfo, String> {
+) -> Result<(), String> {
     let can_manager = Arc::clone(&state.can_manager);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        can_manager.lock().map_err(|e| e.to_string())?.open_channel(handle, bitrate)
+        can_manager.lock().map_err(|e| e.to_string())?.open_channel(channel_handle, bitrate)
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));
 
-    if let Ok(ref info) = result {
-        info!("Opened channel '{}:{}' (handle {}) with baudrate {}", info.backend, info.name, handle, bitrate);
+    if let Ok(()) = result {
+        info!("Opened channel (handle {}) with baudrate {}", channel_handle, bitrate);
     } else {
-        error!("Failed to open channel {handle}: {}", result.as_ref().err().unwrap());
+        error!("Failed to open channel {channel_handle}: {}", result.as_ref().err().unwrap());
     }
     result
 }
 
 #[tauri::command]
-fn close_channel(handle: u32, state: State<'_, TauriState>) -> Result<(), String> {
-    state.can_manager.lock().map_err(|e| e.to_string())?.close_channel(handle)
-}
-
-#[tauri::command]
-fn get_open_channels(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>, String> {
-    Ok(state.can_manager.lock().map_err(|e| e.to_string())?.open_channels_info())
+fn close_channel(channel_handle: u32, state: State<'_, TauriState>) -> Result<(), String> {
+    debug!("Close channel request: handle={channel_handle}");
+    state.can_manager.lock().map_err(|e| e.to_string())?.close_channel(channel_handle)
 }
 
 // ── Send commands ─────────────────────────────────────────────────────────────
@@ -112,7 +120,7 @@ struct SendFrameCmd {
 
 #[tauri::command]
 fn send_frame(cmd: SendFrameCmd, state: State<'_, TauriState>) -> Result<(), String> {
-    state.can_manager.lock().map_err(|e| e.to_string())?.send_raw(cmd.channel_handle, cmd.can_id, cmd.data)
+    state.can_manager.lock().map_err(|e| e.to_string())?.send_frame(cmd.channel_handle, cmd.can_id, cmd.data)
 }
 
 #[derive(Deserialize)]
@@ -262,13 +270,13 @@ pub fn run() {
             write_text_file,
             read_text_file,
             file_exists,
-            #[cfg(target_os = "linux")]
-            provide_sudo_password,
+            provide_admin_password,
             list_can_interfaces,
             create_channel,
+            remove_channel,
             open_channel,
             close_channel,
-            get_open_channels,
+            created_channels,
             send_message,
             send_frame,
             add_periodic_frame,

@@ -1,30 +1,28 @@
 use std::sync::Arc;
 
-#[cfg(target_os = "linux")]
 use std::sync::{Condvar, Mutex};
 
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
-#[cfg(target_os = "linux")]
-enum SudoRequestState {
+
+enum PasswordRequestState {
     Idle,
     Waiting,
     Done,
 }
 
-#[cfg(target_os = "linux")]
-struct SudoState {
+
+struct PwdState {
     cached: Mutex<Option<String>>,
-    request: Mutex<SudoRequestState>,
+    request: Mutex<PasswordRequestState>,
     condvar: Condvar,
 }
 
-#[cfg(target_os = "linux")]
-impl SudoState {
+impl PwdState {
     fn new() -> Self {
         Self {
             cached: Mutex::new(None),
-            request: Mutex::new(SudoRequestState::Idle),
+            request: Mutex::new(PasswordRequestState::Idle),
             condvar: Condvar::new(),
         }
     }
@@ -38,19 +36,19 @@ impl SudoState {
         }
         {
             let mut req = self.request.lock().map_err(|e| e.to_string())?;
-            if matches!(*req, SudoRequestState::Idle | SudoRequestState::Done) {
-                *req = SudoRequestState::Waiting;
-                let _ = app.emit("request-sudo-password", ());
+            if matches!(*req, PasswordRequestState::Idle | PasswordRequestState::Done) {
+                *req = PasswordRequestState::Waiting;
+                let _ = app.emit("request-admin-password", ());
             }
         }
         {
             let mut req = self
                 .condvar
                 .wait_while(self.request.lock().map_err(|e| e.to_string())?, |r| {
-                    matches!(r, SudoRequestState::Waiting)
+                    matches!(r, PasswordRequestState::Waiting)
                 })
                 .map_err(|e| e.to_string())?;
-            *req = SudoRequestState::Idle;
+            *req = PasswordRequestState::Idle;
         }
         self.cached
             .lock()
@@ -68,7 +66,7 @@ impl SudoState {
             }
         }
         if let Ok(mut req) = self.request.lock() {
-            *req = SudoRequestState::Done;
+            *req = PasswordRequestState::Done;
         }
         self.condvar.notify_all();
     }
@@ -78,26 +76,22 @@ impl SudoState {
 
 pub struct AppState {
     pub app: AppHandle,
-    #[cfg(target_os = "linux")]
-    sudo: SudoState,
+    pwd: PwdState,
 }
 
 impl AppState {
     pub fn new(app: AppHandle) -> Arc<Self> {
         Arc::new(Self {
             app,
-            #[cfg(target_os = "linux")]
-            sudo: SudoState::new(),
+            pwd: PwdState::new(),
         })
     }
 
-    #[cfg(target_os = "linux")]
-    pub fn get_sudo_password(&self) -> Result<String, String> {
-        self.sudo.get_or_request(&self.app)
+    pub fn get_admin_password(&self) -> Result<String, String> {
+        self.pwd.get_or_request(&self.app)
     }
 
-    #[cfg(target_os = "linux")]
-    pub fn provide_sudo_password(&self, password: Option<String>) {
-        self.sudo.provide(password);
+    pub fn provide_admin_password(&self, password: Option<String>) {
+        self.pwd.provide(password);
     }
 }

@@ -140,7 +140,8 @@ impl Can {
     }
 
     pub fn open(&mut self, channel: u8, bitrate: u32, admin_password: Option<&str>) -> Result<(), CanOpenError> {
-        if self.channels.contains_key(&channel) {
+        if self.is_open(channel) {
+            error!("Attempted to open channel {channel} which is already open");
             return Err(CanOpenError::AlreadyOpen(format!("Channel {channel} is already open")));
         }
 
@@ -182,15 +183,19 @@ impl Can {
     }
 
     pub fn close(&mut self, channel: u8) -> Result<(), String> {
-        let state = self
-            .channels
-            .remove(&channel)
-            .ok_or_else(|| format!("Channel {channel} is not open"))?;
+        let state = self.channels.remove(&channel).ok_or_else(|| {
+            error!("Attempted to close channel {channel} which is not open");
+            format!("Channel {channel} is not open")
+        })?;
         state.stop.store(true, Ordering::Relaxed);
         let _ = state.rx_thread.join();
         let _ = state.tx_thread.join();
         info!("Closed channel {channel}");
         Ok(())
+    }
+
+    pub fn is_open(&self, channel: u8) -> bool {
+        self.channels.contains_key(&channel)
     }
 
     /// Enqueue a frame to be sent exactly once.
