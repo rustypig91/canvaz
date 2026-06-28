@@ -985,7 +985,7 @@ function promptSudoPassword(): Promise<string | null> {
 async function openChannelByHandle(
     handle: number,
     bitrate: number | null,
-): Promise<> {
+): Promise<void> {
     try {
         await invoke<void>("open_channel", {
             channelHandle: handle,
@@ -994,7 +994,6 @@ async function openChannelByHandle(
         // Store the DBC returned by the channel (freshly parsed from disk).
         const info = channels.get(handle);
         if (info?.dbc) { const m = channels.get(handle); if (m) m.dbc = info.dbc; }
-        return info;
     } catch (e) {
         const msg = String(e);
         if (msg === "Sudo authentication cancelled") {
@@ -1002,7 +1001,7 @@ async function openChannelByHandle(
         } else {
             setError(`Channel error: ${msg}`);
         }
-        return null;
+        return;
     }
 }
 
