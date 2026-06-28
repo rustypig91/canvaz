@@ -1020,6 +1020,8 @@ dialog { min-width: 380px; }
 .about-content p { color: var(--text); line-height: 1.5; max-width: 320px; }
 .about-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 6px; }
 .about-github { color: var(--accent); border-color: var(--accent); }
+/* Update dialog: group buttons at the right so hidden ones collapse cleanly. */
+#dialog-update .about-footer { justify-content: flex-end; gap: 8px; width: 100%; }
 
 /* ── Misc ────────────────────────────────────────────────────────────────── */
 .label-muted { color: var(--text-muted); font-size: 12px; }
