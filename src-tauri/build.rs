@@ -20,9 +20,6 @@ fn main() {
         git_version
     };
 
-    // Drop the tag prefix so the in-app version reads "0.1.0", not "canvaz-v0.1.0".
-    let git_version = git_version.strip_prefix("canvaz-v").map(str::to_string).unwrap_or(git_version);
-
     println!("cargo:rustc-env=GIT_VERSION={git_version}");
     println!("cargo:rerun-if-env-changed=CANVAZ_VERSION");
     println!("cargo:rerun-if-changed=../.git/HEAD");

@@ -2096,7 +2096,7 @@ const RELEASES_LATEST_API = `https://api.github.com/repos/${GITHUB_REPO}/release
 const RELEASES_PAGE_URL = `https://github.com/${GITHUB_REPO}/releases/latest`;
 
 interface LatestRelease {
-    version: string; // tag with the canvaz-v prefix stripped, e.g. "0.1.0"
+    version: string; // Version tag e.g. "v0.1.0"
     url: string;     // page to open for the download
 }
 
@@ -2106,15 +2106,11 @@ let currentVersion = "";
 // dev builds carry a git-describe suffix ("0.1.0-5-gabc", "-modified") or are
 // "unknown". Only clean release builds prompt at startup.
 function isReleaseBuild(version: string): boolean {
-    return /^\d+\.\d+\.\d+$/.test(version);
-}
-
-function normalizeReleaseVersion(tag: string): string {
-    return tag.replace(/^canvaz-v/, "").trim();
+    return /^v\d+\.\d+\.\d+$/.test(version);
 }
 
 // True when `latest` is genuinely newer than what we run. A dev build of the
-// same base version (e.g. "0.1.0-5-gabc" vs released "0.1.0") is not an update.
+// same base version (e.g. "v0.1.0-5-gabc" vs released "v0.1.0") is not an update.
 function isNewerVersion(current: string, latest: string): boolean {
     if (!latest) return false;
     if (current === latest) return false;
@@ -2129,7 +2125,7 @@ async function fetchLatestRelease(): Promise<LatestRelease> {
     if (!resp.ok) throw new Error(`GitHub API returned ${resp.status}`);
     const data = await resp.json() as { tag_name?: string; html_url?: string };
     return {
-        version: normalizeReleaseVersion(data.tag_name ?? ""),
+        version: data.tag_name ?? "",
         url: data.html_url || RELEASES_PAGE_URL,
     };
 }
