@@ -96,6 +96,14 @@ fn close_channel(channel_handle: u32, state: State<'_, TauriState>) -> Result<()
     state.can_manager.lock().map_err(|e| e.to_string())?.close_channel(channel_handle)
 }
 
+/// Close all hardware and forget every channel. Called by the frontend on startup
+/// so a page reload doesn't collide with channels left open by the previous load.
+#[tauri::command]
+fn reset_backend(state: State<'_, TauriState>) -> Result<(), String> {
+    state.can_manager.lock().map_err(|e| e.to_string())?.reset();
+    Ok(())
+}
+
 // ── Send commands ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -279,6 +287,7 @@ pub fn run() {
             remove_channel,
             open_channel,
             close_channel,
+            reset_backend,
             created_channels,
             send_message,
             send_frame,

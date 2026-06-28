@@ -3167,6 +3167,10 @@ function appendLogEntry(entry: LogEntry) {
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 window.addEventListener("DOMContentLoaded", async () => {
+    // The Rust backend outlives a page reload, so any channels opened by the
+    // previous load are still registered/open. Reset it before we rebuild state.
+    await invoke("reset_backend").catch(() => { });
+
     // Tab switching
     document.querySelectorAll<HTMLButtonElement>(".tab-btn").forEach(btn => {
         btn.addEventListener("click", () => {

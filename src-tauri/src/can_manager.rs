@@ -457,19 +457,36 @@ impl CanManager {
         Ok(dbc.map(|d| (*d).clone()))
     }
 
+    /// Close the hardware but keep the channel registered, so it can be reopened
+    /// on the next Start. Unregistering the handle is `remove_channel`'s job.
     pub fn close_channel(&mut self, handle: u32) -> Result<(), String> {
-        let (backend_name, hw_index) = {
-            let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
-            let (bn, idx) = lock
-                .handle_to_index
-                .remove(&handle)
-                .ok_or_else(|| format!("channel handle {handle} not found"))?;
-            (bn, idx)
-        };
+        let (backend_name, hw_index) = self.backend_index(handle)?;
         self.cans
             .get_mut(&backend_name)
             .ok_or("Backend not found")?
             .close(hw_index)
+    }
+
+    /// Close all open hardware and drop every channel registration/data store.
+    /// Used to give a reloading frontend a clean backend to rebuild from.
+    pub fn reset(&mut self) {
+        let indices: Vec<(String, u8)> = match self.shared.lock() {
+            Ok(lock) => lock.handle_to_index.values().cloned().collect(),
+            Err(_) => return,
+        };
+        for (backend_name, hw_index) in indices {
+            if let Some(can) = self.cans.get_mut(&backend_name) {
+                if can.is_open(hw_index) {
+                    let _ = can.close(hw_index);
+                }
+            }
+        }
+        if let Ok(mut lock) = self.shared.lock() {
+            lock.channels.clear();
+            lock.index_to_handle.clear();
+            lock.handle_to_index.clear();
+        }
+        info!("Reset CAN manager: all channels closed and unregistered");
     }
 
     pub fn created_channels_info(&self) -> Vec<ChannelInfo> {
