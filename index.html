@@ -37,6 +37,7 @@
         <div class="menu-item" id="menu-about">
           <button class="menu-trigger">About</button>
           <div class="menu-dropdown">
+            <button class="menu-action" data-action="check-updates">Check for Updates…</button>
             <button class="menu-action" data-action="about">About CAN Signals</button>
           </div>
         </div>
@@ -222,6 +223,19 @@
         <div class="about-footer">
           <button id="btn-github" class="btn btn-sm about-github">GitHub ↗</button>
           <button id="btn-about-close" class="btn btn-primary">Close</button>
+        </div>
+      </div>
+    </dialog>
+
+    <!-- Update dialog -->
+    <dialog id="dialog-update">
+      <div class="about-content">
+        <h2 id="update-title">Update available</h2>
+        <p id="update-message">…</p>
+        <div class="about-footer">
+          <button id="btn-update-skip" class="btn btn-sm">Skip this version</button>
+          <button id="btn-update-close" class="btn btn-sm">Later</button>
+          <button id="btn-update-download" class="btn btn-primary">Download</button>
         </div>
       </div>
     </dialog>

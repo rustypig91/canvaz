@@ -2034,6 +2034,9 @@ async function exportCsv(): Promise<boolean> {
 
 interface Preferences {
     sidebarWidth?: number;
+    // Latest release version the user chose to skip. While this matches the
+    // newest release we won't prompt at startup; a newer release clears it.
+    skippedVersion?: string;
 }
 
 let preferencesPath: string | null = null;
@@ -2056,6 +2059,116 @@ function savePreferences() {
         path: preferencesPath,
         content: JSON.stringify(preferences, null, 2),
     }).catch(() => { });
+}
+
+// ── Update checker ────────────────────────────────────────────────────────────
+// Compares the running version against the newest published GitHub release. At
+// startup we only nag on real release builds (clean semver); development builds
+// are skipped automatically but can still check manually via About → Check for
+// Updates. Skipping a version is remembered in preferences until a newer one
+// appears.
+
+const GITHUB_REPO = "rustypig91/canvaz";
+const RELEASES_LATEST_API = `https://api.github.com/repos/${GITHUB_REPO}/releases/latest`;
+const RELEASES_PAGE_URL = `https://github.com/${GITHUB_REPO}/releases/latest`;
+
+interface LatestRelease {
+    version: string; // tag with the canvaz-v prefix stripped, e.g. "0.1.0"
+    url: string;     // page to open for the download
+}
+
+let currentVersion = "";
+
+// The in-app version build.rs bakes in. Release builds are a clean "X.Y.Z";
+// dev builds carry a git-describe suffix ("0.1.0-5-gabc", "-modified") or are
+// "unknown". Only clean release builds prompt at startup.
+function isReleaseBuild(version: string): boolean {
+    return /^\d+\.\d+\.\d+$/.test(version);
+}
+
+function normalizeReleaseVersion(tag: string): string {
+    return tag.replace(/^canvaz-v/, "").trim();
+}
+
+// True when `latest` is genuinely newer than what we run. A dev build of the
+// same base version (e.g. "0.1.0-5-gabc" vs released "0.1.0") is not an update.
+function isNewerVersion(current: string, latest: string): boolean {
+    if (!latest) return false;
+    if (current === latest) return false;
+    if (current.startsWith(`${latest}-`)) return false;
+    return true;
+}
+
+async function fetchLatestRelease(): Promise<LatestRelease> {
+    const resp = await fetch(RELEASES_LATEST_API, {
+        headers: { Accept: "application/vnd.github+json" },
+    });
+    if (!resp.ok) throw new Error(`GitHub API returned ${resp.status}`);
+    const data = await resp.json() as { tag_name?: string; html_url?: string };
+    return {
+        version: normalizeReleaseVersion(data.tag_name ?? ""),
+        url: data.html_url || RELEASES_PAGE_URL,
+    };
+}
+
+function openUpdateDialog(opts: {
+    title: string;
+    message: string;
+    downloadUrl: string | null;
+    skipVersion: string | null;
+}) {
+    document.getElementById("update-title")!.textContent = opts.title;
+    document.getElementById("update-message")!.textContent = opts.message;
+
+    const downloadBtn = document.getElementById("btn-update-download") as HTMLButtonElement;
+    const skipBtn = document.getElementById("btn-update-skip") as HTMLButtonElement;
+    const dialog = document.getElementById("dialog-update") as HTMLDialogElement;
+
+    downloadBtn.style.display = opts.downloadUrl ? "" : "none";
+    skipBtn.style.display = opts.skipVersion ? "" : "none";
+
+    downloadBtn.onclick = () => { if (opts.downloadUrl) openUrl(opts.downloadUrl); };
+    skipBtn.onclick = () => {
+        if (opts.skipVersion) { preferences.skippedVersion = opts.skipVersion; savePreferences(); }
+        dialog.close();
+    };
+
+    dialog.showModal();
+}
+
+// `manual` distinguishes the explicit About → Check for Updates action (which
+// always reports a result and ignores the skip preference) from the silent
+// startup check (which only surfaces a brand-new, non-skipped release).
+async function checkForUpdates(manual: boolean) {
+    if (manual) setStatus("Checking for updates…");
+
+    let latest: LatestRelease;
+    try {
+        latest = await fetchLatestRelease();
+    } catch (e) {
+        if (manual) openUpdateDialog({ title: "Update check failed", message: `Could not reach GitHub: ${e}`, downloadUrl: null, skipVersion: null });
+        return;
+    }
+
+    if (!latest.version) {
+        if (manual) openUpdateDialog({ title: "Update check failed", message: "Could not determine the latest version.", downloadUrl: null, skipVersion: null });
+        return;
+    }
+
+    if (!isNewerVersion(currentVersion, latest.version)) {
+        if (manual) openUpdateDialog({ title: "Up to date", message: `You're running the latest version (${currentVersion}).`, downloadUrl: null, skipVersion: null });
+        return;
+    }
+
+    // A newer release exists. Honour a prior skip only for the silent check.
+    if (!manual && preferences.skippedVersion === latest.version) return;
+
+    openUpdateDialog({
+        title: "Update available",
+        message: `Version ${latest.version} is available — you're on ${currentVersion}.`,
+        downloadUrl: latest.url,
+        skipVersion: latest.version,
+    });
 }
 
 // ── Window size (data retention) ─────────────────────────────────────────────
@@ -2224,6 +2337,9 @@ function setupMenuBar() {
     document.getElementById("btn-about-close")!.addEventListener("click", () => {
         (document.getElementById("dialog-about") as HTMLDialogElement).close();
     });
+    document.getElementById("btn-update-close")!.addEventListener("click", () => {
+        (document.getElementById("dialog-update") as HTMLDialogElement).close();
+    });
     document.getElementById("btn-github")!.addEventListener("click", () => {
         openUrl("https://github.com/rustypig91/canvaz");
     });
@@ -2249,6 +2365,7 @@ function handleMenuAction(action: string) {
             invoke<string>("get_version").then(v => { document.getElementById("about-version")!.textContent = v; }).catch(() => { });
             (document.getElementById("dialog-about") as HTMLDialogElement).showModal();
             break;
+        case "check-updates": checkForUpdates(true); break;
     }
 }
 
@@ -3294,6 +3411,13 @@ window.addEventListener("DOMContentLoaded", async () => {
 
     // Preferences (per-user, persisted across restarts)
     await loadPreferences();
+
+    // Check for a newer release. Only nag on real release builds; dev builds can
+    // still check manually via About → Check for Updates. Fire-and-forget so a
+    // slow or offline network never blocks startup.
+    currentVersion = await invoke<string>("get_version").catch(() => "");
+    if (isReleaseBuild(currentVersion)) checkForUpdates(false);
+
     applySidebarWidth();
     setupSidebarResize();
     setupWindowSize();
