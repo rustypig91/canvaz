@@ -41,6 +41,20 @@ fn list_can_interfaces(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>,
 }
 
 #[tauri::command]
+fn create_channel(
+    backend_name: String,
+    channel_name: String,
+    dbc_path: Option<String>,
+    state: State<'_, TauriState>,
+) -> Result<String, String> {
+    state
+        .can_manager
+        .lock()
+        .map_err(|e| e.to_string())?
+        .create_channel(&backend_name, &channel_name, dbc_path.as_deref())
+}
+
+#[tauri::command]
 async fn open_channel(
     backend_name: String,
     channel_name: String,
@@ -50,12 +64,9 @@ async fn open_channel(
 ) -> Result<ChannelInfo, String> {
     let can_manager = Arc::clone(&state.can_manager);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        can_manager.lock().map_err(|e| e.to_string())?.open_channel(
-            backend_name,
-            channel_name,
-            bitrate,
-            dbc_path.as_deref(),
-        )
+        let mut mgr = can_manager.lock().map_err(|e| e.to_string())?;
+        let channel_id = mgr.create_channel(&backend_name, &channel_name, dbc_path.as_deref())?;
+        mgr.open_channel(&channel_id, bitrate)
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));
@@ -291,6 +302,7 @@ pub fn run() {
             open_channel,
             close_channel,
             get_open_channels,
+            create_channel,
             send_message,
             send_frame,
             add_periodic_frame,

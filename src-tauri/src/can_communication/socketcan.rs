@@ -5,7 +5,7 @@ use socketcan::embedded_can::{ExtendedId, StandardId};
 use socketcan::CanFrame as SocketCanFrame;
 use socketcan::{CanDataFrame, CanSocket, EmbeddedFrame, Frame, Socket};
 
-use super::{CanBackend, CanFrame, RxHandle, TxHandle};
+use super::{CanBackend, CanFrame, CanOpenError, RxHandle, TxHandle};
 
 // ── RX handle ─────────────────────────────────────────────────────────────────
 
@@ -71,28 +71,7 @@ impl TxHandle for SocketCanTxHandle {
 
 // ── Backend ───────────────────────────────────────────────────────────────────
 
-pub struct SocketCanBackend {
-    sudo_password: Box<dyn Fn() -> Result<String, String> + Send + 'static>,
-}
-
-impl SocketCanBackend {
-    pub fn new(sudo_password: impl Fn() -> Result<String, String> + Send + 'static) -> Self {
-        Self {
-            sudo_password: Box::new(sudo_password),
-        }
-    }
-
-    fn run_ip_auto(&self, args: &[&str]) -> Result<(), String> {
-        match run_ip(args, None) {
-            Ok(()) => Ok(()),
-            Err(e) if e.starts_with("needs-sudo:") => {
-                let pw = (self.sudo_password)()?;
-                run_ip(args, Some(&pw))
-            }
-            Err(e) => Err(e),
-        }
-    }
-}
+pub struct SocketCanBackend;
 
 impl CanBackend for SocketCanBackend {
     fn list_channels(&self) -> Vec<String> {
@@ -108,7 +87,12 @@ impl CanBackend for SocketCanBackend {
             .collect()
     }
 
-    fn open_channel(&mut self, index: u8, bitrate: u32) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
+    fn open_channel(
+        &mut self,
+        index: u8,
+        bitrate: u32,
+        admin_password: Option<&str>,
+    ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
         let channels = self.list_channels();
         let name = channels
             .get(index as usize)
@@ -122,18 +106,20 @@ impl CanBackend for SocketCanBackend {
 
         if !already_up(&name, bitrate) {
             if name.starts_with("vcan") {
-                let _ = self.run_ip_auto(&["link", "add", "dev", &name, "type", "vcan"]);
-                self.run_ip_auto(&["link", "set", &name, "up"])?;
+                let _ = run_ip_auto(&["link", "add", "dev", &name, "type", "vcan"], admin_password);
+                run_ip_auto(&["link", "set", &name, "up"], admin_password)?;
             } else {
-                let _ = self.run_ip_auto(&["link", "set", &name, "down"]);
+                let _ = run_ip_auto(&["link", "set", &name, "down"], admin_password);
                 let baud_s = bitrate.to_string();
-                self.run_ip_auto(&["link", "set", &name, "type", "can", "bitrate", &baud_s])?;
-                self.run_ip_auto(&["link", "set", &name, "up"])?;
+                run_ip_auto(&["link", "set", &name, "type", "can", "bitrate", &baud_s], admin_password)?;
+                run_ip_auto(&["link", "set", &name, "up"], admin_password)?;
             }
         }
 
-        let tx_socket = CanSocket::open(&name).map_err(|e| format!("Failed to open TX socket on '{name}': {e}"))?;
-        let rx_socket = CanSocket::open(&name).map_err(|e| format!("Failed to open RX socket on '{name}': {e}"))?;
+        let tx_socket =
+            CanSocket::open(&name).map_err(|e| CanOpenError::Other(format!("Failed to open TX socket on '{name}': {e}")))?;
+        let rx_socket =
+            CanSocket::open(&name).map_err(|e| CanOpenError::Other(format!("Failed to open RX socket on '{name}': {e}")))?;
 
         Ok((
             Box::new(SocketCanTxHandle { socket: tx_socket }),
@@ -146,6 +132,20 @@ impl CanBackend for SocketCanBackend {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Try running `ip <args>`. If the command fails with a permission error and no
+/// password was supplied, return `PasswordRequired`. If a password is supplied,
+/// retry under `sudo -S`.
+fn run_ip_auto(args: &[&str], admin_password: Option<&str>) -> Result<(), CanOpenError> {
+    match run_ip(args, None) {
+        Ok(()) => Ok(()),
+        Err(e) if e.starts_with("needs-sudo:") => match admin_password {
+            Some(pw) => run_ip(args, Some(pw)).map_err(CanOpenError::Other),
+            None => Err(CanOpenError::PasswordRequired),
+        },
+        Err(e) => Err(CanOpenError::Other(e)),
+    }
+}
 
 fn is_perm(msg: &str) -> bool {
     let lo = msg.to_lowercase();
@@ -179,11 +179,7 @@ fn run_ip(args: &[&str], sudo_password: Option<&str>) -> Result<(), String> {
             })
             .collect::<Vec<_>>()
             .join("\n");
-        Err(if msg.trim().is_empty() {
-            raw.trim().to_string()
-        } else {
-            msg.trim().to_string()
-        })
+        Err(if msg.trim().is_empty() { raw.trim().to_string() } else { msg.trim().to_string() })
     } else {
         let out = std::process::Command::new("ip")
             .args(args)
@@ -193,11 +189,7 @@ fn run_ip(args: &[&str], sudo_password: Option<&str>) -> Result<(), String> {
             return Ok(());
         }
         let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        Err(if is_perm(&msg) {
-            format!("needs-sudo: {msg}")
-        } else {
-            msg
-        })
+        Err(if is_perm(&msg) { format!("needs-sudo: {msg}") } else { msg })
     }
 }
 

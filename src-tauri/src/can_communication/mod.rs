@@ -11,6 +11,7 @@ pub use kvaser::KvaserBackend;
 pub use socketcan::SocketCanBackend;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, Mutex,
@@ -29,10 +30,29 @@ pub struct CanFrame {
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
-enum CanOpenError {
+#[derive(Debug)]
+pub enum CanOpenError {
     AlreadyOpen(String),
     ChannelIndexOutOfRange(String),
     PasswordRequired,
+    Other(String),
+}
+
+impl fmt::Display for CanOpenError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            CanOpenError::AlreadyOpen(s) => write!(f, "channel already open: {s}"),
+            CanOpenError::ChannelIndexOutOfRange(s) => write!(f, "{s}"),
+            CanOpenError::PasswordRequired => write!(f, "password required"),
+            CanOpenError::Other(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl From<String> for CanOpenError {
+    fn from(s: String) -> Self {
+        CanOpenError::Other(s)
+    }
 }
 
 // ── Backend traits ────────────────────────────────────────────────────────────
@@ -56,6 +76,13 @@ pub trait CanBackend: Send + 'static {
         bitrate: u32,
         admin_password: Option<&str>,
     ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError>;
+}
+
+// Allow backends that return String errors to use ? directly.
+impl From<&str> for CanOpenError {
+    fn from(s: &str) -> Self {
+        CanOpenError::Other(s.to_owned())
+    }
 }
 
 // ── Send queue ────────────────────────────────────────────────────────────────

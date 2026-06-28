@@ -272,6 +272,7 @@ struct ManagerShared {
 // ── CanManager ────────────────────────────────────────────────────────────────
 
 pub struct CanManager {
+    app_state: Arc<AppState>,
     shared: Arc<Mutex<ManagerShared>>,
     cans: HashMap<String, Can>,
 }
@@ -304,27 +305,19 @@ impl CanManager {
 
         #[cfg(feature = "linux-can")]
         {
-            #[cfg(target_os = "linux")]
-            let get_pw = {
-                let s = Arc::clone(&app_state);
-                move || s.get_sudo_password()
-            };
-            #[cfg(not(target_os = "linux"))]
-            let get_pw = || -> Result<String, String> { Err("sudo not supported".to_string()) };
-
             let sh_rx = Arc::clone(&shared);
             let sh_tx = Arc::clone(&shared);
             cans.insert(
                 "socketcan".to_string(),
                 Can::new(
-                    SocketCanBackend::new(get_pw),
+                    SocketCanBackend,
                     make_rx_callback("socketcan".into(), sh_rx),
                     make_tx_callback("socketcan".into(), sh_tx),
                 ),
             );
         }
 
-        Self { shared, cans }
+        Self { app_state, shared, cans }
     }
 
     // ── Channel lifecycle ─────────────────────────────────────────────────────
@@ -343,91 +336,108 @@ impl CanManager {
         }
         Ok(out)
     }
-    fn open_channel_with_password_if_required(
+    /// Register a channel (load DBC, allocate data stores) without opening the
+    /// hardware. Returns the `channel_id` handle used for all subsequent calls.
+    /// Calling `create_channel` again for the same channel updates the DBC.
+    pub fn create_channel(
         &mut self,
-        backend_name: String,
-        channel_name: String,
-        bitrate: u32,
-        admin_password: Option<&str>,
-    ) -> Result<(Box<dyn crate::can_communication::TxHandle>, Box<dyn crate::can_communication::RxHandle>), String> {
-        let can = self
+        backend_name: &str,
+        channel_name: &str,
+        dbc_path: Option<&str>,
+    ) -> Result<String, String> {
+        let channel_id = format!("{backend_name}:{channel_name}");
+
+        // Find the hardware index first (cheap, no lock needed).
+        let hw_index = self
             .cans
-            .get_mut(&backend_name)
-            .ok_or_else(|| format!("No backend '{backend_name}'"))?;
-        let hw_index = can
+            .get(backend_name)
+            .ok_or_else(|| format!("No backend '{backend_name}'"))?
             .list_channels()
             .iter()
-            .position(|n| n == &channel_name)
+            .position(|n| n == channel_name)
             .ok_or_else(|| format!("Channel '{channel_name}' not found in '{backend_name}'"))? as u8;
-        can.open(hw_index, bitrate, admin_password)
-    }
-
-    pub fn open_channel(
-        &mut self,
-        backend_name: String,
-        channel_name: String,
-        bitrate: u32,
-        dbc_path: Option<&str>,
-    ) -> Result<ChannelInfo, String> {
-        let id = format!("{backend_name}:{channel_name}");
-
-        // If already open: close and reopen with new bitrate/DBC.
-        let existing_index = self
-            .shared
-            .lock()
-            .map_err(|_| "Lock poisoned".to_string())?
-            .id_to_index
-            .get(&id)
-            .map(|(bn, idx)| (bn.clone(), *idx));
-
-        if let Some((bn, idx)) = existing_index {
-            let can = self.cans.get_mut(&bn).ok_or("Backend not found")?;
-            can.close(idx)?;
-            // Reload DBC and clear stores
-            let new_dbc = dbc_path.map(|p| ParsedDbc::new(p).map(Arc::new)).transpose()?;
-            {
-                let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
-                if let Some(ch) = lock.channels.get_mut(&id) {
-                    ch.frames.clear();
-                    ch.signals.clear();
-                    if let Some(d) = new_dbc {
-                        ch.dbc = Some(d);
-                        ch.info.dbc = ch.dbc.as_deref().cloned();
-                    }
-                }
-            }
-            can.open(idx, bitrate)?;
-            return Ok(self.shared.lock().unwrap().channels[&id].info.clone());
-        }
-
-        // New channel: find index in the backend's channel list.
-        let can = self
-            .cans
-            .get_mut(&backend_name)
-            .ok_or_else(|| format!("No backend '{backend_name}'"))?;
-        let hw_index =
-            can.list_channels()
-                .iter()
-                .position(|n| n == &channel_name)
-                .ok_or_else(|| format!("Channel '{channel_name}' not found in '{backend_name}'"))? as u8;
 
         let dbc = dbc_path.map(|p| ParsedDbc::new(p).map(Arc::new)).transpose()?;
-        let info = ChannelInfo {
-            id: id.clone(),
-            backend: backend_name.clone(),
-            name: channel_name,
-            dbc: dbc.as_deref().cloned(),
-        };
 
-        can.open(hw_index, bitrate, None)?;
+        let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
 
+        if lock.id_to_index.contains_key(&channel_id) {
+            // Already registered — update DBC if a new path was given.
+            if let (Some(d), Some(ch)) = (dbc, lock.channels.get_mut(&channel_id)) {
+                ch.info.dbc = Some((*d).clone());
+                ch.dbc = Some(d);
+            }
+        } else {
+            let info = ChannelInfo {
+                id: channel_id.clone(),
+                backend: backend_name.to_string(),
+                name: channel_name.to_string(),
+                dbc: dbc.as_deref().cloned(),
+            };
+            lock.index_to_id.insert((backend_name.to_string(), hw_index), channel_id.clone());
+            lock.id_to_index.insert(channel_id.clone(), (backend_name.to_string(), hw_index));
+            lock.channels.insert(channel_id.clone(), ChannelData::new(info, dbc));
+        }
+
+        Ok(channel_id)
+    }
+
+    /// Open the hardware for a channel that was previously registered with
+    /// `create_channel`. If the channel is already open it is closed first.
+    /// On Linux, if the backend requires elevated privileges the call blocks
+    /// until the frontend provides a sudo password (via `provide_sudo_password`).
+    pub fn open_channel(&mut self, channel_id: &str, bitrate: u32) -> Result<ChannelInfo, String> {
+        let (backend_name, hw_index) = self.backend_index(channel_id)?;
+
+        // Close if already open so we can reopen with new settings.
+        {
+            let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
+            can.close(hw_index).ok();
+        }
+
+        // Clear stale frame / signal data for this channel.
         {
             let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
-            lock.index_to_id.insert((backend_name.clone(), hw_index), id.clone());
-            lock.id_to_index.insert(id.clone(), (backend_name, hw_index));
-            lock.channels.insert(id.clone(), ChannelData::new(info.clone(), dbc));
+            if let Some(ch) = lock.channels.get_mut(channel_id) {
+                ch.frames.clear();
+                ch.signals.clear();
+            }
         }
-        Ok(info)
+
+        // First attempt: no password.
+        {
+            let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
+            match can.open(hw_index, bitrate, None) {
+                Ok(()) => return self.channel_info(channel_id),
+                Err(crate::can_communication::CanOpenError::PasswordRequired) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+
+        // Second attempt: request password from the frontend and retry.
+        let pw = self.get_admin_password()?;
+        {
+            let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
+            can.open(hw_index, bitrate, Some(&pw)).map_err(|e| e.to_string())?;
+        }
+        self.channel_info(channel_id)
+    }
+
+    fn channel_info(&self, channel_id: &str) -> Result<ChannelInfo, String> {
+        self.shared
+            .lock()
+            .map_err(|_| "Lock poisoned".to_string())?
+            .channels
+            .get(channel_id)
+            .map(|ch| ch.info.clone())
+            .ok_or_else(|| format!("'{channel_id}' not found"))
+    }
+
+    fn get_admin_password(&self) -> Result<String, String> {
+        #[cfg(target_os = "linux")]
+        return self.app_state.get_sudo_password();
+        #[cfg(not(target_os = "linux"))]
+        Err("Administrator privileges are not supported on this platform".to_string())
     }
 
     pub fn close_channel(&mut self, channel_id: &str) -> Result<(), String> {

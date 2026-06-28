@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use libloading::Library;
 
-use super::{CanBackend, CanFrame, RxHandle, TxHandle};
+use super::{CanBackend, CanFrame, CanOpenError, RxHandle, TxHandle};
 
 #[cfg(unix)]
 const CANLIB: &str = "libcanlib.so.1";
@@ -309,7 +309,7 @@ impl CanBackend for KvaserBackend {
             .collect()
     }
 
-    fn open_channel(&mut self, index: u8, bitrate: u32) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), String> {
+    fn open_channel(&mut self, index: u8, bitrate: u32, _admin_password: Option<&str>) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
         let (freq, tseg1, tseg2, sjw) = bitrate_params(bitrate).ok_or_else(|| {
             format!(
                 "Cannot compute CANlib timing for {} bps \
@@ -327,7 +327,7 @@ impl CanBackend for KvaserBackend {
                     (lib.bus_off)(tx_handle);
                     (lib.close)(tx_handle);
                 }
-                return Err(e);
+                return Err(CanOpenError::Other(e));
             }
         };
 
