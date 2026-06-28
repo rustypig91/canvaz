@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use can_dbc::{ByteOrder, Dbc, MessageId, NumericValue, ValueType};
 use serde::{Deserialize, Serialize};
 
-// use crate::can_frame::{CanFrame, CanSignal, DecodedCanMessage};
 use crate::can_communication::CanFrame;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,19 +17,6 @@ pub struct ParsedMessage {
     pub name: String,
     pub dlc: u64,
     pub signals: Vec<ParsedSignal>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DecodedCanSignal {
-    pub name: String,
-    pub physical: f64,
-    pub raw: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DecodedCanMessage {
-    pub name: String,
-    pub signals: Vec<DecodedCanSignal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +35,20 @@ pub struct ParsedSignal {
     pub unit: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DecodedCanSignal {
+    pub name: String,
+    pub physical: f64,
+    pub raw: u64,
+    pub unit: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DecodedCanMessage {
+    pub name: String,
+    pub signals: Vec<DecodedCanSignal>,
+}
+
 impl ParsedMessage {
     pub fn decode_frame(&self, frame: &CanFrame) -> Result<DecodedCanMessage, String> {
         if frame.can_id != self.id {
@@ -61,11 +61,20 @@ impl ParsedMessage {
         let mut decoded_signals = Vec::new();
         for sig in &self.signals {
             let raw = extract_bits(&frame.data, sig.start_bit, sig.length, sig.little_endian);
-            let physical = apply_scaling(raw, sig.length, sig.signed, sig.factor, sig.offset);
+            let physical = decode(
+                &frame.data,
+                sig.start_bit,
+                sig.length,
+                sig.little_endian,
+                sig.signed,
+                sig.factor,
+                sig.offset,
+            );
             decoded_signals.push(DecodedCanSignal {
                 name: sig.name.clone(),
                 physical,
                 raw,
+                unit: sig.unit.clone(),
             });
         }
         Ok(DecodedCanMessage {
@@ -73,8 +82,26 @@ impl ParsedMessage {
             signals: decoded_signals,
         })
     }
-}
 
+    /// Encode the given signal values into a buffer sized to this message's DLC.
+    pub fn encode_signals(&self, signal_values: &HashMap<String, f64>) -> Vec<u8> {
+        let mut buf = vec![0u8; self.dlc as usize];
+        for sig in &self.signals {
+            if let Some(&v) = signal_values.get(&sig.name) {
+                encode(
+                    &mut buf,
+                    v,
+                    sig.start_bit,
+                    sig.length,
+                    sig.little_endian,
+                    sig.factor,
+                    sig.offset,
+                );
+            }
+        }
+        buf
+    }
+}
 
 impl ParsedDbc {
     pub fn new(path: &str) -> Result<Self, String> {
@@ -131,32 +158,23 @@ impl ParsedDbc {
         Ok(())
     }
 
-    pub fn find_signal(&self, signal_name: &str) -> Option<&ParsedSignal> {
-        self.messages
-            .values()
-            .flat_map(|m| m.signals.iter())
-            .find(|s| s.name == signal_name)
-    }
-
-    pub fn find_message(&self, frame: &CanFrame) -> Option<&ParsedMessage> {
-        self.messages.get(&frame.can_id)
-    }
-
-    pub fn parse_frame(&self, frame: &CanFrame) -> Option<DecodedCanMessage> {
-        self.find_message(frame).and_then(|msg| msg.decode_frame(frame).ok())
-    }
-
+    /// Decode a raw frame against the matching message, if one exists.
     pub fn decode_frame(&self, frame: &CanFrame) -> Option<DecodedCanMessage> {
-        if let Some(msg) = self.messages.get(&frame.can_id) {
-            let decoded_message = msg.decode_frame(frame).ok()?;
-            Some(decoded_message)
-        } else {
-            None
-        }
+        self.messages
+            .get(&frame.can_id)
+            .and_then(|msg| msg.decode_frame(frame).ok())
+    }
+
+    /// Encode signal values for `msg_id` into a data buffer.
+    pub fn encode_message(&self, msg_id: u32, signal_values: &HashMap<String, f64>) -> Result<Vec<u8>, String> {
+        self.messages
+            .get(&msg_id)
+            .map(|msg| msg.encode_signals(signal_values))
+            .ok_or_else(|| format!("Message 0x{:X} not in DBC", msg_id))
     }
 }
 
-pub fn decode(
+fn decode(
     data: &[u8],
     start_bit: u64,
     length: u64,
@@ -169,7 +187,7 @@ pub fn decode(
     apply_scaling(raw, length, signed, factor, offset)
 }
 
-pub fn encode(data: &mut [u8], value: f64, start_bit: u64, length: u64, little_endian: bool, factor: f64, offset: f64) {
+fn encode(data: &mut [u8], value: f64, start_bit: u64, length: u64, little_endian: bool, factor: f64, offset: f64) {
     let raw = ((value - offset) / factor).round() as i64;
     let mask = if length >= 64 { u64::MAX } else { (1u64 << length) - 1 };
     let raw_u64 = (raw as u64) & mask;
