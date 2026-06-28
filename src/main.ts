@@ -952,6 +952,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         selectChannel(handle!);
     }
 
+    (document.activeElement as HTMLElement)?.blur();
     dialog.showModal();
 }
 
@@ -965,6 +966,7 @@ function promptSudoPassword(): Promise<string | null> {
         const cancel = document.getElementById("btn-sudo-cancel")!;
 
         input.value = "";
+        (document.activeElement as HTMLElement)?.blur();
         dialog.showModal();
         // Delay focus so the dialog is visible first
         setTimeout(() => input.focus(), 50);
@@ -1972,6 +1974,7 @@ function showConfirm(message: string): Promise<boolean> {
         ok.addEventListener("click", onOk);
         cancel.addEventListener("click", onCancel);
         dialog.addEventListener("cancel", onCancel); // Escape key
+        (document.activeElement as HTMLElement)?.blur();
         dialog.showModal();
     });
 }
@@ -2133,6 +2136,7 @@ function openUpdateDialog(opts: {
         dialog.close();
     };
 
+    (document.activeElement as HTMLElement)?.blur();
     dialog.showModal();
 }
 
@@ -2363,6 +2367,7 @@ function handleMenuAction(action: string) {
         case "export-csv": exportCsv(); break;
         case "about":
             invoke<string>("get_version").then(v => { document.getElementById("about-version")!.textContent = v; }).catch(() => { });
+            (document.activeElement as HTMLElement)?.blur();
             (document.getElementById("dialog-about") as HTMLDialogElement).showModal();
             break;
         case "check-updates": checkForUpdates(true); break;
