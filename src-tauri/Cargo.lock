@@ -402,7 +402,7 @@ dependencies = [
 
 [[package]]
 name = "canvaz"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "can-dbc",
  "libloading 0.8.9",
