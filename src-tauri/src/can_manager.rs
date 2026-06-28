@@ -348,11 +348,7 @@ impl CanManager {
     /// Returns a `u32` handle used for all subsequent calls. The DBC is loaded
     /// later by `open_channel`. Calling `create_channel` again for the same
     /// channel returns the existing handle.
-    pub fn create_channel(
-        &mut self,
-        backend_name: &str,
-        channel_name: &str,
-    ) -> Result<u32, String> {
+    pub fn create_channel(&mut self, backend_name: &str, channel_name: &str) -> Result<u32, String> {
         let hw_index =
             self.cans
                 .get(backend_name)
@@ -399,10 +395,7 @@ impl CanManager {
             .ok_or_else(|| format!("channel handle {handle} not found"))?
             .1;
 
-        let can = self
-            .cans
-            .get_mut(&backend_name)
-            .ok_or("Backend not found")?;
+        let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
 
         if can.is_open(hw_index) {
             return Err(format!(
@@ -410,8 +403,7 @@ impl CanManager {
             ));
         }
 
-        lock.index_to_handle
-            .remove(&(backend_name.clone(), hw_index));
+        lock.index_to_handle.remove(&(backend_name.clone(), hw_index));
         lock.handle_to_index.remove(&handle);
         lock.channels.remove(&handle);
 

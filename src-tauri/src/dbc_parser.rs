@@ -8,6 +8,7 @@ use crate::can_communication::CanFrame;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedDbc {
     pub path: String,
+    /// Keyed by CAN id. Serializes to a JSON object; the frontend treats it as a map.
     pub messages: HashMap<u32, ParsedMessage>,
 }
 
@@ -145,12 +146,15 @@ impl ParsedDbc {
                 })
                 .collect();
 
-            messages.insert(raw_id, ParsedMessage {
-                id: raw_id,
-                name: msg_name,
-                dlc: msg.size,
-                signals,
-            });
+            messages.insert(
+                raw_id,
+                ParsedMessage {
+                    id: raw_id,
+                    name: msg_name,
+                    dlc: msg.size,
+                    signals,
+                },
+            );
         }
 
         self.messages = messages;

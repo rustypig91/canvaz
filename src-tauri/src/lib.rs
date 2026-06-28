@@ -106,6 +106,13 @@ fn reset_backend(state: State<'_, TauriState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Parse a DBC file from disk. Lets the frontend show a channel's signal tree
+/// before the channel is opened.
+#[tauri::command]
+fn parse_dbc(path: String) -> Result<ParsedDbc, String> {
+    ParsedDbc::new(&path)
+}
+
 // ── Send commands ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -290,6 +297,7 @@ pub fn run() {
             open_channel,
             close_channel,
             reset_backend,
+            parse_dbc,
             created_channels,
             send_message,
             send_frame,
