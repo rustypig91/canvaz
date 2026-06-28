@@ -16,7 +16,7 @@ use crate::can_communication::KvaserBackend;
 #[cfg(feature = "linux-can")]
 use crate::can_communication::SocketCanBackend;
 
-use log::{debug, error, info, warn};
+use log::*;
 
 const DEFAULT_WINDOW_MS: u64 = 30_000;
 
@@ -662,23 +662,6 @@ impl CanManager {
             .get(&handle)
             .cloned()
             .ok_or_else(|| format!("channel handle {handle} not found; call create_channel first"))
-    }
-
-    fn channel_info(&self, handle: u32) -> Result<ChannelInfo, String> {
-        self.shared
-            .lock()
-            .map_err(|_| "Lock poisoned".to_string())?
-            .channels
-            .get(&handle)
-            .map(|ch| ch.info.clone())
-            .ok_or_else(|| format!("channel handle {handle} not found"))
-    }
-
-    fn get_admin_password(&self) -> Result<String, String> {
-        #[cfg(target_os = "linux")]
-        return self.app_state.get_admin_password();
-        #[cfg(not(target_os = "linux"))]
-        Err("Administrator privileges are not supported on this platform".to_string())
     }
 }
 

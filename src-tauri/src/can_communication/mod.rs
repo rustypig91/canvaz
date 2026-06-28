@@ -3,7 +3,7 @@ mod kvaser;
 #[cfg(feature = "linux-can")]
 mod socketcan;
 
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 
 #[cfg(feature = "kvaser")]
 pub use kvaser::KvaserBackend;
@@ -30,10 +30,15 @@ pub struct CanFrame {
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
+// Some variants are only constructed by platform-specific backends (e.g.
+// PasswordRequired on Linux), so they read as dead on other targets.
 #[derive(Debug)]
 pub enum CanOpenError {
+    #[allow(dead_code)]
     AlreadyOpen(String),
+    #[allow(dead_code)]
     ChannelIndexOutOfRange(String),
+    #[allow(dead_code)]
     PasswordRequired,
     Other(String),
 }

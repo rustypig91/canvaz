@@ -1,13 +1,15 @@
+use std::collections::HashMap;
+
 use can_dbc::{ByteOrder, Dbc, MessageId, NumericValue, ValueType};
 use serde::{Deserialize, Serialize};
 
-use crate::can_frame::{CanFrame, CanSignal, DecodedCanMessage};
-
+// use crate::can_frame::{CanFrame, CanSignal, DecodedCanMessage};
+use crate::can_communication::CanFrame;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedDbc {
     pub path: String,
-    pub messages: Vec<ParsedMessage>,
+    pub messages: HashMap<u32, ParsedMessage>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,32 +20,17 @@ pub struct ParsedMessage {
     pub signals: Vec<ParsedSignal>,
 }
 
-impl ParsedMessage {
-    pub fn decode_frame(&self, frame: &CanFrame) -> Result<DecodedCanMessage, String> {
-        if frame.can_id != self.id {
-            return Err(format!(
-                "Frame CAN ID {} does not match message ID {}",
-                frame.can_id, self.id
-            ));
-        }
+#[derive(Debug, Clone, Serialize)]
+pub struct DecodedCanSignal {
+    pub name: String,
+    pub physical: f64,
+    pub raw: u64,
+}
 
-        let mut decoded_signals = Vec::new();
-        for sig in &self.signals {
-            let raw = extract_bits(&frame.data, sig.start_bit, sig.length, sig.little_endian);
-            let physical = apply_scaling(raw, sig.length, sig.signed, sig.factor, sig.offset);
-            decoded_signals.push(CanSignal {
-                name: sig.name.clone(),
-                physical,
-                raw,
-                dlc: 0,
-                signals: Vec::new(),
-            });
-        }
-        Ok(DecodedCanMessage {
-            name: self.name.clone(),
-            signals: decoded_signals,
-        })
-    }
+#[derive(Debug, Clone, Serialize)]
+pub struct DecodedCanMessage {
+    pub name: String,
+    pub signals: Vec<DecodedCanSignal>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,21 +49,38 @@ pub struct ParsedSignal {
     pub unit: String,
 }
 
+impl ParsedMessage {
+    pub fn decode_frame(&self, frame: &CanFrame) -> Result<DecodedCanMessage, String> {
+        if frame.can_id != self.id {
+            return Err(format!(
+                "Frame CAN ID {} does not match message ID {}",
+                frame.can_id, self.id
+            ));
+        }
 
-fn numeric_to_f64(v: NumericValue) -> f64 {
-    match v {
-        NumericValue::Uint(n) => n as f64,
-        NumericValue::Int(n) => n as f64,
-        NumericValue::Double(n) => n,
+        let mut decoded_signals = Vec::new();
+        for sig in &self.signals {
+            let raw = extract_bits(&frame.data, sig.start_bit, sig.length, sig.little_endian);
+            let physical = apply_scaling(raw, sig.length, sig.signed, sig.factor, sig.offset);
+            decoded_signals.push(DecodedCanSignal {
+                name: sig.name.clone(),
+                physical,
+                raw,
+            });
+        }
+        Ok(DecodedCanMessage {
+            name: self.name.clone(),
+            signals: decoded_signals,
+        })
     }
 }
 
-#[allow(dead_code)]
+
 impl ParsedDbc {
     pub fn new(path: &str) -> Result<Self, String> {
         let mut dbc = Self {
             path: path.to_string(),
-            messages: Vec::new(),
+            messages: HashMap::new(),
         };
         dbc.reload()?;
 
@@ -87,7 +91,7 @@ impl ParsedDbc {
         let text = std::fs::read_to_string(self.path.as_str()).map_err(|e| format!("Failed to read DBC file: {e}"))?;
         let dbc = Dbc::try_from(text.as_str()).map_err(|e| format!("Failed to parse DBC: {e}"))?;
 
-        let mut messages = Vec::new();
+        let mut messages = HashMap::new();
         for msg in &dbc.messages {
             let raw_id = match msg.id {
                 MessageId::Standard(id) => u32::from(id),
@@ -114,7 +118,7 @@ impl ParsedDbc {
                 })
                 .collect();
 
-            messages.push(ParsedMessage {
+            messages.insert(raw_id, ParsedMessage {
                 id: raw_id,
                 name: msg_name,
                 dlc: msg.size,
@@ -129,23 +133,27 @@ impl ParsedDbc {
 
     pub fn find_signal(&self, signal_name: &str) -> Option<&ParsedSignal> {
         self.messages
-            .iter()
+            .values()
             .flat_map(|m| m.signals.iter())
             .find(|s| s.name == signal_name)
     }
 
     pub fn find_message(&self, frame: &CanFrame) -> Option<&ParsedMessage> {
-        self.messages.iter().find(|m| m.id == frame.can_id)
+        self.messages.get(&frame.can_id)
     }
 
     pub fn parse_frame(&self, frame: &CanFrame) -> Option<DecodedCanMessage> {
-        self.find_message(frame)
-            .and_then(|msg| msg.decode_frame(frame).ok())
+        self.find_message(frame).and_then(|msg| msg.decode_frame(frame).ok())
     }
-}
 
-pub fn parse_dbc(path: &str) -> Result<ParsedDbc, String> {
-    ParsedDbc::new(path)
+    pub fn decode_frame(&self, frame: &CanFrame) -> Option<DecodedCanMessage> {
+        if let Some(msg) = self.messages.get(&frame.can_id) {
+            let decoded_message = msg.decode_frame(frame).ok()?;
+            Some(decoded_message)
+        } else {
+            None
+        }
+    }
 }
 
 pub fn decode(
@@ -245,5 +253,13 @@ fn pack_bits(data: &mut [u8], raw: u64, start_bit: u64, length: u64, little_endi
                 bit_pos -= 1;
             }
         }
+    }
+}
+
+fn numeric_to_f64(v: NumericValue) -> f64 {
+    match v {
+        NumericValue::Uint(n) => n as f64,
+        NumericValue::Int(n) => n as f64,
+        NumericValue::Double(n) => n,
     }
 }

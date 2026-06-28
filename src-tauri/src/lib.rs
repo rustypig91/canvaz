@@ -1,6 +1,9 @@
+// Release builds must be warning-free; this turns any remaining warning into a
+// hard error so it can't slip into a published artifact.
+#![cfg_attr(not(debug_assertions), deny(warnings))]
+
 mod app_state;
 mod can_communication;
-mod can_frame;
 mod can_manager;
 mod dbc_parser;
 mod logger;
@@ -12,12 +15,11 @@ use std::sync::{Arc, Mutex};
 use app_state::AppState;
 use can_manager::{CanManager, ChannelInfo, FrameInfo, ManagerState, SignalSample};
 use dbc_parser::ParsedDbc;
-use logger::init;
 use project::Project;
 use serde::Deserialize;
 use tauri::{Manager, State};
 
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 
 // ── Tauri managed state ───────────────────────────────────────────────────────
 
