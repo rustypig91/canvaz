@@ -295,7 +295,6 @@ impl CanManager {
                     name: ch,
                 });
             }
-            debug!("Listed {} channels from backend '{backend_name}'", out.len());
         }
         Ok(out)
     }
