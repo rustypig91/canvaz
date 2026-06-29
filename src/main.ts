@@ -40,6 +40,7 @@ interface DbcMessage {
     name: string;
     dlc: number;
     signals: DbcSignal[];
+    transmitter?: string | null;
 }
 
 interface ParsedDbc {
@@ -80,7 +81,7 @@ interface CanFrameEvent {
     signals: DecodedSignal[];
 }
 
-interface PlotSignalEntry { signal_name: string; channel: string; }
+interface PlotSignalEntry { signal_name: string; channel: string; message_id?: number; }
 interface PlotPaneConfig { signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean; }
 interface ChannelInfo { backend: string; name: string; }
 interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate: number | null; }
@@ -95,7 +96,7 @@ interface SimulateEntry { signal_name: string; channel: string; value: number; p
 
 interface SimRawFrameConfig {
     channel: string; can_id: number; is_extended: boolean;
-    dlc: number; data: number[]; period_ms: number;
+    dlc: number; data: number[]; period_ms: number; running?: boolean;
 }
 
 interface TraceFiltersConfig {
@@ -125,6 +126,7 @@ interface Project {
     plot_panes: PlotPaneConfig[];
     simulate_signals: SimulateEntry[];
     simulate_raw_frames?: SimRawFrameConfig[];
+    simulate_running_messages?: { channel: string; message_id: number }[];
     trace_filters?: TraceFiltersConfig;
     trace_columns?: TraceColumnsConfig;
     window_size_sec?: number;
@@ -140,6 +142,7 @@ const PLOT_COLORS = [
 interface PlotSeries {
     signalName: string;
     messageName: string;
+    messageId: number;
     unit: string;
     color: string;
     channel: number;
@@ -246,13 +249,17 @@ let plotTabActive = true; // plot tab is the default active tab
 // Signals/sim entries to restore into panes after the next startApp (DBC comes from open_channel)
 let pendingPaneSignals: PlotSignalEntry[][] = [];
 let pendingSimSignals: SimulateEntry[] = [];
+// Keys of raw sim entries that should be auto-started on next startApp.
+let pendingRawAutoStart = new Set<string>();
+// "channelId::messageId" pairs of sim message groups that should auto-start on next startApp.
+let pendingMsgAutoStart = new Set<string>();
 
 // Middle-mouse pan state
 let midPan: { startX: number; startMin: number; startMax: number; chartWidth: number } | null = null;
 
 
-function plotKey(channel: number, signalName: string) {
-    return `${channel}::${signalName}`;
+function plotKey(channel: number, messageId: number, signalName: string) {
+    return `${channel}::${messageId}::${signalName}`;
 }
 
 function decodeSignal(data: number[], sig: DbcSignal): number {
@@ -529,11 +536,11 @@ function closePlotPane(id: string) {
 // ── Signal → pane ─────────────────────────────────────────────────────────────
 
 async function addSignalToPane(pane: PlotPane, handle: number, sig: DbcSignal) {
-    const key = plotKey(handle, sig.name);
+    const key = plotKey(handle, sig.message_id, sig.name);
     if (pane.series.has(key)) return;
     const color = PLOT_COLORS[pane.series.size % PLOT_COLORS.length];
     const series: PlotSeries = {
-        signalName: sig.name, messageName: sig.message_name, unit: sig.unit,
+        signalName: sig.name, messageName: sig.message_name, messageId: sig.message_id, unit: sig.unit,
         color, channel: handle, timestamps: [], data: [], lastValue: null, frozenLength: null,
     };
     // Register the series NOW so live signal-value events are captured immediately
@@ -561,7 +568,7 @@ async function addSignalToPane(pane: PlotPane, handle: number, sig: DbcSignal) {
         // historical samples that are older than the first live sample.
         try {
             const history = await invoke<Array<{ timestamp_ms: number; value: number }>>(
-                "get_signal_history", { handle, signalName: sig.name, sinceMs: 0 }
+                "get_signal_history", { handle, messageId: sig.message_id, signalName: sig.name, sinceMs: 0 }
             );
             const liveStart = series.timestamps[0] ?? Infinity;
             const toInsert = history.filter(s => s.timestamp_ms < liveStart);
@@ -626,12 +633,12 @@ function updateSignalHighlights() {
     const simulated = new Set<string>();
     for (const entry of simEntries.values()) {
         if (entry.kind === "message") {
-            for (const s of entry.signals) simulated.add(plotKey(entry.channel, s.def.name));
+            for (const s of entry.signals) simulated.add(plotKey(entry.channel, s.def.message_id, s.def.name));
         }
     }
 
     document.querySelectorAll<HTMLElement>(".signal-row").forEach(row => {
-        const key = plotKey(parseInt(row.dataset.channel ?? "0"), row.dataset.signal ?? "");
+        const key = plotKey(parseInt(row.dataset.channel ?? "0"), parseInt(row.dataset.messageId ?? "0"), row.dataset.signal ?? "");
         row.classList.toggle("in-plot", plotted.has(key));
         row.classList.toggle("in-sim", simulated.has(key));
     });
@@ -655,11 +662,12 @@ function renderDbcTree(filter = "") {
     const lc = filter.toLowerCase();
 
     const sortedMessages = Object.values(dbc.messages).sort((a, b) => a.name.localeCompare(b.name));
-    for (const msg of sortedMessages) {
+
+    const buildMsgDetails = (msg: DbcMessage, container: HTMLElement) => {
         const visibleSignals = msg.signals.filter(s =>
             !lc || s.name.toLowerCase().includes(lc) || msg.name.toLowerCase().includes(lc)
         );
-        if (!visibleSignals.length) continue;
+        if (!visibleSignals.length) return;
 
         const details = document.createElement("details");
         details.className = "msg-group";
@@ -673,8 +681,9 @@ function renderDbcTree(filter = "") {
             const row = document.createElement("div");
             row.className = "signal-row";
             row.dataset.signal = sig.name;
+            row.dataset.messageId = String(sig.message_id);
             row.dataset.channel = String(selectedChannel!);
-            const key = plotKey(selectedChannel!, sig.name);
+            const key = plotKey(selectedChannel!, sig.message_id, sig.name);
             const lastVal = signalLastValues.get(key);
             const valText = lastVal != null ? formatSigValue(lastVal, sig.unit) : (sig.unit || "");
             const mn = signalMinValues.get(key);
@@ -687,7 +696,6 @@ function renderDbcTree(filter = "") {
             signalValueEls.set(key, row.querySelector<HTMLElement>(".sig-value")!);
             signalRangeEls.set(key, row.querySelector<HTMLElement>(".sig-range")!);
 
-            // Drag to plot
             row.setAttribute("draggable", "true");
             row.addEventListener("dragstart", (e) => {
                 if (!selectedChannel) { e.preventDefault(); return; }
@@ -702,7 +710,6 @@ function renderDbcTree(filter = "") {
                 e.dataTransfer!.effectAllowed = "copy";
             });
 
-            // Double-click: add to first pane (create one if needed)
             row.addEventListener("dblclick", () => {
                 const activeTab = document.querySelector(".tab-btn.active")?.getAttribute("data-tab");
                 if (activeTab === "plot") {
@@ -715,7 +722,49 @@ function renderDbcTree(filter = "") {
 
             details.appendChild(row);
         }
-        tree.appendChild(details);
+        container.appendChild(details);
+    };
+
+    // Group by ECU (transmitter). Messages without a named transmitter use "".
+    const byEcu = new Map<string, DbcMessage[]>();
+    for (const msg of sortedMessages) {
+        const ecu = msg.transmitter ?? "";
+        if (!byEcu.has(ecu)) byEcu.set(ecu, []);
+        byEcu.get(ecu)!.push(msg);
+    }
+
+    const hasNamedEcus = [...byEcu.keys()].some(k => k !== "");
+
+    if (hasNamedEcus) {
+        // Named ECUs first (sorted), unnamed last.
+        const named = [...byEcu.entries()].filter(([k]) => k !== "").sort(([a], [b]) => a.localeCompare(b));
+        const unnamed = byEcu.get("") ?? [];
+
+        for (const [ecu, msgs] of named) {
+            const ecuDetails = document.createElement("details");
+            ecuDetails.className = "ecu-group";
+            ecuDetails.open = true;
+            const ecuSummary = document.createElement("summary");
+            ecuSummary.className = "ecu-summary";
+            ecuSummary.textContent = ecu;
+            ecuDetails.appendChild(ecuSummary);
+            for (const msg of msgs) buildMsgDetails(msg, ecuDetails);
+            if (ecuDetails.childElementCount > 1) tree.appendChild(ecuDetails);
+        }
+
+        if (unnamed.length > 0) {
+            const ecuDetails = document.createElement("details");
+            ecuDetails.className = "ecu-group";
+            ecuDetails.open = true;
+            const ecuSummary = document.createElement("summary");
+            ecuSummary.className = "ecu-summary";
+            ecuSummary.textContent = "Other";
+            ecuDetails.appendChild(ecuSummary);
+            for (const msg of unnamed) buildMsgDetails(msg, ecuDetails);
+            if (ecuDetails.childElementCount > 1) tree.appendChild(ecuDetails);
+        }
+    } else {
+        for (const msg of sortedMessages) buildMsgDetails(msg, tree);
     }
 
     // Refresh highlights after tree rebuild
@@ -1544,8 +1593,18 @@ async function removeSimEntry(key: string) {
 
 async function startSim(key: string) {
     const entry = simEntries.get(key);
-    if (!entry || entry.running) return;
+    // Guard: already sending (backend periodic registered).
+    if (!entry || entry.periodicHandle !== null) return;
     if (!entry.channel) { setStatus("Select a channel first"); return; }
+
+    // Mark user intent immediately — button shows "Stop" even while app is stopped.
+    entry.running = true;
+    const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
+    if (btn) { btn.textContent = "Stop"; btn.classList.add("running"); }
+    scheduleAutoSave();
+
+    // Register with backend only when the app (and its channels) is live.
+    if (!appRunning) return;
 
     try {
         let handle: number;
@@ -1556,12 +1615,12 @@ async function startSim(key: string) {
         } else {
             handle = await invoke<number>("add_periodic_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs } });
         }
-        entry.running = true;
         entry.periodicHandle = handle;
-        const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
-        if (btn) { btn.textContent = "Stop"; btn.classList.add("running"); }
     } catch (e) {
         setError(`Sim start error: ${e}`);
+        entry.running = false;
+        if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
+        scheduleAutoSave();
     }
 }
 
@@ -1575,6 +1634,7 @@ async function stopSim(key: string) {
     entry.running = false;
     const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
     if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
+    scheduleAutoSave();
 }
 
 // ── Project ───────────────────────────────────────────────────────────────────
@@ -1603,7 +1663,7 @@ function buildProject(): Project {
             bitrate: ch.config.bitrate,
         })),
         plot_panes: plotPanes.map(pane => ({
-            signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: handleToId(s.channel) })),
+            signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: handleToId(s.channel), message_id: s.messageId })),
             interpolation: pane.interpolation,
             show_points: pane.showPoints,
         })),
@@ -1612,9 +1672,12 @@ function buildProject(): Project {
                 ? e.signals.map(s => ({ signal_name: s.def.name, channel: handleToId(e.channel), value: s.value, period_ms: e.periodMs }))
                 : []
         ),
+        simulate_running_messages: [...simEntries.values()]
+            .filter((e): e is SimMessageEntry => e.kind === "message" && e.running)
+            .map(e => ({ channel: handleToId(e.channel), message_id: e.messageId })),
         simulate_raw_frames: [...simEntries.values()]
             .filter((e): e is SimRawEntry => e.kind === "raw")
-            .map(e => ({ channel: handleToId(e.channel), can_id: e.canId, is_extended: e.isExtended, dlc: e.dlc, data: e.data, period_ms: e.periodMs })),
+            .map(e => ({ channel: handleToId(e.channel), can_id: e.canId, is_extended: e.isExtended, dlc: e.dlc, data: e.data, period_ms: e.periodMs, running: e.running })),
         trace_filters: {
             channels: traceFilterChannels ? [...traceFilterChannels].map(handleToId) : null,
             can_ids: traceFilterCanIds ? [...traceFilterCanIds] : null,
@@ -1652,6 +1715,8 @@ async function newProject() {
     while (plotPanes.length) closePlotPane(plotPanes[0].id);
     pendingPaneSignals = [];
     pendingSimSignals = [];
+    pendingRawAutoStart.clear();
+    pendingMsgAutoStart.clear();
 
     for (const [key, entry] of simEntries) {
         if (entry.running) {
@@ -1773,7 +1838,15 @@ async function applyProject(project: Project) {
     // Save sim signal entries for restoration after startApp opens channels and loads DBCs.
     pendingSimSignals = project.simulate_signals ?? [];
 
+    // Record which sim message groups should auto-start after startApp opens channels.
+    pendingRawAutoStart.clear();
+    pendingMsgAutoStart.clear();
+    for (const r of project.simulate_running_messages ?? []) {
+        pendingMsgAutoStart.add(`${r.channel}::${r.message_id}`);
+    }
+
     // Restore raw sim frames immediately (they don't need a DBC).
+    // Preserve running intent: entry shows "Stop" if it was running when saved.
     for (const raw of project.simulate_raw_frames ?? []) {
         const key = `raw::${++rawEntryCounter}`;
         const rawHandle = idToHandle(raw.channel) ?? 0;
@@ -1781,7 +1854,7 @@ async function applyProject(project: Project) {
             kind: "raw", channel: rawHandle,
             canId: raw.can_id, isExtended: raw.is_extended,
             dlc: raw.dlc, data: raw.data,
-            periodMs: raw.period_ms, running: false, periodicHandle: null,
+            periodMs: raw.period_ms, running: raw.running ?? false, periodicHandle: null,
         };
         simEntries.set(key, entry);
         document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
@@ -1920,7 +1993,11 @@ async function startApp() {
                 const handle = idToHandle(entry.channel);
                 if (handle === undefined) continue;
                 const dbc = channels.get(handle)?.dbc;
-                const sig = dbc && Object.values(dbc.messages).flatMap((m: DbcMessage) => m.signals).find((s: DbcSignal) => s.name === entry.signal_name);
+                const sig = dbc && Object.values(dbc.messages).flatMap((m: DbcMessage) => m.signals).find(
+                    (s: DbcSignal) => entry.message_id !== undefined
+                        ? s.message_id === entry.message_id && s.name === entry.signal_name
+                        : s.name === entry.signal_name
+                );
                 if (sig) await addSignalToPane(plotPanes[i], handle, sig);
             }
         }
@@ -1944,17 +2021,26 @@ async function startApp() {
         const simContainer = document.getElementById("sim-entries")!;
         for (const [key, { handle, msg, periodMs, values }] of msgMap) {
             if (simEntries.has(key)) continue;
+            const shouldRun = pendingMsgAutoStart.has(`${handleToId(handle)}::${msg.id}`);
             const simEntry: SimMessageEntry = {
                 kind: "message", channel: handle,
                 messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
                 signals: msg.signals.map(s => ({ def: s, value: values.get(s.name) ?? s.min ?? 0 })),
-                periodMs, running: false, periodicHandle: null,
+                periodMs, running: shouldRun, periodicHandle: null,
             };
             simEntries.set(key, simEntry);
             simContainer.appendChild(createSimEntryEl(key, simEntry));
         }
+        pendingMsgAutoStart.clear();
         renderSimEntries();
     }
+
+    // Register backend periodics for all entries the user has marked as running
+    // (covers both restored entries and entries that survived a stop/start cycle).
+    for (const [key, entry] of simEntries) {
+        if (entry.running) await startSim(key);
+    }
+    pendingRawAutoStart.clear();
 
     clearTrace();
     startScrollLoop();
@@ -1974,14 +2060,10 @@ async function stopApp() {
         try { await invoke("close_channel", { channelHandle: handle }); } catch { }
         ch.open = false;
     }
-    // Channels are closed so backend periodics are stopped; just reset UI state.
-    for (const [key, entry] of simEntries) {
-        if (entry.running) {
-            entry.running = false;
-            entry.periodicHandle = null;
-            const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
-            if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
-        }
+    // Channels are closed so backend periodics are gone; preserve running intent so
+    // entries auto-restart on next Start and the UI keeps showing "Stop".
+    for (const entry of simEntries.values()) {
+        entry.periodicHandle = null;
     }
     renderChannelList();
     const btn = document.getElementById("btn-app-run")!;
@@ -2654,7 +2736,7 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
             const maxCells = next.querySelectorAll<HTMLElement>(".te-max");
             msg.signals.forEach((sig: DbcSignal, i: number) => {
                 if (valCells[i]) valCells[i].textContent = formatSigValue(decodeSignal(entry.data, sig), "");
-                const key = plotKey(entry.channelHandle, sig.name);
+                const key = plotKey(entry.channelHandle, entry.canId, sig.name);
                 const mn = signalMinValues.get(key);
                 const mx = signalMaxValues.get(key);
                 if (minCells[i]) minCells[i].textContent = mn !== undefined ? formatSigValue(mn, "") : "—";
@@ -2682,7 +2764,7 @@ function onCanFrame(ev: CanFrameEvent) {
     // Process decoded signals — update sidebar and plot series regardless of pause state.
     const x = (ev.timestamp_ms - appStartTime) / 1000;
     for (const sig of ev.signals) {
-        const sigKey = plotKey(ev.channel_handle, sig.name);
+        const sigKey = plotKey(ev.channel_handle, ev.can_id, sig.name);
         signalLastValues.set(sigKey, sig.value);
         signalMinValues.set(sigKey, sig.min);
         signalMaxValues.set(sigKey, sig.max);
@@ -3183,7 +3265,7 @@ function setupTrace() {
             + '</tr></thead><tbody>';
         for (const sig of msg.signals) {
             const val = decodeSignal(bytes, sig);
-            const key = plotKey(trHandle, sig.name);
+            const key = plotKey(trHandle, canId, sig.name);
             const mn = signalMinValues.get(key);
             const mx = signalMaxValues.get(key);
             const fmt = (v: number | undefined) => v !== undefined ? formatSigValue(v, "") : "—";

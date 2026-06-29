@@ -208,13 +208,13 @@ fn get_frames(handle: Option<u32>, limit: Option<usize>, state: State<'_, TauriS
 }
 
 #[tauri::command]
-fn get_signal_history(handle: u32, signal_name: String, since_ms: u64, state: State<'_, TauriState>) -> Result<Vec<SignalSample>, String> {
-    debug!("get_signal_history: handle={handle}, signal_name={signal_name}, since_ms={since_ms}");
+fn get_signal_history(handle: u32, message_id: u32, signal_name: String, since_ms: u64, state: State<'_, TauriState>) -> Result<Vec<SignalSample>, String> {
+    debug!("get_signal_history: handle={handle}, message_id={message_id:#x}, signal_name={signal_name}, since_ms={since_ms}");
     Ok(state
         .can_manager
         .lock()
         .map_err(|e| e.to_string())?
-        .get_signal_history(handle, &signal_name, since_ms))
+        .get_signal_history(handle, message_id, &signal_name, since_ms))
 }
 
 #[tauri::command]

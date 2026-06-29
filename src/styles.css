@@ -433,6 +433,25 @@ body.resizing {
   padding: 4px 0;
 }
 
+.ecu-group > .ecu-summary {
+  display: flex;
+  align-items: center;
+  padding: 5px 10px 3px;
+  cursor: pointer;
+  user-select: none;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: #71717a;
+  list-style: none;
+  border-top: 1px solid var(--bg3);
+}
+.ecu-group:first-child > .ecu-summary { border-top: none; }
+.ecu-group > .ecu-summary::before { content: '▶'; margin-right: 6px; font-size: 8px; transition: transform 0.1s; }
+.ecu-group[open] > .ecu-summary::before { transform: rotate(90deg); }
+.ecu-group > .ecu-summary:hover { background: var(--bg3); }
+
 .msg-group summary {
   display: flex;
   align-items: center;
@@ -444,6 +463,7 @@ body.resizing {
   color: var(--text-muted);
   list-style: none;
 }
+.ecu-group .msg-group summary { padding-left: 20px; }
 .msg-group summary:hover { background: var(--bg3); }
 .msg-group summary::before { content: '▶'; margin-right: 6px; font-size: 9px; transition: transform 0.1s; }
 .msg-group[open] summary::before { transform: rotate(90deg); }
@@ -461,6 +481,7 @@ body.resizing {
   cursor: pointer;
   gap: 6px;
 }
+.ecu-group .signal-row { padding-left: 34px; }
 .signal-row:hover { background: var(--bg3); }
 .signal-row.in-plot { background: rgba(59,130,246,0.08); }
 .signal-row.in-plot .sig-name { color: var(--accent); }
