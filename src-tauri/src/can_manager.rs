@@ -289,6 +289,7 @@ impl CanManager {
         let mut out = Vec::new();
         for (backend_name, can) in &self.cans {
             for ch in can.list_channels() {
+                debug!("Found channel '{ch}' on backend '{backend_name}'");
                 out.push(ChannelInfo {
                     backend: backend_name.clone(),
                     name: ch,
