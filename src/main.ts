@@ -1593,8 +1593,18 @@ async function removeSimEntry(key: string) {
 
 async function startSim(key: string) {
     const entry = simEntries.get(key);
-    if (!entry || entry.running) return;
+    // Guard: already sending (backend periodic registered).
+    if (!entry || entry.periodicHandle !== null) return;
     if (!entry.channel) { setStatus("Select a channel first"); return; }
+
+    // Mark user intent immediately — button shows "Stop" even while app is stopped.
+    entry.running = true;
+    const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
+    if (btn) { btn.textContent = "Stop"; btn.classList.add("running"); }
+    scheduleAutoSave();
+
+    // Register with backend only when the app (and its channels) is live.
+    if (!appRunning) return;
 
     try {
         let handle: number;
@@ -1605,12 +1615,12 @@ async function startSim(key: string) {
         } else {
             handle = await invoke<number>("add_periodic_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs } });
         }
-        entry.running = true;
         entry.periodicHandle = handle;
-        const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
-        if (btn) { btn.textContent = "Stop"; btn.classList.add("running"); }
     } catch (e) {
         setError(`Sim start error: ${e}`);
+        entry.running = false;
+        if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
+        scheduleAutoSave();
     }
 }
 
@@ -1624,6 +1634,7 @@ async function stopSim(key: string) {
     entry.running = false;
     const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
     if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
+    scheduleAutoSave();
 }
 
 // ── Project ───────────────────────────────────────────────────────────────────
@@ -1835,6 +1846,7 @@ async function applyProject(project: Project) {
     }
 
     // Restore raw sim frames immediately (they don't need a DBC).
+    // Preserve running intent: entry shows "Stop" if it was running when saved.
     for (const raw of project.simulate_raw_frames ?? []) {
         const key = `raw::${++rawEntryCounter}`;
         const rawHandle = idToHandle(raw.channel) ?? 0;
@@ -1842,11 +1854,10 @@ async function applyProject(project: Project) {
             kind: "raw", channel: rawHandle,
             canId: raw.can_id, isExtended: raw.is_extended,
             dlc: raw.dlc, data: raw.data,
-            periodMs: raw.period_ms, running: false, periodicHandle: null,
+            periodMs: raw.period_ms, running: raw.running ?? false, periodicHandle: null,
         };
         simEntries.set(key, entry);
         document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
-        if (raw.running) pendingRawAutoStart.add(key);
     }
 
     // Restore trace column layout
@@ -2010,30 +2021,24 @@ async function startApp() {
         const simContainer = document.getElementById("sim-entries")!;
         for (const [key, { handle, msg, periodMs, values }] of msgMap) {
             if (simEntries.has(key)) continue;
+            const shouldRun = pendingMsgAutoStart.has(`${handleToId(handle)}::${msg.id}`);
             const simEntry: SimMessageEntry = {
                 kind: "message", channel: handle,
                 messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
                 signals: msg.signals.map(s => ({ def: s, value: values.get(s.name) ?? s.min ?? 0 })),
-                periodMs, running: false, periodicHandle: null,
+                periodMs, running: shouldRun, periodicHandle: null,
             };
             simEntries.set(key, simEntry);
             simContainer.appendChild(createSimEntryEl(key, simEntry));
         }
+        pendingMsgAutoStart.clear();
         renderSimEntries();
     }
 
-    // Auto-start sim entries that were running when the project was saved.
+    // Register backend periodics for all entries the user has marked as running
+    // (covers both restored entries and entries that survived a stop/start cycle).
     for (const [key, entry] of simEntries) {
-        if (entry.kind === "message") {
-            const channelId = handleToId(entry.channel);
-            if (pendingMsgAutoStart.has(`${channelId}::${entry.messageId}`)) {
-                await startSim(key);
-            }
-        }
-    }
-    pendingMsgAutoStart.clear();
-    for (const key of pendingRawAutoStart) {
-        if (simEntries.has(key)) await startSim(key);
+        if (entry.running) await startSim(key);
     }
     pendingRawAutoStart.clear();
 
@@ -2055,14 +2060,10 @@ async function stopApp() {
         try { await invoke("close_channel", { channelHandle: handle }); } catch { }
         ch.open = false;
     }
-    // Channels are closed so backend periodics are stopped; just reset UI state.
-    for (const [key, entry] of simEntries) {
-        if (entry.running) {
-            entry.running = false;
-            entry.periodicHandle = null;
-            const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
-            if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
-        }
+    // Channels are closed so backend periodics are gone; preserve running intent so
+    // entries auto-restart on next Start and the UI keeps showing "Stop".
+    for (const entry of simEntries.values()) {
+        entry.periodicHandle = null;
     }
     renderChannelList();
     const btn = document.getElementById("btn-app-run")!;
