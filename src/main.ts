@@ -254,6 +254,11 @@ let pendingRawAutoStart = new Set<string>();
 // "channelId::messageId" pairs of sim message groups that should auto-start on next startApp.
 let pendingMsgAutoStart = new Set<string>();
 
+// Channels that failed create_channel (hardware not present). Kept so the
+// project config is preserved and startApp can retry them.
+interface GhostChannel { config: ChannelConfig; error: string; }
+let ghostChannels: GhostChannel[] = [];
+
 // Middle-mouse pan state
 let midPan: { startX: number; startMin: number; startMax: number; chartWidth: number } | null = null;
 
@@ -1368,6 +1373,29 @@ async function renderChannelList() {
         });
         list.appendChild(item);
     }
+
+    for (const ghost of ghostChannels) {
+        const { config, error } = ghost;
+        const dbcPath = config.dbc_path;
+        const bitrate = config.bitrate;
+        const bitrateLabel = config.name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
+        const item = document.createElement("div");
+        item.className = "channel-item";
+        item.innerHTML = `
+      <span class="dot error" title="${error}"></span>
+      <span class="ch-name" title="${config.name}">${config.name}<span class="ch-backend label-muted"> ${config.backend}</span></span>
+      <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
+      <span class="ch-baud label-muted">${bitrateLabel}</span>
+      <button class="btn-close-ch" title="Remove channel">×</button>
+    `;
+        item.querySelector(".btn-close-ch")!.addEventListener("click", (e) => {
+            e.stopPropagation();
+            ghostChannels.splice(ghostChannels.indexOf(ghost), 1);
+            renderChannelList();
+            scheduleAutoSave();
+        });
+        list.appendChild(item);
+    }
 }
 
 // ── Simulate tab ──────────────────────────────────────────────────────────────
@@ -1656,12 +1684,20 @@ function idToHandle(id: string): number | undefined {
 function buildProject(): Project {
     return {
         version: 1,
-        channels: [...channels.values()].map(ch => ({
-            name: ch.info.name,
-            backend: ch.info.backend,
-            dbc_path: ch.config.dbc_path,
-            bitrate: ch.config.bitrate,
-        })),
+        channels: [
+            ...[...channels.values()].map(ch => ({
+                name: ch.info.name,
+                backend: ch.info.backend,
+                dbc_path: ch.config.dbc_path,
+                bitrate: ch.config.bitrate,
+            })),
+            ...ghostChannels.map(g => ({
+                name: g.config.name,
+                backend: g.config.backend,
+                dbc_path: g.config.dbc_path,
+                bitrate: g.config.bitrate,
+            })),
+        ],
         plot_panes: plotPanes.map(pane => ({
             signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: handleToId(s.channel), message_id: s.messageId })),
             interpolation: pane.interpolation,
@@ -1711,6 +1747,7 @@ async function newProject() {
         try { await invoke("remove_channel", { channelHandle: h }); } catch { }
     }
     channels.clear();
+    ghostChannels = [];
 
     while (plotPanes.length) closePlotPane(plotPanes[0].id);
     pendingPaneSignals = [];
@@ -1788,22 +1825,25 @@ async function applyProject(project: Project) {
     if (appRunning) await stopApp();
 
     channels.clear();
+    ghostChannels = [];
 
     for (const ch of project.channels) {
         const backend = ch.backend ?? "socketcan";
         const bitrate = ch.bitrate ?? null;
-        const handle = await invoke<number>("create_channel", { backendName: backend, channelName: ch.name }).catch(() => null);
-        if (handle !== null) {
-            channels.set(handle, {
-                info: { backend, name: ch.name },
-                config: { name: ch.name, backend, dbc_path: ch.dbc_path ?? null, bitrate },
-                dbc: null,
-                open: false,
-            });
-            await loadChannelDbc(handle);
+        const config: ChannelConfig = { name: ch.name, backend, dbc_path: ch.dbc_path ?? null, bitrate };
+        let handle: number | null = null;
+        let errMsg = "";
+        try {
+            handle = await invoke<number>("create_channel", { backendName: backend, channelName: ch.name });
+        } catch (e) {
+            errMsg = String(e);
         }
-        else {
-            setError(`Failed to create channel ${ch.name} (${backend})`);
+        if (handle !== null) {
+            channels.set(handle, { info: { backend, name: ch.name }, config, dbc: null, open: false });
+            await loadChannelDbc(handle);
+        } else {
+            console.warn(`Channel ${ch.name} (${backend}) inactive: ${errMsg}`);
+            ghostChannels.push({ config, error: errMsg });
         }
     }
 
@@ -1931,6 +1971,27 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
 // ── App recording start / stop ────────────────────────────────────────────────
 
 async function startApp() {
+    // Retry channels that failed create_channel during applyProject (hardware
+    // may have been plugged in since then). Successfully recovered ghosts are
+    // moved into `channels` so they open normally below.
+    for (const ghost of [...ghostChannels]) {
+        let handle: number | null = null;
+        let errMsg = "";
+        try {
+            handle = await invoke<number>("create_channel", { backendName: ghost.config.backend, channelName: ghost.config.name });
+        } catch (e) {
+            errMsg = String(e);
+        }
+        if (handle !== null) {
+            channels.set(handle, { info: { backend: ghost.config.backend, name: ghost.config.name }, config: ghost.config, dbc: null, open: false });
+            ghostChannels.splice(ghostChannels.indexOf(ghost), 1);
+            await loadChannelDbc(handle);
+        } else {
+            ghost.error = errMsg;
+            setError(`Channel ${ghost.config.name} (${ghost.config.backend}) not available: ${errMsg}`);
+        }
+    }
+
     // Open all configured channels (hardware connects here, not when added).
     // Each open_channel call parses the DBC fresh from disk and returns it.
     for (const handle of channels.keys()) {
