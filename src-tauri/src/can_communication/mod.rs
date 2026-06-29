@@ -67,7 +67,10 @@ impl From<String> for CanOpenError {
 // ── Backend traits ────────────────────────────────────────────────────────────
 
 pub trait TxHandle: Send + 'static {
-    fn send(&mut self, frame: &CanFrame) -> Result<(), String>;
+    /// Send `frame` and return its transmit timestamp in milliseconds since the
+    /// Unix epoch. Backends with hardware clocks return an accurate hw-derived
+    /// value; others return a wall-clock approximation captured post-send.
+    fn send(&mut self, frame: &CanFrame) -> Result<u64, String>;
     fn close(&mut self);
 }
 
@@ -320,9 +323,13 @@ fn tx_loop(
             }
         }
 
-        for frame in to_send {
-            if tx.send(&frame).is_ok() {
-                on_tx(channel, frame);
+        for mut frame in to_send {
+            match tx.send(&frame) {
+                Ok(ts) => {
+                    frame.timestamp_ms = Some(ts);
+                    on_tx(channel, frame);
+                }
+                Err(e) => error!("TX error on channel {channel}: {e}"),
             }
         }
 

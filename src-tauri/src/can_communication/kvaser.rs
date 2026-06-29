@@ -36,8 +36,8 @@ type FnSetBus = unsafe extern "system" fn(i32, c_long, u32, u32, u32, u32, u32) 
 type FnBusOn = unsafe extern "system" fn(i32) -> i32;
 type FnBusOff = unsafe extern "system" fn(i32) -> i32;
 type FnReadWait = unsafe extern "system" fn(i32, *mut c_long, *mut u8, *mut u32, *mut u32, *mut c_ulong, c_ulong) -> i32;
-type FnWrite = unsafe extern "system" fn(i32, c_long, *const u8, u32, u32) -> i32;
-type FnWriteSync = unsafe extern "system" fn(i32, c_ulong) -> i32;
+type FnWriteWait = unsafe extern "system" fn(i32, c_long, *const u8, u32, u32, c_ulong) -> i32;
+type FnReadTimer = unsafe extern "system" fn(i32, *mut u64) -> i32;
 type FnGetChannelData = unsafe extern "system" fn(i32, i32, *mut u8, usize) -> i32;
 
 struct CanLib {
@@ -50,8 +50,8 @@ struct CanLib {
     bus_on: FnBusOn,
     bus_off: FnBusOff,
     read_wait: FnReadWait,
-    write: FnWrite,
-    write_sync: FnWriteSync,
+    write_wait: FnWriteWait,
+    read_timer: FnReadTimer,
 }
 
 // SAFETY: all fields are function pointers or a library handle kept for lifetime.
@@ -79,8 +79,8 @@ impl CanLib {
                 bus_on: sym!(b"canBusOn\0", FnBusOn),
                 bus_off: sym!(b"canBusOff\0", FnBusOff),
                 read_wait: sym!(b"canReadWait\0", FnReadWait),
-                write: sym!(b"canWrite\0", FnWrite),
-                write_sync: sym!(b"canWriteSync\0", FnWriteSync),
+                write_wait: sym!(b"canWriteWait\0", FnWriteWait),
+                read_timer: sym!(b"kvReadTimer64\0", FnReadTimer),
                 _lib: lib,
             }))
         }
@@ -199,32 +199,39 @@ fn kvaser_channel_name(lib: &CanLib, index: i32) -> Option<String> {
 pub(crate) struct KvaserTxHandle {
     lib: Arc<CanLib>,
     handle: i32,
+    open_time_ms: u64,
 }
 
 // SAFETY: handle is accessed only from the TX thread after open_channel returns.
 unsafe impl Send for KvaserTxHandle {}
 
 impl TxHandle for KvaserTxHandle {
-    fn send(&mut self, frame: &CanFrame) -> Result<(), String> {
+    fn send(&mut self, frame: &CanFrame) -> Result<u64, String> {
         let flags = if frame.is_extended { CAN_MSG_EXT } else { 0 };
         // SAFETY: handle is valid; data pointer covers frame.data.len() bytes
         let s = unsafe {
-            (self.lib.write)(
+            (self.lib.write_wait)(
                 self.handle,
                 frame.can_id as c_long,
                 frame.data.as_ptr(),
                 frame.data.len() as u32,
                 flags,
+                100,
             )
         };
         if s < CAN_OK {
-            return Err(format!("canWrite failed: {}", canlib_err(s)));
+            return Err(format!("canWriteWait failed: {}", canlib_err(s)));
         }
-        let s = unsafe { (self.lib.write_sync)(self.handle, 100) };
-        if s < CAN_OK {
-            return Err(format!("canWriteSync failed: {}", canlib_err(s)));
-        }
-        Ok(())
+        let mut hw_ts: u64 = 0;
+        let ts = if unsafe { (self.lib.read_timer)(self.handle, &mut hw_ts) } == CAN_OK {
+            self.open_time_ms + hw_ts
+        } else {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis() as u64
+        };
+        Ok(ts)
     }
 
     fn close(&mut self) {}
@@ -333,7 +340,7 @@ impl CanBackend for KvaserBackend {
         })?;
         let lib = CanLib::load()?;
 
-        let (tx_handle, _) = open_handle(&lib, index as i32, freq, tseg1, tseg2, sjw)?;
+        let (tx_handle, tx_open_time_ms) = open_handle(&lib, index as i32, freq, tseg1, tseg2, sjw)?;
         let (rx_handle, open_time_ms) = match open_handle(&lib, index as i32, freq, tseg1, tseg2, sjw) {
             Ok(pair) => pair,
             Err(e) => {
@@ -349,6 +356,7 @@ impl CanBackend for KvaserBackend {
             Box::new(KvaserTxHandle {
                 lib: Arc::clone(&lib),
                 handle: tx_handle,
+                open_time_ms: tx_open_time_ms,
             }),
             Box::new(KvaserRxHandle { lib, handle: rx_handle, open_time_ms }),
         ))
