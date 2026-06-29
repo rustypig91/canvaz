@@ -43,7 +43,6 @@ type FnBusOff = unsafe extern "system" fn(i32) -> i32;
 type FnIoCtl = unsafe extern "system" fn(i32, u32, *mut std::ffi::c_void, u32) -> i32;
 type FnReadWait = unsafe extern "system" fn(i32, *mut c_long, *mut u8, *mut u32, *mut u32, *mut c_ulong, c_ulong) -> i32;
 type FnWriteWait = unsafe extern "system" fn(i32, c_long, *const u8, u32, u32, c_ulong) -> i32;
-type FnReadTimer = unsafe extern "system" fn(i32, *mut u64) -> i32;
 type FnGetChannelData = unsafe extern "system" fn(i32, i32, *mut u8, usize) -> i32;
 
 struct CanLib {
@@ -60,7 +59,6 @@ struct CanLib {
     ioctl: FnIoCtl,
     read_wait: FnReadWait,
     write_wait: FnWriteWait,
-    read_timer: FnReadTimer,
 }
 
 // SAFETY: all fields are function pointers or a library handle kept for lifetime.
@@ -93,7 +91,6 @@ impl CanLib {
                 ioctl: sym!(b"canIoCtl\0", FnIoCtl),
                 read_wait: sym!(b"canReadWait\0", FnReadWait),
                 write_wait: sym!(b"canWriteWait\0", FnWriteWait),
-                read_timer: sym!(b"kvReadTimer64\0", FnReadTimer),
                 _lib: lib,
             }))
         }
@@ -194,7 +191,8 @@ fn kvaser_channel_name(lib: &CanLib, index: i32) -> Option<String> {
 struct KvaserOsHandle {
     lib: Arc<CanLib>,
     handle: i32,
-    open_time_ms: u64,
+    /// (hw_ms_at_first_event, wall_ms_at_first_event). Set on first TX/RX.
+    ts_anchor: Option<(u64, u64)>,
 }
 
 unsafe impl Send for KvaserOsHandle {}
@@ -224,12 +222,7 @@ impl TxHandle for KvaserTxHandle {
         if s < CAN_OK {
             return Err(format!("canWriteWait failed: {}", canlib_err(s)));
         }
-        let mut hw_ts: u64 = 0;
-        frame.timestamp_ms = if unsafe { (h.lib.read_timer)(h.handle, &mut hw_ts) } == CAN_OK {
-            Some(h.open_time_ms + hw_ts)
-        } else {
-            Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
-        };
+        frame.timestamp_ms = Some(now_ms());
         Ok(())
     }
 
@@ -244,7 +237,7 @@ unsafe impl Send for KvaserRxHandle {}
 
 impl RxHandle for KvaserRxHandle {
     fn receive(&mut self, timeout_ms: u64) -> Result<Option<CanFrame>, String> {
-        let h = &self.0;
+        let h = &mut self.0;
         let mut id: c_long = 0;
         let mut data = [0u8; 8];
         let mut dlc: u32 = 0;
@@ -262,12 +255,20 @@ impl RxHandle for KvaserRxHandle {
         if flags & (CAN_MSG_ERROR_FRAME | CAN_MSG_RTR) != 0 {
             return Ok(None);
         }
+        let hw_ms = timestamp as u64;
+        // Anchor the hw timer on the first frame. canReadWait gives ms since
+        // canBusOn, but the exact epoch of the Kvaser timer is driver-dependent.
+        if h.ts_anchor.is_none() {
+            h.ts_anchor = Some((hw_ms, now_ms()));
+        }
+        let (hw_base, wall_base) = h.ts_anchor.unwrap();
+        let abs_ms = wall_base.saturating_add(hw_ms.saturating_sub(hw_base));
         let dlc = (dlc as usize).min(8);
         Ok(Some(CanFrame {
             can_id: id as u32,
             is_extended: (flags & CAN_MSG_EXT) != 0,
             data: data[..dlc].to_vec(),
-            timestamp_ms: Some(h.open_time_ms + timestamp as u64),
+            timestamp_ms: Some(abs_ms),
         }))
     }
 
@@ -330,8 +331,6 @@ impl CanBackend for KvaserBackend {
             return Err(format!("canBusOn (TX) failed: {}", canlib_err(s)).into());
         }
 
-        let open_time_ms = now_ms();
-
         // RX handle: separate OS handle per CANlib threading requirements.
         // canBusOn must be called once per handle even on the same physical channel.
         let rx_raw = unsafe { (lib.open)(idx, CAN_OPEN_ACCEPT_VIRTUAL) };
@@ -347,8 +346,8 @@ impl CanBackend for KvaserBackend {
 
         let lib = Arc::clone(lib);
         Ok((
-            Box::new(KvaserTxHandle(KvaserOsHandle { lib: Arc::clone(&lib), handle: tx_raw, open_time_ms })),
-            Box::new(KvaserRxHandle(KvaserOsHandle { lib, handle: rx_raw, open_time_ms })),
+            Box::new(KvaserTxHandle(KvaserOsHandle { lib: Arc::clone(&lib), handle: tx_raw, ts_anchor: None })),
+            Box::new(KvaserRxHandle(KvaserOsHandle { lib, handle: rx_raw, ts_anchor: None })),
         ))
     }
 

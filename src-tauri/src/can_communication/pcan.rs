@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use libloading::Library;
 
@@ -231,10 +231,10 @@ fn enumerate_channels(lib: &PcanLib) -> Vec<(TPCANHandle, String)> {
 struct PcanChannel {
     lib: Arc<PcanLib>,
     handle: TPCANHandle,
-    /// Wall-clock milliseconds since Unix epoch captured right after CAN_Initialize.
-    /// PCAN timestamps are relative to this moment, so open_time_ms + hw_ts gives
-    /// an absolute epoch-millisecond time.
-    open_time_ms: u64,
+    /// Anchors the PCAN hardware timer to wall clock on the first received frame.
+    /// (hw_ms_at_first_frame, wall_ms_at_first_frame). None until first frame arrives.
+    /// This handles drivers that don't reset their timer at CAN_Initialize.
+    ts_anchor: Mutex<Option<(u64, u64)>>,
 }
 
 // SAFETY: PCAN-Basic is thread-safe for concurrent CAN_Read + CAN_Write on the
@@ -309,13 +309,27 @@ impl RxHandle for PcanRxHandle {
                     continue;
                 }
                 let dlc = (msg.len as usize).min(8);
-                // Convert PCAN relative timestamp to absolute epoch milliseconds.
                 let hw_ms = ts.millis_overflow as u64 * 0x1_0000_0000 + ts.millis as u64;
+                // Anchor the hw timer to wall clock on the first frame. The PCAN driver
+                // may not reset its counter at CAN_Initialize (it can count from driver
+                // load or device plug-in), so we cannot simply add open_time_ms.
+                let abs_ms = {
+                    let mut anchor = ch.ts_anchor.lock().unwrap();
+                    if anchor.is_none() {
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        *anchor = Some((hw_ms, now));
+                    }
+                    let (hw_base, wall_base) = anchor.unwrap();
+                    wall_base.saturating_add(hw_ms.saturating_sub(hw_base))
+                };
                 return Ok(Some(CanFrame {
                     can_id: msg.id,
                     is_extended: (msg.msg_type & PCAN_MESSAGE_EXTENDED) != 0,
                     data: msg.data[..dlc].to_vec(),
-                    timestamp_ms: Some(ch.open_time_ms + hw_ms),
+                    timestamp_ms: Some(abs_ms),
                 }));
             } else if s_primary == PCAN_ERROR_QRCVEMPTY {
                 if std::time::Instant::now() >= deadline {
@@ -383,12 +397,7 @@ impl CanBackend for PcanBackend {
             return Err(format!("CAN_Initialize failed: {}", pcan_err(s)).into());
         }
 
-        let open_time_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let channel = Arc::new(PcanChannel { lib, handle: pcan_handle, open_time_ms });
+        let channel = Arc::new(PcanChannel { lib, handle: pcan_handle, ts_anchor: Mutex::new(None) });
 
         Ok((
             Box::new(PcanTxHandle(Arc::clone(&channel))),
