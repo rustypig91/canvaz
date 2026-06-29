@@ -216,31 +216,29 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
     let mut cans: HashMap<String, Can> = HashMap::new();
 
     #[cfg(feature = "kvaser")]
-    {
-        let sh_rx = Arc::clone(shared);
-        let sh_tx = Arc::clone(shared);
-        cans.insert(
-            "kvaser".to_string(),
-            Can::new(
-                KvaserBackend,
-                make_rx_callback("kvaser".into(), sh_rx),
-                make_tx_callback("kvaser".into(), sh_tx),
-            ),
-        );
+    match KvaserBackend::new() {
+        Ok(backend) => {
+            let sh_rx = Arc::clone(shared);
+            let sh_tx = Arc::clone(shared);
+            cans.insert(
+                "kvaser".to_string(),
+                Can::new(backend, make_rx_callback("kvaser".into(), sh_rx), make_tx_callback("kvaser".into(), sh_tx)),
+            );
+        }
+        Err(e) => warn!("Kvaser backend unavailable: {e}"),
     }
 
     #[cfg(feature = "pcan")]
-    {
-        let sh_rx = Arc::clone(shared);
-        let sh_tx = Arc::clone(shared);
-        cans.insert(
-            "pcan".to_string(),
-            Can::new(
-                PcanBackend,
-                make_rx_callback("pcan".into(), sh_rx),
-                make_tx_callback("pcan".into(), sh_tx),
-            ),
-        );
+    match PcanBackend::new() {
+        Ok(backend) => {
+            let sh_rx = Arc::clone(shared);
+            let sh_tx = Arc::clone(shared);
+            cans.insert(
+                "pcan".to_string(),
+                Can::new(backend, make_rx_callback("pcan".into(), sh_rx), make_tx_callback("pcan".into(), sh_tx)),
+            );
+        }
+        Err(e) => warn!("PCAN backend unavailable: {e}"),
     }
 
     #[cfg(feature = "linux-can")]
@@ -424,24 +422,24 @@ impl CanManager {
         info!("Reset CAN manager: all channels closed and unregistered");
     }
 
-    /// Close all channels, drop every backend (unloading their DLLs), recreate
-    /// fresh backend instances, then re-register every channel that was previously
-    /// created (but leave them all closed). Returns the old→new handle mapping so
-    /// the frontend can update its references.
+    /// Re-enumerate hardware in every backend and re-register all previously
+    /// created channels (leaving them closed). Returns the old→new handle mapping.
+    /// On Kvaser this calls canUnloadLibrary()+canInitializeLibrary() which is the
+    /// documented way to detect hardware connected after the initial library init.
     pub fn reload_backends(&mut self) -> Vec<(u32, u32)> {
-        // Snapshot channel info before reset wipes registrations.
         let previous: Vec<(u32, ChannelInfo)> = self.shared.lock().ok().map(|lock| {
             lock.channels.iter().map(|(&h, d)| (h, d.info.clone())).collect()
         }).unwrap_or_default();
 
         self.reset();
-        // Dropping the old HashMap unloads all backend DLLs.
-        self.cans = HashMap::new();
-        self.cans = build_cans(&self.shared);
 
-        // Re-register each channel. create_channel re-enumerates hardware, so
-        // channels whose hardware is now connected will succeed; others are
-        // omitted and the frontend will handle them as ghosts.
+        // canUnloadLibrary() resets the "already initialised" flag inside CANlib
+        // so the next canInitializeLibrary() performs a true hardware re-scan.
+        // Must be called after all handles are closed (which reset() guarantees).
+        for can in self.cans.values() {
+            can.reinitialize();
+        }
+
         let total = previous.len();
         let mut remapped = Vec::new();
         for (old_handle, info) in previous {
@@ -450,7 +448,7 @@ impl CanManager {
                 Err(e) => warn!("Could not re-register {} {} after reload: {e}", info.backend, info.name),
             }
         }
-        info!("Reloaded all CAN backends; re-registered {}/{total} channels", remapped.len());
+        info!("Reloaded backends; re-registered {}/{total} channels", remapped.len());
         remapped
     }
 

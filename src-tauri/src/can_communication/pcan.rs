@@ -321,6 +321,12 @@ impl RxHandle for PcanRxHandle {
 
 pub struct PcanBackend;
 
+impl PcanBackend {
+    pub fn new() -> Result<Self, String> {
+        PcanLib::load().map(|_| Self)
+    }
+}
+
 impl CanBackend for PcanBackend {
     fn list_channels(&self) -> Vec<String> {
         let lib = match PcanLib::load() {

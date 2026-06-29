@@ -32,6 +32,7 @@ const CAN_OK: i32 = 0;
 const CAN_ERR_NOMSG: i32 = -2;
 
 type FnInit = unsafe extern "system" fn();
+type FnUnload = unsafe extern "system" fn() -> i32;
 type FnGetCount = unsafe extern "system" fn(*mut i32) -> i32;
 type FnOpen = unsafe extern "system" fn(i32, i32) -> i32;
 type FnClose = unsafe extern "system" fn(i32) -> i32;
@@ -45,6 +46,8 @@ type FnGetChannelData = unsafe extern "system" fn(i32, i32, *mut u8, usize) -> i
 
 struct CanLib {
     _lib: Library,
+    init: FnInit,
+    unload: FnUnload,
     get_count: FnGetCount,
     get_channel_data: FnGetChannelData,
     open: FnOpen,
@@ -67,18 +70,16 @@ impl CanLib {
         unsafe {
             let lib = Library::new(CANLIB).map_err(|e| format!("CANlib ({CANLIB}) not found: {e}"))?;
             let init: FnInit = *lib.get(b"canInitializeLibrary\0").map_err(|e| e.to_string())?;
+            let unload: FnUnload = *lib.get(b"canUnloadLibrary\0").map_err(|e| e.to_string())?;
             init();
-            // On Windows, canInitializeLibrary triggers asynchronous PnP device
-            // enumeration in the kernel driver. A brief pause lets that settle
-            // before canGetNumberOfChannels is called.
-            #[cfg(windows)]
-            std::thread::sleep(std::time::Duration::from_millis(200));
             macro_rules! sym {
                 ($b:literal, $t:ty) => {
                     *lib.get::<$t>($b).map_err(|e| e.to_string())?
                 };
             }
             Ok(Arc::new(Self {
+                init,
+                unload,
                 get_count: sym!(b"canGetNumberOfChannels\0", FnGetCount),
                 get_channel_data: sym!(b"canGetChannelData\0", FnGetChannelData),
                 open: sym!(b"canOpenChannel\0", FnOpen),
@@ -323,18 +324,22 @@ impl RxHandle for KvaserRxHandle {
 
 // ── Backend ───────────────────────────────────────────────────────────────────
 
-pub struct KvaserBackend;
+pub struct KvaserBackend {
+    lib: Arc<CanLib>,
+}
+
+impl KvaserBackend {
+    pub fn new() -> Result<Self, String> {
+        Ok(Self { lib: CanLib::load()? })
+    }
+}
 
 impl CanBackend for KvaserBackend {
     fn list_channels(&self) -> Vec<String> {
-        let lib = match CanLib::load() {
-            Ok(l) => l,
-            Err(_) => return Vec::new(),
-        };
         let mut n: i32 = 0;
-        unsafe { (lib.get_count)(&mut n) };
+        unsafe { (self.lib.get_count)(&mut n) };
         (0..n.max(0) as i32)
-            .map(|i| kvaser_channel_name(&lib, i).unwrap_or_else(|| format!("Channel {i}")))
+            .map(|i| kvaser_channel_name(&self.lib, i).unwrap_or_else(|| format!("Channel {i}")))
             .collect()
     }
 
@@ -351,17 +356,25 @@ impl CanBackend for KvaserBackend {
                 bitrate
             )
         })?;
-        let lib = CanLib::load()?;
-
-        // Open a single CANlib handle shared by both TX and RX threads.
-        // This ensures that the self-echo of transmitted frames comes back to
-        // the same handle with canMSG_TX set, so the RX side can filter it.
+        let lib = Arc::clone(&self.lib);
         let (handle, open_time_ms) = open_handle(&lib, index as i32, freq, tseg1, tseg2, sjw)?;
         let channel = Arc::new(KvaserChannel { lib, handle, open_time_ms });
-
         Ok((
             Box::new(KvaserTxHandle(Arc::clone(&channel))),
             Box::new(KvaserRxHandle(channel)),
         ))
+    }
+
+    fn reinitialize(&self) {
+        // canUnloadLibrary() resets CANlib's internal "already initialised" flag
+        // and device list. The subsequent canInitializeLibrary() then performs a
+        // true fresh enumeration and picks up hardware connected since the last
+        // call. This is the documented API path for hot-plug support within a
+        // running process; see Kvaser CANlib user guide, "Initialization" chapter.
+        // Must only be called when all channel handles are closed.
+        unsafe {
+            (self.lib.unload)();
+            (self.lib.init)();
+        }
     }
 }
