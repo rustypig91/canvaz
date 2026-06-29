@@ -118,7 +118,7 @@ struct StoredFrame {
 
 struct ChannelData {
     frames: VecDeque<StoredFrame>,
-    signals: HashMap<String, SignalStats>,
+    signals: HashMap<(u32, String), SignalStats>,
     dbc: Option<Arc<ParsedDbc>>,
     info: ChannelInfo,
 }
@@ -147,11 +147,12 @@ impl ChannelData {
         let msg_name = frame.message_name.clone().unwrap_or_default();
         let mut events = Vec::new();
         for sig in &frame.signals {
+            let sig_key = (frame.can_id, sig.name.clone());
             self.signals
-                .entry(sig.name.clone())
+                .entry(sig_key.clone())
                 .and_modify(|s| s.update(sig.value))
                 .or_insert_with(|| SignalStats::new(sig.value));
-            let s = &self.signals[&sig.name];
+            let s = &self.signals[&sig_key];
             events.push((sig.name.clone(), sig.value, sig.unit.clone(), msg_name.clone(), s.min, s.max));
         }
         events
@@ -181,10 +182,10 @@ impl ChannelData {
             .collect()
     }
 
-    fn get_signal_history(&self, signal_name: &str, since_ms: u64) -> Vec<SignalSample> {
+    fn get_signal_history(&self, can_id: u32, signal_name: &str, since_ms: u64) -> Vec<SignalSample> {
         self.frames
             .iter()
-            .filter(|f| f.timestamp_ms >= since_ms)
+            .filter(|f| f.timestamp_ms >= since_ms && f.can_id == can_id)
             .filter_map(|f| {
                 f.signals.iter().find(|s| s.name == signal_name).map(|s| SignalSample {
                     timestamp_ms: f.timestamp_ms,
@@ -506,12 +507,12 @@ impl CanManager {
         }
     }
 
-    pub fn get_signal_history(&self, handle: u32, signal_name: &str, since_ms: u64) -> Vec<SignalSample> {
+    pub fn get_signal_history(&self, handle: u32, message_id: u32, signal_name: &str, since_ms: u64) -> Vec<SignalSample> {
         match self.shared.lock() {
             Ok(lock) => lock
                 .channels
                 .get(&handle)
-                .map(|c| c.get_signal_history(signal_name, since_ms))
+                .map(|c| c.get_signal_history(message_id, signal_name, since_ms))
                 .unwrap_or_default(),
             Err(_) => Vec::new(),
         }

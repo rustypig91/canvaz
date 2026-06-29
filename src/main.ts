@@ -80,7 +80,7 @@ interface CanFrameEvent {
     signals: DecodedSignal[];
 }
 
-interface PlotSignalEntry { signal_name: string; channel: string; }
+interface PlotSignalEntry { signal_name: string; channel: string; message_id?: number; }
 interface PlotPaneConfig { signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean; }
 interface ChannelInfo { backend: string; name: string; }
 interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate: number | null; }
@@ -140,6 +140,7 @@ const PLOT_COLORS = [
 interface PlotSeries {
     signalName: string;
     messageName: string;
+    messageId: number;
     unit: string;
     color: string;
     channel: number;
@@ -251,8 +252,8 @@ let pendingSimSignals: SimulateEntry[] = [];
 let midPan: { startX: number; startMin: number; startMax: number; chartWidth: number } | null = null;
 
 
-function plotKey(channel: number, signalName: string) {
-    return `${channel}::${signalName}`;
+function plotKey(channel: number, messageId: number, signalName: string) {
+    return `${channel}::${messageId}::${signalName}`;
 }
 
 function decodeSignal(data: number[], sig: DbcSignal): number {
@@ -529,11 +530,11 @@ function closePlotPane(id: string) {
 // ── Signal → pane ─────────────────────────────────────────────────────────────
 
 async function addSignalToPane(pane: PlotPane, handle: number, sig: DbcSignal) {
-    const key = plotKey(handle, sig.name);
+    const key = plotKey(handle, sig.message_id, sig.name);
     if (pane.series.has(key)) return;
     const color = PLOT_COLORS[pane.series.size % PLOT_COLORS.length];
     const series: PlotSeries = {
-        signalName: sig.name, messageName: sig.message_name, unit: sig.unit,
+        signalName: sig.name, messageName: sig.message_name, messageId: sig.message_id, unit: sig.unit,
         color, channel: handle, timestamps: [], data: [], lastValue: null, frozenLength: null,
     };
     // Register the series NOW so live signal-value events are captured immediately
@@ -561,7 +562,7 @@ async function addSignalToPane(pane: PlotPane, handle: number, sig: DbcSignal) {
         // historical samples that are older than the first live sample.
         try {
             const history = await invoke<Array<{ timestamp_ms: number; value: number }>>(
-                "get_signal_history", { handle, signalName: sig.name, sinceMs: 0 }
+                "get_signal_history", { handle, messageId: sig.message_id, signalName: sig.name, sinceMs: 0 }
             );
             const liveStart = series.timestamps[0] ?? Infinity;
             const toInsert = history.filter(s => s.timestamp_ms < liveStart);
@@ -626,12 +627,12 @@ function updateSignalHighlights() {
     const simulated = new Set<string>();
     for (const entry of simEntries.values()) {
         if (entry.kind === "message") {
-            for (const s of entry.signals) simulated.add(plotKey(entry.channel, s.def.name));
+            for (const s of entry.signals) simulated.add(plotKey(entry.channel, s.def.message_id, s.def.name));
         }
     }
 
     document.querySelectorAll<HTMLElement>(".signal-row").forEach(row => {
-        const key = plotKey(parseInt(row.dataset.channel ?? "0"), row.dataset.signal ?? "");
+        const key = plotKey(parseInt(row.dataset.channel ?? "0"), parseInt(row.dataset.messageId ?? "0"), row.dataset.signal ?? "");
         row.classList.toggle("in-plot", plotted.has(key));
         row.classList.toggle("in-sim", simulated.has(key));
     });
@@ -673,8 +674,9 @@ function renderDbcTree(filter = "") {
             const row = document.createElement("div");
             row.className = "signal-row";
             row.dataset.signal = sig.name;
+            row.dataset.messageId = String(sig.message_id);
             row.dataset.channel = String(selectedChannel!);
-            const key = plotKey(selectedChannel!, sig.name);
+            const key = plotKey(selectedChannel!, sig.message_id, sig.name);
             const lastVal = signalLastValues.get(key);
             const valText = lastVal != null ? formatSigValue(lastVal, sig.unit) : (sig.unit || "");
             const mn = signalMinValues.get(key);
@@ -1603,7 +1605,7 @@ function buildProject(): Project {
             bitrate: ch.config.bitrate,
         })),
         plot_panes: plotPanes.map(pane => ({
-            signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: handleToId(s.channel) })),
+            signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: handleToId(s.channel), message_id: s.messageId })),
             interpolation: pane.interpolation,
             show_points: pane.showPoints,
         })),
@@ -1920,7 +1922,11 @@ async function startApp() {
                 const handle = idToHandle(entry.channel);
                 if (handle === undefined) continue;
                 const dbc = channels.get(handle)?.dbc;
-                const sig = dbc && Object.values(dbc.messages).flatMap((m: DbcMessage) => m.signals).find((s: DbcSignal) => s.name === entry.signal_name);
+                const sig = dbc && Object.values(dbc.messages).flatMap((m: DbcMessage) => m.signals).find(
+                    (s: DbcSignal) => entry.message_id !== undefined
+                        ? s.message_id === entry.message_id && s.name === entry.signal_name
+                        : s.name === entry.signal_name
+                );
                 if (sig) await addSignalToPane(plotPanes[i], handle, sig);
             }
         }
@@ -2654,7 +2660,7 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
             const maxCells = next.querySelectorAll<HTMLElement>(".te-max");
             msg.signals.forEach((sig: DbcSignal, i: number) => {
                 if (valCells[i]) valCells[i].textContent = formatSigValue(decodeSignal(entry.data, sig), "");
-                const key = plotKey(entry.channelHandle, sig.name);
+                const key = plotKey(entry.channelHandle, entry.canId, sig.name);
                 const mn = signalMinValues.get(key);
                 const mx = signalMaxValues.get(key);
                 if (minCells[i]) minCells[i].textContent = mn !== undefined ? formatSigValue(mn, "") : "—";
@@ -2682,7 +2688,7 @@ function onCanFrame(ev: CanFrameEvent) {
     // Process decoded signals — update sidebar and plot series regardless of pause state.
     const x = (ev.timestamp_ms - appStartTime) / 1000;
     for (const sig of ev.signals) {
-        const sigKey = plotKey(ev.channel_handle, sig.name);
+        const sigKey = plotKey(ev.channel_handle, ev.can_id, sig.name);
         signalLastValues.set(sigKey, sig.value);
         signalMinValues.set(sigKey, sig.min);
         signalMaxValues.set(sigKey, sig.max);
@@ -3183,7 +3189,7 @@ function setupTrace() {
             + '</tr></thead><tbody>';
         for (const sig of msg.signals) {
             const val = decodeSignal(bytes, sig);
-            const key = plotKey(trHandle, sig.name);
+            const key = plotKey(trHandle, canId, sig.name);
             const mn = signalMinValues.get(key);
             const mx = signalMaxValues.get(key);
             const fmt = (v: number | undefined) => v !== undefined ? formatSigValue(v, "") : "—";
