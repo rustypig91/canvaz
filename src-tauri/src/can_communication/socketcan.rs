@@ -27,6 +27,7 @@ impl RxHandle for SocketCanRxHandle {
                 can_id: df.raw_id(),
                 is_extended: df.is_extended(),
                 data: df.data().to_vec(),
+                timestamp_ms: None,
             })),
             Ok(_) => Ok(None),
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(None),

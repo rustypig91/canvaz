@@ -157,6 +157,7 @@ fn add_periodic_frame(cmd: AddPeriodicFrameCmd, state: State<'_, TauriState>) ->
             can_id: cmd.can_id,
             is_extended: cmd.can_id > 0x7FF,
             data: cmd.data,
+            timestamp_ms: None,
         },
         cmd.period_ms,
     )

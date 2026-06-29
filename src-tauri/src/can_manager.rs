@@ -477,6 +477,7 @@ impl CanManager {
                 can_id,
                 is_extended: can_id > 0x7FF,
                 data,
+                timestamp_ms: None,
             },
         )
     }
@@ -497,6 +498,7 @@ impl CanManager {
                 can_id: msg_id,
                 is_extended: msg_id > 0x7FF,
                 data,
+                timestamp_ms: None,
             },
         )
     }
@@ -539,6 +541,7 @@ impl CanManager {
                 can_id: msg_id,
                 is_extended: msg_id > 0x7FF,
                 data,
+                timestamp_ms: None,
             },
             period_ms,
         )
@@ -681,7 +684,7 @@ impl CanManager {
 
 fn make_rx_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl Fn(u8, CanFrame) + Send + Sync + 'static {
     move |hw_index, raw| {
-        let ts = now_ms();
+        let ts = raw.timestamp_ms.unwrap_or_else(now_ms);
 
         // Hold the lock for the minimum time needed to decode and update state,
         // collecting events to emit after releasing.
@@ -767,7 +770,7 @@ fn make_rx_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl 
 
 fn make_tx_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl Fn(u8, CanFrame) + Send + Sync + 'static {
     move |hw_index, raw| {
-        let ts = now_ms();
+        let ts = raw.timestamp_ms.unwrap_or_else(now_ms);
         let (app, frame_event) = {
             let mut lock = match shared.lock() {
                 Ok(l) => l,

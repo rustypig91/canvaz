@@ -157,7 +157,11 @@ fn canlib_err(status: i32) -> String {
     format!("CANlib error {status} ({desc})")
 }
 
-fn open_handle(lib: &CanLib, index: i32, freq: c_long, tseg1: u32, tseg2: u32, sjw: u32) -> Result<i32, String> {
+/// Returns `(handle, open_time_ms)` where `open_time_ms` is the wall-clock time
+/// in milliseconds since the Unix epoch captured right after `canBusOn` succeeds.
+/// Kvaser hardware timestamps are milliseconds relative to this moment, so
+/// `open_time_ms + hw_timestamp` gives an absolute epoch-millisecond time.
+fn open_handle(lib: &CanLib, index: i32, freq: c_long, tseg1: u32, tseg2: u32, sjw: u32) -> Result<(i32, u64), String> {
     // SAFETY: calling canOpenChannel with valid index and flags
     let handle = unsafe { (lib.open)(index, CAN_OPEN_ACCEPT_VIRTUAL) };
     if handle < 0 {
@@ -173,7 +177,11 @@ fn open_handle(lib: &CanLib, index: i32, freq: c_long, tseg1: u32, tseg2: u32, s
         unsafe { (lib.close)(handle) };
         return Err(format!("canBusOn failed: {}", canlib_err(s)));
     }
-    Ok(handle)
+    let open_time_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    Ok((handle, open_time_ms))
 }
 
 fn kvaser_channel_name(lib: &CanLib, index: i32) -> Option<String> {
@@ -237,6 +245,7 @@ impl Drop for KvaserTxHandle {
 pub(crate) struct KvaserRxHandle {
     lib: Arc<CanLib>,
     handle: i32,
+    open_time_ms: u64,
 }
 
 // SAFETY: handle is accessed only from the RX thread after open_channel returns.
@@ -275,6 +284,7 @@ impl RxHandle for KvaserRxHandle {
             can_id: id as u32,
             is_extended: (flags & CAN_MSG_EXT) != 0,
             data: data[..dlc].to_vec(),
+            timestamp_ms: Some(self.open_time_ms + timestamp as u64),
         }))
     }
 
@@ -323,9 +333,9 @@ impl CanBackend for KvaserBackend {
         })?;
         let lib = CanLib::load()?;
 
-        let tx_handle = open_handle(&lib, index as i32, freq, tseg1, tseg2, sjw)?;
-        let rx_handle = match open_handle(&lib, index as i32, freq, tseg1, tseg2, sjw) {
-            Ok(h) => h,
+        let (tx_handle, _) = open_handle(&lib, index as i32, freq, tseg1, tseg2, sjw)?;
+        let (rx_handle, open_time_ms) = match open_handle(&lib, index as i32, freq, tseg1, tseg2, sjw) {
+            Ok(pair) => pair,
             Err(e) => {
                 unsafe {
                     (lib.bus_off)(tx_handle);
@@ -340,7 +350,7 @@ impl CanBackend for KvaserBackend {
                 lib: Arc::clone(&lib),
                 handle: tx_handle,
             }),
-            Box::new(KvaserRxHandle { lib, handle: rx_handle }),
+            Box::new(KvaserRxHandle { lib, handle: rx_handle, open_time_ms }),
         ))
     }
 }

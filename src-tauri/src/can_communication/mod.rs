@@ -26,6 +26,10 @@ pub struct CanFrame {
     pub can_id: u32,
     pub is_extended: bool,
     pub data: Vec<u8>,
+    /// Hardware-provided receive timestamp in milliseconds since the Unix epoch,
+    /// if the backend supplies one. `None` means the caller should fall back to
+    /// wall-clock time. Only set on received frames — never on frames to transmit.
+    pub timestamp_ms: Option<u64>,
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
