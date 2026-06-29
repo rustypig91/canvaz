@@ -13,6 +13,8 @@ use crate::dbc_parser::ParsedDbc;
 
 #[cfg(feature = "kvaser")]
 use crate::can_communication::KvaserBackend;
+#[cfg(feature = "pcan")]
+use crate::can_communication::PcanBackend;
 #[cfg(feature = "linux-can")]
 use crate::can_communication::SocketCanBackend;
 
@@ -210,6 +212,55 @@ struct ManagerShared {
 
 // ── CanManager ────────────────────────────────────────────────────────────────
 
+fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
+    let mut cans: HashMap<String, Can> = HashMap::new();
+
+    #[cfg(feature = "kvaser")]
+    match KvaserBackend::new() {
+        Ok(backend) => {
+            let sh_rx = Arc::clone(shared);
+            let sh_tx = Arc::clone(shared);
+            cans.insert(
+                "kvaser".to_string(),
+                Can::new(backend, make_rx_callback("kvaser".into(), sh_rx), make_tx_callback("kvaser".into(), sh_tx)),
+            );
+            info!("Kvaser backend initialized successfully");
+        }
+        Err(e) => warn!("Kvaser backend unavailable: {e}"),
+    }
+
+    #[cfg(feature = "pcan")]
+    match PcanBackend::new() {
+        Ok(backend) => {
+            let sh_rx = Arc::clone(shared);
+            let sh_tx = Arc::clone(shared);
+            cans.insert(
+                "pcan".to_string(),
+                Can::new(backend, make_rx_callback("pcan".into(), sh_rx), make_tx_callback("pcan".into(), sh_tx)),
+            );
+            info!("PCAN backend initialized successfully");
+        }
+        Err(e) => warn!("PCAN backend unavailable: {e}"),
+    }
+
+    #[cfg(feature = "linux-can")]
+    {
+        let sh_rx = Arc::clone(shared);
+        let sh_tx = Arc::clone(shared);
+        cans.insert(
+            "socketcan".to_string(),
+            Can::new(
+                SocketCanBackend,
+                make_rx_callback("socketcan".into(), sh_rx),
+                make_tx_callback("socketcan".into(), sh_tx),
+            ),
+        );
+        info!("SocketCAN backend initialized successfully");
+    }
+
+    cans
+}
+
 pub struct CanManager {
     app_state: Arc<AppState>,
     shared: Arc<Mutex<ManagerShared>>,
@@ -226,36 +277,7 @@ impl CanManager {
             handle_to_index: HashMap::new(),
         }));
 
-        let mut cans: HashMap<String, Can> = HashMap::new();
-
-        #[cfg(feature = "kvaser")]
-        {
-            let sh_rx = Arc::clone(&shared);
-            let sh_tx = Arc::clone(&shared);
-            cans.insert(
-                "kvaser".to_string(),
-                Can::new(
-                    KvaserBackend,
-                    make_rx_callback("kvaser".into(), sh_rx),
-                    make_tx_callback("kvaser".into(), sh_tx),
-                ),
-            );
-        }
-
-        #[cfg(feature = "linux-can")]
-        {
-            let sh_rx = Arc::clone(&shared);
-            let sh_tx = Arc::clone(&shared);
-            cans.insert(
-                "socketcan".to_string(),
-                Can::new(
-                    SocketCanBackend,
-                    make_rx_callback("socketcan".into(), sh_rx),
-                    make_tx_callback("socketcan".into(), sh_tx),
-                ),
-            );
-        }
-
+        let cans = build_cans(&shared);
         Self { app_state, shared, cans }
     }
 
@@ -267,6 +289,7 @@ impl CanManager {
         let mut out = Vec::new();
         for (backend_name, can) in &self.cans {
             for ch in can.list_channels() {
+                debug!("Found channel '{ch}' on backend '{backend_name}'");
                 out.push(ChannelInfo {
                     backend: backend_name.clone(),
                     name: ch,
@@ -401,6 +424,36 @@ impl CanManager {
             lock.handle_to_index.clear();
         }
         info!("Reset CAN manager: all channels closed and unregistered");
+    }
+
+    /// Re-enumerate hardware in every backend and re-register all previously
+    /// created channels (leaving them closed). Returns the old→new handle mapping.
+    /// On Kvaser this calls canUnloadLibrary()+canInitializeLibrary() which is the
+    /// documented way to detect hardware connected after the initial library init.
+    pub fn reload_backends(&mut self) -> Vec<(u32, u32)> {
+        let previous: Vec<(u32, ChannelInfo)> = self.shared.lock().ok().map(|lock| {
+            lock.channels.iter().map(|(&h, d)| (h, d.info.clone())).collect()
+        }).unwrap_or_default();
+
+        self.reset();
+
+        // canUnloadLibrary() resets the "already initialised" flag inside CANlib
+        // so the next canInitializeLibrary() performs a true hardware re-scan.
+        // Must be called after all handles are closed (which reset() guarantees).
+        for can in self.cans.values() {
+            can.reinitialize();
+        }
+
+        let total = previous.len();
+        let mut remapped = Vec::new();
+        for (old_handle, info) in previous {
+            match self.create_channel(&info.backend, &info.name) {
+                Ok(new_handle) => remapped.push((old_handle, new_handle)),
+                Err(e) => warn!("Could not re-register {} {} after reload: {e}", info.backend, info.name),
+            }
+        }
+        info!("Reloaded backends; re-registered {}/{total} channels", remapped.len());
+        remapped
     }
 
     pub fn created_channels_info(&self) -> Vec<ChannelInfo> {

@@ -405,6 +405,7 @@ body.resizing {
   flex-shrink: 0;
 }
 .channel-item .dot.closed { background: var(--text-muted); }
+.channel-item .dot.error { background: var(--danger); cursor: help; }
 .channel-item .ch-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
 .channel-item .ch-backend { font-size: 10px; }
 .channel-item .btn-close-ch {

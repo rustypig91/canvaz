@@ -1,5 +1,7 @@
 #[cfg(feature = "kvaser")]
 mod kvaser;
+#[cfg(feature = "pcan")]
+mod pcan;
 #[cfg(feature = "linux-can")]
 mod socketcan;
 
@@ -7,6 +9,8 @@ use log::{debug, error, info};
 
 #[cfg(feature = "kvaser")]
 pub use kvaser::KvaserBackend;
+#[cfg(feature = "pcan")]
+pub use pcan::PcanBackend;
 #[cfg(feature = "linux-can")]
 pub use socketcan::SocketCanBackend;
 
@@ -88,6 +92,9 @@ pub trait CanBackend: Send + 'static {
         bitrate: u32,
         admin_password: Option<&str>,
     ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError>;
+    /// Reset and re-enumerate hardware. Call only after all channels are closed.
+    /// Default is a no-op; backends that support hot-plug override this.
+    fn reinitialize(&self) {}
 }
 
 // Allow backends that return String errors to use ? directly.
@@ -149,6 +156,10 @@ impl Can {
 
     pub fn list_channels(&self) -> Vec<String> {
         self.backend.list_channels()
+    }
+
+    pub fn reinitialize(&self) {
+        self.backend.reinitialize();
     }
 
     pub fn open(&mut self, channel: u8, bitrate: u32, admin_password: Option<&str>) -> Result<(), CanOpenError> {

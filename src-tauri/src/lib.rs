@@ -16,7 +16,7 @@ use app_state::AppState;
 use can_manager::{CanManager, ChannelInfo, FrameInfo, ManagerState, SignalSample};
 use dbc_parser::ParsedDbc;
 use project::Project;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 
 use log::{debug, error, info};
@@ -97,6 +97,18 @@ fn close_channel(channel_handle: u32, state: State<'_, TauriState>) -> Result<()
 fn reset_backend(state: State<'_, TauriState>) -> Result<(), String> {
     state.can_manager.lock().map_err(|e| e.to_string())?.reset();
     Ok(())
+}
+
+#[derive(Serialize)]
+struct RemappedChannel {
+    old_handle: u32,
+    new_handle: u32,
+}
+
+#[tauri::command]
+fn reload_backends(state: State<'_, TauriState>) -> Result<Vec<RemappedChannel>, String> {
+    let remapped = state.can_manager.lock().map_err(|e| e.to_string())?.reload_backends();
+    Ok(remapped.into_iter().map(|(old_handle, new_handle)| RemappedChannel { old_handle, new_handle }).collect())
 }
 
 /// Parse a DBC file from disk. Lets the frontend show a channel's signal tree
@@ -320,6 +332,7 @@ pub fn run() {
             open_channel,
             close_channel,
             reset_backend,
+            reload_backends,
             parse_dbc,
             created_channels,
             send_message,
