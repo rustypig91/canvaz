@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex,
+    Arc, Condvar, Mutex,
 };
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -111,7 +111,7 @@ enum SendEntry {
     },
 }
 
-type SendQueue = Arc<Mutex<Vec<SendEntry>>>;
+type SendQueue = Arc<(Mutex<Vec<SendEntry>>, Condvar)>;
 
 // ── Per-channel open state ────────────────────────────────────────────────────
 
@@ -163,7 +163,7 @@ impl Can {
 
         let (tx_handle, rx_handle) = self.backend.open_channel(channel, bitrate, self.admin_password.as_deref())?;
 
-        let queue: SendQueue = Arc::new(Mutex::new(Vec::new()));
+        let queue: SendQueue = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
         let rx_thread = {
@@ -198,6 +198,7 @@ impl Can {
             format!("Channel {channel} is not open")
         })?;
         state.stop.store(true, Ordering::Relaxed);
+        state.queue.1.notify_one();
         let _ = state.rx_thread.join();
         let _ = state.tx_thread.join();
         info!("Closed channel {channel}");
@@ -211,10 +212,10 @@ impl Can {
     /// Enqueue a frame to be sent exactly once.
     pub fn send_once(&self, channel: u8, frame: CanFrame) -> Result<(), String> {
         debug!("Enqueuing one-shot frame on channel {channel}: id=0x{:X}", frame.can_id);
-        self.queue(channel)?
-            .lock()
-            .map_err(|_| "Queue lock poisoned".to_string())?
-            .push(SendEntry::OneShot(frame));
+        let q = self.queue(channel)?;
+        let (lock, cvar) = q.as_ref();
+        lock.lock().map_err(|_| "Queue lock poisoned".to_string())?.push(SendEntry::OneShot(frame));
+        cvar.notify_one();
         Ok(())
     }
 
@@ -226,28 +227,27 @@ impl Can {
             "Adding periodic frame on channel {channel}: id=0x{:X}, period={}ms, handle={handle}",
             frame.can_id, period_ms
         );
-        self.queue(channel)?
-            .lock()
-            .map_err(|_| "Queue lock poisoned".to_string())?
-            .push(SendEntry::Periodic {
-                handle,
-                frame,
-                period_ms,
-                next: Instant::now(),
-            });
+        let q = self.queue(channel)?;
+        let (lock, cvar) = q.as_ref();
+        lock.lock().map_err(|_| "Queue lock poisoned".to_string())?.push(SendEntry::Periodic {
+            handle,
+            frame,
+            period_ms,
+            next: Instant::now(),
+        });
+        cvar.notify_one();
         Ok(handle)
     }
 
     /// Remove the periodic entry identified by `handle`.
     pub fn remove_periodic(&self, channel: u8, handle: u64) -> Result<(), String> {
         debug!("Removing periodic frame on channel {channel}: handle={handle}");
-        self.queue(channel)?
-            .lock()
-            .map_err(|_| "Queue lock poisoned".to_string())?
-            .retain(|e| match e {
-                SendEntry::Periodic { handle: h, .. } => *h != handle,
-                _ => true,
-            });
+        let q = self.queue(channel)?;
+        let (lock, _) = q.as_ref();
+        lock.lock().map_err(|_| "Queue lock poisoned".to_string())?.retain(|e| match e {
+            SendEntry::Periodic { handle: h, .. } => *h != handle,
+            _ => true,
+        });
         Ok(())
     }
 
@@ -263,6 +263,7 @@ impl Drop for Can {
     fn drop(&mut self) {
         for state in self.channels.values() {
             state.stop.store(true, Ordering::Relaxed);
+            state.queue.1.notify_one();
         }
         // Threads will notice the flag and exit on their next iteration;
         // we don't join here to avoid blocking the drop caller.
@@ -292,48 +293,55 @@ fn tx_loop(
     channel: u8,
     on_tx: Arc<dyn Fn(u8, CanFrame) + Send + Sync>,
 ) {
-    while !stop.load(Ordering::Relaxed) {
+    let (lock, cvar) = &*queue;
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+
         let now = Instant::now();
-        let mut to_send: Vec<CanFrame> = Vec::new();
+        let mut next_deadline: Option<Instant> = None;
 
-        {
-            let mut q = match queue.lock() {
-                Ok(q) => q,
-                Err(_) => break,
-            };
-            let mut i = 0;
-            while i < q.len() {
-                match &mut q[i] {
-                    SendEntry::OneShot(_) => {
-                        if let SendEntry::OneShot(f) = q.remove(i) {
-                            to_send.push(f);
+        let mut q = match lock.lock() {
+            Ok(q) => q,
+            Err(_) => break,
+        };
+        let mut i = 0;
+        while i < q.len() {
+            match &mut q[i] {
+                SendEntry::OneShot(_) => {
+                    if let SendEntry::OneShot(f) = q.remove(i) {
+                        match tx.send(&f) {
+                            Ok(ts) => on_tx(channel, CanFrame { timestamp_ms: Some(ts), ..f }),
+                            Err(e) => error!("TX error on channel {channel}: {e}"),
                         }
-                        // i unchanged — next element has shifted into position i
                     }
-                    SendEntry::Periodic {
-                        frame, period_ms, next, ..
-                    } => {
-                        if now >= *next {
-                            to_send.push(frame.clone());
-                            *next = now + Duration::from_millis(*period_ms);
+                }
+                SendEntry::Periodic { frame, period_ms, next, .. } => {
+                    if now >= *next {
+                        let f = frame.clone();
+                        *next = now + Duration::from_millis(*period_ms);
+                        match tx.send(&f) {
+                            Ok(ts) => on_tx(channel, CanFrame { timestamp_ms: Some(ts), ..f }),
+                            Err(e) => error!("TX error on channel {channel}: {e}"),
                         }
-                        i += 1;
                     }
+                    next_deadline = Some(match next_deadline {
+                        Some(t) => t.min(*next),
+                        None => *next,
+                    });
+                    i += 1;
                 }
             }
         }
 
-        for mut frame in to_send {
-            match tx.send(&frame) {
-                Ok(ts) => {
-                    frame.timestamp_ms = Some(ts);
-                    on_tx(channel, frame);
-                }
-                Err(e) => error!("TX error on channel {channel}: {e}"),
-            }
-        }
-
-        std::thread::sleep(Duration::from_millis(1));
+        // Sleep until the next periodic deadline, or up to 1 s if there are
+        // none. notify_one() in send_once/add_periodic/close wakes us early
+        // when new work arrives or the channel is shutting down.
+        let timeout = next_deadline
+            .map(|t| t.saturating_duration_since(Instant::now()))
+            .unwrap_or(Duration::from_secs(1));
+        let _ = cvar.wait_timeout(q, timeout);
     }
     tx.close();
 }
