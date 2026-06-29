@@ -2304,15 +2304,17 @@ function openSysResDialog() {
     const tbody = document.getElementById("sysres-body")!;
     const totalCpuEl = document.getElementById("sysres-total-cpu")!;
     const totalMemEl = document.getElementById("sysres-total-mem")!;
+    const framesEl = document.getElementById("sysres-frames")!;
 
     type ProcessInfo = { name: string; pid: number; cpu: number; memory: number };
+    type SystemResources = { processes: ProcessInfo[]; frame_count: number; frame_bytes: number };
 
     function mb(bytes: number) { return (bytes / 1024 / 1024).toFixed(1) + " MB"; }
 
     function refresh() {
-        invoke<ProcessInfo[]>("system_resources")
-            .then(procs => {
-                tbody.innerHTML = procs.map(p =>
+        invoke<SystemResources>("system_resources")
+            .then(({ processes, frame_count, frame_bytes }) => {
+                tbody.innerHTML = processes.map(p =>
                     `<tr>
                         <td>${p.name}</td>
                         <td>${p.pid}</td>
@@ -2321,10 +2323,12 @@ function openSysResDialog() {
                     </tr>`
                 ).join("") || `<tr><td colspan="4" class="sysres-label">No processes found</td></tr>`;
 
-                const totalCpu = procs.reduce((s, p) => s + p.cpu, 0);
-                const totalMem = procs.reduce((s, p) => s + p.memory, 0);
+                const totalCpu = processes.reduce((s, p) => s + p.cpu, 0);
+                const totalMem = processes.reduce((s, p) => s + p.memory, 0);
                 totalCpuEl.textContent = totalCpu.toFixed(1) + " %";
                 totalMemEl.textContent = mb(totalMem);
+
+                framesEl.textContent = `Frame buffer: ${frame_count.toLocaleString()} frames · ${mb(frame_bytes)}`;
             })
             .catch(() => {
                 tbody.innerHTML = `<tr><td colspan="4" class="sysres-label">Error reading resources</td></tr>`;
@@ -2332,7 +2336,7 @@ function openSysResDialog() {
     }
 
     refresh();
-    const timer = setInterval(refresh, 300);
+    const timer = setInterval(refresh, 1000);
     dialog.addEventListener("close", () => clearInterval(timer), { once: true });
     (document.activeElement as HTMLElement)?.blur();
     dialog.showModal();

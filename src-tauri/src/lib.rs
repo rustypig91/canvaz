@@ -17,7 +17,7 @@ use can_manager::{CanManager, ChannelInfo, FrameInfo, ManagerState, SignalSample
 use dbc_parser::ParsedDbc;
 use project::Project;
 use serde::{Deserialize, Serialize};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, MINIMUM_CPU_UPDATE_INTERVAL};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tauri::{Manager, State};
 
 use log::{debug, error, info};
@@ -320,8 +320,15 @@ struct ProcessInfo {
     memory: u64,
 }
 
+#[derive(Serialize)]
+struct SystemResources {
+    processes: Vec<ProcessInfo>,
+    frame_count: usize,
+    frame_bytes: usize,
+}
+
 #[tauri::command]
-fn system_resources(state: State<'_, TauriState>) -> Result<Vec<ProcessInfo>, String> {
+fn system_resources(state: State<'_, TauriState>) -> Result<SystemResources, String> {
     let main_pid = Pid::from_u32(std::process::id());
     let mut sys = state.sys.lock().map_err(|e| e.to_string())?;
     let mut webkit_pids = state.webkit_pids.lock().map_err(|e| e.to_string())?;
@@ -369,7 +376,9 @@ fn system_resources(state: State<'_, TauriState>) -> Result<Vec<ProcessInfo>, St
         }
     }
 
-    Ok(result)
+    let (frame_count, frame_bytes) = state.can_manager.lock().map_err(|e| e.to_string())?.frame_stats();
+
+    Ok(SystemResources { processes: result, frame_count, frame_bytes })
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
