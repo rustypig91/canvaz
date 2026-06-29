@@ -24,12 +24,13 @@ const BAUD_50K: c_long = -7;
 const CAN_MSG_EXT: u32 = 0x0004;
 const CAN_MSG_RTR: u32 = 0x0001;
 const CAN_MSG_ERROR_FRAME: u32 = 0x0020;
-// Set by CANlib on frames received by an RX handle that were sent by the TX
-// handle on the same physical channel (self-reception / loopback echo).
-const CAN_MSG_TX: u32 = 0x0040;
 
 const CAN_OK: i32 = 0;
 const CAN_ERR_NOMSG: i32 = -2;
+
+// canIOCTL_SET_LOCAL_TXECHO = 32: frames sent on this handle are NOT echoed back
+// to other handles open on the same physical channel (including our own RX handle).
+const CANIOCTL_SET_LOCAL_TXECHO: u32 = 32;
 
 type FnInit = unsafe extern "system" fn();
 type FnUnload = unsafe extern "system" fn() -> i32;
@@ -39,6 +40,7 @@ type FnClose = unsafe extern "system" fn(i32) -> i32;
 type FnSetBus = unsafe extern "system" fn(i32, c_long, u32, u32, u32, u32, u32) -> i32;
 type FnBusOn = unsafe extern "system" fn(i32) -> i32;
 type FnBusOff = unsafe extern "system" fn(i32) -> i32;
+type FnIoCtl = unsafe extern "system" fn(i32, u32, *mut std::ffi::c_void, u32) -> i32;
 type FnReadWait = unsafe extern "system" fn(i32, *mut c_long, *mut u8, *mut u32, *mut u32, *mut c_ulong, c_ulong) -> i32;
 type FnWriteWait = unsafe extern "system" fn(i32, c_long, *const u8, u32, u32, c_ulong) -> i32;
 type FnReadTimer = unsafe extern "system" fn(i32, *mut u64) -> i32;
@@ -55,6 +57,7 @@ struct CanLib {
     set_bus: FnSetBus,
     bus_on: FnBusOn,
     bus_off: FnBusOff,
+    ioctl: FnIoCtl,
     read_wait: FnReadWait,
     write_wait: FnWriteWait,
     read_timer: FnReadTimer,
@@ -87,6 +90,7 @@ impl CanLib {
                 set_bus: sym!(b"canSetBusParams\0", FnSetBus),
                 bus_on: sym!(b"canBusOn\0", FnBusOn),
                 bus_off: sym!(b"canBusOff\0", FnBusOff),
+                ioctl: sym!(b"canIoCtl\0", FnIoCtl),
                 read_wait: sym!(b"canReadWait\0", FnReadWait),
                 write_wait: sym!(b"canWriteWait\0", FnWriteWait),
                 read_timer: sym!(b"kvReadTimer64\0", FnReadTimer),
@@ -166,31 +170,8 @@ fn canlib_err(status: i32) -> String {
     format!("CANlib error {status} ({desc})")
 }
 
-/// Returns `(handle, open_time_ms)` where `open_time_ms` is the wall-clock time
-/// in milliseconds since the Unix epoch captured right after `canBusOn` succeeds.
-/// Kvaser hardware timestamps are milliseconds relative to this moment, so
-/// `open_time_ms + hw_timestamp` gives an absolute epoch-millisecond time.
-fn open_handle(lib: &CanLib, index: i32, freq: c_long, tseg1: u32, tseg2: u32, sjw: u32) -> Result<(i32, u64), String> {
-    // SAFETY: calling canOpenChannel with valid index and flags
-    let handle = unsafe { (lib.open)(index, CAN_OPEN_ACCEPT_VIRTUAL) };
-    if handle < 0 {
-        return Err(format!("Failed to open Kvaser channel {index}: {}", canlib_err(handle)));
-    }
-    let s = unsafe { (lib.set_bus)(handle, freq, tseg1, tseg2, sjw, 1, 0) };
-    if s < CAN_OK {
-        unsafe { (lib.close)(handle) };
-        return Err(format!("canSetBusParams failed: {}", canlib_err(s)));
-    }
-    let s = unsafe { (lib.bus_on)(handle) };
-    if s < CAN_OK {
-        unsafe { (lib.close)(handle) };
-        return Err(format!("canBusOn failed: {}", canlib_err(s)));
-    }
-    let open_time_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    Ok((handle, open_time_ms))
+fn now_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 fn kvaser_channel_name(lib: &CanLib, index: i32) -> Option<String> {
@@ -203,29 +184,23 @@ fn kvaser_channel_name(lib: &CanLib, index: i32) -> Option<String> {
     String::from_utf8(buf[..len].to_vec()).ok()
 }
 
-// ── Shared channel handle ─────────────────────────────────────────────────────
+// ── Per-thread OS handle ──────────────────────────────────────────────────────
 //
-// A single CANlib handle is shared between the TX and RX threads via Arc.
-// Modern Kvaser CANlib is documented as safe for concurrent canReadWait +
-// canWriteWait calls on the same handle from different threads.  Using one
-// handle means the TX self-echo is returned to the *same* handle that sent
-// the frame, so canMSG_TX (0x0040) is set and the RX side can filter it out.
-// With two separate handles the echo arrived at the RX handle WITHOUT
-// canMSG_TX, making it indistinguishable from a genuine received frame.
+// CANlib docs: "A handle to a CAN circuit should be used in only one thread."
+// The TX and RX threads therefore each hold their own OS-level handle. TX echo
+// is suppressed via canIOCTL_SET_LOCAL_TXECHO so the RX handle does not receive
+// frames that were sent by the TX handle on the same physical channel.
 
-struct KvaserChannel {
+struct KvaserOsHandle {
     lib: Arc<CanLib>,
     handle: i32,
     open_time_ms: u64,
 }
 
-// SAFETY: CANlib is thread-safe for concurrent read+write on the same handle.
-unsafe impl Send for KvaserChannel {}
-unsafe impl Sync for KvaserChannel {}
+unsafe impl Send for KvaserOsHandle {}
 
-impl Drop for KvaserChannel {
+impl Drop for KvaserOsHandle {
     fn drop(&mut self) {
-        // SAFETY: handle was opened by open_channel and this Drop runs exactly once.
         unsafe {
             (self.lib.bus_off)(self.handle);
             (self.lib.close)(self.handle);
@@ -235,69 +210,48 @@ impl Drop for KvaserChannel {
 
 // ── TX handle ─────────────────────────────────────────────────────────────────
 
-pub(crate) struct KvaserTxHandle(Arc<KvaserChannel>);
+pub(crate) struct KvaserTxHandle(KvaserOsHandle);
 
 unsafe impl Send for KvaserTxHandle {}
 
 impl TxHandle for KvaserTxHandle {
     fn send(&mut self, frame: &mut CanFrame) -> Result<(), String> {
-        let ch = &*self.0;
+        let h = &self.0;
         let flags = if frame.is_extended { CAN_MSG_EXT } else { 0 };
-        // SAFETY: handle is valid; data pointer covers frame.data.len() bytes
         let s = unsafe {
-            (ch.lib.write_wait)(
-                ch.handle,
-                frame.can_id as c_long,
-                frame.data.as_ptr(),
-                frame.data.len() as u32,
-                flags,
-                100,
-            )
+            (h.lib.write_wait)(h.handle, frame.can_id as c_long, frame.data.as_ptr(), frame.data.len() as u32, flags, 100)
         };
         if s < CAN_OK {
             return Err(format!("canWriteWait failed: {}", canlib_err(s)));
         }
         let mut hw_ts: u64 = 0;
-        frame.timestamp_ms = if unsafe { (ch.lib.read_timer)(ch.handle, &mut hw_ts) } == CAN_OK {
-            Some(ch.open_time_ms + hw_ts)
+        frame.timestamp_ms = if unsafe { (h.lib.read_timer)(h.handle, &mut hw_ts) } == CAN_OK {
+            Some(h.open_time_ms + hw_ts)
         } else {
-            Some(std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64)
+            Some(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as u64)
         };
         Ok(())
     }
 
-    // Cleanup is handled by KvaserChannel::drop when the last Arc is released.
     fn close(&mut self) {}
 }
 
 // ── RX handle ─────────────────────────────────────────────────────────────────
 
-pub(crate) struct KvaserRxHandle(Arc<KvaserChannel>);
+pub(crate) struct KvaserRxHandle(KvaserOsHandle);
 
 unsafe impl Send for KvaserRxHandle {}
 
 impl RxHandle for KvaserRxHandle {
     fn receive(&mut self, timeout_ms: u64) -> Result<Option<CanFrame>, String> {
-        let ch = &*self.0;
+        let h = &self.0;
         let mut id: c_long = 0;
         let mut data = [0u8; 8];
         let mut dlc: u32 = 0;
         let mut flags: u32 = 0;
         let mut timestamp: c_ulong = 0;
-        // SAFETY: handle is valid; all out-pointers are valid stack locations
         let s = unsafe {
-            (ch.lib.read_wait)(
-                ch.handle,
-                &mut id,
-                data.as_mut_ptr(),
-                &mut dlc,
-                &mut flags,
-                &mut timestamp,
-                timeout_ms as c_ulong,
-            )
+            (h.lib.read_wait)(h.handle, &mut id, data.as_mut_ptr(), &mut dlc, &mut flags, &mut timestamp, timeout_ms as c_ulong)
         };
         if s == CAN_ERR_NOMSG {
             return Ok(None);
@@ -305,8 +259,7 @@ impl RxHandle for KvaserRxHandle {
         if s < CAN_OK {
             return Err(format!("canReadWait failed: {}", canlib_err(s)));
         }
-        // CAN_MSG_TX: frame was sent by this same handle — drop the self-echo.
-        if flags & (CAN_MSG_ERROR_FRAME | CAN_MSG_RTR | CAN_MSG_TX) != 0 {
+        if flags & (CAN_MSG_ERROR_FRAME | CAN_MSG_RTR) != 0 {
             return Ok(None);
         }
         let dlc = (dlc as usize).min(8);
@@ -314,11 +267,10 @@ impl RxHandle for KvaserRxHandle {
             can_id: id as u32,
             is_extended: (flags & CAN_MSG_EXT) != 0,
             data: data[..dlc].to_vec(),
-            timestamp_ms: Some(ch.open_time_ms + timestamp as u64),
+            timestamp_ms: Some(h.open_time_ms + timestamp as u64),
         }))
     }
 
-    // Cleanup is handled by KvaserChannel::drop when the last Arc is released.
     fn close(&mut self) {}
 }
 
@@ -356,12 +308,47 @@ impl CanBackend for KvaserBackend {
                 bitrate
             )
         })?;
-        let lib = Arc::clone(&self.lib);
-        let (handle, open_time_ms) = open_handle(&lib, index as i32, freq, tseg1, tseg2, sjw)?;
-        let channel = Arc::new(KvaserChannel { lib, handle, open_time_ms });
+        let lib = &self.lib;
+        let idx = index as i32;
+
+        // TX handle: has init access, sets bitrate, disables local TX echo so the
+        // RX handle on the same channel does not receive our own transmitted frames.
+        let tx_raw = unsafe { (lib.open)(idx, CAN_OPEN_ACCEPT_VIRTUAL) };
+        if tx_raw < 0 {
+            return Err(format!("Failed to open Kvaser channel {idx} (TX): {}", canlib_err(tx_raw)).into());
+        }
+        let s = unsafe { (lib.set_bus)(tx_raw, freq, tseg1, tseg2, sjw, 1, 0) };
+        if s < CAN_OK {
+            unsafe { (lib.close)(tx_raw) };
+            return Err(format!("canSetBusParams failed: {}", canlib_err(s)).into());
+        }
+        let mut echo_off: u32 = 0;
+        unsafe { (lib.ioctl)(tx_raw, CANIOCTL_SET_LOCAL_TXECHO, &mut echo_off as *mut _ as *mut _, 4) };
+        let s = unsafe { (lib.bus_on)(tx_raw) };
+        if s < CAN_OK {
+            unsafe { (lib.close)(tx_raw) };
+            return Err(format!("canBusOn (TX) failed: {}", canlib_err(s)).into());
+        }
+
+        let open_time_ms = now_ms();
+
+        // RX handle: separate OS handle per CANlib threading requirements.
+        // canBusOn must be called once per handle even on the same physical channel.
+        let rx_raw = unsafe { (lib.open)(idx, CAN_OPEN_ACCEPT_VIRTUAL) };
+        if rx_raw < 0 {
+            unsafe { (lib.bus_off)(tx_raw); (lib.close)(tx_raw) };
+            return Err(format!("Failed to open Kvaser channel {idx} (RX): {}", canlib_err(rx_raw)).into());
+        }
+        let s = unsafe { (lib.bus_on)(rx_raw) };
+        if s < CAN_OK {
+            unsafe { (lib.bus_off)(tx_raw); (lib.close)(tx_raw); (lib.close)(rx_raw) };
+            return Err(format!("canBusOn (RX) failed: {}", canlib_err(s)).into());
+        }
+
+        let lib = Arc::clone(lib);
         Ok((
-            Box::new(KvaserTxHandle(Arc::clone(&channel))),
-            Box::new(KvaserRxHandle(channel)),
+            Box::new(KvaserTxHandle(KvaserOsHandle { lib: Arc::clone(&lib), handle: tx_raw, open_time_ms })),
+            Box::new(KvaserRxHandle(KvaserOsHandle { lib, handle: rx_raw, open_time_ms })),
         ))
     }
 
