@@ -197,24 +197,50 @@ fn kvaser_channel_name(lib: &CanLib, index: i32) -> Option<String> {
     String::from_utf8(buf[..len].to_vec()).ok()
 }
 
-// ── TX handle ─────────────────────────────────────────────────────────────────
+// ── Shared channel handle ─────────────────────────────────────────────────────
+//
+// A single CANlib handle is shared between the TX and RX threads via Arc.
+// Modern Kvaser CANlib is documented as safe for concurrent canReadWait +
+// canWriteWait calls on the same handle from different threads.  Using one
+// handle means the TX self-echo is returned to the *same* handle that sent
+// the frame, so canMSG_TX (0x0040) is set and the RX side can filter it out.
+// With two separate handles the echo arrived at the RX handle WITHOUT
+// canMSG_TX, making it indistinguishable from a genuine received frame.
 
-pub(crate) struct KvaserTxHandle {
+struct KvaserChannel {
     lib: Arc<CanLib>,
     handle: i32,
     open_time_ms: u64,
 }
 
-// SAFETY: handle is accessed only from the TX thread after open_channel returns.
+// SAFETY: CANlib is thread-safe for concurrent read+write on the same handle.
+unsafe impl Send for KvaserChannel {}
+unsafe impl Sync for KvaserChannel {}
+
+impl Drop for KvaserChannel {
+    fn drop(&mut self) {
+        // SAFETY: handle was opened by open_channel and this Drop runs exactly once.
+        unsafe {
+            (self.lib.bus_off)(self.handle);
+            (self.lib.close)(self.handle);
+        }
+    }
+}
+
+// ── TX handle ─────────────────────────────────────────────────────────────────
+
+pub(crate) struct KvaserTxHandle(Arc<KvaserChannel>);
+
 unsafe impl Send for KvaserTxHandle {}
 
 impl TxHandle for KvaserTxHandle {
     fn send(&mut self, frame: &mut CanFrame) -> Result<(), String> {
+        let ch = &*self.0;
         let flags = if frame.is_extended { CAN_MSG_EXT } else { 0 };
         // SAFETY: handle is valid; data pointer covers frame.data.len() bytes
         let s = unsafe {
-            (self.lib.write_wait)(
-                self.handle,
+            (ch.lib.write_wait)(
+                ch.handle,
                 frame.can_id as c_long,
                 frame.data.as_ptr(),
                 frame.data.len() as u32,
@@ -226,8 +252,8 @@ impl TxHandle for KvaserTxHandle {
             return Err(format!("canWriteWait failed: {}", canlib_err(s)));
         }
         let mut hw_ts: u64 = 0;
-        frame.timestamp_ms = if unsafe { (self.lib.read_timer)(self.handle, &mut hw_ts) } == CAN_OK {
-            Some(self.open_time_ms + hw_ts)
+        frame.timestamp_ms = if unsafe { (ch.lib.read_timer)(ch.handle, &mut hw_ts) } == CAN_OK {
+            Some(ch.open_time_ms + hw_ts)
         } else {
             Some(std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -237,32 +263,19 @@ impl TxHandle for KvaserTxHandle {
         Ok(())
     }
 
+    // Cleanup is handled by KvaserChannel::drop when the last Arc is released.
     fn close(&mut self) {}
-}
-
-impl Drop for KvaserTxHandle {
-    fn drop(&mut self) {
-        // SAFETY: handle was opened by open_channel and is still valid at drop time.
-        unsafe {
-            (self.lib.bus_off)(self.handle);
-            (self.lib.close)(self.handle);
-        }
-    }
 }
 
 // ── RX handle ─────────────────────────────────────────────────────────────────
 
-pub(crate) struct KvaserRxHandle {
-    lib: Arc<CanLib>,
-    handle: i32,
-    open_time_ms: u64,
-}
+pub(crate) struct KvaserRxHandle(Arc<KvaserChannel>);
 
-// SAFETY: handle is accessed only from the RX thread after open_channel returns.
 unsafe impl Send for KvaserRxHandle {}
 
 impl RxHandle for KvaserRxHandle {
     fn receive(&mut self, timeout_ms: u64) -> Result<Option<CanFrame>, String> {
+        let ch = &*self.0;
         let mut id: c_long = 0;
         let mut data = [0u8; 8];
         let mut dlc: u32 = 0;
@@ -270,8 +283,8 @@ impl RxHandle for KvaserRxHandle {
         let mut timestamp: c_ulong = 0;
         // SAFETY: handle is valid; all out-pointers are valid stack locations
         let s = unsafe {
-            (self.lib.read_wait)(
-                self.handle,
+            (ch.lib.read_wait)(
+                ch.handle,
                 &mut id,
                 data.as_mut_ptr(),
                 &mut dlc,
@@ -286,6 +299,7 @@ impl RxHandle for KvaserRxHandle {
         if s < CAN_OK {
             return Err(format!("canReadWait failed: {}", canlib_err(s)));
         }
+        // CAN_MSG_TX: frame was sent by this same handle — drop the self-echo.
         if flags & (CAN_MSG_ERROR_FRAME | CAN_MSG_RTR | CAN_MSG_TX) != 0 {
             return Ok(None);
         }
@@ -294,21 +308,12 @@ impl RxHandle for KvaserRxHandle {
             can_id: id as u32,
             is_extended: (flags & CAN_MSG_EXT) != 0,
             data: data[..dlc].to_vec(),
-            timestamp_ms: Some(self.open_time_ms + timestamp as u64),
+            timestamp_ms: Some(ch.open_time_ms + timestamp as u64),
         }))
     }
 
+    // Cleanup is handled by KvaserChannel::drop when the last Arc is released.
     fn close(&mut self) {}
-}
-
-impl Drop for KvaserRxHandle {
-    fn drop(&mut self) {
-        // SAFETY: handle was opened by open_channel and is still valid at drop time.
-        unsafe {
-            (self.lib.bus_off)(self.handle);
-            (self.lib.close)(self.handle);
-        }
-    }
 }
 
 // ── Backend ───────────────────────────────────────────────────────────────────
@@ -343,25 +348,15 @@ impl CanBackend for KvaserBackend {
         })?;
         let lib = CanLib::load()?;
 
-        let (tx_handle, tx_open_time_ms) = open_handle(&lib, index as i32, freq, tseg1, tseg2, sjw)?;
-        let (rx_handle, open_time_ms) = match open_handle(&lib, index as i32, freq, tseg1, tseg2, sjw) {
-            Ok(pair) => pair,
-            Err(e) => {
-                unsafe {
-                    (lib.bus_off)(tx_handle);
-                    (lib.close)(tx_handle);
-                }
-                return Err(CanOpenError::Other(e));
-            }
-        };
+        // Open a single CANlib handle shared by both TX and RX threads.
+        // This ensures that the self-echo of transmitted frames comes back to
+        // the same handle with canMSG_TX set, so the RX side can filter it.
+        let (handle, open_time_ms) = open_handle(&lib, index as i32, freq, tseg1, tseg2, sjw)?;
+        let channel = Arc::new(KvaserChannel { lib, handle, open_time_ms });
 
         Ok((
-            Box::new(KvaserTxHandle {
-                lib: Arc::clone(&lib),
-                handle: tx_handle,
-                open_time_ms: tx_open_time_ms,
-            }),
-            Box::new(KvaserRxHandle { lib, handle: rx_handle, open_time_ms }),
+            Box::new(KvaserTxHandle(Arc::clone(&channel))),
+            Box::new(KvaserRxHandle(channel)),
         ))
     }
 }
