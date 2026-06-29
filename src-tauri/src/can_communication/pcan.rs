@@ -16,17 +16,8 @@ type TPCANBaudrate = u16;
 type TPCANStatus = u32;
 type TPCANType = u8;
 
-// ── Predefined channel handles ─────────────────────────────────────────────────
-// Enumerate USB (0x51..0x60) then PCI (0x41..0x50). LAN channels omitted; rare
-// in bench setups and require a server running.
-static PCAN_USB: &[TPCANHandle] = &[
-    0x51, 0x52, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
-    0x59, 0x5A, 0x5B, 0x5C, 0x5D, 0x5E, 0x5F, 0x60,
-];
-static PCAN_PCI: &[TPCANHandle] = &[
-    0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48,
-    0x49, 0x4A, 0x4B, 0x4C, 0x4D, 0x4E, 0x4F, 0x50,
-];
+// ── Channel handle used when no specific channel is required ──────────────────
+const PCAN_NONEBUS: TPCANHandle = 0x00;
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 
@@ -50,11 +41,30 @@ const PCAN_MESSAGE_STATUS: u8 = 0x80;
 const PCAN_MESSAGE_ERRFRAME: u8 = 0x40;
 
 // CAN_GetValue parameters
+#[allow(dead_code)]
 const PCAN_HARDWARE_NAME: u8 = 0x04;
+#[allow(dead_code)]
 const PCAN_CHANNEL_CONDITION: u8 = 0x26;
+const PCAN_ATTACHED_CHANNELS_COUNT: u8 = 0x2E;
+const PCAN_ATTACHED_CHANNELS: u8 = 0x2F;
 
 const PCAN_CHANNEL_AVAILABLE: u32 = 0x01;
 const PCAN_CHANNEL_OCCUPIED: u32 = 0x02;
+
+// Mirrors TPCANChannelInformation from PCANBasic.h (repr(C), 52 bytes total).
+// Layout: u16 + u8 + u8 + u32 + [u8;33] + (3 pad) + u32 + u32 = 52.
+const PCAN_HARDWARE_NAME_LEN: usize = 33;
+
+#[repr(C)]
+struct TPCANChannelInformation {
+    channel_handle: TPCANHandle,
+    device_type: u8,
+    controller_number: u8,
+    device_features: u32,
+    device_name: [u8; PCAN_HARDWARE_NAME_LEN],
+    device_id: u32,
+    channel_condition: u32,
+}
 
 // ── Predefined baud rates (SJA1000 BTR0/BTR1) ────────────────────────────────
 
@@ -171,41 +181,46 @@ fn pcan_err(s: TPCANStatus) -> String {
     format!("PCAN error 0x{s:05X} ({desc})")
 }
 
-fn channel_condition(lib: &PcanLib, ch: TPCANHandle) -> u32 {
-    let mut condition: u32 = 0;
-    // SAFETY: condition is a valid u32 stack variable; get_value writes 4 bytes
-    unsafe {
-        (lib.get_value)(ch, PCAN_CHANNEL_CONDITION, &mut condition as *mut u32 as *mut u8, 4);
-    }
-    condition
-}
-
-fn channel_hw_name(lib: &PcanLib, ch: TPCANHandle) -> Option<String> {
-    let mut buf = [0u8; 256];
-    // SAFETY: buf is valid for 256 bytes; get_value writes a null-terminated string
-    let s = unsafe { (lib.get_value)(ch, PCAN_HARDWARE_NAME, buf.as_mut_ptr(), buf.len() as u32) };
-    if s != PCAN_ERROR_OK {
-        return None;
-    }
-    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8(buf[..len].to_vec()).ok()
-}
-
-/// Returns `(TPCANHandle, display_name)` for every channel that has a device
-/// connected (available or currently occupied by another process).
+/// Returns `(TPCANHandle, display_name)` for every physically connected channel.
+/// Uses PCAN_ATTACHED_CHANNELS (PCAN-Basic v4+) which asks the driver for the
+/// current list of present devices, rather than probing 32 fixed handles.
 fn enumerate_channels(lib: &PcanLib) -> Vec<(TPCANHandle, String)> {
-    let mut result = Vec::new();
-    for &ch in PCAN_USB.iter().chain(PCAN_PCI.iter()) {
-        let cond = channel_condition(lib, ch);
-        if cond & (PCAN_CHANNEL_AVAILABLE | PCAN_CHANNEL_OCCUPIED) == 0 {
-            continue;
-        }
-        let hw_name = channel_hw_name(lib, ch).unwrap_or_else(|| "PCAN".to_string());
-        // Derive bus number from the handle value.
-        let bus = if ch >= 0x51 { ch - 0x50 } else { ch - 0x40 };
-        result.push((ch, format!("{hw_name} {bus}")));
+    let mut count: u32 = 0;
+    // SAFETY: count is a valid u32; CAN_GetValue writes 4 bytes.
+    let s = unsafe {
+        (lib.get_value)(PCAN_NONEBUS, PCAN_ATTACHED_CHANNELS_COUNT, &mut count as *mut u32 as *mut u8, 4)
+    };
+    if s != PCAN_ERROR_OK || count == 0 {
+        return Vec::new();
     }
-    result
+
+    let struct_size = std::mem::size_of::<TPCANChannelInformation>();
+    let total = count as usize * struct_size;
+    let mut buf = vec![0u8; total];
+
+    // SAFETY: buf is exactly count * struct_size bytes.
+    let s = unsafe {
+        (lib.get_value)(PCAN_NONEBUS, PCAN_ATTACHED_CHANNELS, buf.as_mut_ptr(), total as u32)
+    };
+    if s != PCAN_ERROR_OK {
+        return Vec::new();
+    }
+
+    (0..count as usize)
+        .filter_map(|i| {
+            // SAFETY: each struct_size slice starts on a naturally aligned offset
+            // because the struct's largest alignment is 4 and the buffer is vec-allocated.
+            let info = unsafe { &*(buf[i * struct_size..].as_ptr() as *const TPCANChannelInformation) };
+            if info.channel_condition & (PCAN_CHANNEL_AVAILABLE | PCAN_CHANNEL_OCCUPIED) == 0 {
+                return None;
+            }
+            let len = info.device_name.iter().position(|&b| b == 0).unwrap_or(PCAN_HARDWARE_NAME_LEN);
+            let hw_name = String::from_utf8_lossy(&info.device_name[..len]);
+            let ch = info.channel_handle;
+            let bus: u16 = if ch >= 0x51 { ch - 0x50 } else if ch >= 0x41 { ch - 0x40 } else { ch };
+            Some((ch, format!("{hw_name} {bus}")))
+        })
+        .collect()
 }
 
 // ── Shared channel state ──────────────────────────────────────────────────────
@@ -319,21 +334,19 @@ impl RxHandle for PcanRxHandle {
 
 // ── Backend ───────────────────────────────────────────────────────────────────
 
-pub struct PcanBackend;
+pub struct PcanBackend {
+    lib: Arc<PcanLib>,
+}
 
 impl PcanBackend {
     pub fn new() -> Result<Self, String> {
-        PcanLib::load().map(|_| Self)
+        Ok(Self { lib: PcanLib::load()? })
     }
 }
 
 impl CanBackend for PcanBackend {
     fn list_channels(&self) -> Vec<String> {
-        let lib = match PcanLib::load() {
-            Ok(l) => l,
-            Err(_) => return Vec::new(),
-        };
-        enumerate_channels(&lib).into_iter().map(|(_, name)| name).collect()
+        enumerate_channels(&self.lib).into_iter().map(|(_, name)| name).collect()
     }
 
     fn open_channel(
@@ -349,7 +362,7 @@ impl CanBackend for PcanBackend {
             )
         })?;
 
-        let lib = PcanLib::load()?;
+        let lib = Arc::clone(&self.lib);
         let channels = enumerate_channels(&lib);
         let (pcan_handle, _) = channels
             .get(index as usize)
