@@ -24,32 +24,31 @@ const PCAN_NONEBUS: TPCANHandle = 0x00;
 const PCAN_ERROR_OK: TPCANStatus = 0x00000;
 const PCAN_ERROR_QRCVEMPTY: TPCANStatus = 0x00020;
 
-// Bus-error flags that CAN_Read may OR into an otherwise-valid status.
-const PCAN_ERROR_BUSLIGHT: TPCANStatus = 0x00004;
-const PCAN_ERROR_BUSHEAVY: TPCANStatus = 0x00008;
-const PCAN_ERROR_BUSOFF: TPCANStatus = 0x00010;
+// Bus-error flags that may be OR'd into an otherwise-valid CAN_Read status.
+const PCAN_ERROR_BUSLIGHT: TPCANStatus  = 0x00004;
+const PCAN_ERROR_BUSHEAVY: TPCANStatus  = 0x00008;  // = PCAN_ERROR_BUSWARNING
+const PCAN_ERROR_BUSOFF: TPCANStatus    = 0x00010;
 const PCAN_ERROR_BUSPASSIVE: TPCANStatus = 0x40000;
-const PCAN_ERROR_BERR: TPCANStatus = 0x20000;
 const PCAN_ERROR_ANYBUSERR: TPCANStatus =
-    PCAN_ERROR_BUSLIGHT | PCAN_ERROR_BUSHEAVY | PCAN_ERROR_BUSOFF |
-    PCAN_ERROR_BUSPASSIVE | PCAN_ERROR_BERR;
+    PCAN_ERROR_BUSLIGHT | PCAN_ERROR_BUSHEAVY | PCAN_ERROR_BUSOFF | PCAN_ERROR_BUSPASSIVE;
 
 // MSGTYPE flags in TPCANMsg
-const PCAN_MESSAGE_EXTENDED: u8 = 0x02;
-const PCAN_MESSAGE_RTR: u8 = 0x01;
-const PCAN_MESSAGE_STATUS: u8 = 0x80;
-const PCAN_MESSAGE_ERRFRAME: u8 = 0x40;
+const PCAN_MESSAGE_EXTENDED: u8  = 0x02;
+const PCAN_MESSAGE_RTR: u8       = 0x01;
+const PCAN_MESSAGE_ECHO: u8      = 0x20;  // TX echo frame (self-reception)
+const PCAN_MESSAGE_ERRFRAME: u8  = 0x40;
+const PCAN_MESSAGE_STATUS: u8    = 0x80;
 
-// CAN_GetValue parameters
+// CAN_GetValue parameters (from PCANBasic.h)
 #[allow(dead_code)]
-const PCAN_HARDWARE_NAME: u8 = 0x04;
+const PCAN_CHANNEL_CONDITION: u8      = 0x0D;
 #[allow(dead_code)]
-const PCAN_CHANNEL_CONDITION: u8 = 0x26;
-const PCAN_ATTACHED_CHANNELS_COUNT: u8 = 0x2E;
-const PCAN_ATTACHED_CHANNELS: u8 = 0x2F;
+const PCAN_HARDWARE_NAME: u8          = 0x0E;
+const PCAN_ATTACHED_CHANNELS_COUNT: u8 = 0x2A;
+const PCAN_ATTACHED_CHANNELS: u8      = 0x2B;
 
 const PCAN_CHANNEL_AVAILABLE: u32 = 0x01;
-const PCAN_CHANNEL_OCCUPIED: u32 = 0x02;
+const PCAN_CHANNEL_OCCUPIED: u32  = 0x02;
 
 // Mirrors TPCANChannelInformation from PCANBasic.h (repr(C), 52 bytes total).
 // Layout: u16 + u8 + u8 + u32 + [u8;33] + (3 pad) + u32 + u32 = 52.
@@ -306,7 +305,7 @@ impl RxHandle for PcanRxHandle {
 
             if s_primary == PCAN_ERROR_OK {
                 // Skip RTR, status, and error frames — pass only data frames.
-                if msg.msg_type & (PCAN_MESSAGE_RTR | PCAN_MESSAGE_STATUS | PCAN_MESSAGE_ERRFRAME) != 0 {
+                if msg.msg_type & (PCAN_MESSAGE_RTR | PCAN_MESSAGE_ECHO | PCAN_MESSAGE_STATUS | PCAN_MESSAGE_ERRFRAME) != 0 {
                     continue;
                 }
                 let dlc = (msg.len as usize).min(8);
