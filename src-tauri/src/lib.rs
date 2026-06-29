@@ -17,7 +17,7 @@ use can_manager::{CanManager, ChannelInfo, FrameInfo, ManagerState, SignalSample
 use dbc_parser::ParsedDbc;
 use project::Project;
 use serde::{Deserialize, Serialize};
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, MINIMUM_CPU_UPDATE_INTERVAL};
 use tauri::{Manager, State};
 
 use log::{debug, error, info};
@@ -27,8 +27,9 @@ use log::{debug, error, info};
 struct TauriState {
     app_state: Arc<AppState>,
     can_manager: ManagerState,
-    // Persistent so sysinfo can compute CPU% as a delta between refreshes.
     sys: Mutex<System>,
+    // Cached on first system_resources call; None = not yet discovered.
+    webkit_pids: Mutex<Option<Vec<Pid>>>,
 }
 
 // ── Sudo ──────────────────────────────────────────────────────────────────────
@@ -311,7 +312,7 @@ fn load_project(path: String) -> Result<Project, String> {
     Project::load(&path)
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Serialize)]
 struct ProcessInfo {
     name: String,
     pid: u32,
@@ -319,49 +320,54 @@ struct ProcessInfo {
     memory: u64,
 }
 
-
-fn get_all_children_recursive<'a>(
-    sys: &'a System,
-    parent_pid: Pid,
-    out: &mut Vec<&'a sysinfo::Process>,
-) {
-    for process in sys.processes().values() {
-        if process.parent() == Some(parent_pid) {
-            out.push(process);
-            // Recursively search for this child's own children
-            get_all_children_recursive(sys, process.pid(), out);
-        }
-    }
-}
-
 #[tauri::command]
 fn system_resources(state: State<'_, TauriState>) -> Result<Vec<ProcessInfo>, String> {
     let main_pid = Pid::from_u32(std::process::id());
     let mut sys = state.sys.lock().map_err(|e| e.to_string())?;
-    // Reuse the same System so sysinfo can compute CPU% as a delta vs. last call.
-    // sys.refresh_processes(ProcessesToUpdate::All, true);
-    sys.refresh_all();
+    let mut webkit_pids = state.webkit_pids.lock().map_err(|e| e.to_string())?;
 
+    let nproc = sys.cpus().len();
 
-    // let main_start = sys.process(main_pid).map(|p| p.start_time()).unwrap_or(0);
+    if webkit_pids.is_none() {
+        // One-time full scan to find WebKit child processes by name.
+        sys.refresh_processes(ProcessesToUpdate::All, true);
+        let found: Vec<Pid> = sys
+            .processes()
+            .values()
+            .filter(|p| p.parent() == Some(main_pid) && p.name().to_string_lossy().to_lowercase().contains("webkit"))
+            .map(|p| p.pid())
+            .collect();
+        *webkit_pids = Some(found);
+    } else {
+        // Fast path: only refresh the exact PIDs we care about.
+        let mut pids = vec![main_pid];
+        pids.extend_from_slice(webkit_pids.as_ref().unwrap());
 
-    let mut result = Vec::new();
-
-    let mut processes: Vec<&sysinfo::Process> = Vec::new();
-    processes.push(sys.process(main_pid).ok_or("Main process not found")?);
-    get_all_children_recursive(&sys, main_pid, &mut processes);
-
-    for process in processes {
-        let pid = process.pid().as_u32();
-        result.push(ProcessInfo {
-            name: process.name().to_string_lossy().into_owned(),
-            pid: pid,
-            cpu: process.cpu_usage(),
-            memory: process.memory(),
-        });
+        let specifics = ProcessRefreshKind::nothing().with_cpu().with_memory();
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, specifics);
     }
 
-    result.dedup_by_key(|p| p.pid);
+    let child_pids = webkit_pids.as_ref().unwrap();
+    let mut result = Vec::new();
+
+    if let Some(p) = sys.process(main_pid) {
+        result.push(ProcessInfo {
+            name: p.name().to_string_lossy().into_owned(),
+            pid: main_pid.as_u32(),
+            cpu: p.cpu_usage() / nproc as f32,
+            memory: p.memory(),
+        });
+    }
+    for &pid in child_pids {
+        if let Some(p) = sys.process(pid) {
+            result.push(ProcessInfo {
+                name: p.name().to_string_lossy().into_owned(),
+                pid: pid.as_u32(),
+                cpu: p.cpu_usage() / nproc as f32,
+                memory: p.memory(),
+            });
+        }
+    }
 
     Ok(result)
 }
@@ -384,6 +390,7 @@ pub fn run() {
                 app_state,
                 can_manager: Arc::new(Mutex::new(manager)),
                 sys: Mutex::new(System::new()),
+                webkit_pids: Mutex::new(None),
             });
             Ok(())
         })

@@ -2332,7 +2332,7 @@ function openSysResDialog() {
     }
 
     refresh();
-    const timer = setInterval(refresh, 1000);
+    const timer = setInterval(refresh, 300);
     dialog.addEventListener("close", () => clearInterval(timer), { once: true });
     (document.activeElement as HTMLElement)?.blur();
     dialog.showModal();
