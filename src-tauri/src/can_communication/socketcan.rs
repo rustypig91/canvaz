@@ -27,6 +27,7 @@ impl RxHandle for SocketCanRxHandle {
                 can_id: df.raw_id(),
                 is_extended: df.is_extended(),
                 data: df.data().to_vec(),
+                timestamp_ms: None,
             })),
             Ok(_) => Ok(None),
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(None),
@@ -44,7 +45,7 @@ pub(crate) struct SocketCanTxHandle {
 }
 
 impl TxHandle for SocketCanTxHandle {
-    fn send(&mut self, frame: &CanFrame) -> Result<(), String> {
+    fn send(&mut self, frame: &mut CanFrame) -> Result<(), String> {
         let df: CanDataFrame = if frame.is_extended {
             if frame.can_id > 0x1FFF_FFFF {
                 return Err(format!("Extended CAN ID must be ≤ 0x1FFF_FFFF, got {:#x}", frame.can_id));
@@ -58,7 +59,12 @@ impl TxHandle for SocketCanTxHandle {
             let sid = StandardId::new(frame.can_id as u16).ok_or_else(|| format!("Invalid standard CAN ID: {:#x}", frame.can_id))?;
             CanDataFrame::new(sid, &frame.data).ok_or("Failed to build CAN frame")?
         };
-        self.socket.write_frame(&df).map_err(|e| format!("Write failed: {e}"))
+        self.socket.write_frame(&df).map_err(|e| format!("Write failed: {e}"))?;
+        frame.timestamp_ms = Some(std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64);
+        Ok(())
     }
 
     fn close(&mut self) {}

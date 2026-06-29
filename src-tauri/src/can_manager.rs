@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc, Mutex,
@@ -84,25 +84,13 @@ struct SignalStats {
 
 impl SignalStats {
     fn new(v: f64) -> Self {
-        Self {
-            current: v,
-            min: v,
-            max: v,
-        }
+        Self { current: v, min: v, max: v }
     }
 
     fn update(&mut self, v: f64) {
         self.current = v;
-        if v < self.min {
-            self.min = v;
-        }
-        if v > self.max {
-            self.max = v;
-        }
-    }
-
-    fn held_extreme(&self, v: f64) -> bool {
-        (v - self.min).abs() <= f64::EPSILON || (v - self.max).abs() <= f64::EPSILON
+        if v < self.min { self.min = v; }
+        if v > self.max { self.max = v; }
     }
 }
 
@@ -145,32 +133,17 @@ impl ChannelData {
         }
     }
 
-    /// Push a frame, evict frames older than `window_ms`, rescan signal extremes
-    /// if evicted frames held the current min or max. Returns events to emit:
+    /// Push a frame, evict frames older than `window_ms`. Returns events to emit:
     /// (signal_name, value, unit, message_name, min, max).
+    /// Min/max are all-time since channel open; they grow but never shrink during
+    /// eviction to avoid an O(N²) rescan under the shared lock.
     fn push(&mut self, frame: StoredFrame, window_ms: u64) -> Vec<(String, f64, String, String, f64, f64)> {
         let cutoff = frame.timestamp_ms.saturating_sub(window_ms);
-        let mut needs_rescan: HashSet<String> = HashSet::new();
-
         while self.frames.front().map_or(false, |f| f.timestamp_ms < cutoff) {
-            let evicted = self.frames.pop_front().unwrap();
-            for sig in &evicted.signals {
-                if let Some(stats) = self.signals.get(&sig.name) {
-                    if stats.held_extreme(sig.value) {
-                        needs_rescan.insert(sig.name.clone());
-                    }
-                }
-            }
+            self.frames.pop_front();
         }
-
-        // Push new frame first so rescans include it.
         self.frames.push_back(frame.clone());
 
-        for sig_name in &needs_rescan {
-            self.rescan(sig_name);
-        }
-
-        // Update stats and collect events for new frame's signals.
         let msg_name = frame.message_name.clone().unwrap_or_default();
         let mut events = Vec::new();
         for sig in &frame.signals {
@@ -184,40 +157,9 @@ impl ChannelData {
         events
     }
 
-    fn rescan(&mut self, sig_name: &str) {
-        let vals: Vec<f64> = self
-            .frames
-            .iter()
-            .flat_map(|f| f.signals.iter())
-            .filter(|s| s.name == sig_name)
-            .map(|s| s.value)
-            .collect();
-
-        if let Some(stats) = self.signals.get_mut(sig_name) {
-            if vals.is_empty() {
-                stats.min = stats.current;
-                stats.max = stats.current;
-            } else {
-                stats.min = vals.iter().copied().fold(f64::INFINITY, f64::min);
-                stats.max = vals.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            }
-        }
-    }
-
     fn evict_before(&mut self, cutoff: u64) {
-        let mut needs_rescan: HashSet<String> = HashSet::new();
         while self.frames.front().map_or(false, |f| f.timestamp_ms < cutoff) {
-            let evicted = self.frames.pop_front().unwrap();
-            for sig in &evicted.signals {
-                if let Some(stats) = self.signals.get(&sig.name) {
-                    if stats.held_extreme(sig.value) {
-                        needs_rescan.insert(sig.name.clone());
-                    }
-                }
-            }
-        }
-        for sig_name in &needs_rescan {
-            self.rescan(sig_name);
+            self.frames.pop_front();
         }
     }
 
@@ -477,6 +419,7 @@ impl CanManager {
                 can_id,
                 is_extended: can_id > 0x7FF,
                 data,
+                timestamp_ms: None,
             },
         )
     }
@@ -497,6 +440,7 @@ impl CanManager {
                 can_id: msg_id,
                 is_extended: msg_id > 0x7FF,
                 data,
+                timestamp_ms: None,
             },
         )
     }
@@ -539,6 +483,7 @@ impl CanManager {
                 can_id: msg_id,
                 is_extended: msg_id > 0x7FF,
                 data,
+                timestamp_ms: None,
             },
             period_ms,
         )
@@ -681,7 +626,7 @@ impl CanManager {
 
 fn make_rx_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl Fn(u8, CanFrame) + Send + Sync + 'static {
     move |hw_index, raw| {
-        let ts = now_ms();
+        let ts = raw.timestamp_ms.unwrap_or_else(now_ms);
 
         // Hold the lock for the minimum time needed to decode and update state,
         // collecting events to emit after releasing.
@@ -767,7 +712,7 @@ fn make_rx_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl 
 
 fn make_tx_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl Fn(u8, CanFrame) + Send + Sync + 'static {
     move |hw_index, raw| {
-        let ts = now_ms();
+        let ts = raw.timestamp_ms.unwrap_or_else(now_ms);
         let (app, frame_event) = {
             let mut lock = match shared.lock() {
                 Ok(l) => l,
