@@ -212,6 +212,54 @@ struct ManagerShared {
 
 // ── CanManager ────────────────────────────────────────────────────────────────
 
+fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
+    let mut cans: HashMap<String, Can> = HashMap::new();
+
+    #[cfg(feature = "kvaser")]
+    {
+        let sh_rx = Arc::clone(shared);
+        let sh_tx = Arc::clone(shared);
+        cans.insert(
+            "kvaser".to_string(),
+            Can::new(
+                KvaserBackend,
+                make_rx_callback("kvaser".into(), sh_rx),
+                make_tx_callback("kvaser".into(), sh_tx),
+            ),
+        );
+    }
+
+    #[cfg(feature = "pcan")]
+    {
+        let sh_rx = Arc::clone(shared);
+        let sh_tx = Arc::clone(shared);
+        cans.insert(
+            "pcan".to_string(),
+            Can::new(
+                PcanBackend,
+                make_rx_callback("pcan".into(), sh_rx),
+                make_tx_callback("pcan".into(), sh_tx),
+            ),
+        );
+    }
+
+    #[cfg(feature = "linux-can")]
+    {
+        let sh_rx = Arc::clone(shared);
+        let sh_tx = Arc::clone(shared);
+        cans.insert(
+            "socketcan".to_string(),
+            Can::new(
+                SocketCanBackend,
+                make_rx_callback("socketcan".into(), sh_rx),
+                make_tx_callback("socketcan".into(), sh_tx),
+            ),
+        );
+    }
+
+    cans
+}
+
 pub struct CanManager {
     app_state: Arc<AppState>,
     shared: Arc<Mutex<ManagerShared>>,
@@ -228,50 +276,7 @@ impl CanManager {
             handle_to_index: HashMap::new(),
         }));
 
-        let mut cans: HashMap<String, Can> = HashMap::new();
-
-        #[cfg(feature = "kvaser")]
-        {
-            let sh_rx = Arc::clone(&shared);
-            let sh_tx = Arc::clone(&shared);
-            cans.insert(
-                "kvaser".to_string(),
-                Can::new(
-                    KvaserBackend,
-                    make_rx_callback("kvaser".into(), sh_rx),
-                    make_tx_callback("kvaser".into(), sh_tx),
-                ),
-            );
-        }
-
-        #[cfg(feature = "pcan")]
-        {
-            let sh_rx = Arc::clone(&shared);
-            let sh_tx = Arc::clone(&shared);
-            cans.insert(
-                "pcan".to_string(),
-                Can::new(
-                    PcanBackend,
-                    make_rx_callback("pcan".into(), sh_rx),
-                    make_tx_callback("pcan".into(), sh_tx),
-                ),
-            );
-        }
-
-        #[cfg(feature = "linux-can")]
-        {
-            let sh_rx = Arc::clone(&shared);
-            let sh_tx = Arc::clone(&shared);
-            cans.insert(
-                "socketcan".to_string(),
-                Can::new(
-                    SocketCanBackend,
-                    make_rx_callback("socketcan".into(), sh_rx),
-                    make_tx_callback("socketcan".into(), sh_tx),
-                ),
-            );
-        }
-
+        let cans = build_cans(&shared);
         Self { app_state, shared, cans }
     }
 
@@ -417,6 +422,36 @@ impl CanManager {
             lock.handle_to_index.clear();
         }
         info!("Reset CAN manager: all channels closed and unregistered");
+    }
+
+    /// Close all channels, drop every backend (unloading their DLLs), recreate
+    /// fresh backend instances, then re-register every channel that was previously
+    /// created (but leave them all closed). Returns the old→new handle mapping so
+    /// the frontend can update its references.
+    pub fn reload_backends(&mut self) -> Vec<(u32, u32)> {
+        // Snapshot channel info before reset wipes registrations.
+        let previous: Vec<(u32, ChannelInfo)> = self.shared.lock().ok().map(|lock| {
+            lock.channels.iter().map(|(&h, d)| (h, d.info.clone())).collect()
+        }).unwrap_or_default();
+
+        self.reset();
+        // Dropping the old HashMap unloads all backend DLLs.
+        self.cans = HashMap::new();
+        self.cans = build_cans(&self.shared);
+
+        // Re-register each channel. create_channel re-enumerates hardware, so
+        // channels whose hardware is now connected will succeed; others are
+        // omitted and the frontend will handle them as ghosts.
+        let total = previous.len();
+        let mut remapped = Vec::new();
+        for (old_handle, info) in previous {
+            match self.create_channel(&info.backend, &info.name) {
+                Ok(new_handle) => remapped.push((old_handle, new_handle)),
+                Err(e) => warn!("Could not re-register {} {} after reload: {e}", info.backend, info.name),
+            }
+        }
+        info!("Reloaded all CAN backends; re-registered {}/{total} channels", remapped.len());
+        remapped
     }
 
     pub fn created_channels_info(&self) -> Vec<ChannelInfo> {

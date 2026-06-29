@@ -3508,6 +3508,45 @@ window.addEventListener("DOMContentLoaded", async () => {
         if (!await confirmAndStop("Stop live capture to add a channel?")) return;
         openChannelDialog("add");
     });
+    document.getElementById("btn-reload-backends")!.addEventListener("click", async () => {
+        if (!await confirmAndStop("Stop live capture to reload CAN backends?")) return;
+        let remapped: { old_handle: number; new_handle: number }[];
+        try {
+            remapped = await invoke<{ old_handle: number; new_handle: number }[]>("reload_backends");
+        } catch (e) {
+            setError(`Backend reload failed: ${e}`);
+            return;
+        }
+
+        // Apply old→new handle remapping. Channels not in the remapping failed
+        // to re-register (hardware absent) and become ghosts.
+        const handleMap = new Map(remapped.map(r => [r.old_handle, r.new_handle]));
+        const oldEntries = [...channels.entries()];
+        channels.clear();
+        for (const [oldHandle, ch] of oldEntries) {
+            const newHandle = handleMap.get(oldHandle);
+            if (newHandle !== undefined) {
+                channels.set(newHandle, { ...ch, open: false });
+            } else {
+                ghostChannels.push({ config: ch.config, error: "Not found after backend reload" });
+            }
+        }
+
+        // Promote ghost channels whose hardware is now available.
+        const recovered: GhostChannel[] = [];
+        for (const ghost of [...ghostChannels]) {
+            try {
+                const handle = await invoke<number>("create_channel", { backendName: ghost.config.backend, channelName: ghost.config.name });
+                channels.set(handle, { info: { backend: ghost.config.backend, name: ghost.config.name }, config: ghost.config, dbc: null, open: false });
+                recovered.push(ghost);
+                await loadChannelDbc(handle);
+            } catch (_) {
+                // stays as ghost
+            }
+        }
+        for (const g of recovered) ghostChannels.splice(ghostChannels.indexOf(g), 1);
+        renderChannelList();
+    });
     document.getElementById("btn-channel-cancel")!.addEventListener("click", () => chanDialog.close());
     document.getElementById("form-channel")!.addEventListener("submit", async (e) => { e.preventDefault(); await applyChannelDialog(); });
 
