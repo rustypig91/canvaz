@@ -24,6 +24,9 @@ const BAUD_50K: c_long = -7;
 const CAN_MSG_EXT: u32 = 0x0004;
 const CAN_MSG_RTR: u32 = 0x0001;
 const CAN_MSG_ERROR_FRAME: u32 = 0x0020;
+// Set by CANlib on frames received by an RX handle that were sent by the TX
+// handle on the same physical channel (self-reception / loopback echo).
+const CAN_MSG_TX: u32 = 0x0040;
 
 const CAN_OK: i32 = 0;
 const CAN_ERR_NOMSG: i32 = -2;
@@ -283,7 +286,7 @@ impl RxHandle for KvaserRxHandle {
         if s < CAN_OK {
             return Err(format!("canReadWait failed: {}", canlib_err(s)));
         }
-        if flags & (CAN_MSG_ERROR_FRAME | CAN_MSG_RTR) != 0 {
+        if flags & (CAN_MSG_ERROR_FRAME | CAN_MSG_RTR | CAN_MSG_TX) != 0 {
             return Ok(None);
         }
         let dlc = (dlc as usize).min(8);
