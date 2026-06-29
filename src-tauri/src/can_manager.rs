@@ -224,6 +224,7 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
                 "kvaser".to_string(),
                 Can::new(backend, make_rx_callback("kvaser".into(), sh_rx), make_tx_callback("kvaser".into(), sh_tx)),
             );
+            info!("Kvaser backend initialized successfully");
         }
         Err(e) => warn!("Kvaser backend unavailable: {e}"),
     }
@@ -237,6 +238,7 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
                 "pcan".to_string(),
                 Can::new(backend, make_rx_callback("pcan".into(), sh_rx), make_tx_callback("pcan".into(), sh_tx)),
             );
+            info!("PCAN backend initialized successfully");
         }
         Err(e) => warn!("PCAN backend unavailable: {e}"),
     }
@@ -253,6 +255,7 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
                 make_tx_callback("socketcan".into(), sh_tx),
             ),
         );
+        info!("SocketCAN backend initialized successfully");
     }
 
     cans
@@ -291,6 +294,7 @@ impl CanManager {
                     name: ch,
                 });
             }
+            debug!("Listed {} channels from backend '{backend_name}'", out.len());
         }
         Ok(out)
     }
