@@ -26,9 +26,9 @@ pub struct CanFrame {
     pub can_id: u32,
     pub is_extended: bool,
     pub data: Vec<u8>,
-    /// Hardware-provided receive timestamp in milliseconds since the Unix epoch,
-    /// if the backend supplies one. `None` means the caller should fall back to
-    /// wall-clock time. Only set on received frames — never on frames to transmit.
+    /// Timestamp in milliseconds since the Unix epoch. Set by the backend on
+    /// both received frames (from hardware clock) and sent frames (post-send).
+    /// `None` on frames that have not yet been sent or received.
     pub timestamp_ms: Option<u64>,
 }
 
@@ -67,10 +67,10 @@ impl From<String> for CanOpenError {
 // ── Backend traits ────────────────────────────────────────────────────────────
 
 pub trait TxHandle: Send + 'static {
-    /// Send `frame` and return its transmit timestamp in milliseconds since the
-    /// Unix epoch. Backends with hardware clocks return an accurate hw-derived
-    /// value; others return a wall-clock approximation captured post-send.
-    fn send(&mut self, frame: &CanFrame) -> Result<u64, String>;
+    /// Send `frame`, setting `frame.timestamp_ms` to the transmit time in
+    /// milliseconds since the Unix epoch. Backends with hardware clocks use an
+    /// hw-derived value; others use a wall-clock approximation captured post-send.
+    fn send(&mut self, frame: &mut CanFrame) -> Result<(), String>;
     fn close(&mut self);
 }
 
@@ -310,19 +310,19 @@ fn tx_loop(
         while i < q.len() {
             match &mut q[i] {
                 SendEntry::OneShot(_) => {
-                    if let SendEntry::OneShot(f) = q.remove(i) {
-                        match tx.send(&f) {
-                            Ok(ts) => on_tx(channel, CanFrame { timestamp_ms: Some(ts), ..f }),
+                    if let SendEntry::OneShot(mut f) = q.remove(i) {
+                        match tx.send(&mut f) {
+                            Ok(()) => on_tx(channel, f),
                             Err(e) => error!("TX error on channel {channel}: {e}"),
                         }
                     }
                 }
                 SendEntry::Periodic { frame, period_ms, next, .. } => {
                     if now >= *next {
-                        let f = frame.clone();
+                        let mut f = frame.clone();
                         *next = now + Duration::from_millis(*period_ms);
-                        match tx.send(&f) {
-                            Ok(ts) => on_tx(channel, CanFrame { timestamp_ms: Some(ts), ..f }),
+                        match tx.send(&mut f) {
+                            Ok(()) => on_tx(channel, f),
                             Err(e) => error!("TX error on channel {channel}: {e}"),
                         }
                     }

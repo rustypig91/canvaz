@@ -206,7 +206,7 @@ pub(crate) struct KvaserTxHandle {
 unsafe impl Send for KvaserTxHandle {}
 
 impl TxHandle for KvaserTxHandle {
-    fn send(&mut self, frame: &CanFrame) -> Result<u64, String> {
+    fn send(&mut self, frame: &mut CanFrame) -> Result<(), String> {
         let flags = if frame.is_extended { CAN_MSG_EXT } else { 0 };
         // SAFETY: handle is valid; data pointer covers frame.data.len() bytes
         let s = unsafe {
@@ -223,15 +223,15 @@ impl TxHandle for KvaserTxHandle {
             return Err(format!("canWriteWait failed: {}", canlib_err(s)));
         }
         let mut hw_ts: u64 = 0;
-        let ts = if unsafe { (self.lib.read_timer)(self.handle, &mut hw_ts) } == CAN_OK {
-            self.open_time_ms + hw_ts
+        frame.timestamp_ms = if unsafe { (self.lib.read_timer)(self.handle, &mut hw_ts) } == CAN_OK {
+            Some(self.open_time_ms + hw_ts)
         } else {
-            std::time::SystemTime::now()
+            Some(std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_millis() as u64
+                .as_millis() as u64)
         };
-        Ok(ts)
+        Ok(())
     }
 
     fn close(&mut self) {}
