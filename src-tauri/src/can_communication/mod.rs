@@ -1,5 +1,7 @@
 #[cfg(feature = "kvaser")]
 mod kvaser;
+#[cfg(feature = "pcan")]
+mod pcan;
 #[cfg(feature = "linux-can")]
 mod socketcan;
 
@@ -7,6 +9,8 @@ use log::{debug, error, info};
 
 #[cfg(feature = "kvaser")]
 pub use kvaser::KvaserBackend;
+#[cfg(feature = "pcan")]
+pub use pcan::PcanBackend;
 #[cfg(feature = "linux-can")]
 pub use socketcan::SocketCanBackend;
 

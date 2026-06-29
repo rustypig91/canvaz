@@ -35,8 +35,9 @@ libloading = { version = "0.8" }
 socketcan = { version = "3" }
 
 [features]
-default = ["kvaser"]
+default = ["kvaser", "pcan"]
 kvaser = ["dep:libloading"]
+pcan = ["dep:libloading"]
 linux-can = ["dep:socketcan"]
 
 [profile.release]

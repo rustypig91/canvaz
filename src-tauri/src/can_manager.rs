@@ -13,6 +13,8 @@ use crate::dbc_parser::ParsedDbc;
 
 #[cfg(feature = "kvaser")]
 use crate::can_communication::KvaserBackend;
+#[cfg(feature = "pcan")]
+use crate::can_communication::PcanBackend;
 #[cfg(feature = "linux-can")]
 use crate::can_communication::SocketCanBackend;
 
@@ -238,6 +240,20 @@ impl CanManager {
                     KvaserBackend,
                     make_rx_callback("kvaser".into(), sh_rx),
                     make_tx_callback("kvaser".into(), sh_tx),
+                ),
+            );
+        }
+
+        #[cfg(feature = "pcan")]
+        {
+            let sh_rx = Arc::clone(&shared);
+            let sh_tx = Arc::clone(&shared);
+            cans.insert(
+                "pcan".to_string(),
+                Can::new(
+                    PcanBackend,
+                    make_rx_callback("pcan".into(), sh_rx),
+                    make_tx_callback("pcan".into(), sh_tx),
                 ),
             );
         }
