@@ -43,6 +43,7 @@
           <button class="menu-trigger">About</button>
           <div class="menu-dropdown">
             <button class="menu-action" data-action="check-updates">Check for Updates…</button>
+            <button class="menu-action" data-action="system-resources">System Resources…</button>
             <button class="menu-action" data-action="about">About CAN Signals</button>
           </div>
         </div>
@@ -230,6 +231,29 @@
           <button id="btn-github" class="btn btn-sm about-github">GitHub ↗</button>
           <button id="btn-about-close" class="btn btn-primary">Close</button>
         </div>
+      </div>
+    </dialog>
+
+    <!-- System Resources dialog -->
+    <dialog id="dialog-sysres">
+      <h3>System Resources</h3>
+      <table class="sysres-table">
+        <thead>
+          <tr><th>Process</th><th>PID</th><th>CPU</th><th>Memory</th></tr>
+        </thead>
+        <tbody id="sysres-body">
+          <tr><td colspan="4" class="sysres-label">Loading…</td></tr>
+        </tbody>
+        <tfoot>
+          <tr class="sysres-total">
+            <td colspan="2" class="sysres-label">Total</td>
+            <td id="sysres-total-cpu">—</td>
+            <td id="sysres-total-mem">—</td>
+          </tr>
+        </tfoot>
+      </table>
+      <div class="dialog-actions" style="margin-top:16px">
+        <button id="btn-sysres-close" class="btn btn-primary">Close</button>
       </div>
     </dialog>
 

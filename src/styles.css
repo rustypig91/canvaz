@@ -1044,6 +1044,19 @@ dialog { min-width: 380px; }
 /* Update dialog: group buttons at the right so hidden ones collapse cleanly. */
 #dialog-update .about-footer { justify-content: flex-end; gap: 8px; width: 100%; }
 
+/* ── System Resources dialog ─────────────────────────────────────────────── */
+#dialog-sysres { min-width: 420px; }
+.sysres-table { width: 100%; border-collapse: collapse; }
+.sysres-table th, .sysres-table td { padding: 5px 8px; }
+.sysres-table th { color: var(--text-muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+.sysres-table td:nth-child(2), .sysres-table th:nth-child(2),
+.sysres-table td:nth-child(3), .sysres-table th:nth-child(3),
+.sysres-table td:nth-child(4), .sysres-table th:nth-child(4) { text-align: right; font-variant-numeric: tabular-nums; }
+.sysres-table td:nth-child(2) { color: var(--text-muted); font-size: 12px; }
+.sysres-label { color: var(--text-muted); }
+.sysres-total td { border-top: 1px solid var(--border); font-weight: 600; padding-top: 8px; }
+.sysres-total .sysres-label { color: var(--text); }
+
 /* ── Misc ────────────────────────────────────────────────────────────────── */
 .label-muted { color: var(--text-muted); font-size: 12px; }
 .small-input {

@@ -24,6 +24,7 @@ socketcan = { version = "3", optional = true }
 libloading = { version = "0.8", optional = true }
 thiserror = "1"
 log = "0.4"
+sysinfo = "0.37"
 
 # Platform defaults: on each target the crate is non-optional so it compiles
 # without requiring --features. The feature flags are still used in cfg() guards

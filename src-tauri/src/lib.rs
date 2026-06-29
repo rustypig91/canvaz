@@ -17,6 +17,7 @@ use can_manager::{CanManager, ChannelInfo, FrameInfo, ManagerState, SignalSample
 use dbc_parser::ParsedDbc;
 use project::Project;
 use serde::{Deserialize, Serialize};
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tauri::{Manager, State};
 
 use log::{debug, error, info};
@@ -26,6 +27,8 @@ use log::{debug, error, info};
 struct TauriState {
     app_state: Arc<AppState>,
     can_manager: ManagerState,
+    // Persistent so sysinfo can compute CPU% as a delta between refreshes.
+    sys: Mutex<System>,
 }
 
 // ── Sudo ──────────────────────────────────────────────────────────────────────
@@ -108,7 +111,10 @@ struct RemappedChannel {
 #[tauri::command]
 fn reload_backends(state: State<'_, TauriState>) -> Result<Vec<RemappedChannel>, String> {
     let remapped = state.can_manager.lock().map_err(|e| e.to_string())?.reload_backends();
-    Ok(remapped.into_iter().map(|(old_handle, new_handle)| RemappedChannel { old_handle, new_handle }).collect())
+    Ok(remapped
+        .into_iter()
+        .map(|(old_handle, new_handle)| RemappedChannel { old_handle, new_handle })
+        .collect())
 }
 
 /// Parse a DBC file from disk. Lets the frontend show a channel's signal tree
@@ -220,7 +226,13 @@ fn get_frames(handle: Option<u32>, limit: Option<usize>, state: State<'_, TauriS
 }
 
 #[tauri::command]
-fn get_signal_history(handle: u32, message_id: u32, signal_name: String, since_ms: u64, state: State<'_, TauriState>) -> Result<Vec<SignalSample>, String> {
+fn get_signal_history(
+    handle: u32,
+    message_id: u32,
+    signal_name: String,
+    since_ms: u64,
+    state: State<'_, TauriState>,
+) -> Result<Vec<SignalSample>, String> {
     debug!("get_signal_history: handle={handle}, message_id={message_id:#x}, signal_name={signal_name}, since_ms={since_ms}");
     Ok(state
         .can_manager
@@ -299,6 +311,61 @@ fn load_project(path: String) -> Result<Project, String> {
     Project::load(&path)
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ProcessInfo {
+    name: String,
+    pid: u32,
+    cpu: f32,
+    memory: u64,
+}
+
+
+fn get_all_children_recursive<'a>(
+    sys: &'a System,
+    parent_pid: Pid,
+    out: &mut Vec<&'a sysinfo::Process>,
+) {
+    for process in sys.processes().values() {
+        if process.parent() == Some(parent_pid) {
+            out.push(process);
+            // Recursively search for this child's own children
+            get_all_children_recursive(sys, process.pid(), out);
+        }
+    }
+}
+
+#[tauri::command]
+fn system_resources(state: State<'_, TauriState>) -> Result<Vec<ProcessInfo>, String> {
+    let main_pid = Pid::from_u32(std::process::id());
+    let mut sys = state.sys.lock().map_err(|e| e.to_string())?;
+    // Reuse the same System so sysinfo can compute CPU% as a delta vs. last call.
+    // sys.refresh_processes(ProcessesToUpdate::All, true);
+    sys.refresh_all();
+
+
+    // let main_start = sys.process(main_pid).map(|p| p.start_time()).unwrap_or(0);
+
+    let mut result = Vec::new();
+
+    let mut processes: Vec<&sysinfo::Process> = Vec::new();
+    processes.push(sys.process(main_pid).ok_or("Main process not found")?);
+    get_all_children_recursive(&sys, main_pid, &mut processes);
+
+    for process in processes {
+        let pid = process.pid().as_u32();
+        result.push(ProcessInfo {
+            name: process.name().to_string_lossy().into_owned(),
+            pid: pid,
+            cpu: process.cpu_usage(),
+            memory: process.memory(),
+        });
+    }
+
+    result.dedup_by_key(|p| p.pid);
+
+    Ok(result)
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -316,6 +383,7 @@ pub fn run() {
             app.manage(TauriState {
                 app_state,
                 can_manager: Arc::new(Mutex::new(manager)),
+                sys: Mutex::new(System::new()),
             });
             Ok(())
         })
@@ -347,6 +415,7 @@ pub fn run() {
             export_signals_csv,
             save_project,
             load_project,
+            system_resources,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
