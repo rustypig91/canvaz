@@ -18,6 +18,8 @@ pub struct ParsedMessage {
     pub name: String,
     pub dlc: u64,
     pub signals: Vec<ParsedSignal>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transmitter: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,6 +137,11 @@ impl ParsedDbc {
                 })
                 .collect();
 
+            let transmitter = match &msg.transmitter {
+                can_dbc::Transmitter::NodeName(n) => Some(n.clone()),
+                can_dbc::Transmitter::VectorXXX => None,
+            };
+
             messages.insert(
                 raw_id,
                 ParsedMessage {
@@ -142,6 +149,7 @@ impl ParsedDbc {
                     name: msg_name,
                     dlc: msg.size,
                     signals,
+                    transmitter,
                 },
             );
         }

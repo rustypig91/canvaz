@@ -40,6 +40,7 @@ interface DbcMessage {
     name: string;
     dlc: number;
     signals: DbcSignal[];
+    transmitter?: string | null;
 }
 
 interface ParsedDbc {
@@ -95,7 +96,7 @@ interface SimulateEntry { signal_name: string; channel: string; value: number; p
 
 interface SimRawFrameConfig {
     channel: string; can_id: number; is_extended: boolean;
-    dlc: number; data: number[]; period_ms: number;
+    dlc: number; data: number[]; period_ms: number; running?: boolean;
 }
 
 interface TraceFiltersConfig {
@@ -125,6 +126,7 @@ interface Project {
     plot_panes: PlotPaneConfig[];
     simulate_signals: SimulateEntry[];
     simulate_raw_frames?: SimRawFrameConfig[];
+    simulate_running_messages?: { channel: string; message_id: number }[];
     trace_filters?: TraceFiltersConfig;
     trace_columns?: TraceColumnsConfig;
     window_size_sec?: number;
@@ -247,6 +249,10 @@ let plotTabActive = true; // plot tab is the default active tab
 // Signals/sim entries to restore into panes after the next startApp (DBC comes from open_channel)
 let pendingPaneSignals: PlotSignalEntry[][] = [];
 let pendingSimSignals: SimulateEntry[] = [];
+// Keys of raw sim entries that should be auto-started on next startApp.
+let pendingRawAutoStart = new Set<string>();
+// "channelId::messageId" pairs of sim message groups that should auto-start on next startApp.
+let pendingMsgAutoStart = new Set<string>();
 
 // Middle-mouse pan state
 let midPan: { startX: number; startMin: number; startMax: number; chartWidth: number } | null = null;
@@ -656,11 +662,12 @@ function renderDbcTree(filter = "") {
     const lc = filter.toLowerCase();
 
     const sortedMessages = Object.values(dbc.messages).sort((a, b) => a.name.localeCompare(b.name));
-    for (const msg of sortedMessages) {
+
+    const buildMsgDetails = (msg: DbcMessage, container: HTMLElement) => {
         const visibleSignals = msg.signals.filter(s =>
             !lc || s.name.toLowerCase().includes(lc) || msg.name.toLowerCase().includes(lc)
         );
-        if (!visibleSignals.length) continue;
+        if (!visibleSignals.length) return;
 
         const details = document.createElement("details");
         details.className = "msg-group";
@@ -689,7 +696,6 @@ function renderDbcTree(filter = "") {
             signalValueEls.set(key, row.querySelector<HTMLElement>(".sig-value")!);
             signalRangeEls.set(key, row.querySelector<HTMLElement>(".sig-range")!);
 
-            // Drag to plot
             row.setAttribute("draggable", "true");
             row.addEventListener("dragstart", (e) => {
                 if (!selectedChannel) { e.preventDefault(); return; }
@@ -704,7 +710,6 @@ function renderDbcTree(filter = "") {
                 e.dataTransfer!.effectAllowed = "copy";
             });
 
-            // Double-click: add to first pane (create one if needed)
             row.addEventListener("dblclick", () => {
                 const activeTab = document.querySelector(".tab-btn.active")?.getAttribute("data-tab");
                 if (activeTab === "plot") {
@@ -717,7 +722,49 @@ function renderDbcTree(filter = "") {
 
             details.appendChild(row);
         }
-        tree.appendChild(details);
+        container.appendChild(details);
+    };
+
+    // Group by ECU (transmitter). Messages without a named transmitter use "".
+    const byEcu = new Map<string, DbcMessage[]>();
+    for (const msg of sortedMessages) {
+        const ecu = msg.transmitter ?? "";
+        if (!byEcu.has(ecu)) byEcu.set(ecu, []);
+        byEcu.get(ecu)!.push(msg);
+    }
+
+    const hasNamedEcus = [...byEcu.keys()].some(k => k !== "");
+
+    if (hasNamedEcus) {
+        // Named ECUs first (sorted), unnamed last.
+        const named = [...byEcu.entries()].filter(([k]) => k !== "").sort(([a], [b]) => a.localeCompare(b));
+        const unnamed = byEcu.get("") ?? [];
+
+        for (const [ecu, msgs] of named) {
+            const ecuDetails = document.createElement("details");
+            ecuDetails.className = "ecu-group";
+            ecuDetails.open = true;
+            const ecuSummary = document.createElement("summary");
+            ecuSummary.className = "ecu-summary";
+            ecuSummary.textContent = ecu;
+            ecuDetails.appendChild(ecuSummary);
+            for (const msg of msgs) buildMsgDetails(msg, ecuDetails);
+            if (ecuDetails.childElementCount > 1) tree.appendChild(ecuDetails);
+        }
+
+        if (unnamed.length > 0) {
+            const ecuDetails = document.createElement("details");
+            ecuDetails.className = "ecu-group";
+            ecuDetails.open = true;
+            const ecuSummary = document.createElement("summary");
+            ecuSummary.className = "ecu-summary";
+            ecuSummary.textContent = "Other";
+            ecuDetails.appendChild(ecuSummary);
+            for (const msg of unnamed) buildMsgDetails(msg, ecuDetails);
+            if (ecuDetails.childElementCount > 1) tree.appendChild(ecuDetails);
+        }
+    } else {
+        for (const msg of sortedMessages) buildMsgDetails(msg, tree);
     }
 
     // Refresh highlights after tree rebuild
@@ -1614,9 +1661,12 @@ function buildProject(): Project {
                 ? e.signals.map(s => ({ signal_name: s.def.name, channel: handleToId(e.channel), value: s.value, period_ms: e.periodMs }))
                 : []
         ),
+        simulate_running_messages: [...simEntries.values()]
+            .filter((e): e is SimMessageEntry => e.kind === "message" && e.running)
+            .map(e => ({ channel: handleToId(e.channel), message_id: e.messageId })),
         simulate_raw_frames: [...simEntries.values()]
             .filter((e): e is SimRawEntry => e.kind === "raw")
-            .map(e => ({ channel: handleToId(e.channel), can_id: e.canId, is_extended: e.isExtended, dlc: e.dlc, data: e.data, period_ms: e.periodMs })),
+            .map(e => ({ channel: handleToId(e.channel), can_id: e.canId, is_extended: e.isExtended, dlc: e.dlc, data: e.data, period_ms: e.periodMs, running: e.running })),
         trace_filters: {
             channels: traceFilterChannels ? [...traceFilterChannels].map(handleToId) : null,
             can_ids: traceFilterCanIds ? [...traceFilterCanIds] : null,
@@ -1654,6 +1704,8 @@ async function newProject() {
     while (plotPanes.length) closePlotPane(plotPanes[0].id);
     pendingPaneSignals = [];
     pendingSimSignals = [];
+    pendingRawAutoStart.clear();
+    pendingMsgAutoStart.clear();
 
     for (const [key, entry] of simEntries) {
         if (entry.running) {
@@ -1775,6 +1827,13 @@ async function applyProject(project: Project) {
     // Save sim signal entries for restoration after startApp opens channels and loads DBCs.
     pendingSimSignals = project.simulate_signals ?? [];
 
+    // Record which sim message groups should auto-start after startApp opens channels.
+    pendingRawAutoStart.clear();
+    pendingMsgAutoStart.clear();
+    for (const r of project.simulate_running_messages ?? []) {
+        pendingMsgAutoStart.add(`${r.channel}::${r.message_id}`);
+    }
+
     // Restore raw sim frames immediately (they don't need a DBC).
     for (const raw of project.simulate_raw_frames ?? []) {
         const key = `raw::${++rawEntryCounter}`;
@@ -1787,6 +1846,7 @@ async function applyProject(project: Project) {
         };
         simEntries.set(key, entry);
         document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
+        if (raw.running) pendingRawAutoStart.add(key);
     }
 
     // Restore trace column layout
@@ -1961,6 +2021,21 @@ async function startApp() {
         }
         renderSimEntries();
     }
+
+    // Auto-start sim entries that were running when the project was saved.
+    for (const [key, entry] of simEntries) {
+        if (entry.kind === "message") {
+            const channelId = handleToId(entry.channel);
+            if (pendingMsgAutoStart.has(`${channelId}::${entry.messageId}`)) {
+                await startSim(key);
+            }
+        }
+    }
+    pendingMsgAutoStart.clear();
+    for (const key of pendingRawAutoStart) {
+        if (simEntries.has(key)) await startSim(key);
+    }
+    pendingRawAutoStart.clear();
 
     clearTrace();
     startScrollLoop();

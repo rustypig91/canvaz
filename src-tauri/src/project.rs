@@ -10,6 +10,9 @@ pub struct Project {
     pub simulate_signals: Vec<SimulateEntry>,
     #[serde(default)]
     pub simulate_raw_frames: Vec<SimulateRawFrame>,
+    /// Which sim message groups were running when the project was saved.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub simulate_running_messages: Vec<RunningSimMessage>,
     #[serde(default)]
     pub trace_filters: Option<TraceFiltersConfig>,
     /// Data-retention window in seconds; samples older than this are discarded.
@@ -72,6 +75,14 @@ pub struct SimulateRawFrame {
     pub dlc: u8,
     pub data: Vec<u8>,
     pub period_ms: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub running: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RunningSimMessage {
+    pub channel: String,
+    pub message_id: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
