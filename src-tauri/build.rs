@@ -29,7 +29,6 @@ fn main() {
     // is needed at build time. Users can still override via explicit --features.
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     match target_os.as_str() {
-        "windows" => println!("cargo:rustc-cfg=feature=\"kvaser\""),
         "linux" => println!("cargo:rustc-cfg=feature=\"linux-can\""),
         _ => {}
     }
