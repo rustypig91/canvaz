@@ -68,6 +68,11 @@ impl CanLib {
             let lib = Library::new(CANLIB).map_err(|e| format!("CANlib ({CANLIB}) not found: {e}"))?;
             let init: FnInit = *lib.get(b"canInitializeLibrary\0").map_err(|e| e.to_string())?;
             init();
+            // On Windows, canInitializeLibrary triggers asynchronous PnP device
+            // enumeration in the kernel driver. A brief pause lets that settle
+            // before canGetNumberOfChannels is called.
+            #[cfg(windows)]
+            std::thread::sleep(std::time::Duration::from_millis(200));
             macro_rules! sym {
                 ($b:literal, $t:ty) => {
                     *lib.get::<$t>($b).map_err(|e| e.to_string())?
