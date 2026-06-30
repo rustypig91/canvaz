@@ -17,6 +17,7 @@ use can_manager::{CanManager, ChannelInfo, FrameInfo, ManagerState, SignalSample
 use dbc_parser::ParsedDbc;
 use project::Project;
 use serde::{Deserialize, Serialize};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tauri::{Manager, State};
 
 use log::{debug, error, info};
@@ -26,6 +27,9 @@ use log::{debug, error, info};
 struct TauriState {
     app_state: Arc<AppState>,
     can_manager: ManagerState,
+    sys: Mutex<System>,
+    // Cached on first system_resources call; None = not yet discovered.
+    webkit_pids: Mutex<Option<Vec<Pid>>>,
 }
 
 // ── Sudo ──────────────────────────────────────────────────────────────────────
@@ -108,7 +112,10 @@ struct RemappedChannel {
 #[tauri::command]
 fn reload_backends(state: State<'_, TauriState>) -> Result<Vec<RemappedChannel>, String> {
     let remapped = state.can_manager.lock().map_err(|e| e.to_string())?.reload_backends();
-    Ok(remapped.into_iter().map(|(old_handle, new_handle)| RemappedChannel { old_handle, new_handle }).collect())
+    Ok(remapped
+        .into_iter()
+        .map(|(old_handle, new_handle)| RemappedChannel { old_handle, new_handle })
+        .collect())
 }
 
 /// Parse a DBC file from disk. Lets the frontend show a channel's signal tree
@@ -220,7 +227,13 @@ fn get_frames(handle: Option<u32>, limit: Option<usize>, state: State<'_, TauriS
 }
 
 #[tauri::command]
-fn get_signal_history(handle: u32, message_id: u32, signal_name: String, since_ms: u64, state: State<'_, TauriState>) -> Result<Vec<SignalSample>, String> {
+fn get_signal_history(
+    handle: u32,
+    message_id: u32,
+    signal_name: String,
+    since_ms: u64,
+    state: State<'_, TauriState>,
+) -> Result<Vec<SignalSample>, String> {
     debug!("get_signal_history: handle={handle}, message_id={message_id:#x}, signal_name={signal_name}, since_ms={since_ms}");
     Ok(state
         .can_manager
@@ -299,6 +312,75 @@ fn load_project(path: String) -> Result<Project, String> {
     Project::load(&path)
 }
 
+#[derive(Serialize)]
+struct ProcessInfo {
+    name: String,
+    pid: u32,
+    cpu: f32,
+    memory: u64,
+}
+
+#[derive(Serialize)]
+struct SystemResources {
+    processes: Vec<ProcessInfo>,
+    frame_count: usize,
+    frame_bytes: usize,
+}
+
+#[tauri::command]
+fn system_resources(state: State<'_, TauriState>) -> Result<SystemResources, String> {
+    let main_pid = Pid::from_u32(std::process::id());
+    let mut sys = state.sys.lock().map_err(|e| e.to_string())?;
+    let mut webkit_pids = state.webkit_pids.lock().map_err(|e| e.to_string())?;
+
+    let nproc = sys.cpus().len();
+
+    if webkit_pids.is_none() {
+        // One-time full scan to find WebKit child processes by name.
+        sys.refresh_processes(ProcessesToUpdate::All, true);
+        let found: Vec<Pid> = sys
+            .processes()
+            .values()
+            .filter(|p| p.parent() == Some(main_pid) && p.name().to_string_lossy().to_lowercase().contains("webkit"))
+            .map(|p| p.pid())
+            .collect();
+        *webkit_pids = Some(found);
+    } else {
+        // Fast path: only refresh the exact PIDs we care about.
+        let mut pids = vec![main_pid];
+        pids.extend_from_slice(webkit_pids.as_ref().unwrap());
+
+        let specifics = ProcessRefreshKind::nothing().with_cpu().with_memory();
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&pids), true, specifics);
+    }
+
+    let child_pids = webkit_pids.as_ref().unwrap();
+    let mut result = Vec::new();
+
+    if let Some(p) = sys.process(main_pid) {
+        result.push(ProcessInfo {
+            name: p.name().to_string_lossy().into_owned(),
+            pid: main_pid.as_u32(),
+            cpu: p.cpu_usage() / nproc as f32,
+            memory: p.memory(),
+        });
+    }
+    for &pid in child_pids {
+        if let Some(p) = sys.process(pid) {
+            result.push(ProcessInfo {
+                name: p.name().to_string_lossy().into_owned(),
+                pid: pid.as_u32(),
+                cpu: p.cpu_usage() / nproc as f32,
+                memory: p.memory(),
+            });
+        }
+    }
+
+    let (frame_count, frame_bytes) = state.can_manager.lock().map_err(|e| e.to_string())?.frame_stats();
+
+    Ok(SystemResources { processes: result, frame_count, frame_bytes })
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -316,6 +398,8 @@ pub fn run() {
             app.manage(TauriState {
                 app_state,
                 can_manager: Arc::new(Mutex::new(manager)),
+                sys: Mutex::new(System::new()),
+                webkit_pids: Mutex::new(None),
             });
             Ok(())
         })
@@ -347,6 +431,7 @@ pub fn run() {
             export_signals_csv,
             save_project,
             load_project,
+            system_resources,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

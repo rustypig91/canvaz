@@ -665,6 +665,26 @@ impl CanManager {
         Ok(rows.len())
     }
 
+    /// Returns (total_frame_count, estimated_heap_bytes) across all channels.
+    pub fn frame_stats(&self) -> (usize, usize) {
+        let Ok(lock) = self.shared.lock() else { return (0, 0) };
+        let mut count = 0usize;
+        let mut bytes = 0usize;
+        for ch in lock.channels.values() {
+            count += ch.frames.len();
+            for f in &ch.frames {
+                bytes += std::mem::size_of::<StoredFrame>();
+                bytes += f.data.capacity();
+                bytes += f.message_name.as_ref().map_or(0, |s| s.capacity());
+                bytes += f.signals.capacity() * std::mem::size_of::<StoredSignal>();
+                for s in &f.signals {
+                    bytes += s.name.capacity() + s.unit.capacity();
+                }
+            }
+        }
+        (count, bytes)
+    }
+
     fn backend_index(&self, handle: u32) -> Result<(String, u8), String> {
         self.shared
             .lock()

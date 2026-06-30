@@ -2299,6 +2299,49 @@ function openUpdateDialog(opts: {
     dialog.showModal();
 }
 
+function openSysResDialog() {
+    const dialog = document.getElementById("dialog-sysres") as HTMLDialogElement;
+    const tbody = document.getElementById("sysres-body")!;
+    const totalCpuEl = document.getElementById("sysres-total-cpu")!;
+    const totalMemEl = document.getElementById("sysres-total-mem")!;
+    const framesEl = document.getElementById("sysres-frames")!;
+
+    type ProcessInfo = { name: string; pid: number; cpu: number; memory: number };
+    type SystemResources = { processes: ProcessInfo[]; frame_count: number; frame_bytes: number };
+
+    function mb(bytes: number) { return (bytes / 1024 / 1024).toFixed(1) + " MB"; }
+
+    function refresh() {
+        invoke<SystemResources>("system_resources")
+            .then(({ processes, frame_count, frame_bytes }) => {
+                tbody.innerHTML = processes.map(p =>
+                    `<tr>
+                        <td>${p.name}</td>
+                        <td>${p.pid}</td>
+                        <td>${p.cpu.toFixed(1)} %</td>
+                        <td>${mb(p.memory)}</td>
+                    </tr>`
+                ).join("") || `<tr><td colspan="4" class="sysres-label">No processes found</td></tr>`;
+
+                const totalCpu = processes.reduce((s, p) => s + p.cpu, 0);
+                const totalMem = processes.reduce((s, p) => s + p.memory, 0);
+                totalCpuEl.textContent = totalCpu.toFixed(1) + " %";
+                totalMemEl.textContent = mb(totalMem);
+
+                framesEl.textContent = `Frame buffer: ${frame_count.toLocaleString()} frames · ${mb(frame_bytes)}`;
+            })
+            .catch(() => {
+                tbody.innerHTML = `<tr><td colspan="4" class="sysres-label">Error reading resources</td></tr>`;
+            });
+    }
+
+    refresh();
+    const timer = setInterval(refresh, 1000);
+    dialog.addEventListener("close", () => clearInterval(timer), { once: true });
+    (document.activeElement as HTMLElement)?.blur();
+    dialog.showModal();
+}
+
 // `manual` distinguishes the explicit About → Check for Updates action (which
 // always reports a result and ignores the skip preference) from the silent
 // startup check (which only surfaces a brand-new, non-skipped release).
@@ -2503,6 +2546,9 @@ function setupMenuBar() {
     document.getElementById("btn-update-close")!.addEventListener("click", () => {
         (document.getElementById("dialog-update") as HTMLDialogElement).close();
     });
+    document.getElementById("btn-sysres-close")!.addEventListener("click", () => {
+        (document.getElementById("dialog-sysres") as HTMLDialogElement).close();
+    });
     document.getElementById("btn-github")!.addEventListener("click", () => {
         openUrl("https://github.com/rustypig91/canvaz");
     });
@@ -2532,6 +2578,7 @@ function handleMenuAction(action: string) {
             (document.activeElement as HTMLElement)?.blur();
             (document.getElementById("dialog-about") as HTMLDialogElement).showModal();
             break;
+        case "system-resources": openSysResDialog(); break;
         case "check-updates": checkForUpdates(true); break;
     }
 }
