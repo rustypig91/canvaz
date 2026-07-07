@@ -33,6 +33,8 @@ struct DecodedSignal {
     name: String,
     message_name: String,
     value: f64,
+    /// Raw (unscaled, sign-extended) signal value, for display and VAL_ enum lookup.
+    raw: i64,
     unit: String,
     min: f64,
     max: f64,
@@ -61,6 +63,15 @@ pub struct FrameInfo {
     pub timestamp_ms: u64,
     pub direction: &'static str,
     pub message_name: Option<String>,
+    pub signals: Vec<FrameSignal>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FrameSignal {
+    pub name: String,
+    pub value: f64,
+    pub raw: i64,
+    pub unit: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,6 +113,7 @@ impl SignalStats {
 struct StoredSignal {
     name: String,
     value: f64,
+    raw: i64,
     unit: String,
 }
 
@@ -136,10 +148,10 @@ impl ChannelData {
     }
 
     /// Push a frame, evict frames older than `window_ms`. Returns events to emit:
-    /// (signal_name, value, unit, message_name, min, max).
+    /// (signal_name, value, raw, unit, message_name, min, max).
     /// Min/max are all-time since channel open; they grow but never shrink during
     /// eviction to avoid an O(N²) rescan under the shared lock.
-    fn push(&mut self, frame: StoredFrame, window_ms: u64) -> Vec<(String, f64, String, String, f64, f64)> {
+    fn push(&mut self, frame: StoredFrame, window_ms: u64) -> Vec<(String, f64, i64, String, String, f64, f64)> {
         let cutoff = frame.timestamp_ms.saturating_sub(window_ms);
         while self.frames.front().map_or(false, |f| f.timestamp_ms < cutoff) {
             self.frames.pop_front();
@@ -155,7 +167,7 @@ impl ChannelData {
                 .and_modify(|s| s.update(sig.value))
                 .or_insert_with(|| SignalStats::new(sig.value));
             let s = &self.signals[&sig_key];
-            events.push((sig.name.clone(), sig.value, sig.unit.clone(), msg_name.clone(), s.min, s.max));
+            events.push((sig.name.clone(), sig.value, sig.raw, sig.unit.clone(), msg_name.clone(), s.min, s.max));
         }
         events
     }
@@ -180,6 +192,16 @@ impl ChannelData {
                 timestamp_ms: f.timestamp_ms,
                 direction: f.direction,
                 message_name: f.message_name.clone(),
+                signals: f
+                    .signals
+                    .iter()
+                    .map(|s| FrameSignal {
+                        name: s.name.clone(),
+                        value: s.value,
+                        raw: s.raw,
+                        unit: s.unit.clone(),
+                    })
+                    .collect(),
             })
             .collect()
     }
@@ -738,6 +760,7 @@ fn make_rx_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl 
                             .map(|s| StoredSignal {
                                 name: s.name,
                                 value: s.physical,
+                                raw: s.raw,
                                 unit: s.unit,
                             })
                             .collect()
@@ -754,10 +777,11 @@ fn make_rx_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl 
             let app = lock.app.clone();
             let decoded: Vec<DecodedSignal> = signal_updates
                 .into_iter()
-                .map(|(sig_name, value, unit, msg_name, min, max)| DecodedSignal {
+                .map(|(sig_name, value, raw, unit, msg_name, min, max)| DecodedSignal {
                     name: sig_name,
                     message_name: msg_name,
                     value,
+                    raw,
                     unit,
                     min,
                     max,
@@ -817,6 +841,7 @@ fn make_tx_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl 
                             .map(|s| StoredSignal {
                                 name: s.name,
                                 value: s.physical,
+                                raw: s.raw,
                                 unit: s.unit,
                             })
                             .collect()
@@ -831,10 +856,11 @@ fn make_tx_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl 
             let app = lock.app.clone();
             let decoded: Vec<DecodedSignal> = signal_updates
                 .into_iter()
-                .map(|(sig_name, value, unit, msg_name, min, max)| DecodedSignal {
+                .map(|(sig_name, value, raw, unit, msg_name, min, max)| DecodedSignal {
                     name: sig_name,
                     message_name: msg_name,
                     value,
+                    raw,
                     unit,
                     min,
                     max,

@@ -52,7 +52,9 @@ pub struct SignalEnumValue {
 pub struct DecodedCanSignal {
     pub name: String,
     pub physical: f64,
-    pub raw: u64,
+    /// Raw signal value, sign-extended for signed signals. This is what DBC VAL_
+    /// tables map to labels, so it is what the frontend must key enum lookups off.
+    pub raw: i64,
     pub unit: String,
 }
 
@@ -70,7 +72,11 @@ impl ParsedMessage {
 
         let mut decoded_signals = Vec::new();
         for sig in &self.signals {
-            let raw = extract_bits(&frame.data, sig.start_bit, sig.length, sig.little_endian);
+            let raw = raw_signed(
+                extract_bits(&frame.data, sig.start_bit, sig.length, sig.little_endian),
+                sig.length,
+                sig.signed,
+            );
             let physical = decode(
                 &frame.data,
                 sig.start_bit,
@@ -208,6 +214,19 @@ fn encode(data: &mut [u8], value: f64, start_bit: u64, length: u64, little_endia
     let mask = if length >= 64 { u64::MAX } else { (1u64 << length) - 1 };
     let raw_u64 = (raw as u64) & mask;
     pack_bits(data, raw_u64, start_bit, length, little_endian);
+}
+
+/// Sign-extend a raw bit pattern into a signed integer for signed signals. DBC
+/// VAL_ tables map the signal's (signed) raw value, so this is the value enum
+/// lookups must compare against.
+fn raw_signed(raw: u64, length: u64, signed: bool) -> i64 {
+    if signed && length > 0 && length < 64 {
+        let msb_mask = 1u64 << (length - 1);
+        if raw & msb_mask != 0 {
+            return (raw | !((1u64 << length) - 1)) as i64;
+        }
+    }
+    raw as i64
 }
 
 fn apply_scaling(raw: u64, length: u64, signed: bool, factor: f64, offset: f64) -> f64 {

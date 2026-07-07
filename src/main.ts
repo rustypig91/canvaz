@@ -55,6 +55,14 @@ interface ParsedDbc {
     messages: Record<number, DbcMessage>;
 }
 
+// Per-frame decoded signal carried for trace display (value + raw from Rust).
+interface FrameSignal {
+    name: string;
+    value: number;
+    raw: number;
+    unit: string;
+}
+
 interface FrameInfo {
     channel_handle: number;
     can_id: number;
@@ -64,12 +72,15 @@ interface FrameInfo {
     timestamp_ms: number;
     direction: "rx" | "tx";
     message_name: string | null;
+    signals: FrameSignal[];
 }
 
 interface DecodedSignal {
     name: string;
     message_name: string;
     value: number;
+    // Raw (unscaled, sign-extended) value from Rust; used for display and VAL_ enum lookup.
+    raw: number;
     unit: string;
     min: number;
     max: number;
@@ -271,34 +282,6 @@ let midPan: { startX: number; startMin: number; startMax: number; chartWidth: nu
 
 function plotKey(channel: number, messageId: number, signalName: string) {
     return `${channel}::${messageId}::${signalName}`;
-}
-
-function decodeSignal(data: number[], sig: DbcSignal): number {
-    const { start_bit, length, little_endian, signed, factor, offset: sigOffset } = sig;
-    let raw = 0n;
-    const len = BigInt(length);
-    if (little_endian) {
-        for (let i = 0; i < length; i++) {
-            const byteIdx = ((start_bit + i) / 8) | 0;
-            const bitInByte = (start_bit + i) % 8;
-            if (byteIdx < data.length) raw |= BigInt((data[byteIdx] >> bitInByte) & 1) << BigInt(i);
-        }
-    } else {
-        let bitPos = start_bit;
-        for (let i = 0; i < length; i++) {
-            const byteIdx = (bitPos / 8) | 0;
-            const bitInByte = bitPos % 8;
-            if (byteIdx < data.length) raw |= BigInt((data[byteIdx] >> bitInByte) & 1) << BigInt(length - 1 - i);
-            if (bitPos % 8 === 0) bitPos += 15; else bitPos -= 1;
-        }
-    }
-    let physical: number;
-    if (signed && length > 0 && (raw & (1n << (len - 1n)))) {
-        physical = Number(BigInt.asIntN(64, raw | (~((1n << len) - 1n))));
-    } else {
-        physical = Number(raw);
-    }
-    return physical * factor + sigOffset;
 }
 
 function formatSigValue(value: number, unit: string): string {
@@ -1447,11 +1430,11 @@ function fmtNum(n: number): string {
     return String(Number(n.toFixed(6)));
 }
 
-// DBC named value (VAL_) for a signal's current physical value, or "" if none.
-function enumLabelForPhys(sig: DbcSignal, phys: number): string {
+// DBC named value (VAL_) label for a signal's raw integer value, or "" if none.
+// VAL_ entries key on the raw value, so callers must pass the raw integer.
+function enumLabelForRaw(sig: DbcSignal, raw: number): string {
     const enums = sig.enum_values ?? [];
     if (!enums.length) return "";
-    const raw = physToRaw(sig, phys);
     return enums.find(e => e.value === raw)?.description ?? "";
 }
 
@@ -2716,7 +2699,13 @@ interface TraceEntry {
     timestampMs: number;
     cycleTimeMs: number | null;
     direction: "rx" | "tx";
+    signals: FrameSignal[];
 }
+
+// Decoded signals (value + raw from Rust) for each rendered trace row, keyed by
+// the row element so the expansion table can show them without re-decoding in TS.
+// Auto-cleared when a row is evicted (element GC'd).
+const traceRowSignals = new WeakMap<HTMLTableRowElement, FrameSignal[]>();
 
 type TraceMode = "overwrite" | "append";
 type TraceDataFormat = "hex" | "dec" | "ascii";
@@ -2922,11 +2911,13 @@ function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
         messageName: tr.dataset.msg || null,
         dlc: parseInt(tr.dataset.dlc ?? "0"),
         cycleTimeMs: tr.dataset.cycle ? parseFloat(tr.dataset.cycle) : null,
+        signals: traceRowSignals.get(tr) ?? [],
     };
 }
 
 function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
     const tr = document.createElement("tr");
+    traceRowSignals.set(tr, entry.signals);
     tr.dataset.bytes = JSON.stringify(entry.data);
     tr.dataset.channelHandle = String(entry.channelHandle);
     tr.dataset.canid = String(entry.canId);
@@ -2944,6 +2935,7 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
 }
 
 function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
+    traceRowSignals.set(tr, entry.signals);
     tr.dataset.bytes = JSON.stringify(entry.data);
     tr.dataset.ts = String(entry.timestampMs);
     tr.dataset.dlc = String(entry.dlc);
@@ -2960,19 +2952,29 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     if (next?.dataset.expand) {
         const msg = channels.get(entry.channelHandle)?.dbc?.messages[entry.canId];
         if (msg) {
+            const decodedByName = new Map(entry.signals.map(s => [s.name, s]));
             const valCells = next.querySelectorAll<HTMLElement>(".te-val");
             const minCells = next.querySelectorAll<HTMLElement>(".te-min");
             const maxCells = next.querySelectorAll<HTMLElement>(".te-max");
             const enumCells = next.querySelectorAll<HTMLElement>(".te-enum");
             msg.signals.forEach((sig: DbcSignal, i: number) => {
-                const val = decodeSignal(entry.data, sig);
-                if (valCells[i]) valCells[i].textContent = formatSigValue(val, "");
+                const d = decodedByName.get(sig.name);
+                if (valCells[i]) {
+                    valCells[i].textContent = d ? formatSigValue(d.value, "") : "—";
+                    if (d) valCells[i].title = `Raw: ${d.raw}`;
+                }
                 const key = plotKey(entry.channelHandle, entry.canId, sig.name);
                 const mn = signalMinValues.get(key);
                 const mx = signalMaxValues.get(key);
-                if (minCells[i]) minCells[i].textContent = mn !== undefined ? formatSigValue(mn, "") : "—";
-                if (maxCells[i]) maxCells[i].textContent = mx !== undefined ? formatSigValue(mx, "") : "—";
-                if (enumCells[i]) enumCells[i].textContent = enumLabelForPhys(sig, val) || "—";
+                if (minCells[i]) {
+                    minCells[i].textContent = mn !== undefined ? formatSigValue(mn, "") : "—";
+                    if (mn !== undefined) minCells[i].title = `Raw: ${physToRaw(sig, mn)}`;
+                }
+                if (maxCells[i]) {
+                    maxCells[i].textContent = mx !== undefined ? formatSigValue(mx, "") : "—";
+                    if (mx !== undefined) maxCells[i].title = `Raw: ${physToRaw(sig, mx)}`;
+                }
+                if (enumCells[i]) enumCells[i].textContent = d ? (enumLabelForRaw(sig, d.raw) || "—") : "—";
             });
         }
     }
@@ -3032,6 +3034,7 @@ function onCanFrame(ev: CanFrameEvent) {
         timestampMs: ev.timestamp_ms,
         cycleTimeMs: cycleTime,
         direction,
+        signals: ev.signals,
     };
 
     if (viewPaused) {
@@ -3082,6 +3085,7 @@ async function loadTraceFrames() {
             timestampMs: f.timestamp_ms,
             cycleTimeMs,
             direction: f.direction,
+            signals: f.signals,
         };
     }).reverse();
 }
@@ -3482,9 +3486,9 @@ function setupTrace() {
 
         const trHandle = parseInt(tr.dataset.channelHandle ?? "0");
         const canId = parseInt(tr.dataset.canid ?? "0");
-        const bytes: number[] = JSON.parse(tr.dataset.bytes ?? "[]");
         const msg = channels.get(trHandle)?.dbc?.messages[canId];
         if (!msg) return;
+        const decodedByName = new Map((traceRowSignals.get(tr) ?? []).map(s => [s.name, s]));
 
         const expandTr = document.createElement("tr");
         expandTr.dataset.expand = "1";
@@ -3498,18 +3502,19 @@ function setupTrace() {
             + (hasEnums ? '<th>Name</th>' : '')
             + '</tr></thead><tbody>';
         for (const sig of msg.signals) {
-            const val = decodeSignal(bytes, sig);
+            const d = decodedByName.get(sig.name);
             const key = plotKey(trHandle, canId, sig.name);
             const mn = signalMinValues.get(key);
             const mx = signalMaxValues.get(key);
             const fmt = (v: number | undefined) => v !== undefined ? formatSigValue(v, "") : "—";
+            const rawTitle = (v: number | undefined) => v !== undefined ? ` title="Raw: ${physToRaw(sig, v)}"` : "";
             html += `<tr>
         <td class="te-name">${sig.name}</td>
-        <td class="te-val">${formatSigValue(val, "")}</td>
-        <td class="te-min">${fmt(mn)}</td>
-        <td class="te-max">${fmt(mx)}</td>
+        <td class="te-val"${d ? ` title="Raw: ${d.raw}"` : ""}>${d ? formatSigValue(d.value, "") : "—"}</td>
+        <td class="te-min"${rawTitle(mn)}>${fmt(mn)}</td>
+        <td class="te-max"${rawTitle(mx)}>${fmt(mx)}</td>
         <td class="te-unit">${sig.unit || "—"}</td>`
-                + (hasEnums ? `<td class="te-enum">${enumLabelForPhys(sig, val) || "—"}</td>` : "")
+                + (hasEnums ? `<td class="te-enum">${d ? (enumLabelForRaw(sig, d.raw) || "—") : "—"}</td>` : "")
                 + `</tr>`;
         }
         html += '</tbody></table>';
