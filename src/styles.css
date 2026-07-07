@@ -978,6 +978,21 @@ body.col-resizing { cursor: col-resize !important; user-select: none; }
 .trace-expand-table .te-min  { font-family: monospace; color: var(--success); cursor: help; }
 .trace-expand-table .te-max  { font-family: monospace; color: var(--warning); cursor: help; }
 .trace-expand-table .te-unit { color: var(--text-muted); }
+.app-tooltip {
+  position: fixed;
+  z-index: 9999;
+  display: none;
+  pointer-events: none;
+  background: var(--bg3);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 7px;
+  font-size: 11px;
+  font-family: monospace;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
 .trace-expand-table .te-enum { color: var(--text); font-style: italic; }
 #trace-table td {
   padding: 3px 8px;

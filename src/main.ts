@@ -1175,6 +1175,47 @@ document.addEventListener("mousemove", (e) => {
 });
 document.addEventListener("mouseup", (e) => { if (e.button === 1) midPan = null; });
 
+// ── Hover tooltip ─────────────────────────────────────────────────────────────
+// Native `title` tooltips don't reliably re-appear when the pointer moves
+// straight from one titled element to an adjacent one. This custom tooltip shows
+// instantly for any element carrying a `data-tip` attribute and follows the cursor.
+let tooltipEl: HTMLElement | null = null;
+let tipTarget: HTMLElement | null = null;
+function positionTooltip(x: number, y: number) {
+    if (!tooltipEl) return;
+    tooltipEl.style.left = `${x + 12}px`;
+    tooltipEl.style.top = `${y + 16}px`;
+    const r = tooltipEl.getBoundingClientRect();
+    if (r.right > window.innerWidth) tooltipEl.style.left = `${x - r.width - 4}px`;
+    if (r.bottom > window.innerHeight) tooltipEl.style.top = `${y - r.height - 4}px`;
+}
+document.addEventListener("mouseover", (e) => {
+    const t = (e.target as HTMLElement).closest<HTMLElement>("[data-tip]");
+    if (!t) return;
+    tipTarget = t;
+    if (!tooltipEl) {
+        tooltipEl = document.createElement("div");
+        tooltipEl.className = "app-tooltip";
+        document.body.appendChild(tooltipEl);
+    }
+    tooltipEl.textContent = t.dataset.tip ?? "";
+    tooltipEl.style.display = "block";
+    positionTooltip(e.clientX, e.clientY);
+});
+document.addEventListener("mousemove", (e) => {
+    if (tipTarget) positionTooltip(e.clientX, e.clientY);
+});
+document.addEventListener("mouseout", (e) => {
+    if (!tipTarget) return;
+    const related = e.relatedTarget as HTMLElement | null;
+    // Keep showing while moving between descendants of the same tipped element;
+    // hide once the pointer leaves it (and isn't entering another tipped element
+    // — that case re-fires mouseover and swaps the text instantly).
+    if (related && related.closest("[data-tip]") === tipTarget) return;
+    tipTarget = null;
+    if (tooltipEl) tooltipEl.style.display = "none";
+});
+
 function showFilterMenu(
     x: number, y: number,
     items: { label: string; key: string }[],
@@ -2961,18 +3002,18 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
                 const d = decodedByName.get(sig.name);
                 if (valCells[i]) {
                     valCells[i].textContent = d ? formatSigValue(d.value, "") : "—";
-                    if (d) valCells[i].title = `Raw: ${d.raw}`;
+                    if (d) valCells[i].dataset.tip = `Raw: ${d.raw}`;
                 }
                 const key = plotKey(entry.channelHandle, entry.canId, sig.name);
                 const mn = signalMinValues.get(key);
                 const mx = signalMaxValues.get(key);
                 if (minCells[i]) {
                     minCells[i].textContent = mn !== undefined ? formatSigValue(mn, "") : "—";
-                    if (mn !== undefined) minCells[i].title = `Raw: ${physToRaw(sig, mn)}`;
+                    if (mn !== undefined) minCells[i].dataset.tip = `Raw: ${physToRaw(sig, mn)}`;
                 }
                 if (maxCells[i]) {
                     maxCells[i].textContent = mx !== undefined ? formatSigValue(mx, "") : "—";
-                    if (mx !== undefined) maxCells[i].title = `Raw: ${physToRaw(sig, mx)}`;
+                    if (mx !== undefined) maxCells[i].dataset.tip = `Raw: ${physToRaw(sig, mx)}`;
                 }
                 if (enumCells[i]) enumCells[i].textContent = d ? (enumLabelForRaw(sig, d.raw) || "—") : "—";
             });
@@ -3507,12 +3548,12 @@ function setupTrace() {
             const mn = signalMinValues.get(key);
             const mx = signalMaxValues.get(key);
             const fmt = (v: number | undefined) => v !== undefined ? formatSigValue(v, "") : "—";
-            const rawTitle = (v: number | undefined) => v !== undefined ? ` title="Raw: ${physToRaw(sig, v)}"` : "";
+            const rawTip = (v: number | undefined) => v !== undefined ? ` data-tip="Raw: ${physToRaw(sig, v)}"` : "";
             html += `<tr>
         <td class="te-name">${sig.name}</td>
-        <td class="te-val"${d ? ` title="Raw: ${d.raw}"` : ""}>${d ? formatSigValue(d.value, "") : "—"}</td>
-        <td class="te-min"${rawTitle(mn)}>${fmt(mn)}</td>
-        <td class="te-max"${rawTitle(mx)}>${fmt(mx)}</td>
+        <td class="te-val"${d ? ` data-tip="Raw: ${d.raw}"` : ""}>${d ? formatSigValue(d.value, "") : "—"}</td>
+        <td class="te-min"${rawTip(mn)}>${fmt(mn)}</td>
+        <td class="te-max"${rawTip(mx)}>${fmt(mx)}</td>
         <td class="te-unit">${sig.unit || "—"}</td>`
                 + (hasEnums ? `<td class="te-enum">${d ? (enumLabelForRaw(sig, d.raw) || "—") : "—"}</td>` : "")
                 + `</tr>`;
