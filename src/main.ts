@@ -2429,10 +2429,14 @@ function openUpdateDialog(opts: {
 
     const downloadBtn = document.getElementById("btn-update-download") as HTMLButtonElement;
     const skipBtn = document.getElementById("btn-update-skip") as HTMLButtonElement;
+    const closeBtn = document.getElementById("btn-update-close") as HTMLButtonElement;
     const dialog = document.getElementById("dialog-update") as HTMLDialogElement;
 
     downloadBtn.style.display = opts.downloadUrl ? "" : "none";
     skipBtn.style.display = opts.skipVersion ? "" : "none";
+    // With no update to download, the dialog is just an acknowledgement — label the
+    // dismiss button "Ok" instead of "Later" (which implies a pending action).
+    closeBtn.textContent = opts.downloadUrl ? "Later" : "Ok";
 
     downloadBtn.onclick = () => { if (opts.downloadUrl) openUrl(opts.downloadUrl); };
     skipBtn.onclick = () => {
