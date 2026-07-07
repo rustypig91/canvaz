@@ -720,21 +720,33 @@ body.resizing {
 
 .sim-group-body { padding: 4px 0; }
 
+/* Shared column template so physical / unit / raw / enum line up across every
+   row in a message like a table. Only the name track flexes; every other track
+   is a fixed width, otherwise a per-row-varying track (e.g. the enum cell being
+   empty on some rows) would shift the flexible name column and misalign the
+   value columns. The enum track is reserved for the whole message via .has-enums
+   so rows without named values still line up under those that have them. */
 .sim-signal-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(80px, 1fr) 96px 44px 72px 34px;
   align-items: center;
   gap: 8px;
   padding: 4px 14px;
   border-bottom: 1px solid rgba(255,255,255,0.03);
 }
+.sim-group-body.has-enums .sim-signal-row {
+  grid-template-columns: minmax(80px, 1fr) 96px 44px 72px 34px 150px;
+}
 .sim-signal-row:last-child { border-bottom: none; }
 
 .sim-sig-name {
-  flex: 1;
   font-size: 12px;
   color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.sim-sig-unit { min-width: 32px; text-align: right; font-size: 11px; }
+.sim-sig-unit { font-size: 11px; }
 .sim-sig-raw-lbl { font-size: 11px; }
 
 .sim-value-input,
@@ -745,10 +757,11 @@ body.resizing {
   border-radius: 4px;
   color: var(--text);
   padding: 2px 6px;
-  width: 90px;
+  width: 100%;
+  box-sizing: border-box;
   font-size: 12px;
+  text-align: right;
 }
-.sim-raw-input { width: 70px; }
 
 .sim-enum-sel {
   background: var(--bg);
@@ -757,7 +770,8 @@ body.resizing {
   color: var(--text);
   padding: 2px 6px;
   font-size: 12px;
-  max-width: 160px;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .sim-period {

@@ -1431,18 +1431,15 @@ function clampPhys(sig: DbcSignal, phys: number): number {
 }
 
 // Given a candidate physical value, return the physical + raw pair that will
-// actually be sent: clamped to the declared range and to what the bit field can
-// hold. This is the single place value limits are enforced.
+// actually be sent. The raw value is the nearest integer the bit field can hold,
+// and the physical value is snapped back to exactly what that raw encodes — so
+// the box always shows the closest value that can really be transmitted. This is
+// the single place value limits are enforced.
 function normalizeSignalValue(sig: DbcSignal, phys: number): { phys: number; raw: number } {
-    let p = clampPhys(sig, phys);
-    let raw = physToRaw(sig, p);
+    const clampedPhys = clampPhys(sig, phys);
     const rr = signalRawRange(sig);
-    const clamped = Math.min(rr.max, Math.max(rr.min, raw));
-    if (clamped !== raw) {
-        raw = clamped;
-        p = clampPhys(sig, rawToPhys(sig, raw));
-    }
-    return { phys: p, raw };
+    const raw = Math.min(rr.max, Math.max(rr.min, physToRaw(sig, clampedPhys)));
+    return { phys: rawToPhys(sig, raw), raw };
 }
 
 // Trim float noise for display without forcing a fixed precision.
@@ -1498,6 +1495,9 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
 
     if (entry.kind === "message") {
         const idHex = "0x" + entry.messageId.toString(16).toUpperCase().padStart(3, "0");
+        // Reserve the enum column for the whole message (not per-row) so the raw
+        // inputs stay aligned whether or not a given signal has named values.
+        const hasEnums = entry.signals.some(s => (s.def.enum_values ?? []).length > 0);
         el.innerHTML = `
       <div class="sim-group-header">
         <span class="sim-kind-badge kind-msg">MSG</span>
@@ -1513,10 +1513,12 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
           <button class="btn btn-sm btn-danger sim-remove">✕</button>
         </div>
       </div>
-      <div class="sim-group-body">
+      <div class="sim-group-body${hasEnums ? " has-enums" : ""}">
         ${entry.signals.map((s, i) => {
             const { phys, raw } = normalizeSignalValue(s.def, s.value);
             const rr = signalRawRange(s.def);
+            // Arrow/spinner step = one raw unit's worth of physical value.
+            const physStep = Number.isFinite(s.def.factor) && s.def.factor !== 0 ? Math.abs(s.def.factor) : "any";
             const rangeTitle = s.def.max > s.def.min ? `Range: ${fmtNum(s.def.min)} … ${fmtNum(s.def.max)}` : "";
             const enums = s.def.enum_values ?? [];
             const enumSel = enums.length ? `
@@ -1527,9 +1529,9 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             return `
           <div class="sim-signal-row">
             <span class="sim-sig-name" title="${rangeTitle}">${s.def.name}</span>
-            <input type="number" class="sim-phys-input" data-idx="${i}" value="${fmtNum(phys)}" step="any" title="Physical value${rangeTitle ? " — " + rangeTitle : ""}">
+            <input type="number" class="sim-phys-input" data-idx="${i}" value="${fmtNum(phys)}" step="${physStep}"${rangeTitle ? ` min="${s.def.min}" max="${s.def.max}"` : ""} title="Physical value — step ${fmtNum(Math.abs(s.def.factor))}${s.def.unit ? " " + s.def.unit : ""}${rangeTitle ? " — " + rangeTitle : ""}">
             <span class="sim-sig-unit label-muted">${s.def.unit || ""}</span>
-            <input type="number" class="sim-raw-input" data-idx="${i}" value="${raw}" step="1" min="${rr.min}" max="${rr.max}" title="Raw value">
+            <input type="number" class="sim-raw-input" data-idx="${i}" value="${raw}" step="1" min="${rr.min}" max="${rr.max}" title="Raw value — range ${rr.min} … ${rr.max}">
             <span class="sim-sig-raw-lbl label-muted">raw</span>
             ${enumSel}
           </div>`;
