@@ -33,6 +33,12 @@ interface DbcSignal {
     min: number;
     max: number;
     unit: string;
+    enum_values?: SignalEnumValue[];
+}
+
+interface SignalEnumValue {
+    value: number;
+    description: string;
 }
 
 interface DbcMessage {
@@ -1398,6 +1404,60 @@ async function renderChannelList() {
     }
 }
 
+// ── Signal value helpers (physical ↔ raw) ─────────────────────────────────────
+
+// Representable raw range for a signal given its bit length and signedness.
+function signalRawRange(sig: DbcSignal): { min: number; max: number } {
+    if (sig.signed && sig.length > 0) {
+        const half = Math.pow(2, sig.length - 1);
+        return { min: -half, max: half - 1 };
+    }
+    return { min: 0, max: Math.pow(2, sig.length) - 1 };
+}
+
+function physToRaw(sig: DbcSignal, phys: number): number {
+    return Math.round((phys - sig.offset) / sig.factor);
+}
+
+function rawToPhys(sig: DbcSignal, raw: number): number {
+    return raw * sig.factor + sig.offset;
+}
+
+// Clamp a physical value to the DBC-declared [min, max]. Many DBCs leave both at
+// 0 to mean "unspecified" — only clamp when a real range is present.
+function clampPhys(sig: DbcSignal, phys: number): number {
+    if (sig.max > sig.min) return Math.min(sig.max, Math.max(sig.min, phys));
+    return phys;
+}
+
+// Given a candidate physical value, return the physical + raw pair that will
+// actually be sent: clamped to the declared range and to what the bit field can
+// hold. This is the single place value limits are enforced.
+function normalizeSignalValue(sig: DbcSignal, phys: number): { phys: number; raw: number } {
+    let p = clampPhys(sig, phys);
+    let raw = physToRaw(sig, p);
+    const rr = signalRawRange(sig);
+    const clamped = Math.min(rr.max, Math.max(rr.min, raw));
+    if (clamped !== raw) {
+        raw = clamped;
+        p = clampPhys(sig, rawToPhys(sig, raw));
+    }
+    return { phys: p, raw };
+}
+
+// Trim float noise for display without forcing a fixed precision.
+function fmtNum(n: number): string {
+    return String(Number(n.toFixed(6)));
+}
+
+// Physical signal-value map for a message entry, clamped to each signal's limits
+// so a value entered (or restored from an old project) above max is never sent.
+function simSignalValues(entry: SimMessageEntry): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const s of entry.signals) out[s.def.name] = normalizeSignalValue(s.def, s.value).phys;
+    return out;
+}
+
 // ── Simulate tab ──────────────────────────────────────────────────────────────
 
 interface SimMessageEntry {
@@ -1454,12 +1514,26 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         </div>
       </div>
       <div class="sim-group-body">
-        ${entry.signals.map((s, i) => `
+        ${entry.signals.map((s, i) => {
+            const { phys, raw } = normalizeSignalValue(s.def, s.value);
+            const rr = signalRawRange(s.def);
+            const rangeTitle = s.def.max > s.def.min ? `Range: ${fmtNum(s.def.min)} … ${fmtNum(s.def.max)}` : "";
+            const enums = s.def.enum_values ?? [];
+            const enumSel = enums.length ? `
+            <select class="sim-enum-sel" data-idx="${i}" title="Named values">
+              <option value=""${enums.some(e => e.value === raw) ? "" : " selected"}>—</option>
+              ${enums.map(e => `<option value="${e.value}"${e.value === raw ? " selected" : ""}>${e.description} (${e.value})</option>`).join("")}
+            </select>` : "";
+            return `
           <div class="sim-signal-row">
-            <span class="sim-sig-name">${s.def.name}</span>
-            <input type="number" class="sim-value-input" data-idx="${i}" value="${s.value}" step="any">
-            ${s.def.unit ? `<span class="sim-sig-unit label-muted">${s.def.unit}</span>` : ""}
-          </div>`).join("")}
+            <span class="sim-sig-name" title="${rangeTitle}">${s.def.name}</span>
+            <input type="number" class="sim-phys-input" data-idx="${i}" value="${fmtNum(phys)}" step="any" title="Physical value${rangeTitle ? " — " + rangeTitle : ""}">
+            <span class="sim-sig-unit label-muted">${s.def.unit || ""}</span>
+            <input type="number" class="sim-raw-input" data-idx="${i}" value="${raw}" step="1" min="${rr.min}" max="${rr.max}" title="Raw value">
+            <span class="sim-sig-raw-lbl label-muted">raw</span>
+            ${enumSel}
+          </div>`;
+        }).join("")}
       </div>`;
 
         el.querySelector<HTMLInputElement>(".sim-period")!.addEventListener("input", async (e) => {
@@ -1467,16 +1541,45 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             if (entry.running) { await stopSim(key); entry.periodMs = p; await startSim(key); }
             else entry.periodMs = p;
         });
-        el.querySelectorAll<HTMLInputElement>(".sim-value-input").forEach(inp => {
-            inp.addEventListener("input", async () => {
-                entry.signals[parseInt(inp.dataset.idx ?? "0")].value = parseFloat(inp.value) || 0;
-                if (entry.running) { await stopSim(key); await startSim(key); }
+
+        // Commit a new physical value for signal `i`: clamp, store, and refresh the
+        // physical/raw/enum boxes so all three stay consistent. Restarts a running sim.
+        const setSignalValue = async (i: number, candidatePhys: number) => {
+            const s = entry.signals[i];
+            const { phys, raw } = normalizeSignalValue(s.def, candidatePhys);
+            s.value = phys;
+            const row = el.querySelectorAll(".sim-signal-row")[i];
+            const physInp = row.querySelector<HTMLInputElement>(".sim-phys-input")!;
+            const rawInp = row.querySelector<HTMLInputElement>(".sim-raw-input")!;
+            const enumSel = row.querySelector<HTMLSelectElement>(".sim-enum-sel");
+            physInp.value = fmtNum(phys);
+            rawInp.value = String(raw);
+            if (enumSel) enumSel.value = (s.def.enum_values ?? []).some(e => e.value === raw) ? String(raw) : "";
+            if (entry.running) { await stopSim(key); await startSim(key); }
+            scheduleAutoSave();
+        };
+
+        el.querySelectorAll<HTMLInputElement>(".sim-phys-input").forEach(inp => {
+            inp.addEventListener("change", () => {
+                setSignalValue(parseInt(inp.dataset.idx ?? "0"), parseFloat(inp.value) || 0);
+            });
+        });
+        el.querySelectorAll<HTMLInputElement>(".sim-raw-input").forEach(inp => {
+            inp.addEventListener("change", () => {
+                const i = parseInt(inp.dataset.idx ?? "0");
+                const raw = parseInt(inp.value) || 0;
+                setSignalValue(i, rawToPhys(entry.signals[i].def, raw));
+            });
+        });
+        el.querySelectorAll<HTMLSelectElement>(".sim-enum-sel").forEach(sel => {
+            sel.addEventListener("change", () => {
+                if (sel.value === "") return;
+                const i = parseInt(sel.dataset.idx ?? "0");
+                setSignalValue(i, rawToPhys(entry.signals[i].def, parseInt(sel.value)));
             });
         });
         el.querySelector(".sim-send-once")!.addEventListener("click", async () => {
-            const signalValues: Record<string, number> = {};
-            for (const s of entry.signals) signalValues[s.def.name] = s.value;
-            try { await invoke("send_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: signalValues } }); }
+            try { await invoke("send_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry) } }); }
             catch (e) { setError(`Send error: ${e}`); }
         });
 
@@ -1637,9 +1740,7 @@ async function startSim(key: string) {
     try {
         let handle: number;
         if (entry.kind === "message") {
-            const signalValues: Record<string, number> = {};
-            for (const s of entry.signals) signalValues[s.def.name] = s.value;
-            handle = await invoke<number>("add_periodic_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: signalValues, period_ms: entry.periodMs } });
+            handle = await invoke<number>("add_periodic_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), period_ms: entry.periodMs } });
         } else {
             handle = await invoke<number>("add_periodic_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs } });
         }

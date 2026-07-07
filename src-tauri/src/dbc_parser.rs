@@ -36,6 +36,16 @@ pub struct ParsedSignal {
     pub min: f64,
     pub max: f64,
     pub unit: String,
+    /// DBC `VAL_` value descriptions (enum entries). Empty when the signal has none.
+    #[serde(default)]
+    pub enum_values: Vec<SignalEnumValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalEnumValue {
+    /// Raw signal value this description applies to.
+    pub value: i64,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -121,19 +131,34 @@ impl ParsedDbc {
             let signals = msg
                 .signals
                 .iter()
-                .map(|sig| ParsedSignal {
-                    name: sig.name.clone(),
-                    message_id: raw_id,
-                    message_name: msg_name.clone(),
-                    start_bit: sig.start_bit,
-                    length: sig.size,
-                    little_endian: sig.byte_order == ByteOrder::LittleEndian,
-                    signed: sig.value_type == ValueType::Signed,
-                    factor: sig.factor,
-                    offset: sig.offset,
-                    min: numeric_to_f64(sig.min),
-                    max: numeric_to_f64(sig.max),
-                    unit: sig.unit.clone(),
+                .map(|sig| {
+                    let enum_values = dbc
+                        .value_descriptions_for_signal(msg.id, &sig.name)
+                        .map(|descs| {
+                            descs
+                                .iter()
+                                .map(|d| SignalEnumValue {
+                                    value: d.id,
+                                    description: d.description.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    ParsedSignal {
+                        name: sig.name.clone(),
+                        message_id: raw_id,
+                        message_name: msg_name.clone(),
+                        start_bit: sig.start_bit,
+                        length: sig.size,
+                        little_endian: sig.byte_order == ByteOrder::LittleEndian,
+                        signed: sig.value_type == ValueType::Signed,
+                        factor: sig.factor,
+                        offset: sig.offset,
+                        min: numeric_to_f64(sig.min),
+                        max: numeric_to_f64(sig.max),
+                        unit: sig.unit.clone(),
+                        enum_values,
+                    }
                 })
                 .collect();
 
