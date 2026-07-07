@@ -33,6 +33,12 @@ interface DbcSignal {
     min: number;
     max: number;
     unit: string;
+    enum_values?: SignalEnumValue[];
+}
+
+interface SignalEnumValue {
+    value: number;
+    description: string;
 }
 
 interface DbcMessage {
@@ -49,6 +55,14 @@ interface ParsedDbc {
     messages: Record<number, DbcMessage>;
 }
 
+// Per-frame decoded signal carried for trace display (value + raw from Rust).
+interface FrameSignal {
+    name: string;
+    value: number;
+    raw: number;
+    unit: string;
+}
+
 interface FrameInfo {
     channel_handle: number;
     can_id: number;
@@ -58,12 +72,15 @@ interface FrameInfo {
     timestamp_ms: number;
     direction: "rx" | "tx";
     message_name: string | null;
+    signals: FrameSignal[];
 }
 
 interface DecodedSignal {
     name: string;
     message_name: string;
     value: number;
+    // Raw (unscaled, sign-extended) value from Rust; used for display and VAL_ enum lookup.
+    raw: number;
     unit: string;
     min: number;
     max: number;
@@ -92,7 +109,11 @@ interface Channel {
     dbc: ParsedDbc | null;   // DBC tree, parsed by open_channel; null until opened
     open: boolean;           // hardware currently open?
 }
-interface SimulateEntry { signal_name: string; channel: string; value: number; period_ms: number; }
+// One simulated message instance; the same message can appear multiple times.
+interface SimMessageConfig {
+    channel: string; message_id: number; period_ms: number; running?: boolean;
+    signals: { name: string; value: number }[];
+}
 
 interface SimRawFrameConfig {
     channel: string; can_id: number; is_extended: boolean;
@@ -124,9 +145,8 @@ interface Project {
     version: number;
     channels: ChannelConfig[];
     plot_panes: PlotPaneConfig[];
-    simulate_signals: SimulateEntry[];
+    simulate_messages?: SimMessageConfig[];
     simulate_raw_frames?: SimRawFrameConfig[];
-    simulate_running_messages?: { channel: string; message_id: number }[];
     trace_filters?: TraceFiltersConfig;
     trace_columns?: TraceColumnsConfig;
     window_size_sec?: number;
@@ -248,11 +268,8 @@ let plotTabActive = true; // plot tab is the default active tab
 
 // Signals/sim entries to restore into panes after the next startApp (DBC comes from open_channel)
 let pendingPaneSignals: PlotSignalEntry[][] = [];
-let pendingSimSignals: SimulateEntry[] = [];
-// Keys of raw sim entries that should be auto-started on next startApp.
-let pendingRawAutoStart = new Set<string>();
-// "channelId::messageId" pairs of sim message groups that should auto-start on next startApp.
-let pendingMsgAutoStart = new Set<string>();
+// Simulated message instances to restore on next startApp.
+let pendingSimMessages: SimMessageConfig[] = [];
 
 // Channels that failed create_channel (hardware not present). Kept so the
 // project config is preserved and startApp can retry them.
@@ -265,34 +282,6 @@ let midPan: { startX: number; startMin: number; startMax: number; chartWidth: nu
 
 function plotKey(channel: number, messageId: number, signalName: string) {
     return `${channel}::${messageId}::${signalName}`;
-}
-
-function decodeSignal(data: number[], sig: DbcSignal): number {
-    const { start_bit, length, little_endian, signed, factor, offset: sigOffset } = sig;
-    let raw = 0n;
-    const len = BigInt(length);
-    if (little_endian) {
-        for (let i = 0; i < length; i++) {
-            const byteIdx = ((start_bit + i) / 8) | 0;
-            const bitInByte = (start_bit + i) % 8;
-            if (byteIdx < data.length) raw |= BigInt((data[byteIdx] >> bitInByte) & 1) << BigInt(i);
-        }
-    } else {
-        let bitPos = start_bit;
-        for (let i = 0; i < length; i++) {
-            const byteIdx = (bitPos / 8) | 0;
-            const bitInByte = bitPos % 8;
-            if (byteIdx < data.length) raw |= BigInt((data[byteIdx] >> bitInByte) & 1) << BigInt(length - 1 - i);
-            if (bitPos % 8 === 0) bitPos += 15; else bitPos -= 1;
-        }
-    }
-    let physical: number;
-    if (signed && length > 0 && (raw & (1n << (len - 1n)))) {
-        physical = Number(BigInt.asIntN(64, raw | (~((1n << len) - 1n))));
-    } else {
-        physical = Number(raw);
-    }
-    return physical * factor + sigOffset;
 }
 
 function formatSigValue(value: number, unit: string): string {
@@ -635,17 +624,21 @@ function updateSignalHighlights() {
     for (const pane of plotPanes)
         for (const key of pane.series.keys()) plotted.add(key);
 
-    const simulated = new Set<string>();
+    // Simulation is per whole message, so track it at the message level
+    // (channel::messageId) and indicate it on the message group, not each signal.
+    const simulatedMsgs = new Set<string>();
     for (const entry of simEntries.values()) {
-        if (entry.kind === "message") {
-            for (const s of entry.signals) simulated.add(plotKey(entry.channel, s.def.message_id, s.def.name));
-        }
+        if (entry.kind === "message") simulatedMsgs.add(`${entry.channel}::${entry.messageId}`);
     }
 
     document.querySelectorAll<HTMLElement>(".signal-row").forEach(row => {
         const key = plotKey(parseInt(row.dataset.channel ?? "0"), parseInt(row.dataset.messageId ?? "0"), row.dataset.signal ?? "");
         row.classList.toggle("in-plot", plotted.has(key));
-        row.classList.toggle("in-sim", simulated.has(key));
+    });
+
+    document.querySelectorAll<HTMLElement>(".msg-group").forEach(group => {
+        const msgKey = `${group.dataset.channel ?? "0"}::${group.dataset.messageId ?? "0"}`;
+        group.classList.toggle("in-sim", simulatedMsgs.has(msgKey));
     });
 }
 
@@ -656,6 +649,7 @@ function renderDbcTree(filter = "") {
     tree.innerHTML = "";
     signalValueEls.clear();
     signalRangeEls.clear();
+    signalEnums.clear();
 
     const dbc = selectedChannel !== null ? (channels.get(selectedChannel)?.dbc ?? null) : null;
     if (!dbc) {
@@ -676,6 +670,8 @@ function renderDbcTree(filter = "") {
 
         const details = document.createElement("details");
         details.className = "msg-group";
+        details.dataset.channel = String(selectedChannel!);
+        details.dataset.messageId = String(msg.id);
         if (filter) details.open = true;
 
         const summary = document.createElement("summary");
@@ -689,8 +685,9 @@ function renderDbcTree(filter = "") {
             row.dataset.messageId = String(sig.message_id);
             row.dataset.channel = String(selectedChannel!);
             const key = plotKey(selectedChannel!, sig.message_id, sig.name);
+            if (sig.enum_values?.length) signalEnums.set(key, sig.enum_values);
             const lastVal = signalLastValues.get(key);
-            const valText = lastVal != null ? formatSigValue(lastVal, sig.unit) : (sig.unit || "");
+            const valText = lastVal != null ? sidebarValueText(key, lastVal, signalLastRaw.get(key), sig.unit) : (sig.unit || "");
             const mn = signalMinValues.get(key);
             const mx = signalMaxValues.get(key);
             const rangeText = mn !== undefined ? `↓${formatSigValue(mn, "")} ↑${formatSigValue(mx!, "")}` : "↓— ↑—";
@@ -878,11 +875,27 @@ function channelName(handle: number): string {
     return channels.get(handle)?.info.name ?? String(handle);
 }
 const signalLastValues = new Map<string, number>();
+const signalLastRaw = new Map<string, number>();
 const signalMinValues = new Map<string, number>();
 const signalMaxValues = new Map<string, number>();
 const signalValueEls = new Map<string, HTMLElement>();
 const signalRangeEls = new Map<string, HTMLElement>();
+// Enum (VAL_) tables for signals currently shown in the sidebar tree, keyed by
+// plotKey. Populated in renderDbcTree; used to append the named value in the pane.
+const signalEnums = new Map<string, SignalEnumValue[]>();
 let selectedChannel: number | null = null;
+
+// Sidebar value text: physical value plus its DBC named value when the raw value
+// maps to one (e.g. "3 (Third)").
+function sidebarValueText(key: string, value: number, raw: number | undefined, unit: string): string {
+    const base = formatSigValue(value, unit);
+    const enums = signalEnums.get(key);
+    if (enums && raw !== undefined) {
+        const label = enums.find(e => e.value === raw)?.description;
+        if (label) return `${base} (${label})`;
+    }
+    return base;
+}
 
 // ── Auto-save / session restore ───────────────────────────────────────────────
 
@@ -1186,6 +1199,47 @@ document.addEventListener("mousemove", (e) => {
 });
 document.addEventListener("mouseup", (e) => { if (e.button === 1) midPan = null; });
 
+// ── Hover tooltip ─────────────────────────────────────────────────────────────
+// Native `title` tooltips don't reliably re-appear when the pointer moves
+// straight from one titled element to an adjacent one. This custom tooltip shows
+// instantly for any element carrying a `data-tip` attribute and follows the cursor.
+let tooltipEl: HTMLElement | null = null;
+let tipTarget: HTMLElement | null = null;
+function positionTooltip(x: number, y: number) {
+    if (!tooltipEl) return;
+    tooltipEl.style.left = `${x + 12}px`;
+    tooltipEl.style.top = `${y + 16}px`;
+    const r = tooltipEl.getBoundingClientRect();
+    if (r.right > window.innerWidth) tooltipEl.style.left = `${x - r.width - 4}px`;
+    if (r.bottom > window.innerHeight) tooltipEl.style.top = `${y - r.height - 4}px`;
+}
+document.addEventListener("mouseover", (e) => {
+    const t = (e.target as HTMLElement).closest<HTMLElement>("[data-tip]");
+    if (!t) return;
+    tipTarget = t;
+    if (!tooltipEl) {
+        tooltipEl = document.createElement("div");
+        tooltipEl.className = "app-tooltip";
+        document.body.appendChild(tooltipEl);
+    }
+    tooltipEl.textContent = t.dataset.tip ?? "";
+    tooltipEl.style.display = "block";
+    positionTooltip(e.clientX, e.clientY);
+});
+document.addEventListener("mousemove", (e) => {
+    if (tipTarget) positionTooltip(e.clientX, e.clientY);
+});
+document.addEventListener("mouseout", (e) => {
+    if (!tipTarget) return;
+    const related = e.relatedTarget as HTMLElement | null;
+    // Keep showing while moving between descendants of the same tipped element;
+    // hide once the pointer leaves it (and isn't entering another tipped element
+    // — that case re-fires mouseover and swaps the text instantly).
+    if (related && related.closest("[data-tip]") === tipTarget) return;
+    tipTarget = null;
+    if (tooltipEl) tooltipEl.style.display = "none";
+});
+
 function showFilterMenu(
     x: number, y: number,
     items: { label: string; key: string }[],
@@ -1398,6 +1452,68 @@ async function renderChannelList() {
     }
 }
 
+// ── Signal value helpers (physical ↔ raw) ─────────────────────────────────────
+
+// Representable raw range for a signal given its bit length and signedness.
+function signalRawRange(sig: DbcSignal): { min: number; max: number } {
+    if (sig.signed && sig.length > 0) {
+        const half = Math.pow(2, sig.length - 1);
+        return { min: -half, max: half - 1 };
+    }
+    return { min: 0, max: Math.pow(2, sig.length) - 1 };
+}
+
+function physToRaw(sig: DbcSignal, phys: number): number {
+    // A degenerate factor of 0 means every raw value encodes the same physical
+    // (the offset) — use raw 0 rather than dividing to NaN.
+    if (!sig.factor) return 0;
+    return Math.round((phys - sig.offset) / sig.factor);
+}
+
+function rawToPhys(sig: DbcSignal, raw: number): number {
+    return raw * sig.factor + sig.offset;
+}
+
+// Clamp a physical value to the DBC-declared [min, max]. Many DBCs leave both at
+// 0 to mean "unspecified" — only clamp when a real range is present.
+function clampPhys(sig: DbcSignal, phys: number): number {
+    if (sig.max > sig.min) return Math.min(sig.max, Math.max(sig.min, phys));
+    return phys;
+}
+
+// Given a candidate physical value, return the physical + raw pair that will
+// actually be sent. The raw value is the nearest integer the bit field can hold,
+// and the physical value is snapped back to exactly what that raw encodes — so
+// the box always shows the closest value that can really be transmitted. This is
+// the single place value limits are enforced.
+function normalizeSignalValue(sig: DbcSignal, phys: number): { phys: number; raw: number } {
+    const clampedPhys = clampPhys(sig, phys);
+    const rr = signalRawRange(sig);
+    const raw = Math.min(rr.max, Math.max(rr.min, physToRaw(sig, clampedPhys)));
+    return { phys: rawToPhys(sig, raw), raw };
+}
+
+// Trim float noise for display without forcing a fixed precision.
+function fmtNum(n: number): string {
+    return String(Number(n.toFixed(6)));
+}
+
+// DBC named value (VAL_) label for a signal's raw integer value, or "" if none.
+// VAL_ entries key on the raw value, so callers must pass the raw integer.
+function enumLabelForRaw(sig: DbcSignal, raw: number): string {
+    const enums = sig.enum_values ?? [];
+    if (!enums.length) return "";
+    return enums.find(e => e.value === raw)?.description ?? "";
+}
+
+// Physical signal-value map for a message entry, clamped to each signal's limits
+// so a value entered (or restored from an old project) above max is never sent.
+function simSignalValues(entry: SimMessageEntry): Record<string, number> {
+    const out: Record<string, number> = {};
+    for (const s of entry.signals) out[s.def.name] = normalizeSignalValue(s.def, s.value).phys;
+    return out;
+}
+
 // ── Simulate tab ──────────────────────────────────────────────────────────────
 
 interface SimMessageEntry {
@@ -1428,6 +1544,9 @@ type SimEntry = SimMessageEntry | SimRawEntry;
 
 const simEntries = new Map<string, SimEntry>();
 let rawEntryCounter = 0;
+// Message sim entries are keyed by a unique instance id (not by message id) so the
+// same message can be simulated multiple times concurrently.
+let msgEntryCounter = 0;
 
 // ── Sim entry element builders ────────────────────────────────────────────────
 
@@ -1438,6 +1557,9 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
 
     if (entry.kind === "message") {
         const idHex = "0x" + entry.messageId.toString(16).toUpperCase().padStart(3, "0");
+        // Reserve the enum column for the whole message (not per-row) so the raw
+        // inputs stay aligned whether or not a given signal has named values.
+        const hasEnums = entry.signals.some(s => (s.def.enum_values ?? []).length > 0);
         el.innerHTML = `
       <div class="sim-group-header">
         <span class="sim-kind-badge kind-msg">MSG</span>
@@ -1453,13 +1575,29 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
           <button class="btn btn-sm btn-danger sim-remove">✕</button>
         </div>
       </div>
-      <div class="sim-group-body">
-        ${entry.signals.map((s, i) => `
+      <div class="sim-group-body${hasEnums ? " has-enums" : ""}">
+        ${entry.signals.map((s, i) => {
+            const { phys, raw } = normalizeSignalValue(s.def, s.value);
+            const rr = signalRawRange(s.def);
+            // Arrow/spinner step = one raw unit's worth of physical value.
+            const physStep = Number.isFinite(s.def.factor) && s.def.factor !== 0 ? Math.abs(s.def.factor) : "any";
+            const rangeTitle = s.def.max > s.def.min ? `Range: ${fmtNum(s.def.min)} … ${fmtNum(s.def.max)}` : "";
+            const enums = s.def.enum_values ?? [];
+            const enumSel = enums.length ? `
+            <select class="sim-enum-sel" data-idx="${i}" title="Named values">
+              <option value="" hidden disabled${enums.some(e => e.value === raw) ? "" : " selected"}>—</option>
+              ${enums.map(e => `<option value="${e.value}"${e.value === raw ? " selected" : ""}>${e.description} (${e.value})</option>`).join("")}
+            </select>` : "";
+            return `
           <div class="sim-signal-row">
-            <span class="sim-sig-name">${s.def.name}</span>
-            <input type="number" class="sim-value-input" data-idx="${i}" value="${s.value}" step="any">
-            ${s.def.unit ? `<span class="sim-sig-unit label-muted">${s.def.unit}</span>` : ""}
-          </div>`).join("")}
+            <span class="sim-sig-name" title="${rangeTitle}">${s.def.name}</span>
+            <input type="number" class="sim-phys-input" data-idx="${i}" value="${fmtNum(phys)}" step="${physStep}"${rangeTitle ? ` min="${s.def.min}" max="${s.def.max}"` : ""} title="Physical value — step ${fmtNum(Math.abs(s.def.factor))}${s.def.unit ? " " + s.def.unit : ""}${rangeTitle ? " — " + rangeTitle : ""}">
+            <span class="sim-sig-unit label-muted">${s.def.unit || ""}</span>
+            <input type="number" class="sim-raw-input" data-idx="${i}" value="${raw}" step="1" min="${rr.min}" max="${rr.max}" title="Raw value — range ${rr.min} … ${rr.max}">
+            <span class="sim-sig-raw-lbl label-muted">raw</span>
+            ${enumSel}
+          </div>`;
+        }).join("")}
       </div>`;
 
         el.querySelector<HTMLInputElement>(".sim-period")!.addEventListener("input", async (e) => {
@@ -1467,16 +1605,45 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             if (entry.running) { await stopSim(key); entry.periodMs = p; await startSim(key); }
             else entry.periodMs = p;
         });
-        el.querySelectorAll<HTMLInputElement>(".sim-value-input").forEach(inp => {
-            inp.addEventListener("input", async () => {
-                entry.signals[parseInt(inp.dataset.idx ?? "0")].value = parseFloat(inp.value) || 0;
-                if (entry.running) { await stopSim(key); await startSim(key); }
+
+        // Commit a new physical value for signal `i`: clamp, store, and refresh the
+        // physical/raw/enum boxes so all three stay consistent. Restarts a running sim.
+        const setSignalValue = async (i: number, candidatePhys: number) => {
+            const s = entry.signals[i];
+            const { phys, raw } = normalizeSignalValue(s.def, candidatePhys);
+            s.value = phys;
+            const row = el.querySelectorAll(".sim-signal-row")[i];
+            const physInp = row.querySelector<HTMLInputElement>(".sim-phys-input")!;
+            const rawInp = row.querySelector<HTMLInputElement>(".sim-raw-input")!;
+            const enumSel = row.querySelector<HTMLSelectElement>(".sim-enum-sel");
+            physInp.value = fmtNum(phys);
+            rawInp.value = String(raw);
+            if (enumSel) enumSel.value = (s.def.enum_values ?? []).some(e => e.value === raw) ? String(raw) : "";
+            if (entry.running) { await stopSim(key); await startSim(key); }
+            scheduleAutoSave();
+        };
+
+        el.querySelectorAll<HTMLInputElement>(".sim-phys-input").forEach(inp => {
+            inp.addEventListener("change", () => {
+                setSignalValue(parseInt(inp.dataset.idx ?? "0"), parseFloat(inp.value) || 0);
+            });
+        });
+        el.querySelectorAll<HTMLInputElement>(".sim-raw-input").forEach(inp => {
+            inp.addEventListener("change", () => {
+                const i = parseInt(inp.dataset.idx ?? "0");
+                const raw = parseInt(inp.value) || 0;
+                setSignalValue(i, rawToPhys(entry.signals[i].def, raw));
+            });
+        });
+        el.querySelectorAll<HTMLSelectElement>(".sim-enum-sel").forEach(sel => {
+            sel.addEventListener("change", () => {
+                if (sel.value === "") return;
+                const i = parseInt(sel.dataset.idx ?? "0");
+                setSignalValue(i, rawToPhys(entry.signals[i].def, parseInt(sel.value)));
             });
         });
         el.querySelector(".sim-send-once")!.addEventListener("click", async () => {
-            const signalValues: Record<string, number> = {};
-            for (const s of entry.signals) signalValues[s.def.name] = s.value;
-            try { await invoke("send_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: signalValues } }); }
+            try { await invoke("send_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry) } }); }
             catch (e) { setError(`Send error: ${e}`); }
         });
 
@@ -1578,11 +1745,10 @@ function renderSimEntries() {
 function addSimSignal(handle: number, sig: DbcSignal) {
     const dbc = channels.get(handle)?.dbc;
     if (!dbc) { setStatus("No DBC loaded for this channel"); return; }
-    const msg = Object.values(dbc.messages).find((m: DbcMessage) => m.signals.some((s: DbcSignal) => s.name === sig.name));
+    const msg = dbc.messages[sig.message_id];
     if (!msg) return;
 
-    const key = `msg::${handle}::${msg.id}`;
-    if (simEntries.has(key)) { setStatus(`Message '${msg.name}' already added`); return; }
+    const key = `msg::${++msgEntryCounter}`;
 
     const entry: SimMessageEntry = {
         kind: "message", channel: handle,
@@ -1637,9 +1803,7 @@ async function startSim(key: string) {
     try {
         let handle: number;
         if (entry.kind === "message") {
-            const signalValues: Record<string, number> = {};
-            for (const s of entry.signals) signalValues[s.def.name] = s.value;
-            handle = await invoke<number>("add_periodic_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: signalValues, period_ms: entry.periodMs } });
+            handle = await invoke<number>("add_periodic_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), period_ms: entry.periodMs } });
         } else {
             handle = await invoke<number>("add_periodic_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs } });
         }
@@ -1703,14 +1867,15 @@ function buildProject(): Project {
             interpolation: pane.interpolation,
             show_points: pane.showPoints,
         })),
-        simulate_signals: [...simEntries.values()].flatMap(e =>
-            e.kind === "message"
-                ? e.signals.map(s => ({ signal_name: s.def.name, channel: handleToId(e.channel), value: s.value, period_ms: e.periodMs }))
-                : []
-        ),
-        simulate_running_messages: [...simEntries.values()]
-            .filter((e): e is SimMessageEntry => e.kind === "message" && e.running)
-            .map(e => ({ channel: handleToId(e.channel), message_id: e.messageId })),
+        simulate_messages: [...simEntries.values()]
+            .filter((e): e is SimMessageEntry => e.kind === "message")
+            .map(e => ({
+                channel: handleToId(e.channel),
+                message_id: e.messageId,
+                period_ms: e.periodMs,
+                running: e.running,
+                signals: e.signals.map(s => ({ name: s.def.name, value: s.value })),
+            })),
         simulate_raw_frames: [...simEntries.values()]
             .filter((e): e is SimRawEntry => e.kind === "raw")
             .map(e => ({ channel: handleToId(e.channel), can_id: e.canId, is_extended: e.isExtended, dlc: e.dlc, data: e.data, period_ms: e.periodMs, running: e.running })),
@@ -1751,9 +1916,7 @@ async function newProject() {
 
     while (plotPanes.length) closePlotPane(plotPanes[0].id);
     pendingPaneSignals = [];
-    pendingSimSignals = [];
-    pendingRawAutoStart.clear();
-    pendingMsgAutoStart.clear();
+    pendingSimMessages = [];
 
     for (const [key, entry] of simEntries) {
         if (entry.running) {
@@ -1765,6 +1928,7 @@ async function newProject() {
 
     clearTrace();
     signalLastValues.clear();
+    signalLastRaw.clear();
     signalMinValues.clear();
     signalMaxValues.clear();
 
@@ -1875,15 +2039,8 @@ async function applyProject(project: Project) {
     simEntries.clear();
     document.getElementById("sim-entries")!.innerHTML = "";
 
-    // Save sim signal entries for restoration after startApp opens channels and loads DBCs.
-    pendingSimSignals = project.simulate_signals ?? [];
-
-    // Record which sim message groups should auto-start after startApp opens channels.
-    pendingRawAutoStart.clear();
-    pendingMsgAutoStart.clear();
-    for (const r of project.simulate_running_messages ?? []) {
-        pendingMsgAutoStart.add(`${r.channel}::${r.message_id}`);
-    }
+    // Defer sim message restoration until startApp opens channels and loads DBCs.
+    pendingSimMessages = project.simulate_messages ?? [];
 
     // Restore raw sim frames immediately (they don't need a DBC).
     // Preserve running intent: entry shows "Stop" if it was running when saved.
@@ -1999,7 +2156,11 @@ async function startApp() {
     }
     renderChannelList();
 
-    // Prune simulated message entries whose message no longer exists in the reloaded DBC
+    // Reconcile simulated message entries with the reloaded DBC. Entries hold a
+    // snapshot of each signal's definition, so after the DBC changes on disk we
+    // prune entries whose message is gone and, for survivors, swap in the fresh
+    // signal defs (preserving prior values by name), update the DLC, and re-render
+    // so added/removed signals and changed scaling take effect.
     {
         const simContainer = document.getElementById("sim-entries")!;
         for (const [key, entry] of [...simEntries]) {
@@ -2008,7 +2169,13 @@ async function startApp() {
             if (!msg) {
                 simEntries.delete(key);
                 simContainer.querySelector(`[data-sim-key="${key}"]`)?.remove();
+                continue;
             }
+            const prevValues = new Map(entry.signals.map(s => [s.def.name, s.value]));
+            entry.messageName = msg.name;
+            entry.dlc = msg.dlc;
+            entry.signals = msg.signals.map(s => ({ def: s, value: prevValues.get(s.name) ?? s.min ?? 0 }));
+            simContainer.querySelector(`[data-sim-key="${key}"]`)?.replaceWith(createSimEntryEl(key, entry));
         }
     }
 
@@ -2025,6 +2192,7 @@ async function startApp() {
     appRunning = true;
     appStartTime = Date.now();
     signalLastValues.clear();
+    signalLastRaw.clear();
     signalMinValues.clear();
     signalMaxValues.clear();
 
@@ -2064,36 +2232,31 @@ async function startApp() {
         }
     }
 
-    // Restore sim signal entries deferred from applyProject.
-    if (pendingSimSignals.length > 0) {
-        const toRestore = pendingSimSignals;
-        pendingSimSignals = [];
-        const msgMap = new Map<string, { handle: number; msg: DbcMessage; periodMs: number; values: Map<string, number> }>();
-        for (const entry of toRestore) {
-            const handle = idToHandle(entry.channel);
-            if (handle === undefined) continue;
-            const dbc = channels.get(handle)?.dbc;
-            const msg = dbc && Object.values(dbc.messages).find((m: DbcMessage) => m.signals.some((s: DbcSignal) => s.name === entry.signal_name));
-            if (!msg) continue;
-            const key = `msg::${handle}::${msg.id}`;
-            if (!msgMap.has(key)) msgMap.set(key, { handle, msg, periodMs: entry.period_ms, values: new Map() });
-            msgMap.get(key)!.values.set(entry.signal_name, entry.value);
-        }
+    // Restore per-instance sim message entries (new format) deferred from applyProject.
+    if (pendingSimMessages.length > 0) {
+        const toRestore = pendingSimMessages;
+        pendingSimMessages = [];
         const simContainer = document.getElementById("sim-entries")!;
-        for (const [key, { handle, msg, periodMs, values }] of msgMap) {
-            if (simEntries.has(key)) continue;
-            const shouldRun = pendingMsgAutoStart.has(`${handleToId(handle)}::${msg.id}`);
+        for (const m of toRestore) {
+            const handle = idToHandle(m.channel);
+            if (handle === undefined) continue;
+            const msg = channels.get(handle)?.dbc?.messages[m.message_id];
+            if (!msg) continue;
+            const valueByName = new Map(m.signals.map(s => [s.name, s.value]));
+            const key = `msg::${++msgEntryCounter}`;
             const simEntry: SimMessageEntry = {
                 kind: "message", channel: handle,
                 messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
-                signals: msg.signals.map(s => ({ def: s, value: values.get(s.name) ?? s.min ?? 0 })),
-                periodMs, running: shouldRun, periodicHandle: null,
+                signals: msg.signals.map(s => ({ def: s, value: valueByName.get(s.name) ?? s.min ?? 0 })),
+                periodMs: m.period_ms, running: m.running ?? false, periodicHandle: null,
             };
             simEntries.set(key, simEntry);
             simContainer.appendChild(createSimEntryEl(key, simEntry));
         }
-        pendingMsgAutoStart.clear();
         renderSimEntries();
+        // The DBC tree was rendered above before these entries existed; re-apply the
+        // message-level simulation indicators now that simEntries is populated.
+        updateSignalHighlights();
     }
 
     // Register backend periodics for all entries the user has marked as running
@@ -2101,7 +2264,6 @@ async function startApp() {
     for (const [key, entry] of simEntries) {
         if (entry.running) await startSim(key);
     }
-    pendingRawAutoStart.clear();
 
     clearTrace();
     startScrollLoop();
@@ -2284,10 +2446,14 @@ function openUpdateDialog(opts: {
 
     const downloadBtn = document.getElementById("btn-update-download") as HTMLButtonElement;
     const skipBtn = document.getElementById("btn-update-skip") as HTMLButtonElement;
+    const closeBtn = document.getElementById("btn-update-close") as HTMLButtonElement;
     const dialog = document.getElementById("dialog-update") as HTMLDialogElement;
 
     downloadBtn.style.display = opts.downloadUrl ? "" : "none";
     skipBtn.style.display = opts.skipVersion ? "" : "none";
+    // With no update to download, the dialog is just an acknowledgement — label the
+    // dismiss button "Ok" instead of "Later" (which implies a pending action).
+    closeBtn.textContent = opts.downloadUrl ? "Later" : "Ok";
 
     downloadBtn.onclick = () => { if (opts.downloadUrl) openUrl(opts.downloadUrl); };
     skipBtn.onclick = () => {
@@ -2595,7 +2761,13 @@ interface TraceEntry {
     timestampMs: number;
     cycleTimeMs: number | null;
     direction: "rx" | "tx";
+    signals: FrameSignal[];
 }
+
+// Decoded signals (value + raw from Rust) for each rendered trace row, keyed by
+// the row element so the expansion table can show them without re-decoding in TS.
+// Auto-cleared when a row is evicted (element GC'd).
+const traceRowSignals = new WeakMap<HTMLTableRowElement, FrameSignal[]>();
 
 type TraceMode = "overwrite" | "append";
 type TraceDataFormat = "hex" | "dec" | "ascii";
@@ -2801,11 +2973,13 @@ function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
         messageName: tr.dataset.msg || null,
         dlc: parseInt(tr.dataset.dlc ?? "0"),
         cycleTimeMs: tr.dataset.cycle ? parseFloat(tr.dataset.cycle) : null,
+        signals: traceRowSignals.get(tr) ?? [],
     };
 }
 
 function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
     const tr = document.createElement("tr");
+    traceRowSignals.set(tr, entry.signals);
     tr.dataset.bytes = JSON.stringify(entry.data);
     tr.dataset.channelHandle = String(entry.channelHandle);
     tr.dataset.canid = String(entry.canId);
@@ -2823,6 +2997,7 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
 }
 
 function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
+    traceRowSignals.set(tr, entry.signals);
     tr.dataset.bytes = JSON.stringify(entry.data);
     tr.dataset.ts = String(entry.timestampMs);
     tr.dataset.dlc = String(entry.dlc);
@@ -2839,16 +3014,29 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     if (next?.dataset.expand) {
         const msg = channels.get(entry.channelHandle)?.dbc?.messages[entry.canId];
         if (msg) {
+            const decodedByName = new Map(entry.signals.map(s => [s.name, s]));
             const valCells = next.querySelectorAll<HTMLElement>(".te-val");
             const minCells = next.querySelectorAll<HTMLElement>(".te-min");
             const maxCells = next.querySelectorAll<HTMLElement>(".te-max");
+            const enumCells = next.querySelectorAll<HTMLElement>(".te-enum");
             msg.signals.forEach((sig: DbcSignal, i: number) => {
-                if (valCells[i]) valCells[i].textContent = formatSigValue(decodeSignal(entry.data, sig), "");
+                const d = decodedByName.get(sig.name);
+                if (valCells[i]) {
+                    valCells[i].textContent = d ? formatSigValue(d.value, "") : "—";
+                    if (d) valCells[i].dataset.tip = `Raw: ${d.raw}`;
+                }
                 const key = plotKey(entry.channelHandle, entry.canId, sig.name);
                 const mn = signalMinValues.get(key);
                 const mx = signalMaxValues.get(key);
-                if (minCells[i]) minCells[i].textContent = mn !== undefined ? formatSigValue(mn, "") : "—";
-                if (maxCells[i]) maxCells[i].textContent = mx !== undefined ? formatSigValue(mx, "") : "—";
+                if (minCells[i]) {
+                    minCells[i].textContent = mn !== undefined ? formatSigValue(mn, "") : "—";
+                    if (mn !== undefined) minCells[i].dataset.tip = `Raw: ${physToRaw(sig, mn)}`;
+                }
+                if (maxCells[i]) {
+                    maxCells[i].textContent = mx !== undefined ? formatSigValue(mx, "") : "—";
+                    if (mx !== undefined) maxCells[i].dataset.tip = `Raw: ${physToRaw(sig, mx)}`;
+                }
+                if (enumCells[i]) enumCells[i].textContent = d ? (enumLabelForRaw(sig, d.raw) || "—") : "—";
             });
         }
     }
@@ -2874,11 +3062,12 @@ function onCanFrame(ev: CanFrameEvent) {
     for (const sig of ev.signals) {
         const sigKey = plotKey(ev.channel_handle, ev.can_id, sig.name);
         signalLastValues.set(sigKey, sig.value);
+        signalLastRaw.set(sigKey, sig.raw);
         signalMinValues.set(sigKey, sig.min);
         signalMaxValues.set(sigKey, sig.max);
         const valEl = signalValueEls.get(sigKey);
         if (valEl) {
-            valEl.textContent = formatSigValue(sig.value, sig.unit);
+            valEl.textContent = sidebarValueText(sigKey, sig.value, sig.raw, sig.unit);
             valEl.classList.remove("sig-value--empty");
         }
         const rangeEl = signalRangeEls.get(sigKey);
@@ -2908,6 +3097,7 @@ function onCanFrame(ev: CanFrameEvent) {
         timestampMs: ev.timestamp_ms,
         cycleTimeMs: cycleTime,
         direction,
+        signals: ev.signals,
     };
 
     if (viewPaused) {
@@ -2958,6 +3148,7 @@ async function loadTraceFrames() {
             timestampMs: f.timestamp_ms,
             cycleTimeMs,
             direction: f.direction,
+            signals: f.signals,
         };
     }).reverse();
 }
@@ -3358,9 +3549,9 @@ function setupTrace() {
 
         const trHandle = parseInt(tr.dataset.channelHandle ?? "0");
         const canId = parseInt(tr.dataset.canid ?? "0");
-        const bytes: number[] = JSON.parse(tr.dataset.bytes ?? "[]");
         const msg = channels.get(trHandle)?.dbc?.messages[canId];
         if (!msg) return;
+        const decodedByName = new Map((traceRowSignals.get(tr) ?? []).map(s => [s.name, s]));
 
         const expandTr = document.createElement("tr");
         expandTr.dataset.expand = "1";
@@ -3368,21 +3559,26 @@ function setupTrace() {
         td.colSpan = traceColOrder.filter(k => !traceColHidden.has(k)).length;
         td.className = "trace-expand-cell";
 
+        const hasEnums = msg.signals.some((s: DbcSignal) => (s.enum_values ?? []).length > 0);
         let html = '<table class="trace-expand-table"><thead><tr>'
             + '<th>Signal</th><th>Value</th><th>Min</th><th>Max</th><th>Unit</th>'
+            + (hasEnums ? '<th>Name</th>' : '')
             + '</tr></thead><tbody>';
         for (const sig of msg.signals) {
-            const val = decodeSignal(bytes, sig);
+            const d = decodedByName.get(sig.name);
             const key = plotKey(trHandle, canId, sig.name);
             const mn = signalMinValues.get(key);
             const mx = signalMaxValues.get(key);
             const fmt = (v: number | undefined) => v !== undefined ? formatSigValue(v, "") : "—";
+            const rawTip = (v: number | undefined) => v !== undefined ? ` data-tip="Raw: ${physToRaw(sig, v)}"` : "";
             html += `<tr>
         <td class="te-name">${sig.name}</td>
-        <td class="te-val">${formatSigValue(val, "")}</td>
-        <td class="te-min">${fmt(mn)}</td>
-        <td class="te-max">${fmt(mx)}</td>
-        <td class="te-unit">${sig.unit || "—"}</td></tr>`;
+        <td class="te-val"${d ? ` data-tip="Raw: ${d.raw}"` : ""}>${d ? formatSigValue(d.value, "") : "—"}</td>
+        <td class="te-min"${rawTip(mn)}>${fmt(mn)}</td>
+        <td class="te-max"${rawTip(mx)}>${fmt(mx)}</td>
+        <td class="te-unit">${sig.unit || "—"}</td>`
+                + (hasEnums ? `<td class="te-enum">${d ? (enumLabelForRaw(sig, d.raw) || "—") : "—"}</td>` : "")
+                + `</tr>`;
         }
         html += '</tbody></table>';
         td.innerHTML = html;

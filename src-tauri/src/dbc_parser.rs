@@ -36,13 +36,25 @@ pub struct ParsedSignal {
     pub min: f64,
     pub max: f64,
     pub unit: String,
+    /// DBC `VAL_` value descriptions (enum entries). Empty when the signal has none.
+    #[serde(default)]
+    pub enum_values: Vec<SignalEnumValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SignalEnumValue {
+    /// Raw signal value this description applies to.
+    pub value: i64,
+    pub description: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DecodedCanSignal {
     pub name: String,
     pub physical: f64,
-    pub raw: u64,
+    /// Raw signal value, sign-extended for signed signals. This is what DBC VAL_
+    /// tables map to labels, so it is what the frontend must key enum lookups off.
+    pub raw: i64,
     pub unit: String,
 }
 
@@ -60,7 +72,11 @@ impl ParsedMessage {
 
         let mut decoded_signals = Vec::new();
         for sig in &self.signals {
-            let raw = extract_bits(&frame.data, sig.start_bit, sig.length, sig.little_endian);
+            let raw = raw_signed(
+                extract_bits(&frame.data, sig.start_bit, sig.length, sig.little_endian),
+                sig.length,
+                sig.signed,
+            );
             let physical = decode(
                 &frame.data,
                 sig.start_bit,
@@ -121,19 +137,34 @@ impl ParsedDbc {
             let signals = msg
                 .signals
                 .iter()
-                .map(|sig| ParsedSignal {
-                    name: sig.name.clone(),
-                    message_id: raw_id,
-                    message_name: msg_name.clone(),
-                    start_bit: sig.start_bit,
-                    length: sig.size,
-                    little_endian: sig.byte_order == ByteOrder::LittleEndian,
-                    signed: sig.value_type == ValueType::Signed,
-                    factor: sig.factor,
-                    offset: sig.offset,
-                    min: numeric_to_f64(sig.min),
-                    max: numeric_to_f64(sig.max),
-                    unit: sig.unit.clone(),
+                .map(|sig| {
+                    let enum_values = dbc
+                        .value_descriptions_for_signal(msg.id, &sig.name)
+                        .map(|descs| {
+                            descs
+                                .iter()
+                                .map(|d| SignalEnumValue {
+                                    value: d.id,
+                                    description: d.description.clone(),
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    ParsedSignal {
+                        name: sig.name.clone(),
+                        message_id: raw_id,
+                        message_name: msg_name.clone(),
+                        start_bit: sig.start_bit,
+                        length: sig.size,
+                        little_endian: sig.byte_order == ByteOrder::LittleEndian,
+                        signed: sig.value_type == ValueType::Signed,
+                        factor: sig.factor,
+                        offset: sig.offset,
+                        min: numeric_to_f64(sig.min),
+                        max: numeric_to_f64(sig.max),
+                        unit: sig.unit.clone(),
+                        enum_values,
+                    }
                 })
                 .collect();
 
@@ -179,10 +210,25 @@ fn decode(data: &[u8], start_bit: u64, length: u64, little_endian: bool, signed:
 }
 
 fn encode(data: &mut [u8], value: f64, start_bit: u64, length: u64, little_endian: bool, factor: f64, offset: f64) {
-    let raw = ((value - offset) / factor).round() as i64;
+    // A degenerate factor of 0 means every raw value encodes the same physical
+    // (the offset) — use raw 0 rather than dividing to ±inf and saturating.
+    let raw = if factor == 0.0 { 0 } else { ((value - offset) / factor).round() as i64 };
     let mask = if length >= 64 { u64::MAX } else { (1u64 << length) - 1 };
     let raw_u64 = (raw as u64) & mask;
     pack_bits(data, raw_u64, start_bit, length, little_endian);
+}
+
+/// Sign-extend a raw bit pattern into a signed integer for signed signals. DBC
+/// VAL_ tables map the signal's (signed) raw value, so this is the value enum
+/// lookups must compare against.
+fn raw_signed(raw: u64, length: u64, signed: bool) -> i64 {
+    if signed && length > 0 && length < 64 {
+        let msb_mask = 1u64 << (length - 1);
+        if raw & msb_mask != 0 {
+            return (raw | !((1u64 << length) - 1)) as i64;
+        }
+    }
+    raw as i64
 }
 
 fn apply_scaling(raw: u64, length: u64, signed: bool, factor: f64, offset: f64) -> f64 {

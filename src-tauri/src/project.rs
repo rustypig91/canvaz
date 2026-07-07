@@ -7,12 +7,12 @@ pub struct Project {
     pub channels: Vec<ChannelConfig>,
     /// Each entry is one plot pane; each pane holds its signal list.
     pub plot_panes: Vec<PlotPaneConfig>,
-    pub simulate_signals: Vec<SimulateEntry>,
+    /// One entry per simulated message instance. Allows the same message to be
+    /// simulated multiple times with independent values/period.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub simulate_messages: Vec<SimulateMessage>,
     #[serde(default)]
     pub simulate_raw_frames: Vec<SimulateRawFrame>,
-    /// Which sim message groups were running when the project was saved.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub simulate_running_messages: Vec<RunningSimMessage>,
     #[serde(default)]
     pub trace_filters: Option<TraceFiltersConfig>,
     /// Data-retention window in seconds; samples older than this are discarded.
@@ -60,11 +60,19 @@ pub struct PlotSignalEntry {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SimulateEntry {
-    pub signal_name: String,
+pub struct SimulateMessage {
     pub channel: String,
-    pub value: f64,
+    pub message_id: u32,
     pub period_ms: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub running: bool,
+    pub signals: Vec<SimulateMessageSignal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulateMessageSignal {
+    pub name: String,
+    pub value: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -77,12 +85,6 @@ pub struct SimulateRawFrame {
     pub period_ms: u64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub running: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct RunningSimMessage {
-    pub channel: String,
-    pub message_id: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

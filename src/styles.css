@@ -486,7 +486,19 @@ body.resizing {
 .signal-row:hover { background: var(--bg3); }
 .signal-row.in-plot { background: rgba(59,130,246,0.08); }
 .signal-row.in-plot .sig-name { color: var(--accent); }
-.signal-row.in-sim { outline: 1px solid #f97316; outline-offset: -1px; }
+
+/* A message is simulated as a whole — indicate it subtly on the message group:
+   a thin left accent bar (no layout shift) plus a small dot after the ID badge. */
+.msg-group.in-sim > summary { box-shadow: inset 2px 0 0 #f97316; }
+.msg-group.in-sim > summary::after {
+  content: '';
+  width: 6px;
+  height: 6px;
+  margin-left: 8px;
+  border-radius: 50%;
+  background: #f97316;
+  flex-shrink: 0;
+}
 .signal-row .sig-name { flex: 1; }
 .signal-row .sig-value {
   font-family: monospace;
@@ -720,30 +732,58 @@ body.resizing {
 
 .sim-group-body { padding: 4px 0; }
 
+/* Shared column template so physical / unit / raw / enum line up across every
+   row in a message like a table. Only the name track flexes; every other track
+   is a fixed width, otherwise a per-row-varying track (e.g. the enum cell being
+   empty on some rows) would shift the flexible name column and misalign the
+   value columns. The enum track is reserved for the whole message via .has-enums
+   so rows without named values still line up under those that have them. */
 .sim-signal-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(80px, 1fr) 96px 44px 72px 34px;
   align-items: center;
   gap: 8px;
   padding: 4px 14px;
   border-bottom: 1px solid rgba(255,255,255,0.03);
 }
+.sim-group-body.has-enums .sim-signal-row {
+  grid-template-columns: minmax(80px, 1fr) 96px 44px 72px 34px 150px;
+}
 .sim-signal-row:last-child { border-bottom: none; }
 
 .sim-sig-name {
-  flex: 1;
   font-size: 12px;
   color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.sim-sig-unit { min-width: 32px; text-align: right; }
+.sim-sig-unit { font-size: 11px; }
+.sim-sig-raw-lbl { font-size: 11px; }
 
-.sim-value-input {
+.sim-value-input,
+.sim-phys-input,
+.sim-raw-input {
   background: var(--bg);
   border: 1px solid var(--border);
   border-radius: 4px;
   color: var(--text);
   padding: 2px 6px;
-  width: 90px;
+  width: 100%;
+  box-sizing: border-box;
   font-size: 12px;
+  text-align: right;
+}
+
+.sim-enum-sel {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  padding: 2px 6px;
+  font-size: 12px;
+  width: 100%;
+  box-sizing: border-box;
 }
 
 .sim-period {
@@ -856,7 +896,9 @@ body.resizing {
 }
 .ctx-col-item:hover { background: var(--bg3); }
 .ctx-col-item input[type="checkbox"] { cursor: pointer; }
-#trace-table thead th {
+/* Scoped to the direct header row so these do not leak into the nested
+   signal-expansion table's <thead> (which must not look clickable). */
+#trace-table > thead th {
   position: sticky;
   top: 0;
   white-space: nowrap;
@@ -873,9 +915,9 @@ body.resizing {
   border-bottom: 1px solid var(--border);
   z-index: 1;
 }
-#trace-table thead th { cursor: pointer; user-select: none; }
-#trace-table thead th:hover { color: var(--text); }
-#trace-table thead th.th-filtered { color: var(--accent); }
+#trace-table > thead th { cursor: pointer; user-select: none; }
+#trace-table > thead th:hover { color: var(--text); }
+#trace-table > thead th.th-filtered { color: var(--accent); }
 .col-resizer {
   position: absolute; right: 0; top: 0; bottom: 0; width: 5px;
   cursor: col-resize; z-index: 2;
@@ -948,6 +990,22 @@ body.col-resizing { cursor: col-resize !important; user-select: none; }
 .trace-expand-table .te-min  { font-family: monospace; color: var(--success); }
 .trace-expand-table .te-max  { font-family: monospace; color: var(--warning); }
 .trace-expand-table .te-unit { color: var(--text-muted); }
+.app-tooltip {
+  position: fixed;
+  z-index: 9999;
+  display: none;
+  pointer-events: none;
+  background: var(--bg3);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 3px 7px;
+  font-size: 11px;
+  font-family: monospace;
+  white-space: nowrap;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
+}
+.trace-expand-table .te-enum { color: var(--text); font-style: italic; }
 #trace-table td {
   padding: 3px 8px;
   white-space: nowrap;
