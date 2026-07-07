@@ -270,8 +270,6 @@ let plotTabActive = true; // plot tab is the default active tab
 let pendingPaneSignals: PlotSignalEntry[][] = [];
 // Simulated message instances to restore on next startApp.
 let pendingSimMessages: SimMessageConfig[] = [];
-// Keys of raw sim entries that should be auto-started on next startApp.
-let pendingRawAutoStart = new Set<string>();
 
 // Channels that failed create_channel (hardware not present). Kept so the
 // project config is preserved and startApp can retry them.
@@ -1466,6 +1464,9 @@ function signalRawRange(sig: DbcSignal): { min: number; max: number } {
 }
 
 function physToRaw(sig: DbcSignal, phys: number): number {
+    // A degenerate factor of 0 means every raw value encodes the same physical
+    // (the offset) — use raw 0 rather than dividing to NaN.
+    if (!sig.factor) return 0;
     return Math.round((phys - sig.offset) / sig.factor);
 }
 
@@ -1744,7 +1745,7 @@ function renderSimEntries() {
 function addSimSignal(handle: number, sig: DbcSignal) {
     const dbc = channels.get(handle)?.dbc;
     if (!dbc) { setStatus("No DBC loaded for this channel"); return; }
-    const msg = Object.values(dbc.messages).find((m: DbcMessage) => m.signals.some((s: DbcSignal) => s.name === sig.name));
+    const msg = dbc.messages[sig.message_id];
     if (!msg) return;
 
     const key = `msg::${++msgEntryCounter}`;
@@ -1916,7 +1917,6 @@ async function newProject() {
     while (plotPanes.length) closePlotPane(plotPanes[0].id);
     pendingPaneSignals = [];
     pendingSimMessages = [];
-    pendingRawAutoStart.clear();
 
     for (const [key, entry] of simEntries) {
         if (entry.running) {
@@ -2041,8 +2041,6 @@ async function applyProject(project: Project) {
 
     // Defer sim message restoration until startApp opens channels and loads DBCs.
     pendingSimMessages = project.simulate_messages ?? [];
-
-    pendingRawAutoStart.clear();
 
     // Restore raw sim frames immediately (they don't need a DBC).
     // Preserve running intent: entry shows "Stop" if it was running when saved.
@@ -2266,7 +2264,6 @@ async function startApp() {
     for (const [key, entry] of simEntries) {
         if (entry.running) await startSim(key);
     }
-    pendingRawAutoStart.clear();
 
     clearTrace();
     startScrollLoop();

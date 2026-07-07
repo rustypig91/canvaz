@@ -210,7 +210,9 @@ fn decode(data: &[u8], start_bit: u64, length: u64, little_endian: bool, signed:
 }
 
 fn encode(data: &mut [u8], value: f64, start_bit: u64, length: u64, little_endian: bool, factor: f64, offset: f64) {
-    let raw = ((value - offset) / factor).round() as i64;
+    // A degenerate factor of 0 means every raw value encodes the same physical
+    // (the offset) — use raw 0 rather than dividing to ±inf and saturating.
+    let raw = if factor == 0.0 { 0 } else { ((value - offset) / factor).round() as i64 };
     let mask = if length >= 64 { u64::MAX } else { (1u64 << length) - 1 };
     let raw_u64 = (raw as u64) & mask;
     pack_bits(data, raw_u64, start_bit, length, little_endian);
