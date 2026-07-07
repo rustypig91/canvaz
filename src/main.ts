@@ -2102,7 +2102,11 @@ async function startApp() {
     }
     renderChannelList();
 
-    // Prune simulated message entries whose message no longer exists in the reloaded DBC
+    // Reconcile simulated message entries with the reloaded DBC. Entries hold a
+    // snapshot of each signal's definition, so after the DBC changes on disk we
+    // prune entries whose message is gone and, for survivors, swap in the fresh
+    // signal defs (preserving prior values by name), update the DLC, and re-render
+    // so added/removed signals and changed scaling take effect.
     {
         const simContainer = document.getElementById("sim-entries")!;
         for (const [key, entry] of [...simEntries]) {
@@ -2111,7 +2115,13 @@ async function startApp() {
             if (!msg) {
                 simEntries.delete(key);
                 simContainer.querySelector(`[data-sim-key="${key}"]`)?.remove();
+                continue;
             }
+            const prevValues = new Map(entry.signals.map(s => [s.def.name, s.value]));
+            entry.messageName = msg.name;
+            entry.dlc = msg.dlc;
+            entry.signals = msg.signals.map(s => ({ def: s, value: prevValues.get(s.name) ?? s.min ?? 0 }));
+            simContainer.querySelector(`[data-sim-key="${key}"]`)?.replaceWith(createSimEntryEl(key, entry));
         }
     }
 

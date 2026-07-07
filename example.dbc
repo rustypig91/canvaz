@@ -39,6 +39,7 @@ BU_: ENGINE_ECU BODY_ECU DASH
 BO_ 256 EngineStatus: 8 ENGINE_ECU
  SG_ EngineRPM : 0|16@1+ (0.25,0) [0|16383.75] "rpm" DASH
  SG_ CoolantTemp : 16|8@1+ (1,-40) [-40|215] "degC" DASH
+ SG_ GearState : 24|4@1+ (1,0) [0|7] "" DASH
  SG_ EngineState : 28|3@1+ (1,0) [0|4] "" DASH
  SG_ ThrottlePercent : 32|8@1+ (0.5,0) [0|100] "%" DASH
 
