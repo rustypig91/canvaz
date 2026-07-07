@@ -1447,6 +1447,14 @@ function fmtNum(n: number): string {
     return String(Number(n.toFixed(6)));
 }
 
+// DBC named value (VAL_) for a signal's current physical value, or "" if none.
+function enumLabelForPhys(sig: DbcSignal, phys: number): string {
+    const enums = sig.enum_values ?? [];
+    if (!enums.length) return "";
+    const raw = physToRaw(sig, phys);
+    return enums.find(e => e.value === raw)?.description ?? "";
+}
+
 // Physical signal-value map for a message entry, clamped to each signal's limits
 // so a value entered (or restored from an old project) above max is never sent.
 function simSignalValues(entry: SimMessageEntry): Record<string, number> {
@@ -2955,13 +2963,16 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
             const valCells = next.querySelectorAll<HTMLElement>(".te-val");
             const minCells = next.querySelectorAll<HTMLElement>(".te-min");
             const maxCells = next.querySelectorAll<HTMLElement>(".te-max");
+            const enumCells = next.querySelectorAll<HTMLElement>(".te-enum");
             msg.signals.forEach((sig: DbcSignal, i: number) => {
-                if (valCells[i]) valCells[i].textContent = formatSigValue(decodeSignal(entry.data, sig), "");
+                const val = decodeSignal(entry.data, sig);
+                if (valCells[i]) valCells[i].textContent = formatSigValue(val, "");
                 const key = plotKey(entry.channelHandle, entry.canId, sig.name);
                 const mn = signalMinValues.get(key);
                 const mx = signalMaxValues.get(key);
                 if (minCells[i]) minCells[i].textContent = mn !== undefined ? formatSigValue(mn, "") : "—";
                 if (maxCells[i]) maxCells[i].textContent = mx !== undefined ? formatSigValue(mx, "") : "—";
+                if (enumCells[i]) enumCells[i].textContent = enumLabelForPhys(sig, val) || "—";
             });
         }
     }
@@ -3481,8 +3492,10 @@ function setupTrace() {
         td.colSpan = traceColOrder.filter(k => !traceColHidden.has(k)).length;
         td.className = "trace-expand-cell";
 
+        const hasEnums = msg.signals.some((s: DbcSignal) => (s.enum_values ?? []).length > 0);
         let html = '<table class="trace-expand-table"><thead><tr>'
             + '<th>Signal</th><th>Value</th><th>Min</th><th>Max</th><th>Unit</th>'
+            + (hasEnums ? '<th>Name</th>' : '')
             + '</tr></thead><tbody>';
         for (const sig of msg.signals) {
             const val = decodeSignal(bytes, sig);
@@ -3495,7 +3508,9 @@ function setupTrace() {
         <td class="te-val">${formatSigValue(val, "")}</td>
         <td class="te-min">${fmt(mn)}</td>
         <td class="te-max">${fmt(mx)}</td>
-        <td class="te-unit">${sig.unit || "—"}</td></tr>`;
+        <td class="te-unit">${sig.unit || "—"}</td>`
+                + (hasEnums ? `<td class="te-enum">${enumLabelForPhys(sig, val) || "—"}</td>` : "")
+                + `</tr>`;
         }
         html += '</tbody></table>';
         td.innerHTML = html;

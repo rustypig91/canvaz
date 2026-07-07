@@ -976,6 +976,7 @@ body.col-resizing { cursor: col-resize !important; user-select: none; }
 .trace-expand-table .te-min  { font-family: monospace; color: var(--success); }
 .trace-expand-table .te-max  { font-family: monospace; color: var(--warning); }
 .trace-expand-table .te-unit { color: var(--text-muted); }
+.trace-expand-table .te-enum { color: var(--text); font-style: italic; }
 #trace-table td {
   padding: 3px 8px;
   white-space: nowrap;
