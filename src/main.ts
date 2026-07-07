@@ -645,6 +645,7 @@ function renderDbcTree(filter = "") {
     tree.innerHTML = "";
     signalValueEls.clear();
     signalRangeEls.clear();
+    signalEnums.clear();
 
     const dbc = selectedChannel !== null ? (channels.get(selectedChannel)?.dbc ?? null) : null;
     if (!dbc) {
@@ -678,8 +679,9 @@ function renderDbcTree(filter = "") {
             row.dataset.messageId = String(sig.message_id);
             row.dataset.channel = String(selectedChannel!);
             const key = plotKey(selectedChannel!, sig.message_id, sig.name);
+            if (sig.enum_values?.length) signalEnums.set(key, sig.enum_values);
             const lastVal = signalLastValues.get(key);
-            const valText = lastVal != null ? formatSigValue(lastVal, sig.unit) : (sig.unit || "");
+            const valText = lastVal != null ? sidebarValueText(key, lastVal, signalLastRaw.get(key), sig.unit) : (sig.unit || "");
             const mn = signalMinValues.get(key);
             const mx = signalMaxValues.get(key);
             const rangeText = mn !== undefined ? `↓${formatSigValue(mn, "")} ↑${formatSigValue(mx!, "")}` : "↓— ↑—";
@@ -867,11 +869,27 @@ function channelName(handle: number): string {
     return channels.get(handle)?.info.name ?? String(handle);
 }
 const signalLastValues = new Map<string, number>();
+const signalLastRaw = new Map<string, number>();
 const signalMinValues = new Map<string, number>();
 const signalMaxValues = new Map<string, number>();
 const signalValueEls = new Map<string, HTMLElement>();
 const signalRangeEls = new Map<string, HTMLElement>();
+// Enum (VAL_) tables for signals currently shown in the sidebar tree, keyed by
+// plotKey. Populated in renderDbcTree; used to append the named value in the pane.
+const signalEnums = new Map<string, SignalEnumValue[]>();
 let selectedChannel: number | null = null;
+
+// Sidebar value text: physical value plus its DBC named value when the raw value
+// maps to one (e.g. "3 (Third)").
+function sidebarValueText(key: string, value: number, raw: number | undefined, unit: string): string {
+    const base = formatSigValue(value, unit);
+    const enums = signalEnums.get(key);
+    if (enums && raw !== undefined) {
+        const label = enums.find(e => e.value === raw)?.description;
+        if (label) return `${base} (${label})`;
+    }
+    return base;
+}
 
 // ── Auto-save / session restore ───────────────────────────────────────────────
 
@@ -1900,6 +1918,7 @@ async function newProject() {
 
     clearTrace();
     signalLastValues.clear();
+    signalLastRaw.clear();
     signalMinValues.clear();
     signalMaxValues.clear();
 
@@ -2170,6 +2189,7 @@ async function startApp() {
     appRunning = true;
     appStartTime = Date.now();
     signalLastValues.clear();
+    signalLastRaw.clear();
     signalMinValues.clear();
     signalMaxValues.clear();
 
@@ -3045,11 +3065,12 @@ function onCanFrame(ev: CanFrameEvent) {
     for (const sig of ev.signals) {
         const sigKey = plotKey(ev.channel_handle, ev.can_id, sig.name);
         signalLastValues.set(sigKey, sig.value);
+        signalLastRaw.set(sigKey, sig.raw);
         signalMinValues.set(sigKey, sig.min);
         signalMaxValues.set(sigKey, sig.max);
         const valEl = signalValueEls.get(sigKey);
         if (valEl) {
-            valEl.textContent = formatSigValue(sig.value, sig.unit);
+            valEl.textContent = sidebarValueText(sigKey, sig.value, sig.raw, sig.unit);
             valEl.classList.remove("sig-value--empty");
         }
         const rangeEl = signalRangeEls.get(sigKey);
