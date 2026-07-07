@@ -341,7 +341,10 @@ fn system_resources(state: State<'_, TauriState>) -> Result<SystemResources, Str
         let found: Vec<Pid> = sys
             .processes()
             .values()
-            .filter(|p| p.parent() == Some(main_pid) && p.name().to_string_lossy().to_lowercase().contains("webkit"))
+            .filter(|p| {
+                let name = p.name().to_string_lossy().to_lowercase();
+                (p.parent() == Some(main_pid)) && (name.contains("webkit") || name.contains("webview"))
+            })
             .map(|p| p.pid())
             .collect();
         *webkit_pids = Some(found);
@@ -378,7 +381,11 @@ fn system_resources(state: State<'_, TauriState>) -> Result<SystemResources, Str
 
     let (frame_count, frame_bytes) = state.can_manager.lock().map_err(|e| e.to_string())?.frame_stats();
 
-    Ok(SystemResources { processes: result, frame_count, frame_bytes })
+    Ok(SystemResources {
+        processes: result,
+        frame_count,
+        frame_bytes,
+    })
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
