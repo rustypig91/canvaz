@@ -109,7 +109,11 @@ interface Channel {
     dbc: ParsedDbc | null;   // DBC tree, parsed by open_channel; null until opened
     open: boolean;           // hardware currently open?
 }
-interface SimulateEntry { signal_name: string; channel: string; value: number; period_ms: number; }
+// One simulated message instance; the same message can appear multiple times.
+interface SimMessageConfig {
+    channel: string; message_id: number; period_ms: number; running?: boolean;
+    signals: { name: string; value: number }[];
+}
 
 interface SimRawFrameConfig {
     channel: string; can_id: number; is_extended: boolean;
@@ -141,9 +145,8 @@ interface Project {
     version: number;
     channels: ChannelConfig[];
     plot_panes: PlotPaneConfig[];
-    simulate_signals: SimulateEntry[];
+    simulate_messages?: SimMessageConfig[];
     simulate_raw_frames?: SimRawFrameConfig[];
-    simulate_running_messages?: { channel: string; message_id: number }[];
     trace_filters?: TraceFiltersConfig;
     trace_columns?: TraceColumnsConfig;
     window_size_sec?: number;
@@ -265,11 +268,10 @@ let plotTabActive = true; // plot tab is the default active tab
 
 // Signals/sim entries to restore into panes after the next startApp (DBC comes from open_channel)
 let pendingPaneSignals: PlotSignalEntry[][] = [];
-let pendingSimSignals: SimulateEntry[] = [];
+// Simulated message instances to restore on next startApp.
+let pendingSimMessages: SimMessageConfig[] = [];
 // Keys of raw sim entries that should be auto-started on next startApp.
 let pendingRawAutoStart = new Set<string>();
-// "channelId::messageId" pairs of sim message groups that should auto-start on next startApp.
-let pendingMsgAutoStart = new Set<string>();
 
 // Channels that failed create_channel (hardware not present). Kept so the
 // project config is preserved and startApp can retry them.
@@ -1541,6 +1543,9 @@ type SimEntry = SimMessageEntry | SimRawEntry;
 
 const simEntries = new Map<string, SimEntry>();
 let rawEntryCounter = 0;
+// Message sim entries are keyed by a unique instance id (not by message id) so the
+// same message can be simulated multiple times concurrently.
+let msgEntryCounter = 0;
 
 // ── Sim entry element builders ────────────────────────────────────────────────
 
@@ -1742,8 +1747,7 @@ function addSimSignal(handle: number, sig: DbcSignal) {
     const msg = Object.values(dbc.messages).find((m: DbcMessage) => m.signals.some((s: DbcSignal) => s.name === sig.name));
     if (!msg) return;
 
-    const key = `msg::${handle}::${msg.id}`;
-    if (simEntries.has(key)) { setStatus(`Message '${msg.name}' already added`); return; }
+    const key = `msg::${++msgEntryCounter}`;
 
     const entry: SimMessageEntry = {
         kind: "message", channel: handle,
@@ -1862,14 +1866,15 @@ function buildProject(): Project {
             interpolation: pane.interpolation,
             show_points: pane.showPoints,
         })),
-        simulate_signals: [...simEntries.values()].flatMap(e =>
-            e.kind === "message"
-                ? e.signals.map(s => ({ signal_name: s.def.name, channel: handleToId(e.channel), value: s.value, period_ms: e.periodMs }))
-                : []
-        ),
-        simulate_running_messages: [...simEntries.values()]
-            .filter((e): e is SimMessageEntry => e.kind === "message" && e.running)
-            .map(e => ({ channel: handleToId(e.channel), message_id: e.messageId })),
+        simulate_messages: [...simEntries.values()]
+            .filter((e): e is SimMessageEntry => e.kind === "message")
+            .map(e => ({
+                channel: handleToId(e.channel),
+                message_id: e.messageId,
+                period_ms: e.periodMs,
+                running: e.running,
+                signals: e.signals.map(s => ({ name: s.def.name, value: s.value })),
+            })),
         simulate_raw_frames: [...simEntries.values()]
             .filter((e): e is SimRawEntry => e.kind === "raw")
             .map(e => ({ channel: handleToId(e.channel), can_id: e.canId, is_extended: e.isExtended, dlc: e.dlc, data: e.data, period_ms: e.periodMs, running: e.running })),
@@ -1910,9 +1915,8 @@ async function newProject() {
 
     while (plotPanes.length) closePlotPane(plotPanes[0].id);
     pendingPaneSignals = [];
-    pendingSimSignals = [];
+    pendingSimMessages = [];
     pendingRawAutoStart.clear();
-    pendingMsgAutoStart.clear();
 
     for (const [key, entry] of simEntries) {
         if (entry.running) {
@@ -2035,15 +2039,10 @@ async function applyProject(project: Project) {
     simEntries.clear();
     document.getElementById("sim-entries")!.innerHTML = "";
 
-    // Save sim signal entries for restoration after startApp opens channels and loads DBCs.
-    pendingSimSignals = project.simulate_signals ?? [];
+    // Defer sim message restoration until startApp opens channels and loads DBCs.
+    pendingSimMessages = project.simulate_messages ?? [];
 
-    // Record which sim message groups should auto-start after startApp opens channels.
     pendingRawAutoStart.clear();
-    pendingMsgAutoStart.clear();
-    for (const r of project.simulate_running_messages ?? []) {
-        pendingMsgAutoStart.add(`${r.channel}::${r.message_id}`);
-    }
 
     // Restore raw sim frames immediately (they don't need a DBC).
     // Preserve running intent: entry shows "Stop" if it was running when saved.
@@ -2235,38 +2234,30 @@ async function startApp() {
         }
     }
 
-    // Restore sim signal entries deferred from applyProject.
-    if (pendingSimSignals.length > 0) {
-        const toRestore = pendingSimSignals;
-        pendingSimSignals = [];
-        const msgMap = new Map<string, { handle: number; msg: DbcMessage; periodMs: number; values: Map<string, number> }>();
-        for (const entry of toRestore) {
-            const handle = idToHandle(entry.channel);
-            if (handle === undefined) continue;
-            const dbc = channels.get(handle)?.dbc;
-            const msg = dbc && Object.values(dbc.messages).find((m: DbcMessage) => m.signals.some((s: DbcSignal) => s.name === entry.signal_name));
-            if (!msg) continue;
-            const key = `msg::${handle}::${msg.id}`;
-            if (!msgMap.has(key)) msgMap.set(key, { handle, msg, periodMs: entry.period_ms, values: new Map() });
-            msgMap.get(key)!.values.set(entry.signal_name, entry.value);
-        }
+    // Restore per-instance sim message entries (new format) deferred from applyProject.
+    if (pendingSimMessages.length > 0) {
+        const toRestore = pendingSimMessages;
+        pendingSimMessages = [];
         const simContainer = document.getElementById("sim-entries")!;
-        for (const [key, { handle, msg, periodMs, values }] of msgMap) {
-            if (simEntries.has(key)) continue;
-            const shouldRun = pendingMsgAutoStart.has(`${handleToId(handle)}::${msg.id}`);
+        for (const m of toRestore) {
+            const handle = idToHandle(m.channel);
+            if (handle === undefined) continue;
+            const msg = channels.get(handle)?.dbc?.messages[m.message_id];
+            if (!msg) continue;
+            const valueByName = new Map(m.signals.map(s => [s.name, s.value]));
+            const key = `msg::${++msgEntryCounter}`;
             const simEntry: SimMessageEntry = {
                 kind: "message", channel: handle,
                 messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
-                signals: msg.signals.map(s => ({ def: s, value: values.get(s.name) ?? s.min ?? 0 })),
-                periodMs, running: shouldRun, periodicHandle: null,
+                signals: msg.signals.map(s => ({ def: s, value: valueByName.get(s.name) ?? s.min ?? 0 })),
+                periodMs: m.period_ms, running: m.running ?? false, periodicHandle: null,
             };
             simEntries.set(key, simEntry);
             simContainer.appendChild(createSimEntryEl(key, simEntry));
         }
-        pendingMsgAutoStart.clear();
         renderSimEntries();
-        // The DBC tree was rendered above before these entries existed, so re-apply
-        // the message-level simulation indicators now that simEntries is populated.
+        // The DBC tree was rendered above before these entries existed; re-apply the
+        // message-level simulation indicators now that simEntries is populated.
         updateSignalHighlights();
     }
 
