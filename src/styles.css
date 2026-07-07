@@ -486,7 +486,19 @@ body.resizing {
 .signal-row:hover { background: var(--bg3); }
 .signal-row.in-plot { background: rgba(59,130,246,0.08); }
 .signal-row.in-plot .sig-name { color: var(--accent); }
-.signal-row.in-sim { outline: 1px solid #f97316; outline-offset: -1px; }
+
+/* A message is simulated as a whole — indicate it subtly on the message group:
+   a thin left accent bar (no layout shift) plus a small dot after the ID badge. */
+.msg-group.in-sim > summary { box-shadow: inset 2px 0 0 #f97316; }
+.msg-group.in-sim > summary::after {
+  content: '';
+  width: 6px;
+  height: 6px;
+  margin-left: 8px;
+  border-radius: 50%;
+  background: #f97316;
+  flex-shrink: 0;
+}
 .signal-row .sig-name { flex: 1; }
 .signal-row .sig-value {
   font-family: monospace;

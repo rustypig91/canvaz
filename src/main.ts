@@ -624,17 +624,21 @@ function updateSignalHighlights() {
     for (const pane of plotPanes)
         for (const key of pane.series.keys()) plotted.add(key);
 
-    const simulated = new Set<string>();
+    // Simulation is per whole message, so track it at the message level
+    // (channel::messageId) and indicate it on the message group, not each signal.
+    const simulatedMsgs = new Set<string>();
     for (const entry of simEntries.values()) {
-        if (entry.kind === "message") {
-            for (const s of entry.signals) simulated.add(plotKey(entry.channel, s.def.message_id, s.def.name));
-        }
+        if (entry.kind === "message") simulatedMsgs.add(`${entry.channel}::${entry.messageId}`);
     }
 
     document.querySelectorAll<HTMLElement>(".signal-row").forEach(row => {
         const key = plotKey(parseInt(row.dataset.channel ?? "0"), parseInt(row.dataset.messageId ?? "0"), row.dataset.signal ?? "");
         row.classList.toggle("in-plot", plotted.has(key));
-        row.classList.toggle("in-sim", simulated.has(key));
+    });
+
+    document.querySelectorAll<HTMLElement>(".msg-group").forEach(group => {
+        const msgKey = `${group.dataset.channel ?? "0"}::${group.dataset.messageId ?? "0"}`;
+        group.classList.toggle("in-sim", simulatedMsgs.has(msgKey));
     });
 }
 
@@ -666,6 +670,8 @@ function renderDbcTree(filter = "") {
 
         const details = document.createElement("details");
         details.className = "msg-group";
+        details.dataset.channel = String(selectedChannel!);
+        details.dataset.messageId = String(msg.id);
         if (filter) details.open = true;
 
         const summary = document.createElement("summary");
@@ -2259,6 +2265,9 @@ async function startApp() {
         }
         pendingMsgAutoStart.clear();
         renderSimEntries();
+        // The DBC tree was rendered above before these entries existed, so re-apply
+        // the message-level simulation indicators now that simEntries is populated.
+        updateSignalHighlights();
     }
 
     // Register backend periodics for all entries the user has marked as running
