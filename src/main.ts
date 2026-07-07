@@ -1555,7 +1555,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             const enums = s.def.enum_values ?? [];
             const enumSel = enums.length ? `
             <select class="sim-enum-sel" data-idx="${i}" title="Named values">
-              <option value=""${enums.some(e => e.value === raw) ? "" : " selected"}>—</option>
+              <option value="" hidden disabled${enums.some(e => e.value === raw) ? "" : " selected"}>—</option>
               ${enums.map(e => `<option value="${e.value}"${e.value === raw ? " selected" : ""}>${e.description} (${e.value})</option>`).join("")}
             </select>` : "";
             return `
