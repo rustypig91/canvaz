@@ -884,7 +884,9 @@ body.resizing {
 }
 .ctx-col-item:hover { background: var(--bg3); }
 .ctx-col-item input[type="checkbox"] { cursor: pointer; }
-#trace-table thead th {
+/* Scoped to the direct header row so these do not leak into the nested
+   signal-expansion table's <thead> (which must not look clickable). */
+#trace-table > thead th {
   position: sticky;
   top: 0;
   white-space: nowrap;
@@ -901,9 +903,9 @@ body.resizing {
   border-bottom: 1px solid var(--border);
   z-index: 1;
 }
-#trace-table thead th { cursor: pointer; user-select: none; }
-#trace-table thead th:hover { color: var(--text); }
-#trace-table thead th.th-filtered { color: var(--accent); }
+#trace-table > thead th { cursor: pointer; user-select: none; }
+#trace-table > thead th:hover { color: var(--text); }
+#trace-table > thead th.th-filtered { color: var(--accent); }
 .col-resizer {
   position: absolute; right: 0; top: 0; bottom: 0; width: 5px;
   cursor: col-resize; z-index: 2;
