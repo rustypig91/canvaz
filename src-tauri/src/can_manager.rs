@@ -28,17 +28,6 @@ static NEXT_CHANNEL_HANDLE: AtomicU32 = AtomicU32::new(1);
 
 // ── Public event / query types ────────────────────────────────────────────────
 
-/// Per-signal payload of the batched frame event. Deliberately minimal: the
-/// frontend already holds the parsed DBC (message name, unit, enums) and tracks
-/// min/max itself, so shipping those per frame would only bloat the IPC traffic.
-#[derive(Debug, Clone, Serialize)]
-struct DecodedSignal {
-    name: String,
-    value: f64,
-    /// Raw (unscaled, sign-extended) signal value, for display and VAL_ enum lookup.
-    raw: i64,
-}
-
 #[derive(Debug, Clone, Serialize)]
 struct CanFrameEvent {
     channel_handle: u32,
@@ -48,8 +37,13 @@ struct CanFrameEvent {
     data: Vec<u8>,
     timestamp_ms: u64,
     direction: &'static str,
-    message_name: Option<String>,
-    signals: Vec<DecodedSignal>,
+    /// Decoded signals as interleaved [value, raw, value, raw, …] pairs in DBC
+    /// message signal order. Names/units/message name are NOT sent: the frontend
+    /// holds the same parsed DBC and derives them by position, which keeps the
+    /// per-frame payload free of strings (they dominated IPC/GC churn at high
+    /// frame rates). Raw values survive the f64 round-trip up to 2^53 — the same
+    /// limit JSON numbers already imposed.
+    signals: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -643,13 +637,15 @@ impl CanManager {
 
         let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
 
-        let mut rows: Vec<(u64, &str, &str, f64, &str)> = Vec::new();
+        let mut rows: Vec<(u64, &str, &str, &str, f64, &str)> = Vec::new();
         for ch in lock.channels.values() {
             for f in &ch.frames {
+                let msg_name = f.message_name.as_deref().unwrap_or("");
                 for sig in &f.signals {
                     rows.push((
                         f.timestamp_ms,
                         ch.info.name.as_str(),
+                        msg_name,
                         sig.name.as_str(),
                         sig.value,
                         sig.unit.as_str(),
@@ -662,11 +658,11 @@ impl CanManager {
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         let mut writer = BufWriter::new(file);
 
-        writeln!(writer, "timestamp_ms,elapsed_s,channel,signal_name,value,unit").map_err(|e| e.to_string())?;
+        writeln!(writer, "timestamp_ms,elapsed_s,channel,message,signal_name,value,unit").map_err(|e| e.to_string())?;
 
-        for (ts, ch_name, sig_name, value, unit) in &rows {
+        for (ts, ch_name, msg_name, sig_name, value, unit) in &rows {
             let elapsed = (*ts as f64 - start_ms as f64) / 1000.0;
-            writeln!(writer, "{},{:.3},{},{},{},{}", ts, elapsed, ch_name, sig_name, value, unit).map_err(|e| e.to_string())?;
+            writeln!(writer, "{},{:.3},{},{},{},{},{}", ts, elapsed, ch_name, msg_name, sig_name, value, unit).map_err(|e| e.to_string())?;
         }
 
         writer.flush().map_err(|e| e.to_string())?;
@@ -741,7 +737,7 @@ fn make_frame_callback(
             data: raw.data.clone(),
             timestamp_ms: ts,
             direction,
-            message_name: message_name.clone(),
+            message_name,
             signals: decoded_msg
                 .map(|m| {
                     m.signals
@@ -757,15 +753,13 @@ fn make_frame_callback(
                 .unwrap_or_default(),
         };
 
-        let decoded: Vec<DecodedSignal> = stored
-            .signals
-            .iter()
-            .map(|s| DecodedSignal {
-                name: s.name.clone(),
-                value: s.value,
-                raw: s.raw,
-            })
-            .collect();
+        // Interleaved [value, raw] pairs, in the same order the DBC lists the
+        // message's signals (decode_frame preserves it).
+        let mut sig_data: Vec<f64> = Vec::with_capacity(stored.signals.len() * 2);
+        for s in &stored.signals {
+            sig_data.push(s.value);
+            sig_data.push(s.raw as f64);
+        }
 
         let event = CanFrameEvent {
             channel_handle: handle,
@@ -775,8 +769,7 @@ fn make_frame_callback(
             data: raw.data,
             timestamp_ms: ts,
             direction,
-            message_name,
-            signals: decoded,
+            signals: sig_data,
         };
 
         if let Some(ch) = lock.channels.get_mut(&handle) {

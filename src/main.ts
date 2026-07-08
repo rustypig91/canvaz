@@ -75,15 +75,6 @@ interface FrameInfo {
     signals: FrameSignal[];
 }
 
-// Minimal per-signal payload of the batched frame event. Message name, unit and
-// enums come from the DBC already held in the frontend; min/max are tracked here.
-interface DecodedSignal {
-    name: string;
-    value: number;
-    // Raw (unscaled, sign-extended) value from Rust; used for display and VAL_ enum lookup.
-    raw: number;
-}
-
 interface CanFrameEvent {
     channel_handle: number;
     can_id: number;
@@ -92,8 +83,10 @@ interface CanFrameEvent {
     data: number[];
     timestamp_ms: number;
     direction: "rx" | "tx";
-    message_name: string | null;
-    signals: DecodedSignal[];
+    // Decoded signals as interleaved [value, raw, value, raw, …] pairs in DBC
+    // message signal order. Names/units/message name are derived from the DBC by
+    // position — no strings on the per-frame wire (they dominated GC churn).
+    signals: number[];
 }
 
 interface PlotSignalEntry { signal_name: string; channel: string; message_id?: number; }
@@ -279,9 +272,30 @@ let ghostChannels: GhostChannel[] = [];
 // Middle-mouse pan state
 let midPan: { startX: number; startMin: number; startMax: number; chartWidth: number } | null = null;
 
+// X window shared by all panes just before zooming/panning began, so "reset
+// zoom" can restore every pane to it. The zoom plugin only remembers the pane
+// the user dragged on; the others get their range mirrored by direct option
+// writes, which resetZoom() knows nothing about.
+let preZoomX: { min: number; max: number } | null = null;
+
 
 function plotKey(channel: number, messageId: number, signalName: string) {
     return `${channel}::${messageId}::${signalName}`;
+}
+
+// plotKey strings for every signal of a message, built once per (channel,
+// message) and reused. Building them per signal per frame dominated GC churn at
+// high frame rates. Invalidated whenever a channel's DBC is (re)loaded.
+const sigKeyCache = new Map<number, Map<number, string[]>>();
+function sigKeysFor(handle: number, msg: DbcMessage): string[] {
+    let byMsg = sigKeyCache.get(handle);
+    if (!byMsg) { byMsg = new Map(); sigKeyCache.set(handle, byMsg); }
+    let keys = byMsg.get(msg.id);
+    if (!keys) {
+        keys = msg.signals.map(s => plotKey(handle, msg.id, s.name));
+        byMsg.set(msg.id, keys);
+    }
+    return keys;
 }
 
 function formatSigValue(value: number, unit: string): string {
@@ -302,6 +316,7 @@ function updatePaneTitle(pane: PlotPane) {
 }
 
 function clearPaneZoom(pane: PlotPane) {
+    preZoomX = null;
     if (!pane.zoomed) return;
     const zoomOpts = (pane.chart.options.plugins as any).zoom.zoom;
     const saved = zoomOpts.onZoomComplete;
@@ -312,10 +327,37 @@ function clearPaneZoom(pane: PlotPane) {
     pane.el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!.style.display = "none";
 }
 
+// Reset zoom on ALL panes, restoring the x window they showed before zooming
+// began. resetZoom() alone only restores the pane the user dragged on (the
+// plugin saved its pre-zoom range); mirrored panes must be restored explicitly.
+function resetAllZoom() {
+    const restore = preZoomX;
+    const now = (Date.now() - appStartTime) / 1000;
+    const min = restore ? restore.min : Math.max(0, now - windowSizeSec);
+    const max = restore ? restore.max : Math.max(windowSizeSec, now);
+    for (const pane of plotPanes) {
+        clearPaneZoom(pane);
+        const xScale = (pane.chart.options.scales as any)["x"];
+        xScale.min = min;
+        xScale.max = max;
+        pane.chart.update();
+    }
+}
+
 function snapshotPlotPanes() {
-    for (const pane of plotPanes)
-        for (const s of pane.series.values())
+    for (const pane of plotPanes) {
+        const seriesArray = [...pane.series.values()];
+        for (let i = 0; i < seriesArray.length; i++) {
+            const s = seriesArray[i];
             s.frozenData = s.data.slice();
+            // Point the chart at the frozen copy immediately. Later update()
+            // calls during the pause (second zoom, mirrored ranges, mid-pan)
+            // would otherwise re-read the live array, which pruning keeps
+            // draining — the zoomed-in region empties and its points vanish.
+            const ds = pane.chart.data.datasets[i] as any;
+            if (ds) ds.data = s.frozenData;
+        }
+    }
     // Freeze the sidebar value maps too, so signal rows built during the pause
     // match the frozen view instead of showing live values.
     sidebarSnapshot = {
@@ -376,9 +418,7 @@ function createPlotPane(): PlotPane {
         scheduleAutoSave();
     });
     const resetZoomBtn = el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!;
-    resetZoomBtn.addEventListener("click", () => {
-        for (const p of plotPanes) clearPaneZoom(p);
-    });
+    resetZoomBtn.addEventListener("click", () => resetAllZoom());
 
     const canvas = el.querySelector<HTMLCanvasElement>("canvas")!;
 
@@ -394,6 +434,7 @@ function createPlotPane(): PlotPane {
             startMax: xScale.max,
             chartWidth: area.right - area.left,
         };
+        if (preZoomX === null) preZoomX = { min: xScale.min, max: xScale.max };
         // Freeze the view (only meaningful while capture is live and unpaused).
         if (appRunning && !viewPaused) {
             viewPaused = true;
@@ -442,6 +483,12 @@ function createPlotPane(): PlotPane {
                             borderWidth: 1,
                         },
                         mode: "x" as const,
+                        onZoomStart: () => {
+                            if (preZoomX === null) {
+                                const xs = (pane.chart.scales as any)["x"];
+                                preZoomX = { min: xs.min, max: xs.max };
+                            }
+                        },
                         onZoomComplete: () => {
                             pane.zoomed = true;
                             resetZoomBtn.style.display = "";
@@ -1125,6 +1172,7 @@ function promptSudoPassword(): Promise<string | null> {
 async function loadChannelDbc(handle: number): Promise<void> {
     const ch = channels.get(handle);
     if (!ch) return;
+    sigKeyCache.delete(handle); // key tables are derived from the DBC being replaced
     if (!ch.config.dbc_path) { ch.dbc = null; return; }
     try {
         ch.dbc = await invoke<ParsedDbc>("parse_dbc", { path: ch.config.dbc_path });
@@ -1149,6 +1197,7 @@ async function openChannelByHandle(handle: number): Promise<boolean> {
             dbcPath: ch.config.dbc_path ?? null,
         });
         ch.dbc = dbc ?? null;
+        sigKeyCache.delete(handle); // key tables are derived from the DBC just replaced
         ch.open = true;
         return true;
     } catch (e) {
@@ -2838,13 +2887,14 @@ interface TraceEntry {
     timestampMs: number;
     cycleTimeMs: number | null;
     direction: "rx" | "tx";
-    signals: DecodedSignal[];
+    // Interleaved [value, raw] pairs in DBC message signal order (see CanFrameEvent).
+    signals: number[];
 }
 
-// Decoded signals (value + raw from Rust) for each rendered trace row, keyed by
-// the row element so the expansion table can show them without re-decoding in TS.
-// Auto-cleared when a row is evicted (element GC'd).
-const traceRowSignals = new WeakMap<HTMLTableRowElement, DecodedSignal[]>();
+// Decoded signal values (interleaved [value, raw] pairs) for each rendered trace
+// row, keyed by the row element so the expansion table can show them without
+// re-decoding in TS. Auto-cleared when a row is evicted (element GC'd).
+const traceRowSignals = new WeakMap<HTMLTableRowElement, number[]>();
 
 type TraceMode = "overwrite" | "append";
 type TraceDataFormat = "hex" | "dec" | "ascii";
@@ -3092,16 +3142,16 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     if (next?.dataset.expand) {
         const msg = channels.get(entry.channelHandle)?.dbc?.messages[entry.canId];
         if (msg) {
-            const decodedByName = new Map(entry.signals.map(s => [s.name, s]));
+            const vals = entry.signals; // interleaved [value, raw], index-aligned with msg.signals
             const valCells = next.querySelectorAll<HTMLElement>(".te-val");
             const minCells = next.querySelectorAll<HTMLElement>(".te-min");
             const maxCells = next.querySelectorAll<HTMLElement>(".te-max");
             const enumCells = next.querySelectorAll<HTMLElement>(".te-enum");
             msg.signals.forEach((sig: DbcSignal, i: number) => {
-                const d = decodedByName.get(sig.name);
+                const hasVal = 2 * i + 1 < vals.length;
                 if (valCells[i]) {
-                    valCells[i].textContent = d ? formatSigValue(d.value, "") : "—";
-                    if (d) valCells[i].dataset.tip = `Raw: ${d.raw}`;
+                    valCells[i].textContent = hasVal ? formatSigValue(vals[2 * i], "") : "—";
+                    if (hasVal) valCells[i].dataset.tip = `Raw: ${vals[2 * i + 1]}`;
                 }
                 const key = plotKey(entry.channelHandle, entry.canId, sig.name);
                 const mn = signalMinValues.get(key);
@@ -3114,7 +3164,7 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
                     maxCells[i].textContent = mx !== undefined ? formatSigValue(mx, "") : "—";
                     if (mx !== undefined) maxCells[i].dataset.tip = `Raw: ${physToRaw(sig, mx)}`;
                 }
-                if (enumCells[i]) enumCells[i].textContent = d ? (enumLabelForRaw(sig, d.raw) || "—") : "—";
+                if (enumCells[i]) enumCells[i].textContent = hasVal ? (enumLabelForRaw(sig, vals[2 * i + 1]) || "—") : "—";
             });
         }
     }
@@ -3131,10 +3181,15 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
     const appendEntries: TraceEntry[] = [];
 
     for (const ev of events) {
+        // Message identity comes from the frontend's copy of the DBC (the event
+        // carries no strings); both sides parsed the same file at open.
+        const msg = channels.get(ev.channel_handle)?.dbc?.messages[ev.can_id] ?? null;
+        const messageName = msg?.name ?? null;
+
         // Update seen sets (for filter autocomplete) and cycle timing.
         traceSeenChannels.add(ev.channel_handle);
         traceSeenCanIds.add(ev.can_id);
-        if (ev.message_name) traceSeenMsgNames.add(ev.message_name);
+        if (messageName) traceSeenMsgNames.add(messageName);
         else traceSeenNoMsg = true;
 
         const direction = ev.direction ?? "rx";
@@ -3143,27 +3198,34 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
         const cycleTime = prev != null ? ev.timestamp_ms - prev : null;
         traceLastTs.set(key, ev.timestamp_ms);
 
-        // Process decoded signals — update value maps and plot series regardless
-        // of pause state (frozen charts display a snapshot, data keeps flowing).
-        const x = (ev.timestamp_ms - appStartTime) / 1000;
-        for (const sig of ev.signals) {
-            const sigKey = plotKey(ev.channel_handle, ev.can_id, sig.name);
-            signalLastValues.set(sigKey, sig.value);
-            signalLastRaw.set(sigKey, sig.raw);
-            const mn = signalMinValues.get(sigKey);
-            if (mn === undefined || sig.value < mn) signalMinValues.set(sigKey, sig.value);
-            const mx = signalMaxValues.get(sigKey);
-            if (mx === undefined || sig.value > mx) signalMaxValues.set(sigKey, sig.value);
-            dirtySignals.add(sigKey);
-            for (const pane of plotPanes) {
-                const series = pane.series.get(sigKey);
-                if (!series) continue;
-                if (series.timestamps.length > 0 &&
-                    series.timestamps[series.timestamps.length - 1] >= ev.timestamp_ms) continue;
-                series.timestamps.push(ev.timestamp_ms);
-                series.data.push({ x, y: sig.value });
-                series.lastValue = sig.value;
-                markPaneDirty(pane); // no-op while viewPaused; data accumulates in series
+        // Process decoded signals (interleaved [value, raw] pairs, index-aligned
+        // with msg.signals) — update value maps and plot series regardless of
+        // pause state (frozen charts display a snapshot, data keeps flowing).
+        if (msg && ev.signals.length > 0) {
+            const keys = sigKeysFor(ev.channel_handle, msg);
+            const x = (ev.timestamp_ms - appStartTime) / 1000;
+            const n = Math.min(keys.length, ev.signals.length >>> 1);
+            for (let i = 0; i < n; i++) {
+                const value = ev.signals[2 * i];
+                const raw = ev.signals[2 * i + 1];
+                const sigKey = keys[i];
+                signalLastValues.set(sigKey, value);
+                signalLastRaw.set(sigKey, raw);
+                const mn = signalMinValues.get(sigKey);
+                if (mn === undefined || value < mn) signalMinValues.set(sigKey, value);
+                const mx = signalMaxValues.get(sigKey);
+                if (mx === undefined || value > mx) signalMaxValues.set(sigKey, value);
+                dirtySignals.add(sigKey);
+                for (const pane of plotPanes) {
+                    const series = pane.series.get(sigKey);
+                    if (!series) continue;
+                    if (series.timestamps.length > 0 &&
+                        series.timestamps[series.timestamps.length - 1] >= ev.timestamp_ms) continue;
+                    series.timestamps.push(ev.timestamp_ms);
+                    series.data.push({ x, y: value });
+                    series.lastValue = value;
+                    markPaneDirty(pane); // no-op while viewPaused; data accumulates in series
+                }
             }
         }
 
@@ -3173,7 +3235,7 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
             isExtended: ev.is_extended,
             dlc: ev.dlc,
             data: ev.data,
-            messageName: ev.message_name ?? null,
+            messageName,
             timestampMs: ev.timestamp_ms,
             cycleTimeMs: cycleTime,
             direction,
@@ -3261,7 +3323,9 @@ async function loadTraceFrames() {
             timestampMs: f.timestamp_ms,
             cycleTimeMs,
             direction: f.direction,
-            signals: f.signals,
+            // get_frames returns named signals; flatten to the interleaved
+            // [value, raw] layout used everywhere else (same DBC order).
+            signals: f.signals.flatMap(s => [s.value, s.raw]),
         };
     }).reverse();
 }
@@ -3664,7 +3728,8 @@ function setupTrace() {
         const canId = parseInt(tr.dataset.canid ?? "0");
         const msg = channels.get(trHandle)?.dbc?.messages[canId];
         if (!msg) return;
-        const decodedByName = new Map((traceRowSignals.get(tr) ?? []).map(s => [s.name, s]));
+        // Interleaved [value, raw] pairs, index-aligned with msg.signals.
+        const vals = traceRowSignals.get(tr) ?? [];
 
         const expandTr = document.createElement("tr");
         expandTr.dataset.expand = "1";
@@ -3677,8 +3742,9 @@ function setupTrace() {
             + '<th>Signal</th><th>Value</th><th>Min</th><th>Max</th><th>Unit</th>'
             + (hasEnums ? '<th>Name</th>' : '')
             + '</tr></thead><tbody>';
-        for (const sig of msg.signals) {
-            const d = decodedByName.get(sig.name);
+        for (let i = 0; i < msg.signals.length; i++) {
+            const sig = msg.signals[i];
+            const hasVal = 2 * i + 1 < vals.length;
             const key = plotKey(trHandle, canId, sig.name);
             const mn = signalMinValues.get(key);
             const mx = signalMaxValues.get(key);
@@ -3686,11 +3752,11 @@ function setupTrace() {
             const rawTip = (v: number | undefined) => v !== undefined ? ` data-tip="Raw: ${physToRaw(sig, v)}"` : "";
             html += `<tr>
         <td class="te-name">${sig.name}</td>
-        <td class="te-val"${d ? ` data-tip="Raw: ${d.raw}"` : ""}>${d ? formatSigValue(d.value, "") : "—"}</td>
+        <td class="te-val"${hasVal ? ` data-tip="Raw: ${vals[2 * i + 1]}"` : ""}>${hasVal ? formatSigValue(vals[2 * i], "") : "—"}</td>
         <td class="te-min"${rawTip(mn)}>${fmt(mn)}</td>
         <td class="te-max"${rawTip(mx)}>${fmt(mx)}</td>
         <td class="te-unit">${sig.unit || "—"}</td>`
-                + (hasEnums ? `<td class="te-enum">${d ? (enumLabelForRaw(sig, d.raw) || "—") : "—"}</td>` : "")
+                + (hasEnums ? `<td class="te-enum">${hasVal ? (enumLabelForRaw(sig, vals[2 * i + 1]) || "—") : "—"}</td>` : "")
                 + `</tr>`;
         }
         html += '</tbody></table>';

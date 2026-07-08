@@ -1,4 +1,5 @@
 use std::io::Write as _;
+use std::sync::Arc;
 use std::time::Duration;
 
 use socketcan::embedded_can::{ExtendedId, StandardId};
@@ -10,7 +11,7 @@ use super::{CanBackend, CanFrame, CanOpenError, RxHandle, TxHandle};
 // ── RX handle ─────────────────────────────────────────────────────────────────
 
 pub(crate) struct SocketCanRxHandle {
-    socket: CanSocket,
+    socket: Arc<CanSocket>,
     configured_timeout_ms: u64,
 }
 
@@ -41,7 +42,7 @@ impl RxHandle for SocketCanRxHandle {
 // ── TX handle ─────────────────────────────────────────────────────────────────
 
 pub(crate) struct SocketCanTxHandle {
-    socket: CanSocket,
+    socket: Arc<CanSocket>,
 }
 
 impl TxHandle for SocketCanTxHandle {
@@ -114,13 +115,20 @@ impl CanBackend for SocketCanBackend {
             }
         }
 
-        let tx_socket = CanSocket::open(&name).map_err(|e| CanOpenError::Other(format!("Failed to open TX socket on '{name}': {e}")))?;
-        let rx_socket = CanSocket::open(&name).map_err(|e| CanOpenError::Other(format!("Failed to open RX socket on '{name}': {e}")))?;
+        // One socket shared by the TX and RX threads (socket reads/writes are
+        // thread-safe). With a single socket the kernel defaults do exactly what
+        // we want: our own transmissions are NOT read back (CAN_RAW_RECV_OWN_MSGS
+        // is off) while loopback to other local sockets/processes stays enabled.
+        // Two separate sockets would receive each other's transmissions via
+        // loopback, duplicating every sent frame as an RX entry.
+        let socket = Arc::new(
+            CanSocket::open(&name).map_err(|e| CanOpenError::Other(format!("Failed to open socket on '{name}': {e}")))?,
+        );
 
         Ok((
-            Box::new(SocketCanTxHandle { socket: tx_socket }),
+            Box::new(SocketCanTxHandle { socket: Arc::clone(&socket) }),
             Box::new(SocketCanRxHandle {
-                socket: rx_socket,
+                socket,
                 configured_timeout_ms: 0,
             }),
         ))
