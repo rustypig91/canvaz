@@ -318,8 +318,21 @@ impl CanBackend for KvaserBackend {
         let lib = &self.lib;
         let idx = index as i32;
 
-        // TX handle: has init access, sets bitrate, disables local TX echo so the
-        // RX handle on the same channel does not receive our own transmitted frames.
+        // Clear LOCAL_TXECHO on a handle. CANlib documents the setting from the
+        // receiving side — "when on, messages sent from another handle on the
+        // same channel appear as received messages on this handle" — so it must
+        // be OFF on the RX handle; we clear it on both handles to be robust
+        // across driver versions. The buffer must be a 1-byte unsigned char per
+        // the docs (a wrong size fails with canERR_PARAM and echo stays on).
+        let set_echo_off = |h: i32| {
+            let mut echo_off: u8 = 0;
+            let s = unsafe { (lib.ioctl)(h, CANIOCTL_SET_LOCAL_TXECHO, &mut echo_off as *mut u8 as *mut _, 1) };
+            if s < CAN_OK {
+                log::warn!("canIoCtl(SET_LOCAL_TXECHO) failed: {} — sent frames may echo as RX", canlib_err(s));
+            }
+        };
+
+        // TX handle: has init access and sets the bitrate.
         let tx_raw = unsafe { (lib.open)(idx, CAN_OPEN_ACCEPT_VIRTUAL) };
         if tx_raw < 0 {
             return Err(format!("Failed to open Kvaser channel {idx} (TX): {}", canlib_err(tx_raw)).into());
@@ -329,14 +342,7 @@ impl CanBackend for KvaserBackend {
             unsafe { (lib.close)(tx_raw) };
             return Err(format!("canSetBusParams failed: {}", canlib_err(s)).into());
         }
-        // CANlib specifies an unsigned char (1 byte) for SET_LOCAL_TXECHO; a wrong
-        // buffer size makes the call fail with canERR_PARAM and echo stays on,
-        // which duplicated every sent frame as an RX entry.
-        let mut echo_off: u8 = 0;
-        let s = unsafe { (lib.ioctl)(tx_raw, CANIOCTL_SET_LOCAL_TXECHO, &mut echo_off as *mut u8 as *mut _, 1) };
-        if s < CAN_OK {
-            log::warn!("canIoCtl(SET_LOCAL_TXECHO) failed: {} — sent frames may echo as RX", canlib_err(s));
-        }
+        set_echo_off(tx_raw);
         let s = unsafe { (lib.bus_on)(tx_raw) };
         if s < CAN_OK {
             unsafe { (lib.close)(tx_raw) };
@@ -350,6 +356,8 @@ impl CanBackend for KvaserBackend {
             unsafe { (lib.bus_off)(tx_raw); (lib.close)(tx_raw) };
             return Err(format!("Failed to open Kvaser channel {idx} (RX): {}", canlib_err(rx_raw)).into());
         }
+        // The RX handle is the one that would receive the echo — see set_echo_off.
+        set_echo_off(rx_raw);
         let s = unsafe { (lib.bus_on)(rx_raw) };
         if s < CAN_OK {
             unsafe { (lib.bus_off)(tx_raw); (lib.close)(tx_raw); (lib.close)(rx_raw) };
