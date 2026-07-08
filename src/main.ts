@@ -272,6 +272,12 @@ let ghostChannels: GhostChannel[] = [];
 // Middle-mouse pan state
 let midPan: { startX: number; startMin: number; startMax: number; chartWidth: number } | null = null;
 
+// X window shared by all panes just before zooming/panning began, so "reset
+// zoom" can restore every pane to it. The zoom plugin only remembers the pane
+// the user dragged on; the others get their range mirrored by direct option
+// writes, which resetZoom() knows nothing about.
+let preZoomX: { min: number; max: number } | null = null;
+
 
 function plotKey(channel: number, messageId: number, signalName: string) {
     return `${channel}::${messageId}::${signalName}`;
@@ -310,6 +316,7 @@ function updatePaneTitle(pane: PlotPane) {
 }
 
 function clearPaneZoom(pane: PlotPane) {
+    preZoomX = null;
     if (!pane.zoomed) return;
     const zoomOpts = (pane.chart.options.plugins as any).zoom.zoom;
     const saved = zoomOpts.onZoomComplete;
@@ -320,10 +327,37 @@ function clearPaneZoom(pane: PlotPane) {
     pane.el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!.style.display = "none";
 }
 
+// Reset zoom on ALL panes, restoring the x window they showed before zooming
+// began. resetZoom() alone only restores the pane the user dragged on (the
+// plugin saved its pre-zoom range); mirrored panes must be restored explicitly.
+function resetAllZoom() {
+    const restore = preZoomX;
+    const now = (Date.now() - appStartTime) / 1000;
+    const min = restore ? restore.min : Math.max(0, now - windowSizeSec);
+    const max = restore ? restore.max : Math.max(windowSizeSec, now);
+    for (const pane of plotPanes) {
+        clearPaneZoom(pane);
+        const xScale = (pane.chart.options.scales as any)["x"];
+        xScale.min = min;
+        xScale.max = max;
+        pane.chart.update();
+    }
+}
+
 function snapshotPlotPanes() {
-    for (const pane of plotPanes)
-        for (const s of pane.series.values())
+    for (const pane of plotPanes) {
+        const seriesArray = [...pane.series.values()];
+        for (let i = 0; i < seriesArray.length; i++) {
+            const s = seriesArray[i];
             s.frozenData = s.data.slice();
+            // Point the chart at the frozen copy immediately. Later update()
+            // calls during the pause (second zoom, mirrored ranges, mid-pan)
+            // would otherwise re-read the live array, which pruning keeps
+            // draining — the zoomed-in region empties and its points vanish.
+            const ds = pane.chart.data.datasets[i] as any;
+            if (ds) ds.data = s.frozenData;
+        }
+    }
     // Freeze the sidebar value maps too, so signal rows built during the pause
     // match the frozen view instead of showing live values.
     sidebarSnapshot = {
@@ -384,9 +418,7 @@ function createPlotPane(): PlotPane {
         scheduleAutoSave();
     });
     const resetZoomBtn = el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!;
-    resetZoomBtn.addEventListener("click", () => {
-        for (const p of plotPanes) clearPaneZoom(p);
-    });
+    resetZoomBtn.addEventListener("click", () => resetAllZoom());
 
     const canvas = el.querySelector<HTMLCanvasElement>("canvas")!;
 
@@ -402,6 +434,7 @@ function createPlotPane(): PlotPane {
             startMax: xScale.max,
             chartWidth: area.right - area.left,
         };
+        if (preZoomX === null) preZoomX = { min: xScale.min, max: xScale.max };
         // Freeze the view (only meaningful while capture is live and unpaused).
         if (appRunning && !viewPaused) {
             viewPaused = true;
@@ -450,6 +483,12 @@ function createPlotPane(): PlotPane {
                             borderWidth: 1,
                         },
                         mode: "x" as const,
+                        onZoomStart: () => {
+                            if (preZoomX === null) {
+                                const xs = (pane.chart.scales as any)["x"];
+                                preZoomX = { min: xs.min, max: xs.max };
+                            }
+                        },
                         onZoomComplete: () => {
                             pane.zoomed = true;
                             resetZoomBtn.style.display = "";
