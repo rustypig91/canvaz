@@ -637,13 +637,15 @@ impl CanManager {
 
         let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
 
-        let mut rows: Vec<(u64, &str, &str, f64, &str)> = Vec::new();
+        let mut rows: Vec<(u64, &str, &str, &str, f64, &str)> = Vec::new();
         for ch in lock.channels.values() {
             for f in &ch.frames {
+                let msg_name = f.message_name.as_deref().unwrap_or("");
                 for sig in &f.signals {
                     rows.push((
                         f.timestamp_ms,
                         ch.info.name.as_str(),
+                        msg_name,
                         sig.name.as_str(),
                         sig.value,
                         sig.unit.as_str(),
@@ -656,11 +658,11 @@ impl CanManager {
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         let mut writer = BufWriter::new(file);
 
-        writeln!(writer, "timestamp_ms,elapsed_s,channel,signal_name,value,unit").map_err(|e| e.to_string())?;
+        writeln!(writer, "timestamp_ms,elapsed_s,channel,message,signal_name,value,unit").map_err(|e| e.to_string())?;
 
-        for (ts, ch_name, sig_name, value, unit) in &rows {
+        for (ts, ch_name, msg_name, sig_name, value, unit) in &rows {
             let elapsed = (*ts as f64 - start_ms as f64) / 1000.0;
-            writeln!(writer, "{},{:.3},{},{},{},{}", ts, elapsed, ch_name, sig_name, value, unit).map_err(|e| e.to_string())?;
+            writeln!(writer, "{},{:.3},{},{},{},{},{}", ts, elapsed, ch_name, msg_name, sig_name, value, unit).map_err(|e| e.to_string())?;
         }
 
         writer.flush().map_err(|e| e.to_string())?;
