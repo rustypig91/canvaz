@@ -357,6 +357,15 @@ function snapshotPlotPanes() {
             const ds = pane.chart.data.datasets[i] as any;
             if (ds) ds.data = s.frozenData;
         }
+        // Update NOW so Chart.js rebinds its array-mutation listeners to the
+        // frozen copy. Otherwise it keeps listening to the live array and
+        // queues element syncs against the wrong (frozen) length while ingest
+        // pushes and pruning splices during the pause; if the pause ends with
+        // ds.data set back to the same live reference, that stale queue is
+        // applied and punches undefined holes into the element array — the
+        // next chart.update() then throws "Cannot set properties of
+        // undefined (setting 'x')".
+        pane.chart.update("none");
     }
     // Freeze the sidebar value maps too, so signal rows built during the pause
     // match the frozen view instead of showing live values.
@@ -3916,6 +3925,17 @@ function appendLogEntry(entry: LogEntry) {
     while (container.childElementCount > MAX_LOG_ENTRIES) container.firstElementChild!.remove();
     container.scrollTop = container.scrollHeight;
 }
+
+// Surface uncaught frontend errors in the message log; the devtools console
+// isn't visible in a packaged build.
+window.addEventListener("error", (e) => {
+    const loc = e.filename ? ` (${e.filename.split("/").pop()}:${e.lineno}:${e.colno})` : "";
+    setError(`Frontend error: ${e.message}${loc}`);
+});
+window.addEventListener("unhandledrejection", (e) => {
+    const reason = e.reason instanceof Error ? (e.reason.stack ?? e.reason.message) : String(e.reason);
+    setError(`Unhandled promise rejection: ${reason}`);
+});
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
