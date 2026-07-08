@@ -316,6 +316,14 @@ function snapshotPlotPanes() {
     for (const pane of plotPanes)
         for (const s of pane.series.values())
             s.frozenData = s.data.slice();
+    // Freeze the sidebar value maps too, so signal rows built during the pause
+    // match the frozen view instead of showing live values.
+    sidebarSnapshot = {
+        values: new Map(signalLastValues),
+        raw: new Map(signalLastRaw),
+        min: new Map(signalMinValues),
+        max: new Map(signalMaxValues),
+    };
 }
 
 function removeSigFromPane(pane: PlotPane, key: string) {
@@ -678,10 +686,13 @@ function renderDbcTree(filter = "") {
         const key = plotKey(selectedChannel!, sig.message_id, sig.name);
         if (sig.enum_values?.length) signalEnums.set(key, sig.enum_values);
         signalUnits.set(key, sig.unit);
-        const lastVal = signalLastValues.get(key);
-        const valText = lastVal != null ? sidebarValueText(key, lastVal, signalLastRaw.get(key), sig.unit) : (sig.unit || "");
-        const mn = signalMinValues.get(key);
-        const mx = signalMaxValues.get(key);
+        // While paused, build from the pause-time snapshot so lazily expanded
+        // messages match the frozen view.
+        const snap = viewPaused ? sidebarSnapshot : null;
+        const lastVal = (snap?.values ?? signalLastValues).get(key);
+        const valText = lastVal != null ? sidebarValueText(key, lastVal, (snap?.raw ?? signalLastRaw).get(key), sig.unit) : (sig.unit || "");
+        const mn = (snap?.min ?? signalMinValues).get(key);
+        const mx = (snap?.max ?? signalMaxValues).get(key);
         const rangeText = mn !== undefined ? `↓${formatSigValue(mn, "")} ↑${formatSigValue(mx!, "")}` : "↓— ↑—";
         row.innerHTML = `
         <span class="sig-name">${sig.name}</span>
@@ -927,6 +938,16 @@ const signalRangeEls = new Map<string, HTMLElement>();
 const signalEnums = new Map<string, SignalEnumValue[]>();
 // Unit per sidebar-visible signal (plotKey → unit); frame events no longer carry it.
 const signalUnits = new Map<string, string>();
+// Copies of the signal value maps taken when the view is paused. Signal rows
+// built while paused (the tree populates lazily on expand) read from these so
+// they show pause-time values; live tracking continues in the maps above.
+interface SidebarSnapshot {
+    values: Map<string, number>;
+    raw: Map<string, number>;
+    min: Map<string, number>;
+    max: Map<string, number>;
+}
+let sidebarSnapshot: SidebarSnapshot | null = null;
 let selectedChannel: number | null = null;
 
 // Sidebar value text: physical value plus its DBC named value when the raw value
@@ -2245,6 +2266,7 @@ async function startApp() {
 
     // Reset global pause state
     viewPaused = false;
+    sidebarSnapshot = null;
     updatePauseViewBtn();
 
     // Clear all plot pane data, reset zoom and X-axis bounds
@@ -3162,16 +3184,20 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
     }
 
     // Sidebar: one DOM write per signal per batch, from the latest values.
-    for (const sigKey of dirtySignals) {
-        const valEl = signalValueEls.get(sigKey);
-        if (valEl) {
-            valEl.textContent = sidebarValueText(sigKey, signalLastValues.get(sigKey)!, signalLastRaw.get(sigKey), signalUnits.get(sigKey) ?? "");
-            valEl.classList.remove("sig-value--empty");
-        }
-        const rangeEl = signalRangeEls.get(sigKey);
-        if (rangeEl) {
-            rangeEl.textContent = `↓${formatSigValue(signalMinValues.get(sigKey)!, "")} ↑${formatSigValue(signalMaxValues.get(sigKey)!, "")}`;
-            rangeEl.classList.remove("sig-value--empty");
+    // Frozen while the view is paused — the maps keep tracking underneath and
+    // resumeFromPause() brings the rows back up to date.
+    if (!viewPaused) {
+        for (const sigKey of dirtySignals) {
+            const valEl = signalValueEls.get(sigKey);
+            if (valEl) {
+                valEl.textContent = sidebarValueText(sigKey, signalLastValues.get(sigKey)!, signalLastRaw.get(sigKey), signalUnits.get(sigKey) ?? "");
+                valEl.classList.remove("sig-value--empty");
+            }
+            const rangeEl = signalRangeEls.get(sigKey);
+            if (rangeEl) {
+                rangeEl.textContent = `↓${formatSigValue(signalMinValues.get(sigKey)!, "")} ↑${formatSigValue(signalMaxValues.get(sigKey)!, "")}`;
+                rangeEl.classList.remove("sig-value--empty");
+            }
         }
     }
 
@@ -3688,7 +3714,28 @@ function updatePauseViewBtn() {
     btn.classList.toggle("running", viewPaused);
 }
 
+// Rewrite every rendered sidebar row from the latest value maps. Used on resume
+// so rows frozen during the pause catch up immediately.
+function refreshSidebarValues() {
+    for (const [key, valEl] of signalValueEls) {
+        const v = signalLastValues.get(key);
+        if (v == null) continue;
+        valEl.textContent = sidebarValueText(key, v, signalLastRaw.get(key), signalUnits.get(key) ?? "");
+        valEl.classList.remove("sig-value--empty");
+    }
+    for (const [key, rangeEl] of signalRangeEls) {
+        const mn = signalMinValues.get(key);
+        if (mn === undefined) continue;
+        rangeEl.textContent = `↓${formatSigValue(mn, "")} ↑${formatSigValue(signalMaxValues.get(key)!, "")}`;
+        rangeEl.classList.remove("sig-value--empty");
+    }
+}
+
 function resumeFromPause() {
+    // Sidebar values/min/max were frozen during the pause; snap them to current.
+    sidebarSnapshot = null;
+    refreshSidebarValues();
+
     // Flush pending trace updates
     const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
     if (traceMode === "overwrite") {
