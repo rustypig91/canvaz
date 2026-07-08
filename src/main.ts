@@ -394,7 +394,8 @@ function createPlotPane(): PlotPane {
             startMax: xScale.max,
             chartWidth: area.right - area.left,
         };
-        if (!viewPaused) {
+        // Freeze the view (only meaningful while capture is live and unpaused).
+        if (appRunning && !viewPaused) {
             viewPaused = true;
             updatePauseViewBtn();
             snapshotPlotPanes();
@@ -444,7 +445,8 @@ function createPlotPane(): PlotPane {
                         onZoomComplete: () => {
                             pane.zoomed = true;
                             resetZoomBtn.style.display = "";
-                            if (!viewPaused) {
+                            // Freeze the view (only meaningful while capture is live).
+                            if (appRunning && !viewPaused) {
                                 viewPaused = true;
                                 updatePauseViewBtn();
                                 snapshotPlotPanes();
@@ -2342,7 +2344,14 @@ async function startApp() {
 }
 
 async function stopApp() {
+    // If the view is paused, resume it first so pending trace/plot/sidebar
+    // updates are flushed and the final live state is shown before stopping.
+    if (viewPaused) {
+        viewPaused = false;
+        resumeFromPause();
+    }
     appRunning = false;
+    updatePauseViewBtn();
     // Close hardware connections; they will reopen on the next Start.
     for (const [handle, ch] of channels) {
         if (!ch.open) continue;
@@ -3709,9 +3718,11 @@ function setupTrace() {
 // ── Global pause ─────────────────────────────────────────────────────────────
 
 function updatePauseViewBtn() {
-    const btn = document.getElementById("btn-pause-view")!;
+    const btn = document.getElementById("btn-pause-view") as HTMLButtonElement;
     btn.textContent = viewPaused ? "Resume" : "Pause";
     btn.classList.toggle("running", viewPaused);
+    // Pausing only makes sense while capture is live.
+    btn.disabled = !appRunning;
 }
 
 // Rewrite every rendered sidebar row from the latest value maps. Used on resume
@@ -3958,6 +3969,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     });
 
     document.getElementById("btn-pause-view")!.addEventListener("click", () => {
+        if (!appRunning) return; // button is disabled while stopped; belt & braces
         viewPaused = !viewPaused;
         updatePauseViewBtn();
         if (viewPaused) snapshotPlotPanes();

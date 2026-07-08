@@ -249,8 +249,9 @@ kbd {
   white-space: nowrap;
   flex-shrink: 0;
 }
-#btn-pause-view:hover { color: var(--text); border-color: var(--text-muted); }
+#btn-pause-view:hover:not(:disabled) { color: var(--text); border-color: var(--text-muted); }
 #btn-pause-view.running { background: rgba(245,158,11,0.15); border-color: #f59e0b; color: #f59e0b; }
+#btn-pause-view:disabled { opacity: 0.4; cursor: default; }
 
 #window-size-ctrl {
   display: flex;
