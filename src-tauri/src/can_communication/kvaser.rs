@@ -24,6 +24,12 @@ const BAUD_50K: c_long = -7;
 const CAN_MSG_EXT: u32 = 0x0004;
 const CAN_MSG_RTR: u32 = 0x0001;
 const CAN_MSG_ERROR_FRAME: u32 = 0x0020;
+// Transmit acknowledgements: canMSG_TXACK marks a frame this handle sent;
+// canMSG_LOCAL_TXACK (CANlib ≥ 5.39) marks a frame echoed because another
+// handle on the same channel — our TX handle — sent it. Neither is bus traffic,
+// so the RX path drops both (the app records its own TX entries itself).
+const CAN_MSG_TXACK: u32 = 0x0040;
+const CAN_MSG_LOCAL_TXACK: u32 = 0x1000_0000;
 
 const CAN_OK: i32 = 0;
 const CAN_ERR_NOMSG: i32 = -2;
@@ -252,7 +258,7 @@ impl RxHandle for KvaserRxHandle {
         if s < CAN_OK {
             return Err(format!("canReadWait failed: {}", canlib_err(s)));
         }
-        if flags & (CAN_MSG_ERROR_FRAME | CAN_MSG_RTR) != 0 {
+        if flags & (CAN_MSG_ERROR_FRAME | CAN_MSG_RTR | CAN_MSG_TXACK | CAN_MSG_LOCAL_TXACK) != 0 {
             return Ok(None);
         }
         let hw_ms = timestamp as u64;
@@ -323,8 +329,14 @@ impl CanBackend for KvaserBackend {
             unsafe { (lib.close)(tx_raw) };
             return Err(format!("canSetBusParams failed: {}", canlib_err(s)).into());
         }
-        let mut echo_off: u32 = 0;
-        unsafe { (lib.ioctl)(tx_raw, CANIOCTL_SET_LOCAL_TXECHO, &mut echo_off as *mut _ as *mut _, 4) };
+        // CANlib specifies an unsigned char (1 byte) for SET_LOCAL_TXECHO; a wrong
+        // buffer size makes the call fail with canERR_PARAM and echo stays on,
+        // which duplicated every sent frame as an RX entry.
+        let mut echo_off: u8 = 0;
+        let s = unsafe { (lib.ioctl)(tx_raw, CANIOCTL_SET_LOCAL_TXECHO, &mut echo_off as *mut u8 as *mut _, 1) };
+        if s < CAN_OK {
+            log::warn!("canIoCtl(SET_LOCAL_TXECHO) failed: {} — sent frames may echo as RX", canlib_err(s));
+        }
         let s = unsafe { (lib.bus_on)(tx_raw) };
         if s < CAN_OK {
             unsafe { (lib.close)(tx_raw) };
