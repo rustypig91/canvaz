@@ -1,6 +1,6 @@
 [package]
 name = "canvaz"
-version = "0.2.2"
+version = "0.2.3"
 description = "CAN bus signal viewer and simulator"
 authors = ["Christoffer Zakrisson"]
 edition = "2021"
