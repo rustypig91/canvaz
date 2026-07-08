@@ -28,16 +28,15 @@ static NEXT_CHANNEL_HANDLE: AtomicU32 = AtomicU32::new(1);
 
 // ── Public event / query types ────────────────────────────────────────────────
 
+/// Per-signal payload of the batched frame event. Deliberately minimal: the
+/// frontend already holds the parsed DBC (message name, unit, enums) and tracks
+/// min/max itself, so shipping those per frame would only bloat the IPC traffic.
 #[derive(Debug, Clone, Serialize)]
 struct DecodedSignal {
     name: String,
-    message_name: String,
     value: f64,
     /// Raw (unscaled, sign-extended) signal value, for display and VAL_ enum lookup.
     raw: i64,
-    unit: String,
-    min: f64,
-    max: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,27 +85,6 @@ pub struct ChannelInfo {
     pub name: String,
 }
 
-// ── Internal signal stats ──────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct SignalStats {
-    current: f64,
-    min: f64,
-    max: f64,
-}
-
-impl SignalStats {
-    fn new(v: f64) -> Self {
-        Self { current: v, min: v, max: v }
-    }
-
-    fn update(&mut self, v: f64) {
-        self.current = v;
-        if v < self.min { self.min = v; }
-        if v > self.max { self.max = v; }
-    }
-}
-
 // ── Internal frame storage ────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -132,7 +110,6 @@ struct StoredFrame {
 
 struct ChannelData {
     frames: VecDeque<StoredFrame>,
-    signals: HashMap<(u32, String), SignalStats>,
     dbc: Option<Arc<ParsedDbc>>,
     info: ChannelInfo,
 }
@@ -141,35 +118,18 @@ impl ChannelData {
     fn new(info: ChannelInfo) -> Self {
         Self {
             frames: VecDeque::new(),
-            signals: HashMap::new(),
             dbc: None,
             info,
         }
     }
 
-    /// Push a frame, evict frames older than `window_ms`. Returns events to emit:
-    /// (signal_name, value, raw, unit, message_name, min, max).
-    /// Min/max are all-time since channel open; they grow but never shrink during
-    /// eviction to avoid an O(N²) rescan under the shared lock.
-    fn push(&mut self, frame: StoredFrame, window_ms: u64) -> Vec<(String, f64, i64, String, String, f64, f64)> {
+    /// Push a frame, evicting frames older than `window_ms` first.
+    fn push(&mut self, frame: StoredFrame, window_ms: u64) {
         let cutoff = frame.timestamp_ms.saturating_sub(window_ms);
         while self.frames.front().map_or(false, |f| f.timestamp_ms < cutoff) {
             self.frames.pop_front();
         }
-        self.frames.push_back(frame.clone());
-
-        let msg_name = frame.message_name.clone().unwrap_or_default();
-        let mut events = Vec::new();
-        for sig in &frame.signals {
-            let sig_key = (frame.can_id, sig.name.clone());
-            self.signals
-                .entry(sig_key.clone())
-                .and_modify(|s| s.update(sig.value))
-                .or_insert_with(|| SignalStats::new(sig.value));
-            let s = &self.signals[&sig_key];
-            events.push((sig.name.clone(), sig.value, sig.raw, sig.unit.clone(), msg_name.clone(), s.min, s.max));
-        }
-        events
+        self.frames.push_back(frame);
     }
 
     fn evict_before(&mut self, cutoff: u64) {
@@ -230,7 +190,16 @@ struct ManagerShared {
     index_to_handle: HashMap<(String, u8), u32>,
     /// channel handle → (backend_name, hw_index)
     handle_to_index: HashMap<u32, (String, u8)>,
+    /// Frames waiting to be emitted to the frontend. RX/TX callbacks append here
+    /// and a flusher thread drains it every FLUSH_INTERVAL_MS as one batched
+    /// "can-frame-batch" event — one IPC message per tick instead of per frame.
+    pending_events: Vec<CanFrameEvent>,
 }
+
+/// How often the pending frame-event buffer is flushed to the webview. 33 ms
+/// (~30 fps) is below perception for live views while collapsing thousands of
+/// per-frame IPC messages per second into at most ~30.
+const FLUSH_INTERVAL_MS: u64 = 33;
 
 // ── CanManager ────────────────────────────────────────────────────────────────
 
@@ -244,7 +213,7 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
             let sh_tx = Arc::clone(shared);
             cans.insert(
                 "kvaser".to_string(),
-                Can::new(backend, make_rx_callback("kvaser".into(), sh_rx), make_tx_callback("kvaser".into(), sh_tx)),
+                Can::new(backend, make_frame_callback("kvaser".into(), sh_rx, "rx"), make_frame_callback("kvaser".into(), sh_tx, "tx")),
             );
             info!("Kvaser backend initialized successfully");
         }
@@ -258,7 +227,7 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
             let sh_tx = Arc::clone(shared);
             cans.insert(
                 "pcan".to_string(),
-                Can::new(backend, make_rx_callback("pcan".into(), sh_rx), make_tx_callback("pcan".into(), sh_tx)),
+                Can::new(backend, make_frame_callback("pcan".into(), sh_rx, "rx"), make_frame_callback("pcan".into(), sh_tx, "tx")),
             );
             info!("PCAN backend initialized successfully");
         }
@@ -273,8 +242,8 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
             "socketcan".to_string(),
             Can::new(
                 SocketCanBackend,
-                make_rx_callback("socketcan".into(), sh_rx),
-                make_tx_callback("socketcan".into(), sh_tx),
+                make_frame_callback("socketcan".into(), sh_rx, "rx"),
+                make_frame_callback("socketcan".into(), sh_tx, "tx"),
             ),
         );
         info!("SocketCAN backend initialized successfully");
@@ -297,7 +266,25 @@ impl CanManager {
             channels: HashMap::new(),
             index_to_handle: HashMap::new(),
             handle_to_index: HashMap::new(),
+            pending_events: Vec::new(),
         }));
+
+        // Flusher: drain buffered frame events into one batched webview event per
+        // tick. Lives for the whole app; the buffer is bounded by one tick of bus
+        // traffic. Emitting happens outside the lock.
+        let flush_shared = Arc::clone(&shared);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(FLUSH_INTERVAL_MS));
+            let batch = {
+                let Ok(mut lock) = flush_shared.lock() else { continue };
+                if lock.pending_events.is_empty() {
+                    continue;
+                }
+                let batch = std::mem::take(&mut lock.pending_events);
+                (lock.app.clone(), batch)
+            };
+            let _ = batch.0.emit("can-frame-batch", &batch.1);
+        });
 
         let cans = build_cans(&shared);
         Self { app_state, shared, cans }
@@ -400,7 +387,6 @@ impl CanManager {
             let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
             if let Some(ch) = lock.channels.get_mut(&handle) {
                 ch.frames.clear();
-                ch.signals.clear();
                 ch.dbc = dbc.clone();
             }
         }
@@ -720,168 +706,83 @@ impl CanManager {
 
 // ── Callback factories ────────────────────────────────────────────────────────
 
-fn make_rx_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl Fn(u8, CanFrame) + Send + Sync + 'static {
+fn make_frame_callback(
+    backend: String,
+    shared: Arc<Mutex<ManagerShared>>,
+    direction: &'static str,
+) -> impl Fn(u8, CanFrame) + Send + Sync + 'static {
     move |hw_index, raw| {
         let ts = raw.timestamp_ms.unwrap_or_else(now_ms);
 
-        // Hold the lock for the minimum time needed to decode and update state,
-        // collecting events to emit after releasing.
-        let (app, frame_event) = {
-            let mut lock = match shared.lock() {
-                Ok(l) => l,
-                Err(_) => return,
-            };
-
-            let handle = match lock.index_to_handle.get(&(backend.clone(), hw_index)).cloned() {
-                Some(h) => h,
-                None => return,
-            };
-
-            let window_ms = lock.window_ms;
-            let dbc = match lock.channels.get(&handle) {
-                Some(ch) => ch.dbc.clone(),
-                None => return,
-            };
-
-            let decoded_msg = dbc.as_ref().and_then(|d| d.decode_frame(&raw));
-            let message_name = decoded_msg.as_ref().map(|m| m.name.clone());
-
-            let stored = StoredFrame {
-                can_id: raw.can_id,
-                is_extended: raw.is_extended,
-                data: raw.data.clone(),
-                timestamp_ms: ts,
-                direction: "rx",
-                message_name: message_name.clone(),
-                signals: decoded_msg
-                    .map(|m| {
-                        m.signals
-                            .into_iter()
-                            .map(|s| StoredSignal {
-                                name: s.name,
-                                value: s.physical,
-                                raw: s.raw,
-                                unit: s.unit,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            };
-
-            let signal_updates = lock
-                .channels
-                .get_mut(&handle)
-                .map(|ch| ch.push(stored, window_ms))
-                .unwrap_or_default();
-
-            let app = lock.app.clone();
-            let decoded: Vec<DecodedSignal> = signal_updates
-                .into_iter()
-                .map(|(sig_name, value, raw, unit, msg_name, min, max)| DecodedSignal {
-                    name: sig_name,
-                    message_name: msg_name,
-                    value,
-                    raw,
-                    unit,
-                    min,
-                    max,
-                })
-                .collect();
-
-            (
-                app,
-                CanFrameEvent {
-                    channel_handle: handle,
-                    can_id: raw.can_id,
-                    is_extended: raw.is_extended,
-                    dlc: raw.data.len() as u8,
-                    data: raw.data,
-                    timestamp_ms: ts,
-                    direction: "rx",
-                    message_name,
-                    signals: decoded,
-                },
-            )
+        // Hold the lock only long enough to decode, store the frame, and queue
+        // the event; the flusher thread emits queued events in batches.
+        let mut lock = match shared.lock() {
+            Ok(l) => l,
+            Err(_) => return,
         };
 
-        let _ = app.emit("can-frame", &frame_event);
-    }
-}
-
-fn make_tx_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl Fn(u8, CanFrame) + Send + Sync + 'static {
-    move |hw_index, raw| {
-        let ts = raw.timestamp_ms.unwrap_or_else(now_ms);
-        let (app, frame_event) = {
-            let mut lock = match shared.lock() {
-                Ok(l) => l,
-                Err(_) => return,
-            };
-            let handle = match lock.index_to_handle.get(&(backend.clone(), hw_index)).cloned() {
-                Some(h) => h,
-                None => return,
-            };
-            let window_ms = lock.window_ms;
-            let dbc = match lock.channels.get(&handle) {
-                Some(ch) => ch.dbc.clone(),
-                None => return,
-            };
-            let decoded_msg = dbc.as_ref().and_then(|d| d.decode_frame(&raw));
-            let message_name = decoded_msg.as_ref().map(|m| m.name.clone());
-            let stored = StoredFrame {
-                can_id: raw.can_id,
-                is_extended: raw.is_extended,
-                data: raw.data.clone(),
-                timestamp_ms: ts,
-                direction: "tx",
-                message_name: message_name.clone(),
-                signals: decoded_msg
-                    .map(|m| {
-                        m.signals
-                            .into_iter()
-                            .map(|s| StoredSignal {
-                                name: s.name,
-                                value: s.physical,
-                                raw: s.raw,
-                                unit: s.unit,
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-            };
-            let signal_updates = lock
-                .channels
-                .get_mut(&handle)
-                .map(|ch| ch.push(stored, window_ms))
-                .unwrap_or_default();
-            let app = lock.app.clone();
-            let decoded: Vec<DecodedSignal> = signal_updates
-                .into_iter()
-                .map(|(sig_name, value, raw, unit, msg_name, min, max)| DecodedSignal {
-                    name: sig_name,
-                    message_name: msg_name,
-                    value,
-                    raw,
-                    unit,
-                    min,
-                    max,
-                })
-                .collect();
-            (
-                app,
-                CanFrameEvent {
-                    channel_handle: handle,
-                    can_id: raw.can_id,
-                    is_extended: raw.is_extended,
-                    dlc: raw.data.len() as u8,
-                    data: raw.data,
-                    timestamp_ms: ts,
-                    direction: "tx",
-                    message_name,
-                    signals: decoded,
-                },
-            )
+        let handle = match lock.index_to_handle.get(&(backend.clone(), hw_index)).cloned() {
+            Some(h) => h,
+            None => return,
         };
-        let _ = app.emit("can-frame", &frame_event);
+
+        let window_ms = lock.window_ms;
+        let dbc = match lock.channels.get(&handle) {
+            Some(ch) => ch.dbc.clone(),
+            None => return,
+        };
+
+        let decoded_msg = dbc.as_ref().and_then(|d| d.decode_frame(&raw));
+        let message_name = decoded_msg.as_ref().map(|m| m.name.clone());
+
+        let stored = StoredFrame {
+            can_id: raw.can_id,
+            is_extended: raw.is_extended,
+            data: raw.data.clone(),
+            timestamp_ms: ts,
+            direction,
+            message_name: message_name.clone(),
+            signals: decoded_msg
+                .map(|m| {
+                    m.signals
+                        .into_iter()
+                        .map(|s| StoredSignal {
+                            name: s.name,
+                            value: s.physical,
+                            raw: s.raw,
+                            unit: s.unit,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        };
+
+        let decoded: Vec<DecodedSignal> = stored
+            .signals
+            .iter()
+            .map(|s| DecodedSignal {
+                name: s.name.clone(),
+                value: s.value,
+                raw: s.raw,
+            })
+            .collect();
+
+        let event = CanFrameEvent {
+            channel_handle: handle,
+            can_id: raw.can_id,
+            is_extended: raw.is_extended,
+            dlc: raw.data.len() as u8,
+            data: raw.data,
+            timestamp_ms: ts,
+            direction,
+            message_name,
+            signals: decoded,
+        };
+
+        if let Some(ch) = lock.channels.get_mut(&handle) {
+            ch.push(stored, window_ms);
+        }
+        lock.pending_events.push(event);
     }
 }
 

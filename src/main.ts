@@ -75,15 +75,13 @@ interface FrameInfo {
     signals: FrameSignal[];
 }
 
+// Minimal per-signal payload of the batched frame event. Message name, unit and
+// enums come from the DBC already held in the frontend; min/max are tracked here.
 interface DecodedSignal {
     name: string;
-    message_name: string;
     value: number;
     // Raw (unscaled, sign-extended) value from Rust; used for display and VAL_ enum lookup.
     raw: number;
-    unit: string;
-    min: number;
-    max: number;
 }
 
 interface CanFrameEvent {
@@ -169,7 +167,9 @@ interface PlotSeries {
     timestamps: number[];       // absolute ms, used for pruning
     data: { x: number; y: number }[];  // x = elapsed seconds from appStartTime
     lastValue: number | null;
-    frozenLength: number | null; // data.length snapshot taken at pause time; null = not frozen
+    // Copy of `data` taken at pause time and shown while paused; null = not frozen.
+    // A copy (not an index) so the live array keeps being pruned during long pauses.
+    frozenData: { x: number; y: number }[] | null;
 }
 
 interface PlotPane {
@@ -199,9 +199,9 @@ let scrollRafId: number | null = null;
 function applyYRange(pane: PlotPane) {
     let yMin = Infinity, yMax = -Infinity;
     for (const s of pane.series.values()) {
-        const len = s.frozenLength ?? s.data.length;
-        if (len === 0) continue;
-        const y = s.data[0].y;
+        const arr = s.frozenData ?? s.data;
+        if (arr.length === 0) continue;
+        const y = arr[0].y;
         if (y < yMin) yMin = y;
         if (y > yMax) yMax = y;
     }
@@ -315,7 +315,15 @@ function clearPaneZoom(pane: PlotPane) {
 function snapshotPlotPanes() {
     for (const pane of plotPanes)
         for (const s of pane.series.values())
-            s.frozenLength = s.data.length;
+            s.frozenData = s.data.slice();
+    // Freeze the sidebar value maps too, so signal rows built during the pause
+    // match the frozen view instead of showing live values.
+    sidebarSnapshot = {
+        values: new Map(signalLastValues),
+        raw: new Map(signalLastRaw),
+        min: new Map(signalMinValues),
+        max: new Map(signalMaxValues),
+    };
 }
 
 function removeSigFromPane(pane: PlotPane, key: string) {
@@ -386,7 +394,8 @@ function createPlotPane(): PlotPane {
             startMax: xScale.max,
             chartWidth: area.right - area.left,
         };
-        if (!viewPaused) {
+        // Freeze the view (only meaningful while capture is live and unpaused).
+        if (appRunning && !viewPaused) {
             viewPaused = true;
             updatePauseViewBtn();
             snapshotPlotPanes();
@@ -436,7 +445,8 @@ function createPlotPane(): PlotPane {
                         onZoomComplete: () => {
                             pane.zoomed = true;
                             resetZoomBtn.style.display = "";
-                            if (!viewPaused) {
+                            // Freeze the view (only meaningful while capture is live).
+                            if (appRunning && !viewPaused) {
                                 viewPaused = true;
                                 updatePauseViewBtn();
                                 snapshotPlotPanes();
@@ -535,7 +545,7 @@ async function addSignalToPane(pane: PlotPane, handle: number, sig: DbcSignal) {
     const color = PLOT_COLORS[pane.series.size % PLOT_COLORS.length];
     const series: PlotSeries = {
         signalName: sig.name, messageName: sig.message_name, messageId: sig.message_id, unit: sig.unit,
-        color, channel: handle, timestamps: [], data: [], lastValue: null, frozenLength: null,
+        color, channel: handle, timestamps: [], data: [], lastValue: null, frozenData: null,
     };
     // Register the series NOW so live signal-value events are captured immediately
     // while we await the history fetch below.
@@ -599,7 +609,7 @@ function syncDatasets(pane: PlotPane) {
         const showDot = pane.showPoints || hovered;
         const ds = pane.chart.data.datasets[i] as any;
         ds.label = s.signalName;
-        ds.data = viewPaused && s.frozenLength !== null ? s.data.slice(0, s.frozenLength) : s.data;
+        ds.data = viewPaused && s.frozenData ? s.frozenData : s.data;
         ds.borderColor = s.color;
         ds.pointBackgroundColor = s.color;
         ds.backgroundColor = "transparent";
@@ -644,12 +654,19 @@ function updateSignalHighlights() {
 
 // ── DBC tree rendering ────────────────────────────────────────────────────────
 
+// True when any plot pane currently charts this plotKey.
+function isKeyPlotted(key: string): boolean {
+    for (const pane of plotPanes) if (pane.series.has(key)) return true;
+    return false;
+}
+
 function renderDbcTree(filter = "") {
     const tree = document.getElementById("dbc-tree")!;
     tree.innerHTML = "";
     signalValueEls.clear();
     signalRangeEls.clear();
     signalEnums.clear();
+    signalUnits.clear();
 
     const dbc = selectedChannel !== null ? (channels.get(selectedChannel)?.dbc ?? null) : null;
     if (!dbc) {
@@ -662,6 +679,35 @@ function renderDbcTree(filter = "") {
 
     const sortedMessages = Object.values(dbc.messages).sort((a, b) => a.name.localeCompare(b.name));
 
+    const buildSignalRow = (sig: DbcSignal): HTMLElement => {
+        const row = document.createElement("div");
+        row.className = "signal-row";
+        row.dataset.signal = sig.name;
+        row.dataset.messageId = String(sig.message_id);
+        row.dataset.channel = String(selectedChannel!);
+        const key = plotKey(selectedChannel!, sig.message_id, sig.name);
+        if (sig.enum_values?.length) signalEnums.set(key, sig.enum_values);
+        signalUnits.set(key, sig.unit);
+        // While paused, build from the pause-time snapshot so lazily expanded
+        // messages match the frozen view.
+        const snap = viewPaused ? sidebarSnapshot : null;
+        const lastVal = (snap?.values ?? signalLastValues).get(key);
+        const valText = lastVal != null ? sidebarValueText(key, lastVal, (snap?.raw ?? signalLastRaw).get(key), sig.unit) : (sig.unit || "");
+        const mn = (snap?.min ?? signalMinValues).get(key);
+        const mx = (snap?.max ?? signalMaxValues).get(key);
+        const rangeText = mn !== undefined ? `↓${formatSigValue(mn, "")} ↑${formatSigValue(mx!, "")}` : "↓— ↑—";
+        row.innerHTML = `
+        <span class="sig-name">${sig.name}</span>
+        <span class="sig-value${lastVal == null ? " sig-value--empty" : ""}">${valText}</span>
+        <span class="sig-range${mn === undefined ? " sig-value--empty" : ""}">${rangeText}</span>`;
+        signalValueEls.set(key, row.querySelector<HTMLElement>(".sig-value")!);
+        signalRangeEls.set(key, row.querySelector<HTMLElement>(".sig-range")!);
+        if (isKeyPlotted(key)) row.classList.add("in-plot");
+        row.setAttribute("draggable", "true");
+        // Drag / double-click behaviour is delegated on #dbc-tree (setupDbcTree).
+        return row;
+    };
+
     const buildMsgDetails = (msg: DbcMessage, container: HTMLElement) => {
         const visibleSignals = msg.signals.filter(s =>
             !lc || s.name.toLowerCase().includes(lc) || msg.name.toLowerCase().includes(lc)
@@ -672,57 +718,23 @@ function renderDbcTree(filter = "") {
         details.className = "msg-group";
         details.dataset.channel = String(selectedChannel!);
         details.dataset.messageId = String(msg.id);
-        if (filter) details.open = true;
 
         const summary = document.createElement("summary");
         summary.innerHTML = `${msg.name}<span class="msg-id-badge">0x${msg.id.toString(16).toUpperCase().padStart(3, "0")}</span>`;
         details.appendChild(summary);
 
-        for (const sig of visibleSignals) {
-            const row = document.createElement("div");
-            row.className = "signal-row";
-            row.dataset.signal = sig.name;
-            row.dataset.messageId = String(sig.message_id);
-            row.dataset.channel = String(selectedChannel!);
-            const key = plotKey(selectedChannel!, sig.message_id, sig.name);
-            if (sig.enum_values?.length) signalEnums.set(key, sig.enum_values);
-            const lastVal = signalLastValues.get(key);
-            const valText = lastVal != null ? sidebarValueText(key, lastVal, signalLastRaw.get(key), sig.unit) : (sig.unit || "");
-            const mn = signalMinValues.get(key);
-            const mx = signalMaxValues.get(key);
-            const rangeText = mn !== undefined ? `↓${formatSigValue(mn, "")} ↑${formatSigValue(mx!, "")}` : "↓— ↑—";
-            row.innerHTML = `
-        <span class="sig-name">${sig.name}</span>
-        <span class="sig-value${lastVal == null ? " sig-value--empty" : ""}">${valText}</span>
-        <span class="sig-range${mn === undefined ? " sig-value--empty" : ""}">${rangeText}</span>`;
-            signalValueEls.set(key, row.querySelector<HTMLElement>(".sig-value")!);
-            signalRangeEls.set(key, row.querySelector<HTMLElement>(".sig-range")!);
-
-            row.setAttribute("draggable", "true");
-            row.addEventListener("dragstart", (e) => {
-                if (!selectedChannel) { e.preventDefault(); return; }
-                const payload: DragSignal = {
-                    channel: selectedChannel,
-                    signalName: sig.name,
-                    messageName: sig.message_name,
-                    unit: sig.unit,
-                    sig,
-                };
-                e.dataTransfer!.setData("application/can-signal", JSON.stringify(payload));
-                e.dataTransfer!.effectAllowed = "copy";
-            });
-
-            row.addEventListener("dblclick", () => {
-                const activeTab = document.querySelector(".tab-btn.active")?.getAttribute("data-tab");
-                if (activeTab === "plot") {
-                    const pane = plotPanes[0] ?? createPlotPane();
-                    addSignalToPane(pane, selectedChannel!, sig);
-                } else if (activeTab === "simulate") {
-                    addSimSignal(selectedChannel!, sig);
-                }
-            });
-
-            details.appendChild(row);
+        // Signal rows are built on first expand. A large DBC would otherwise keep
+        // tens of thousands of rows (plus listeners) resident in the DOM.
+        let populated = false;
+        const populate = () => {
+            if (populated) return;
+            populated = true;
+            for (const sig of visibleSignals) details.appendChild(buildSignalRow(sig));
+        };
+        details.addEventListener("toggle", () => { if (details.open) populate(); });
+        if (filter) {
+            details.open = true;
+            populate();
         }
         container.appendChild(details);
     };
@@ -786,6 +798,49 @@ interface DragSignal {
 function parseDragSignal(e: DragEvent): DragSignal | null {
     try { return JSON.parse(e.dataTransfer?.getData("application/can-signal") ?? "null"); }
     catch { return null; }
+}
+
+// Resolve a sidebar signal row back to its DBC definition. Rows only carry
+// identifiers; keeping a closure per row would defeat the lazy tree.
+function sigFromRow(row: HTMLElement): { handle: number; sig: DbcSignal } | null {
+    const handle = parseInt(row.dataset.channel ?? "");
+    const msgId = parseInt(row.dataset.messageId ?? "");
+    const sig = channels.get(handle)?.dbc?.messages[msgId]?.signals.find(s => s.name === row.dataset.signal);
+    return sig ? { handle, sig } : null;
+}
+
+// One delegated dragstart/dblclick pair for the whole tree instead of two
+// listeners per signal row.
+function setupDbcTree() {
+    const tree = document.getElementById("dbc-tree")!;
+    tree.addEventListener("dragstart", (e) => {
+        const row = (e.target as HTMLElement).closest<HTMLElement>(".signal-row");
+        if (!row) return;
+        const found = sigFromRow(row);
+        if (!found) { e.preventDefault(); return; }
+        const payload: DragSignal = {
+            channel: found.handle,
+            signalName: found.sig.name,
+            messageName: found.sig.message_name,
+            unit: found.sig.unit,
+            sig: found.sig,
+        };
+        e.dataTransfer!.setData("application/can-signal", JSON.stringify(payload));
+        e.dataTransfer!.effectAllowed = "copy";
+    });
+    tree.addEventListener("dblclick", (e) => {
+        const row = (e.target as HTMLElement).closest<HTMLElement>(".signal-row");
+        if (!row) return;
+        const found = sigFromRow(row);
+        if (!found) return;
+        const activeTab = document.querySelector(".tab-btn.active")?.getAttribute("data-tab");
+        if (activeTab === "plot") {
+            const pane = plotPanes[0] ?? createPlotPane();
+            addSignalToPane(pane, found.handle, found.sig);
+        } else if (activeTab === "simulate") {
+            addSimSignal(found.handle, found.sig);
+        }
+    });
 }
 
 function setupPaneDrop(el: HTMLElement, pane: PlotPane) {
@@ -881,8 +936,20 @@ const signalMaxValues = new Map<string, number>();
 const signalValueEls = new Map<string, HTMLElement>();
 const signalRangeEls = new Map<string, HTMLElement>();
 // Enum (VAL_) tables for signals currently shown in the sidebar tree, keyed by
-// plotKey. Populated in renderDbcTree; used to append the named value in the pane.
+// plotKey. Populated when the tree rows are built; used to append the named value.
 const signalEnums = new Map<string, SignalEnumValue[]>();
+// Unit per sidebar-visible signal (plotKey → unit); frame events no longer carry it.
+const signalUnits = new Map<string, string>();
+// Copies of the signal value maps taken when the view is paused. Signal rows
+// built while paused (the tree populates lazily on expand) read from these so
+// they show pause-time values; live tracking continues in the maps above.
+interface SidebarSnapshot {
+    values: Map<string, number>;
+    raw: Map<string, number>;
+    min: Map<string, number>;
+    max: Map<string, number>;
+}
+let sidebarSnapshot: SidebarSnapshot | null = null;
 let selectedChannel: number | null = null;
 
 // Sidebar value text: physical value plus its DBC named value when the raw value
@@ -2201,11 +2268,12 @@ async function startApp() {
 
     // Reset global pause state
     viewPaused = false;
+    sidebarSnapshot = null;
     updatePauseViewBtn();
 
     // Clear all plot pane data, reset zoom and X-axis bounds
     for (const pane of plotPanes) {
-        for (const s of pane.series.values()) { s.timestamps.length = 0; s.data.length = 0; s.lastValue = null; s.frozenLength = null; }
+        for (const s of pane.series.values()) { s.timestamps.length = 0; s.data.length = 0; s.lastValue = null; s.frozenData = null; }
         clearPaneZoom(pane);
         const xScale = (pane.chart.options.scales as any)["x"];
         xScale.min = 0;
@@ -2276,7 +2344,14 @@ async function startApp() {
 }
 
 async function stopApp() {
+    // If the view is paused, resume it first so pending trace/plot/sidebar
+    // updates are flushed and the final live state is shown before stopping.
+    if (viewPaused) {
+        viewPaused = false;
+        resumeFromPause();
+    }
     appRunning = false;
+    updatePauseViewBtn();
     // Close hardware connections; they will reopen on the next Start.
     for (const [handle, ch] of channels) {
         if (!ch.open) continue;
@@ -2552,7 +2627,9 @@ const DEFAULT_WINDOW_SEC = 60;
 let windowSizeSec = DEFAULT_WINDOW_SEC;
 
 function pruneOldData() {
-    if (!appRunning || viewPaused) return; // leave a stopped / frozen chart untouched
+    // Prune even while the view is paused — the frozen display uses its own
+    // snapshot, so the live arrays must not grow unbounded during long pauses.
+    if (!appRunning) return; // leave a stopped chart untouched
     const cutoff = Date.now() - windowSizeSec * 1000;
     for (const pane of plotPanes) {
         for (const s of pane.series.values()) {
@@ -2761,18 +2838,19 @@ interface TraceEntry {
     timestampMs: number;
     cycleTimeMs: number | null;
     direction: "rx" | "tx";
-    signals: FrameSignal[];
+    signals: DecodedSignal[];
 }
 
 // Decoded signals (value + raw from Rust) for each rendered trace row, keyed by
 // the row element so the expansion table can show them without re-decoding in TS.
 // Auto-cleared when a row is evicted (element GC'd).
-const traceRowSignals = new WeakMap<HTMLTableRowElement, FrameSignal[]>();
+const traceRowSignals = new WeakMap<HTMLTableRowElement, DecodedSignal[]>();
 
 type TraceMode = "overwrite" | "append";
 type TraceDataFormat = "hex" | "dec" | "ascii";
 let traceMode: TraceMode = "overwrite";
 let traceDataFormat: TraceDataFormat = "hex";
+let traceTabActive = false; // plot tab is the default active tab
 let traceMaxRows = 1000;
 let traceHeaderEls: HTMLTableCellElement[] = [];
 
@@ -3042,87 +3120,122 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     }
 }
 
-function onCanFrame(ev: CanFrameEvent) {
-    if (!appRunning) return;
+function onCanFrameBatch(events: CanFrameEvent[]) {
+    if (!appRunning || events.length === 0) return;
 
-    // Update seen sets (for filter autocomplete) and cycle timing.
-    traceSeenChannels.add(ev.channel_handle);
-    traceSeenCanIds.add(ev.can_id);
-    if (ev.message_name) traceSeenMsgNames.add(ev.message_name);
-    else traceSeenNoMsg = true;
+    // Signals touched in this batch; sidebar DOM is written once per signal per
+    // batch (the maps below always hold the latest value) instead of per frame.
+    const dirtySignals = new Set<string>();
+    // Overwrite mode: only the newest entry per trace key needs a DOM update.
+    const latestOverwrite = new Map<string, TraceEntry>();
+    const appendEntries: TraceEntry[] = [];
 
-    const direction = ev.direction ?? "rx";
-    const key = traceKey(ev.channel_handle, ev.can_id, direction);
-    const prev = traceLastTs.get(key);
-    const cycleTime = prev != null ? ev.timestamp_ms - prev : null;
-    traceLastTs.set(key, ev.timestamp_ms);
+    for (const ev of events) {
+        // Update seen sets (for filter autocomplete) and cycle timing.
+        traceSeenChannels.add(ev.channel_handle);
+        traceSeenCanIds.add(ev.can_id);
+        if (ev.message_name) traceSeenMsgNames.add(ev.message_name);
+        else traceSeenNoMsg = true;
 
-    // Process decoded signals — update sidebar and plot series regardless of pause state.
-    const x = (ev.timestamp_ms - appStartTime) / 1000;
-    for (const sig of ev.signals) {
-        const sigKey = plotKey(ev.channel_handle, ev.can_id, sig.name);
-        signalLastValues.set(sigKey, sig.value);
-        signalLastRaw.set(sigKey, sig.raw);
-        signalMinValues.set(sigKey, sig.min);
-        signalMaxValues.set(sigKey, sig.max);
-        const valEl = signalValueEls.get(sigKey);
-        if (valEl) {
-            valEl.textContent = sidebarValueText(sigKey, sig.value, sig.raw, sig.unit);
-            valEl.classList.remove("sig-value--empty");
+        const direction = ev.direction ?? "rx";
+        const key = traceKey(ev.channel_handle, ev.can_id, direction);
+        const prev = traceLastTs.get(key);
+        const cycleTime = prev != null ? ev.timestamp_ms - prev : null;
+        traceLastTs.set(key, ev.timestamp_ms);
+
+        // Process decoded signals — update value maps and plot series regardless
+        // of pause state (frozen charts display a snapshot, data keeps flowing).
+        const x = (ev.timestamp_ms - appStartTime) / 1000;
+        for (const sig of ev.signals) {
+            const sigKey = plotKey(ev.channel_handle, ev.can_id, sig.name);
+            signalLastValues.set(sigKey, sig.value);
+            signalLastRaw.set(sigKey, sig.raw);
+            const mn = signalMinValues.get(sigKey);
+            if (mn === undefined || sig.value < mn) signalMinValues.set(sigKey, sig.value);
+            const mx = signalMaxValues.get(sigKey);
+            if (mx === undefined || sig.value > mx) signalMaxValues.set(sigKey, sig.value);
+            dirtySignals.add(sigKey);
+            for (const pane of plotPanes) {
+                const series = pane.series.get(sigKey);
+                if (!series) continue;
+                if (series.timestamps.length > 0 &&
+                    series.timestamps[series.timestamps.length - 1] >= ev.timestamp_ms) continue;
+                series.timestamps.push(ev.timestamp_ms);
+                series.data.push({ x, y: sig.value });
+                series.lastValue = sig.value;
+                markPaneDirty(pane); // no-op while viewPaused; data accumulates in series
+            }
         }
-        const rangeEl = signalRangeEls.get(sigKey);
-        if (rangeEl) {
-            rangeEl.textContent = `↓${formatSigValue(sig.min, "")} ↑${formatSigValue(sig.max, "")}`;
-            rangeEl.classList.remove("sig-value--empty");
+
+        const entry: TraceEntry = {
+            channelHandle: ev.channel_handle,
+            canId: ev.can_id,
+            isExtended: ev.is_extended,
+            dlc: ev.dlc,
+            data: ev.data,
+            messageName: ev.message_name ?? null,
+            timestampMs: ev.timestamp_ms,
+            cycleTimeMs: cycleTime,
+            direction,
+            signals: ev.signals,
+        };
+
+        if (viewPaused) {
+            // Accumulate latest state per key; DOM stays frozen until resume.
+            if (traceMode === "overwrite") tracePendingOverwrite.set(key, entry);
+            continue;
         }
-        for (const pane of plotPanes) {
-            const series = pane.series.get(sigKey);
-            if (!series) continue;
-            if (series.timestamps.length > 0 &&
-                series.timestamps[series.timestamps.length - 1] >= ev.timestamp_ms) continue;
-            series.timestamps.push(ev.timestamp_ms);
-            series.data.push({ x, y: sig.value });
-            series.lastValue = sig.value;
-            markPaneDirty(pane); // no-op while viewPaused; data accumulates in series
+
+        if (traceMode === "overwrite") latestOverwrite.set(key, entry);
+        // Append rows are only built while the trace tab is visible; switching to
+        // the tab reloads the buffer from the backend and rebuilds the table.
+        else if (traceTabActive) appendEntries.push(entry);
+    }
+
+    // Sidebar: one DOM write per signal per batch, from the latest values.
+    // Frozen while the view is paused — the maps keep tracking underneath and
+    // resumeFromPause() brings the rows back up to date.
+    if (!viewPaused) {
+        for (const sigKey of dirtySignals) {
+            const valEl = signalValueEls.get(sigKey);
+            if (valEl) {
+                valEl.textContent = sidebarValueText(sigKey, signalLastValues.get(sigKey)!, signalLastRaw.get(sigKey), signalUnits.get(sigKey) ?? "");
+                valEl.classList.remove("sig-value--empty");
+            }
+            const rangeEl = signalRangeEls.get(sigKey);
+            if (rangeEl) {
+                rangeEl.textContent = `↓${formatSigValue(signalMinValues.get(sigKey)!, "")} ↑${formatSigValue(signalMaxValues.get(sigKey)!, "")}`;
+                rangeEl.classList.remove("sig-value--empty");
+            }
         }
     }
 
-    const entry: TraceEntry = {
-        channelHandle: ev.channel_handle,
-        canId: ev.can_id,
-        isExtended: ev.is_extended,
-        dlc: ev.dlc,
-        data: ev.data,
-        messageName: ev.message_name ?? null,
-        timestampMs: ev.timestamp_ms,
-        cycleTimeMs: cycleTime,
-        direction,
-        signals: ev.signals,
-    };
-
-    if (viewPaused) {
-        // Accumulate latest state per key; DOM stays frozen until resume.
-        if (traceMode === "overwrite") tracePendingOverwrite.set(key, entry);
-        return;
+    if (latestOverwrite.size > 0) {
+        const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
+        for (const [key, entry] of latestOverwrite) {
+            const existing = traceRowEls.get(key);
+            if (existing) {
+                updateTraceRowEl(existing, entry);
+            } else {
+                const tr = buildTraceRow(entry);
+                traceRowEls.set(key, tr);
+                tbody.appendChild(tr);
+            }
+        }
     }
 
-    const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
-
-    if (traceMode === "overwrite") {
-        const existing = traceRowEls.get(key);
-        if (existing) {
-            updateTraceRowEl(existing, entry);
-        } else {
-            const tr = buildTraceRow(entry);
-            traceRowEls.set(key, tr);
-            tbody.appendChild(tr);
+    if (appendEntries.length > 0) {
+        const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
+        // Events arrive oldest→newest; insert in reverse so the newest ends up on top.
+        const frag = document.createDocumentFragment();
+        for (let i = appendEntries.length - 1; i >= 0; i--) {
+            const e = appendEntries[i];
+            if (traceRowVisible(e.channelHandle, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName)) {
+                frag.appendChild(buildTraceRow(e));
+            }
         }
-    } else {
-        if (traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) {
-            const tr = buildTraceRow(entry);
-            tbody.insertBefore(tr, tbody.firstChild);
-            while (tbody.rows.length > traceMaxRows) tbody.deleteRow(-1);
-        }
+        tbody.insertBefore(frag, tbody.firstChild);
+        while (tbody.rows.length > traceMaxRows) tbody.deleteRow(-1);
     }
 }
 
@@ -3605,12 +3718,35 @@ function setupTrace() {
 // ── Global pause ─────────────────────────────────────────────────────────────
 
 function updatePauseViewBtn() {
-    const btn = document.getElementById("btn-pause-view")!;
+    const btn = document.getElementById("btn-pause-view") as HTMLButtonElement;
     btn.textContent = viewPaused ? "Resume" : "Pause";
     btn.classList.toggle("running", viewPaused);
+    // Pausing only makes sense while capture is live.
+    btn.disabled = !appRunning;
+}
+
+// Rewrite every rendered sidebar row from the latest value maps. Used on resume
+// so rows frozen during the pause catch up immediately.
+function refreshSidebarValues() {
+    for (const [key, valEl] of signalValueEls) {
+        const v = signalLastValues.get(key);
+        if (v == null) continue;
+        valEl.textContent = sidebarValueText(key, v, signalLastRaw.get(key), signalUnits.get(key) ?? "");
+        valEl.classList.remove("sig-value--empty");
+    }
+    for (const [key, rangeEl] of signalRangeEls) {
+        const mn = signalMinValues.get(key);
+        if (mn === undefined) continue;
+        rangeEl.textContent = `↓${formatSigValue(mn, "")} ↑${formatSigValue(signalMaxValues.get(key)!, "")}`;
+        rangeEl.classList.remove("sig-value--empty");
+    }
 }
 
 function resumeFromPause() {
+    // Sidebar values/min/max were frozen during the pause; snap them to current.
+    sidebarSnapshot = null;
+    refreshSidebarValues();
+
     // Flush pending trace updates
     const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
     if (traceMode === "overwrite") {
@@ -3647,7 +3783,7 @@ function resumeFromPause() {
     for (const pane of plotPanes) {
         const seriesArray = [...pane.series.values()];
         for (let i = 0; i < seriesArray.length; i++) {
-            seriesArray[i].frozenLength = null;
+            seriesArray[i].frozenData = null;
             const ds = pane.chart.data.datasets[i] as any;
             if (ds) ds.data = seriesArray[i].data;
         }
@@ -3664,6 +3800,9 @@ function resumeFromPause() {
 
 interface LogEntry { ts: string; text: string; isError: boolean; }
 const messageLog: LogEntry[] = [];
+// Oldest entries are dropped past this point so a long session can't grow the
+// log (array + DOM) without bound.
+const MAX_LOG_ENTRIES = 300;
 
 function updateWindowTitle() {
     const base = projectPath ? `Canvaz — ${projectPath}` : "Canvaz";
@@ -3678,6 +3817,7 @@ function setStatus(msg: string, isError = false) {
 
     const entry: LogEntry = { ts: new Date().toLocaleTimeString(), text: msg, isError };
     messageLog.push(entry);
+    if (messageLog.length > MAX_LOG_ENTRIES) messageLog.shift();
     appendLogEntry(entry);
 
     if (isError) {
@@ -3707,6 +3847,7 @@ function appendLogEntry(entry: LogEntry) {
     div.appendChild(ts);
     div.appendChild(text);
     container.appendChild(div);
+    while (container.childElementCount > MAX_LOG_ENTRIES) container.firstElementChild!.remove();
     container.scrollTop = container.scrollHeight;
 }
 
@@ -3725,16 +3866,23 @@ window.addEventListener("DOMContentLoaded", async () => {
             btn.classList.add("active");
             document.getElementById(`tab-${btn.dataset.tab}`)!.classList.add("active");
             plotTabActive = btn.dataset.tab === "plot";
+            traceTabActive = btn.dataset.tab === "trace";
             if (plotTabActive && appRunning && !viewPaused) startScrollLoop();
-            if (btn.dataset.tab === "trace" && appRunning) {
+            if (traceTabActive && appRunning) {
                 loadTraceFrames().then(() => applyTraceFilter());
             }
         });
     });
 
-    // DBC filter
+    // DBC tree interactions (delegated drag / double-click)
+    setupDbcTree();
+
+    // DBC filter — debounced so fast typing doesn't rebuild the tree per keystroke.
+    let searchDebounce: ReturnType<typeof setTimeout> | null = null;
     document.getElementById("signal-search")!.addEventListener("input", (e) => {
-        renderDbcTree((e.target as HTMLInputElement).value);
+        const value = (e.target as HTMLInputElement).value;
+        if (searchDebounce) clearTimeout(searchDebounce);
+        searchDebounce = setTimeout(() => renderDbcTree(value), 120);
     });
 
     // Expand / collapse all DBC message groups
@@ -3821,6 +3969,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     });
 
     document.getElementById("btn-pause-view")!.addEventListener("click", () => {
+        if (!appRunning) return; // button is disabled while stopped; belt & braces
         viewPaused = !viewPaused;
         updatePauseViewBtn();
         if (viewPaused) snapshotPlotPanes();
@@ -3878,8 +4027,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     // Trace
     setupTrace();
 
-    // Events
-    await listen<CanFrameEvent>("can-frame", (event) => onCanFrame(event.payload));
+    // Events — the backend batches frames and emits one event per ~33 ms tick.
+    await listen<CanFrameEvent[]>("can-frame-batch", (event) => onCanFrameBatch(event.payload));
 
     // Sudo password request from the Rust backend — show dialog once, cache in Rust.
     await listen("request-admin-password", async () => {
