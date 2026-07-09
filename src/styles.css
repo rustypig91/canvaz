@@ -963,7 +963,10 @@ body.col-resizing { cursor: col-resize !important; user-select: none; }
 .range-filter-inp:focus { outline: none; border-color: var(--accent); }
 #trace-table tbody tr { border-bottom: 1px solid rgba(255,255,255,0.04); }
 #trace-table tbody tr:nth-child(even) td { background: rgba(255,255,255,0.018); }
-#trace-table tbody tr:hover td { background: var(--bg3); }
+/* Expanded rows and their expansion cell are excluded: once a message is
+   opened, hovering it (or the signal table / plot area) should not repaint the
+   whole block. The signal rows inside the expansion keep their own hover. */
+#trace-table tbody tr:not(.trace-row-expanded):not([data-expand]):hover td { background: var(--bg3); }
 #trace-table tbody tr.dbc-match td:nth-child(5) { color: var(--accent); }
 #trace-table tbody tr.dbc-match { cursor: pointer; }
 #trace-table tbody tr.trace-row-expanded td { background: var(--bg3); }
