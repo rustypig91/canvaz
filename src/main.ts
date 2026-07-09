@@ -138,10 +138,11 @@ interface TraceFiltersConfig {
     max_rows?: number | null;
 }
 
+// Column widths are deliberately not persisted: every session starts at the
+// default widths and resizes last only until the app is reloaded.
 interface TraceColumnsConfig {
     order?: string[];
     hidden?: string[];
-    widths?: Record<string, number>;
 }
 
 interface Project {
@@ -2113,7 +2114,6 @@ function buildProject(): Project {
         trace_columns: {
             order: traceColOrder,
             hidden: [...traceColHidden],
-            widths: { ...traceColWidths },
         },
     };
 }
@@ -2285,7 +2285,6 @@ async function applyProject(project: Project) {
             traceColOrder = [...saved, ...missing];
         }
         if (tc.hidden) traceColHidden = new Set(tc.hidden.filter(k => validKeys.has(k)));
-        if (tc.widths) traceColWidths = Object.fromEntries(Object.entries(tc.widths).filter(([k]) => validKeys.has(k)));
         rebuildTraceColumns();
     }
 
@@ -3279,7 +3278,7 @@ function buildTraceCellHtml(key: string, entry: TraceEntry): string {
     const dirClass = entry.direction === "tx" ? "dir-tx" : "dir-rx";
     const j = entry.j1939;
     switch (key) {
-        case "pgn": return `<td data-col="pgn" class="td-canid"${j ? ` title="PGN ${j.pgn} (0x${j.pgn.toString(16).toUpperCase()})"` : ""}>${j ? fmtPgn(j.pgn) : "—"}</td>`;
+        case "pgn": return `<td data-col="pgn" class="td-canid"${j ? ` data-tip="PGN ${j.pgn} (0x${j.pgn.toString(16).toUpperCase()})"` : ""}>${j ? fmtPgn(j.pgn) : "—"}</td>`;
         case "prio": return `<td data-col="prio" style="text-align:center">${j ? j.priority : "—"}</td>`;
         case "sa": return `<td data-col="sa" class="td-canid">${j ? fmtJ1939Addr(j.sa) : "—"}</td>`;
         case "da": return `<td data-col="da" class="td-canid">${j ? (j.da === 0xFF ? "All" : fmtJ1939Addr(j.da)) : "—"}</td>`;
@@ -3287,7 +3286,7 @@ function buildTraceCellHtml(key: string, entry: TraceEntry): string {
         case "dir": return `<td data-col="dir"><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>`;
         case "channel": return `<td data-col="channel">${channelName(entry.channelHandle)}</td>`;
         case "canId": return `<td data-col="canId" class="td-canid">${fmtId(entry.canId, entry.isExtended)}</td>`;
-        case "msg": return `<td data-col="msg"${entry.messageName ? ` title="${entry.messageName}"` : ""}>${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>`;
+        case "msg": return `<td data-col="msg">${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>`;
         case "dlc": return `<td data-col="dlc" style="text-align:center">${entry.dlc}</td>`;
         case "data": return `<td data-col="data" class="td-data">${fmtData(entry.data)}</td>`;
         case "cycle": return `<td data-col="cycle" class="td-cycle">${entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—"}</td>`;
@@ -3784,7 +3783,6 @@ function setupTraceHeaders() {
                     handle.classList.remove("active"); document.body.classList.remove("col-resizing");
                     document.removeEventListener("mousemove", onMove);
                     document.removeEventListener("mouseup", onUp);
-                    scheduleAutoSave();
                 };
                 document.addEventListener("mousemove", onMove);
                 document.addEventListener("mouseup", onUp);
@@ -4176,15 +4174,23 @@ function setupTrace() {
         scheduleAutoSave();
     });
 
-    // Long payloads (reassembled J1939 transport messages) get clipped by the
-    // fixed column layout; show the full data as a tooltip, but only when the
-    // text actually overflows. Capture phase so data-tip is set before the
-    // document-level tooltip handler (bubble phase) looks for it.
+    // Cell content clipped by the fixed column layout (long payloads, message
+    // names, …) is shown in full as a tooltip, on any trace cell. Capture phase
+    // so data-tip is set before the document-level tooltip handler (bubble
+    // phase) looks for it. Cells carrying a static data-tip of their own (the
+    // PGN decimal value) are left alone; dynamically added clip-tips are marked
+    // with data-clip-tip so they can be distinguished and removed again.
     document.getElementById("trace-container")!.addEventListener("mouseover", (e) => {
-        const td = (e.target as HTMLElement).closest<HTMLTableCellElement>('td[data-col="data"]');
+        const td = (e.target as HTMLElement).closest<HTMLTableCellElement>("td[data-col]");
         if (!td) return;
-        if (td.scrollWidth > td.clientWidth) td.dataset.tip = td.textContent ?? "";
-        else delete td.dataset.tip;
+        if (td.dataset.tip !== undefined && td.dataset.clipTip === undefined) return;
+        if (td.scrollWidth > td.clientWidth) {
+            td.dataset.tip = td.textContent ?? "";
+            td.dataset.clipTip = "1";
+        } else {
+            delete td.dataset.tip;
+            delete td.dataset.clipTip;
+        }
     }, true);
 }
 

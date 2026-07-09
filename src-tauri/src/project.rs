@@ -137,14 +137,14 @@ fn default_true() -> bool {
     true
 }
 
+/// Column widths are intentionally not part of this: sessions always start at
+/// the default widths (a `widths` key in older project files is ignored).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TraceColumnsConfig {
     #[serde(default)]
     pub order: Vec<String>,
     #[serde(default)]
     pub hidden: Vec<String>,
-    #[serde(default)]
-    pub widths: std::collections::HashMap<String, u32>,
 }
 
 #[allow(dead_code)]
