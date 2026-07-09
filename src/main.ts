@@ -121,10 +121,17 @@ interface TraceFiltersConfig {
     can_ids?: number[] | null;
     msg_names?: string[] | null;
     dir?: string[] | null;
+    // J1939 column filters; -1 stands for frames without J1939 info.
+    pgns?: number[] | null;
+    prios?: number[] | null;
+    sas?: number[] | null;
+    das?: number[] | null;
+    broadcast?: boolean | null;
     dlc_min?: number | null;
     dlc_max?: number | null;
     cycle_min?: number | null;
     cycle_max?: number | null;
+    // Length doubles as the "bytes to check" count of the data filter.
     data?: (number | null)[];
     data_format?: string;
     overwrite?: boolean;
@@ -311,6 +318,19 @@ function j1939Pgn(canId: number): number {
     let pgn = (canId >> 8) & 0x3ff00;
     if (pf >= 240) pgn |= (canId >> 8) & 0xFF;
     return pgn;
+}
+
+// PDU2 (PF ≥ 240) parameter groups are broadcast; PDU1 are destination-specific.
+function j1939IsBroadcast(pgn: number): boolean {
+    return ((pgn >> 8) & 0xFF) >= 240;
+}
+
+function fmtPgn(pgn: number): string {
+    return pgn.toString(16).toUpperCase().padStart(4, "0") + "h";
+}
+
+function fmtJ1939Addr(addr: number): string {
+    return addr.toString(16).toUpperCase().padStart(2, "0") + "h";
 }
 
 // Per-channel PGN → DBC message map for J1939 channels, so frames match their
@@ -1426,11 +1446,14 @@ function showFilterMenu(
     items: { label: string; key: string }[],
     active: Set<string> | null,
     onFilter: (active: Set<string> | null) => void,
+    topContent?: HTMLElement,
 ) {
     if (ctxMenu) ctxMenu.remove();
     const menu = document.createElement("div");
     menu.className = "ctx-menu filter-menu";
     menu.addEventListener("click", e => e.stopPropagation());
+
+    if (topContent) menu.appendChild(topContent);
 
     const controls = document.createElement("div");
     controls.className = "filter-controls";
@@ -2072,6 +2095,11 @@ function buildProject(): Project {
             can_ids: traceFilterCanIds ? [...traceFilterCanIds] : null,
             msg_names: traceFilterMsgNames ? [...traceFilterMsgNames] : null,
             dir: traceFilterDir ? [...traceFilterDir] : null,
+            pgns: traceFilterPgns ? [...traceFilterPgns] : null,
+            prios: traceFilterPrios ? [...traceFilterPrios] : null,
+            sas: traceFilterSas ? [...traceFilterSas] : null,
+            das: traceFilterDas ? [...traceFilterDas] : null,
+            broadcast: traceFilterBroadcast,
             dlc_min: traceFilterDlcMin,
             dlc_max: traceFilterDlcMax,
             cycle_min: traceFilterCycleMin,
@@ -2271,6 +2299,10 @@ function syncFilteredHeaders() {
     th("canId")?.classList.toggle("th-filtered", traceFilterCanIds !== null);
     th("msg")?.classList.toggle("th-filtered", traceFilterMsgNames !== null);
     th("dir")?.classList.toggle("th-filtered", traceFilterDir !== null);
+    th("pgn")?.classList.toggle("th-filtered", traceFilterPgns !== null || traceFilterBroadcast !== null);
+    th("prio")?.classList.toggle("th-filtered", traceFilterPrios !== null);
+    th("sa")?.classList.toggle("th-filtered", traceFilterSas !== null);
+    th("da")?.classList.toggle("th-filtered", traceFilterDas !== null);
     th("dlc")?.classList.toggle("th-filtered", traceFilterDlcMin !== null || traceFilterDlcMax !== null);
     th("cycle")?.classList.toggle("th-filtered", traceFilterCycleMin !== null || traceFilterCycleMax !== null);
     th("data")?.classList.toggle("th-filtered", traceFilterData.some(v => v !== null));
@@ -2285,12 +2317,20 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
     traceFilterCanIds = f.can_ids ? new Set(f.can_ids) : null;
     traceFilterMsgNames = f.msg_names ? new Set(f.msg_names) : null;
     traceFilterDir = f.dir ? new Set(f.dir) : null;
+    traceFilterPgns = f.pgns ? new Set(f.pgns) : null;
+    traceFilterPrios = f.prios ? new Set(f.prios) : null;
+    traceFilterSas = f.sas ? new Set(f.sas) : null;
+    traceFilterDas = f.das ? new Set(f.das) : null;
+    traceFilterBroadcast = f.broadcast ?? null;
     traceFilterDlcMin = f.dlc_min ?? null;
     traceFilterDlcMax = f.dlc_max ?? null;
     traceFilterCycleMin = f.cycle_min ?? null;
     traceFilterCycleMax = f.cycle_max ?? null;
+    // The saved array's length is the "bytes to check" count (older projects
+    // always saved 8).
     const savedData = f.data ?? [];
-    traceFilterData = Array.from({ length: 8 }, (_, i) => savedData[i] ?? null);
+    const dataLen = Math.min(MAX_DATA_FILTER_BYTES, Math.max(1, savedData.length || 8));
+    traceFilterData = Array.from({ length: dataLen }, (_, i) => savedData[i] ?? null);
 
     if (f.data_format === "hex" || f.data_format === "dec" || f.data_format === "ascii")
         traceDataFormat = f.data_format;
@@ -2310,6 +2350,12 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
     if (traceFilterMsgNames) {
         traceFilterMsgNames.forEach(v => { if (v === "") traceSeenNoMsg = true; else traceSeenMsgNames.add(v); });
     }
+    const seedJ1939 = (filter: Set<number> | null, seen: Set<number>) =>
+        filter?.forEach(v => { if (v === -1) traceSeenNoJ1939 = true; else seen.add(v); });
+    seedJ1939(traceFilterPgns, traceSeenPgns);
+    seedJ1939(traceFilterPrios, traceSeenPrios);
+    seedJ1939(traceFilterSas, traceSeenSas);
+    seedJ1939(traceFilterDas, traceSeenDas);
 
     syncFilteredHeaders();
     updateClearFiltersBtn();
@@ -3025,9 +3071,25 @@ const traceSeenChannels = new Set<number>();
 const traceSeenCanIds = new Set<number>();
 const traceSeenMsgNames = new Set<string>();
 let traceSeenNoMsg = false;
+// Seen J1939 values feed the pgn/prio/sa/da filter menus; frames without J1939
+// info (standard frames on a J1939 channel) are represented by -1 / "(non-J1939)".
+const traceSeenPgns = new Set<number>();
+const traceSeenPrios = new Set<number>();
+const traceSeenSas = new Set<number>();
+const traceSeenDas = new Set<number>();
+let traceSeenNoJ1939 = false;
 let traceFilterChannels: Set<number> | null = null;
 let traceFilterCanIds: Set<number> | null = null;
 let traceFilterMsgNames: Set<string> | null = null;
+let traceFilterPgns: Set<number> | null = null;
+let traceFilterPrios: Set<number> | null = null;
+let traceFilterSas: Set<number> | null = null;
+let traceFilterDas: Set<number> | null = null;
+// null = any; true = broadcast (PDU2) PGNs only; false = destination-specific only.
+let traceFilterBroadcast: boolean | null = null;
+// One optional expected value per data byte position; the array length is the
+// user-configurable "bytes to check" count (default 8, up to MAX_DATA_FILTER_BYTES).
+const MAX_DATA_FILTER_BYTES = 64;
 let traceFilterData: (number | null)[] = new Array(8).fill(null);
 let traceFilterCycleMin: number | null = null;
 let traceFilterCycleMax: number | null = null;
@@ -3076,11 +3138,17 @@ function parseByte(s: string): number | null {
     return (isNaN(n) || n < 0 || n > 255) ? null : n;
 }
 
-function traceRowVisible(channelHandle: number, canId: number, bytes: number[], dir: string, cycleMs: number | null, dlc: number, msgName: string | null = null): boolean {
+function traceRowVisible(channelHandle: number, canId: number, bytes: number[], dir: string, cycleMs: number | null, dlc: number, msgName: string | null = null, j1939: J1939Info | null = null): boolean {
     if (traceFilterChannels !== null && !traceFilterChannels.has(channelHandle)) return false;
     if (traceFilterCanIds !== null && !traceFilterCanIds.has(canId)) return false;
     if (traceFilterDir !== null && !traceFilterDir.has(dir)) return false;
     if (traceFilterMsgNames !== null && !traceFilterMsgNames.has(msgName ?? "")) return false;
+    // J1939 filters: frames without J1939 info match the -1 "(non-J1939)" key.
+    if (traceFilterPgns !== null && !traceFilterPgns.has(j1939 ? j1939.pgn : -1)) return false;
+    if (traceFilterPrios !== null && !traceFilterPrios.has(j1939 ? j1939.priority : -1)) return false;
+    if (traceFilterSas !== null && !traceFilterSas.has(j1939 ? j1939.sa : -1)) return false;
+    if (traceFilterDas !== null && !traceFilterDas.has(j1939 ? j1939.da : -1)) return false;
+    if (traceFilterBroadcast !== null && (!j1939 || j1939IsBroadcast(j1939.pgn) !== traceFilterBroadcast)) return false;
     for (let i = 0; i < traceFilterData.length; i++) {
         const expected = traceFilterData[i];
         if (expected === null) continue;
@@ -3099,7 +3167,7 @@ function applyTraceFilter() {
         // Rebuild DOM entirely from the in-memory buffer — never keep invisible rows in the DOM.
         tbody.innerHTML = "";
         for (const entry of traceLocalBuffer) {
-            if (traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) {
+            if (traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName, entry.j1939)) {
                 tbody.appendChild(buildTraceRow(entry));
             }
         }
@@ -3116,7 +3184,15 @@ function applyTraceFilter() {
         const cycleMs = tr.dataset.cycle ? parseFloat(tr.dataset.cycle) : null;
         const dlc = parseInt(tr.dataset.dlc ?? "0");
         const msgName = tr.dataset.msg || null;
-        const visible = traceRowVisible(ch, id, bytes, dir, cycleMs, dlc, msgName);
+        const j1939: J1939Info | null = tr.dataset.pgn
+            ? {
+                pgn: parseInt(tr.dataset.pgn),
+                priority: parseInt(tr.dataset.prio ?? "0"),
+                sa: parseInt(tr.dataset.sa ?? "0"),
+                da: parseInt(tr.dataset.da ?? "255"),
+            }
+            : null;
+        const visible = traceRowVisible(ch, id, bytes, dir, cycleMs, dlc, msgName, j1939);
         tr.style.display = visible ? "" : "none";
         // If hiding a row that has an open expansion, close it
         if (!visible) {
@@ -3203,10 +3279,10 @@ function buildTraceCellHtml(key: string, entry: TraceEntry): string {
     const dirClass = entry.direction === "tx" ? "dir-tx" : "dir-rx";
     const j = entry.j1939;
     switch (key) {
-        case "pgn": return `<td data-col="pgn" class="td-canid"${j ? ` title="PGN ${j.pgn} (0x${j.pgn.toString(16).toUpperCase()})"` : ""}>${j ? j.pgn.toString(16).toUpperCase().padStart(4, "0") + "h" : "—"}</td>`;
+        case "pgn": return `<td data-col="pgn" class="td-canid"${j ? ` title="PGN ${j.pgn} (0x${j.pgn.toString(16).toUpperCase()})"` : ""}>${j ? fmtPgn(j.pgn) : "—"}</td>`;
         case "prio": return `<td data-col="prio" style="text-align:center">${j ? j.priority : "—"}</td>`;
-        case "sa": return `<td data-col="sa" class="td-canid">${j ? j.sa.toString(16).toUpperCase().padStart(2, "0") + "h" : "—"}</td>`;
-        case "da": return `<td data-col="da" class="td-canid">${j ? (j.da === 0xFF ? "All" : j.da.toString(16).toUpperCase().padStart(2, "0") + "h") : "—"}</td>`;
+        case "sa": return `<td data-col="sa" class="td-canid">${j ? fmtJ1939Addr(j.sa) : "—"}</td>`;
+        case "da": return `<td data-col="da" class="td-canid">${j ? (j.da === 0xFF ? "All" : fmtJ1939Addr(j.da)) : "—"}</td>`;
         case "ts": return `<td data-col="ts" class="td-ts">${fmtElapsed(entry.timestampMs)}</td>`;
         case "dir": return `<td data-col="dir"><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>`;
         case "channel": return `<td data-col="channel">${channelName(entry.channelHandle)}</td>`;
@@ -3261,7 +3337,7 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
         tr.dataset.da = String(entry.j1939.da);
     }
     if (entry.messageName) tr.classList.add("dbc-match");
-    if (!traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) tr.style.display = "none";
+    if (!traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName, entry.j1939)) tr.style.display = "none";
     tr.innerHTML = visibleTraceCols().map(k => buildTraceCellHtml(k, entry)).join("");
     return tr;
 }
@@ -3272,7 +3348,7 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     tr.dataset.ts = String(entry.timestampMs);
     tr.dataset.dlc = String(entry.dlc);
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
-    tr.style.display = traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName) ? "" : "none";
+    tr.style.display = traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName, entry.j1939) ? "" : "none";
     const gc = (k: string) => tr.querySelector<HTMLTableCellElement>(`[data-col="${k}"]`);
     const tsCell = gc("ts"); if (tsCell) tsCell.textContent = fmtElapsed(entry.timestampMs);
     const dlcCell = gc("dlc"); if (dlcCell) dlcCell.textContent = String(entry.dlc);
@@ -3336,6 +3412,14 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
         traceSeenCanIds.add(ev.can_id);
         if (messageName) traceSeenMsgNames.add(messageName);
         else traceSeenNoMsg = true;
+        if (ev.j1939) {
+            traceSeenPgns.add(ev.j1939.pgn);
+            traceSeenPrios.add(ev.j1939.priority);
+            traceSeenSas.add(ev.j1939.sa);
+            traceSeenDas.add(ev.j1939.da);
+        } else {
+            traceSeenNoJ1939 = true;
+        }
 
         const direction = ev.direction ?? "rx";
         const key = traceKey(ev.channel_handle, ev.can_id, direction);
@@ -3438,7 +3522,7 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
         const frag = document.createDocumentFragment();
         for (let i = appendEntries.length - 1; i >= 0; i--) {
             const e = appendEntries[i];
-            if (traceRowVisible(e.channelHandle, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName)) {
+            if (traceRowVisible(e.channelHandle, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName, e.j1939)) {
                 frag.appendChild(buildTraceRow(e));
             }
         }
@@ -3477,6 +3561,14 @@ async function loadTraceFrames() {
         if (f.message_name) traceSeenMsgNames.add(f.message_name);
         traceSeenChannels.add(f.channel_handle);
         traceSeenCanIds.add(f.can_id);
+        if (f.j1939) {
+            traceSeenPgns.add(f.j1939.pgn);
+            traceSeenPrios.add(f.j1939.priority);
+            traceSeenSas.add(f.j1939.sa);
+            traceSeenDas.add(f.j1939.da);
+        } else {
+            traceSeenNoJ1939 = true;
+        }
         return {
             channelHandle: f.channel_handle,
             canId: f.can_id,
@@ -3504,6 +3596,11 @@ function clearTrace() {
     traceSeenCanIds.clear();
     traceSeenMsgNames.clear();
     traceSeenNoMsg = false;
+    traceSeenPgns.clear();
+    traceSeenPrios.clear();
+    traceSeenSas.clear();
+    traceSeenDas.clear();
+    traceSeenNoJ1939 = false;
     traceLocalBuffer = [];
 }
 
@@ -3521,6 +3618,11 @@ function anyFilterActive(): boolean {
         || traceFilterCanIds !== null
         || traceFilterMsgNames !== null
         || traceFilterDir !== null
+        || traceFilterPgns !== null
+        || traceFilterPrios !== null
+        || traceFilterSas !== null
+        || traceFilterDas !== null
+        || traceFilterBroadcast !== null
         || traceFilterDlcMin !== null
         || traceFilterDlcMax !== null
         || traceFilterCycleMin !== null
@@ -3538,6 +3640,11 @@ function clearAllFilters() {
     traceFilterCanIds = null;
     traceFilterMsgNames = null;
     traceFilterDir = null;
+    traceFilterPgns = null;
+    traceFilterPrios = null;
+    traceFilterSas = null;
+    traceFilterDas = null;
+    traceFilterBroadcast = null;
     traceFilterDlcMin = null;
     traceFilterDlcMax = null;
     traceFilterCycleMin = null;
@@ -3736,6 +3843,64 @@ function setupTraceHeaders() {
                         syncFilteredHeaders(); applyTraceFilter();
                     });
             });
+        } else if (key === "pgn") {
+            th.addEventListener("contextmenu", (e) => {
+                e.preventDefault();
+                const items = [...traceSeenPgns].sort((a, b) => a - b)
+                    .map(p => ({ label: `${fmtPgn(p)}${j1939IsBroadcast(p) ? "" : " (dest.)"}`, key: String(p) }));
+                if (traceSeenNoJ1939) items.push({ label: "(non-J1939)", key: "-1" });
+                if (!items.length) return;
+                // Broadcast / destination-specific selector shown above the PGN list.
+                const bRow = document.createElement("div");
+                bRow.className = "data-fmt-row";
+                for (const [value, label] of [[null, "Any"], [true, "Broadcast"], [false, "Dest."]] as const) {
+                    const btn = document.createElement("button");
+                    btn.textContent = label;
+                    btn.className = "data-fmt-btn" + (traceFilterBroadcast === value ? " active" : "");
+                    btn.addEventListener("click", () => {
+                        traceFilterBroadcast = value;
+                        bRow.querySelectorAll<HTMLButtonElement>(".data-fmt-btn").forEach(b => b.classList.remove("active"));
+                        btn.classList.add("active");
+                        syncFilteredHeaders(); applyTraceFilter();
+                    });
+                    bRow.appendChild(btn);
+                }
+                showFilterMenu(e.clientX, e.clientY, items,
+                    traceFilterPgns !== null ? new Set([...traceFilterPgns].map(String)) : null,
+                    (active) => {
+                        traceFilterPgns = active !== null ? new Set([...active].map(Number)) : null;
+                        syncFilteredHeaders(); applyTraceFilter();
+                    }, bRow);
+            });
+        } else if (key === "prio" || key === "sa" || key === "da") {
+            // Shared seen-value filter for the remaining J1939 columns.
+            const cfg = {
+                prio: {
+                    seen: traceSeenPrios, fmt: (v: number) => String(v),
+                    get: () => traceFilterPrios, set: (v: Set<number> | null) => { traceFilterPrios = v; },
+                },
+                sa: {
+                    seen: traceSeenSas, fmt: fmtJ1939Addr,
+                    get: () => traceFilterSas, set: (v: Set<number> | null) => { traceFilterSas = v; },
+                },
+                da: {
+                    seen: traceSeenDas, fmt: (v: number) => v === 0xFF ? "All (FFh)" : fmtJ1939Addr(v),
+                    get: () => traceFilterDas, set: (v: Set<number> | null) => { traceFilterDas = v; },
+                },
+            }[key];
+            th.addEventListener("contextmenu", (e) => {
+                e.preventDefault();
+                const items = [...cfg.seen].sort((a, b) => a - b).map(v => ({ label: cfg.fmt(v), key: String(v) }));
+                if (traceSeenNoJ1939) items.push({ label: "(non-J1939)", key: "-1" });
+                if (!items.length) return;
+                const current = cfg.get();
+                showFilterMenu(e.clientX, e.clientY, items,
+                    current !== null ? new Set([...current].map(String)) : null,
+                    (active) => {
+                        cfg.set(active !== null ? new Set([...active].map(Number)) : null);
+                        syncFilteredHeaders(); applyTraceFilter();
+                    });
+            });
         } else if (key === "data") {
             th.addEventListener("contextmenu", (e) => {
                 e.preventDefault();
@@ -3759,23 +3924,51 @@ function setupTraceHeaders() {
                 }
                 menu.appendChild(fmtRow);
                 const sep = document.createElement("div"); sep.className = "data-filter-sep"; menu.appendChild(sep);
+
+                // How many data byte positions to filter on. Default 8; raise it
+                // to match reassembled J1939 transport messages (dlc > 8).
+                const countRow = document.createElement("div"); countRow.className = "range-filter-row";
+                const countLbl = document.createElement("span"); countLbl.className = "range-filter-lbl"; countLbl.textContent = "Bytes:";
+                const countInp = document.createElement("input");
+                countInp.type = "number"; countInp.min = "1"; countInp.max = String(MAX_DATA_FILTER_BYTES);
+                countInp.className = "range-filter-inp";
+                countInp.value = String(traceFilterData.length);
+                countRow.append(countLbl, countInp);
+                menu.appendChild(countRow);
+
                 const inputs: HTMLInputElement[] = [];
                 const grid = document.createElement("div"); grid.className = "data-filter-grid";
-                for (let idx = 0; idx < 8; idx++) {
-                    const cell = document.createElement("div"); cell.className = "data-filter-cell";
-                    const lbl = document.createElement("span"); lbl.className = "data-filter-lbl"; lbl.textContent = String(idx);
-                    const inp = document.createElement("input");
-                    inp.type = "text"; inp.className = "data-filter-inp"; inp.placeholder = "—"; inp.maxLength = 4;
-                    const cur = traceFilterData[idx];
-                    if (cur !== null) inp.value = cur.toString(16).toUpperCase().padStart(2, "0");
-                    inp.addEventListener("input", () => {
-                        const val = parseByte(inp.value);
-                        traceFilterData[idx] = val;
-                        inp.classList.toggle("data-filter-invalid", inp.value.trim() !== "" && val === null);
-                        syncFilteredHeaders(); applyTraceFilter();
-                    });
-                    cell.append(lbl, inp); grid.appendChild(cell); inputs.push(inp);
-                }
+                grid.style.maxHeight = "40vh"; grid.style.overflowY = "auto";
+                const buildGrid = () => {
+                    grid.innerHTML = "";
+                    inputs.length = 0;
+                    for (let idx = 0; idx < traceFilterData.length; idx++) {
+                        const cell = document.createElement("div"); cell.className = "data-filter-cell";
+                        const lbl = document.createElement("span"); lbl.className = "data-filter-lbl"; lbl.textContent = String(idx);
+                        const inp = document.createElement("input");
+                        inp.type = "text"; inp.className = "data-filter-inp"; inp.placeholder = "—"; inp.maxLength = 4;
+                        const cur = traceFilterData[idx];
+                        if (cur !== null) inp.value = cur.toString(16).toUpperCase().padStart(2, "0");
+                        inp.addEventListener("input", () => {
+                            const val = parseByte(inp.value);
+                            traceFilterData[idx] = val;
+                            inp.classList.toggle("data-filter-invalid", inp.value.trim() !== "" && val === null);
+                            syncFilteredHeaders(); applyTraceFilter();
+                        });
+                        cell.append(lbl, inp); grid.appendChild(cell); inputs.push(inp);
+                    }
+                };
+                buildGrid();
+                countInp.addEventListener("change", () => {
+                    const n = Math.max(1, Math.min(MAX_DATA_FILTER_BYTES, parseInt(countInp.value) || 8));
+                    countInp.value = String(n);
+                    if (n === traceFilterData.length) return;
+                    // Values at surviving positions are kept; truncated positions
+                    // lose their filter.
+                    traceFilterData = Array.from({ length: n }, (_, i) => traceFilterData[i] ?? null);
+                    buildGrid();
+                    syncFilteredHeaders(); applyTraceFilter(); scheduleAutoSave();
+                });
                 menu.appendChild(grid);
                 const hint = document.createElement("div"); hint.className = "data-filter-hint";
                 hint.textContent = "hex (FF) or decimal (255), empty = any"; menu.appendChild(hint);
@@ -3948,6 +4141,16 @@ function setupTrace() {
         scheduleAutoSave();
     });
 
+    // Long payloads (reassembled J1939 transport messages) get clipped by the
+    // fixed column layout; show the full data as a tooltip, but only when the
+    // text actually overflows. Capture phase so data-tip is set before the
+    // document-level tooltip handler (bubble phase) looks for it.
+    document.getElementById("trace-container")!.addEventListener("mouseover", (e) => {
+        const td = (e.target as HTMLElement).closest<HTMLTableCellElement>('td[data-col="data"]');
+        if (!td) return;
+        if (td.scrollWidth > td.clientWidth) td.dataset.tip = td.textContent ?? "";
+        else delete td.dataset.tip;
+    }, true);
 }
 
 // ── Global pause ─────────────────────────────────────────────────────────────
@@ -4005,7 +4208,7 @@ function resumeFromPause() {
             let count = 0;
             for (const e of traceLocalBuffer) {
                 if (count >= traceMaxRows) break;
-                if (traceRowVisible(e.channelHandle, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName)) {
+                if (traceRowVisible(e.channelHandle, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName, e.j1939)) {
                     frag.appendChild(buildTraceRow(e));
                     count++;
                 }

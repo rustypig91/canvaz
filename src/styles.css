@@ -1003,7 +1003,11 @@ body.col-resizing { cursor: col-resize !important; user-select: none; }
   padding: 3px 7px;
   font-size: 11px;
   font-family: monospace;
-  white-space: nowrap;
+  /* Short tips stay on one line; long ones (full data payloads) wrap instead
+     of running off-screen. */
+  max-width: min(640px, 70vw);
+  white-space: normal;
+  overflow-wrap: break-word;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
 }
 .trace-expand-table .te-enum { color: var(--text); font-style: italic; }

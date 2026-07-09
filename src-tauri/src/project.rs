@@ -100,6 +100,18 @@ pub struct TraceFiltersConfig {
     pub msg_names: Option<Vec<String>>,
     #[serde(default)]
     pub dir: Option<Vec<String>>,
+    /// J1939 column filters; -1 stands for frames without J1939 info.
+    #[serde(default)]
+    pub pgns: Option<Vec<i64>>,
+    #[serde(default)]
+    pub prios: Option<Vec<i64>>,
+    #[serde(default)]
+    pub sas: Option<Vec<i64>>,
+    #[serde(default)]
+    pub das: Option<Vec<i64>>,
+    /// true = broadcast (PDU2) PGNs only, false = destination-specific only.
+    #[serde(default)]
+    pub broadcast: Option<bool>,
     #[serde(default)]
     pub dlc_min: Option<u32>,
     #[serde(default)]
