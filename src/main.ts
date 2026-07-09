@@ -4182,8 +4182,12 @@ async function toggleTracePlot(sigRow: HTMLTableRowElement, handle: number, msgI
                 borderColor: PLOT_COLORS[0],
                 backgroundColor: "transparent",
                 borderWidth: 1.5,
-                pointRadius: 0,
+                // Every sample is marked and the line steps between them — the
+                // inline plot never interpolates.
+                pointRadius: 3,
+                pointBackgroundColor: PLOT_COLORS[0],
                 tension: 0,
+                stepped: "before",
             }],
         },
         options: {
