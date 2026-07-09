@@ -283,6 +283,26 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
     cans
 }
 
+/// Disambiguate duplicate channel names by appending the hardware index.
+/// Multi-channel devices can report the same product string for every channel
+/// (Kvaser's CHANNEL_DATA_NAME does exactly that, e.g. two "Kvaser Virtual CAN
+/// Driver" entries). Channel identity is name-based everywhere above this
+/// point — create_channel resolves the name to a hardware index by position,
+/// and projects persist channels by name — so two identical names silently
+/// collapse onto the first hardware channel and frames then decode against the
+/// wrong channel's DBC.
+fn dedupe_channel_names(names: Vec<String>) -> Vec<String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for n in &names {
+        *counts.entry(n.clone()).or_default() += 1;
+    }
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(i, n)| if counts[&n] > 1 { format!("{n} (ch {i})") } else { n })
+        .collect()
+}
+
 pub struct CanManager {
     app_state: Arc<AppState>,
     shared: Arc<Mutex<ManagerShared>>,
@@ -328,7 +348,7 @@ impl CanManager {
     pub fn list_channels(&self) -> Result<Vec<ChannelInfo>, String> {
         let mut out = Vec::new();
         for (backend_name, can) in &self.cans {
-            for ch in can.list_channels() {
+            for ch in dedupe_channel_names(can.list_channels()) {
                 debug!("Found channel '{ch}' on backend '{backend_name}'");
                 out.push(ChannelInfo {
                     backend: backend_name.clone(),
@@ -344,11 +364,13 @@ impl CanManager {
     /// later by `open_channel`. Calling `create_channel` again for the same
     /// channel returns the existing handle.
     pub fn create_channel(&mut self, backend_name: &str, channel_name: &str) -> Result<u32, String> {
-        let hw_index = self
+        let can = self
             .cans
             .get(backend_name)
-            .ok_or_else(|| format!("No backend '{backend_name}'"))?
-            .list_channels()
+            .ok_or_else(|| format!("No backend '{backend_name}'"))?;
+        // Resolve against the same deduplicated names list_channels() hands out,
+        // so a name identifies exactly one hardware index.
+        let hw_index = dedupe_channel_names(can.list_channels())
             .iter()
             .position(|n| n == channel_name)
             .ok_or_else(|| format!("Channel '{channel_name}' not found in '{backend_name}'"))? as u8;
@@ -881,4 +903,28 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedupe_channel_names;
+
+    fn v(names: &[&str]) -> Vec<String> {
+        names.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn unique_names_pass_through() {
+        assert_eq!(dedupe_channel_names(v(&["can0", "can1"])), v(&["can0", "can1"]));
+    }
+
+    #[test]
+    fn duplicate_names_get_hardware_index() {
+        // Two channels of one device reporting the same product string must map
+        // to distinct names, keyed to their hardware index.
+        assert_eq!(
+            dedupe_channel_names(v(&["Kvaser Leaf", "Kvaser Virtual CAN Driver", "Kvaser Virtual CAN Driver"])),
+            v(&["Kvaser Leaf", "Kvaser Virtual CAN Driver (ch 1)", "Kvaser Virtual CAN Driver (ch 2)"]),
+        );
+    }
 }
