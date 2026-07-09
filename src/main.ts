@@ -334,12 +334,20 @@ function fmtJ1939Addr(addr: number): string {
     return addr.toString(16).toUpperCase().padStart(2, "0") + "h";
 }
 
-// Per-channel PGN → DBC message map for J1939 channels, so frames match their
-// DBC message regardless of the priority/source-address bits in the wire id.
-// Built lazily; invalidated alongside sigKeyCache whenever a DBC is reloaded.
+// Per-channel (PGN, source address) → DBC message map for J1939 channels, so
+// frames match their DBC message regardless of the priority bits (and, for
+// PDU1 groups, the destination address) in the wire id. The source address
+// stays part of the identity — the same PGN from two nodes can be two
+// different DBC messages. Keys are (pgn << 8) | sa. Built lazily; invalidated
+// alongside sigKeyCache whenever a DBC is reloaded.
 const pgnMapCache = new Map<number, Map<number, DbcMessage>>();
 
-// DBC message for a frame: exact id match first, then (on J1939 channels) by PGN.
+function j1939MatchKey(canId: number): number {
+    return (j1939Pgn(canId) << 8) | (canId & 0xFF);
+}
+
+// DBC message for a frame: exact id match first, then (on J1939 channels) by
+// PGN + source address.
 function dbcMessageFor(handle: number, canId: number, isExtended: boolean): DbcMessage | null {
     const ch = channels.get(handle);
     const dbc = ch?.dbc;
@@ -351,11 +359,11 @@ function dbcMessageFor(handle: number, canId: number, isExtended: boolean): DbcM
     if (!map) {
         map = new Map();
         for (const m of Object.values(dbc.messages)) {
-            if (m.id > 0x7FF) map.set(j1939Pgn(m.id), m);
+            if (m.id > 0x7FF) map.set(j1939MatchKey(m.id), m);
         }
         pgnMapCache.set(handle, map);
     }
-    return map.get(j1939Pgn(canId)) ?? null;
+    return map.get(j1939MatchKey(canId)) ?? null;
 }
 
 function formatSigValue(value: number, unit: string): string {
@@ -3402,7 +3410,8 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
     for (const ev of events) {
         // Message identity comes from the frontend's copy of the DBC (the event
         // carries no strings); both sides parsed the same file at open. On J1939
-        // channels the lookup falls back to PGN matching, mirroring the backend.
+        // channels the lookup falls back to PGN + source-address matching,
+        // mirroring the backend.
         const msg = dbcMessageFor(ev.channel_handle, ev.can_id, ev.is_extended);
         const messageName = msg?.name ?? null;
 
