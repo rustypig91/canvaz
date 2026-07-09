@@ -968,11 +968,26 @@ body.col-resizing { cursor: col-resize !important; user-select: none; }
 #trace-table tbody tr.dbc-match { cursor: pointer; }
 #trace-table tbody tr.trace-row-expanded td { background: var(--bg3); }
 .trace-expand-cell { padding: 0 !important; border-bottom: 2px solid var(--accent) !important; }
+/* Signal table on the left, inline signal plot filling the free space right of it. */
+.trace-expand-wrap { display: flex; gap: 16px; align-items: stretch; }
 .trace-expand-table {
   border-collapse: collapse;
   font-size: 12px;
   margin: 6px 16px 8px 32px;
+  flex: 0 0 auto;
 }
+.trace-expand-plot {
+  flex: 1 1 auto;
+  position: relative;
+  min-width: 240px;
+  min-height: 150px;
+  margin: 6px 16px 8px 0;
+}
+/* Absolute so the chart canvas cannot feed back into the flex row's height. */
+.trace-expand-plot canvas { position: absolute; inset: 0; }
+.trace-expand-table tbody tr { cursor: pointer; }
+.trace-expand-table tbody tr:hover td { background: rgba(255, 255, 255, 0.05); }
+.trace-expand-table tbody tr.te-plotted .te-name { color: var(--accent); font-weight: 600; }
 .trace-expand-table thead th {
   text-align: left;
   padding: 0 16px 4px 0;
