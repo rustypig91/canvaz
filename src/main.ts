@@ -4062,25 +4062,25 @@ function setupTraceHeaders() {
 
 // ── Inline trace plots ────────────────────────────────────────────────────────
 // Clicking a signal row inside a trace row expansion opens a live plot of that
-// signal in the free space to the right of the expansion's signal table. One
-// plot per expansion; clicking another signal switches it, clicking the same
-// signal again closes it.
+// signal in a fixed-height row inserted directly under it. Each signal of a
+// message can have its own plot open at the same time; clicking the signal
+// again closes it. The charts scroll continuously (requestAnimationFrame),
+// like the panes in the plot tab.
 
 interface TracePlot {
     chart: Chart;
     sigKey: string;
-    signalName: string;
     data: { x: number; y: number }[];
     lastTs: number;
-    /// Highlighted signal row inside the expansion's signal table.
-    row: HTMLTableRowElement;
+    /// Highlighted signal row the plot sits under.
+    sigRow: HTMLTableRowElement;
 }
 
-// Keyed by the expansion <tr> the plot lives in.
+// Keyed by the plot's own <tr> inside the expansion's signal table.
 const tracePlots = new Map<HTMLTableRowElement, TracePlot>();
 // Membership test used in the hot per-frame decode loop.
 let tracePlotSigKeys = new Set<string>();
-let tracePlotTimer: number | null = null;
+let tracePlotRaf: number | null = null;
 
 function rebuildTracePlotKeys() {
     tracePlotSigKeys = new Set([...tracePlots.values()].map(tp => tp.sigKey));
@@ -4094,17 +4094,13 @@ function pushTracePlotPoint(sigKey: string, tsMs: number, x: number, value: numb
     }
 }
 
-function destroyTracePlot(expandTr: HTMLTableRowElement) {
-    const tp = tracePlots.get(expandTr);
+function destroyTracePlot(plotTr: HTMLTableRowElement) {
+    const tp = tracePlots.get(plotTr);
     if (!tp) return;
     tp.chart.destroy();
-    tp.row.classList.remove("te-plotted");
-    tracePlots.delete(expandTr);
-    const container = expandTr.querySelector<HTMLElement>(".trace-expand-plot");
-    if (container) {
-        container.hidden = true;
-        container.innerHTML = "";
-    }
+    tp.sigRow.classList.remove("te-plotted");
+    tracePlots.delete(plotTr);
+    plotTr.remove();
     rebuildTracePlotKeys();
 }
 
@@ -4114,30 +4110,28 @@ function destroyAllTracePlots() {
     rebuildTracePlotKeys();
 }
 
-// Scroll the x window and redraw all inline plots. Also garbage-collects plots
-// whose expansion row left the DOM through a path without an explicit destroy
-// (row eviction, bulk table rebuilds).
-function updateTracePlots() {
+// Continuous scroll loop for the inline plots, mirroring the plot tab: advance
+// the x window by wall time every animation frame and redraw. Also
+// garbage-collects plots whose row left the DOM through a path without an
+// explicit destroy (row eviction, bulk table rebuilds).
+function tracePlotTick() {
     if (tracePlots.size === 0) {
-        if (tracePlotTimer !== null) {
-            clearInterval(tracePlotTimer);
-            tracePlotTimer = null;
-        }
+        tracePlotRaf = null;
         return;
     }
     const now = (Date.now() - appStartTime) / 1000;
     const cutoffX = now - windowSizeSec;
     let removed = false;
-    for (const [expandTr, tp] of tracePlots) {
-        if (!expandTr.isConnected) {
+    for (const [plotTr, tp] of tracePlots) {
+        if (!plotTr.isConnected) {
             tp.chart.destroy();
-            tracePlots.delete(expandTr);
+            tracePlots.delete(plotTr);
             removed = true;
             continue;
         }
-        // Frozen (pause) or hidden (other tab): data keeps accumulating, the
-        // chart catches up on the next visible tick.
-        if (viewPaused || !traceTabActive) continue;
+        // Stopped, frozen (pause) or hidden (other tab): no scrolling; data
+        // keeps accumulating and the chart catches up when visible again.
+        if (!appRunning || viewPaused || !traceTabActive) continue;
         while (tp.data.length > 0 && tp.data[0].x < cutoffX) tp.data.shift();
         const xs = (tp.chart.options.scales as any)["x"];
         xs.min = Math.max(0, now - windowSizeSec);
@@ -4145,32 +4139,39 @@ function updateTracePlots() {
         tp.chart.update("none");
     }
     if (removed) rebuildTracePlotKeys();
+    tracePlotRaf = requestAnimationFrame(tracePlotTick);
 }
 
-function ensureTracePlotTicker() {
-    if (tracePlotTimer === null) tracePlotTimer = window.setInterval(updateTracePlots, 250);
+function startTracePlotLoop() {
+    if (tracePlotRaf === null) tracePlotRaf = requestAnimationFrame(tracePlotTick);
 }
 
-async function toggleTracePlot(
-    expandTr: HTMLTableRowElement,
-    sigRow: HTMLTableRowElement,
-    handle: number,
-    msgId: number,
-    sig: DbcSignal,
-) {
-    const existing = tracePlots.get(expandTr);
-    if (existing) {
-        const same = existing.signalName === sig.name;
-        destroyTracePlot(expandTr);
-        if (same) return; // toggle off
+async function toggleTracePlot(sigRow: HTMLTableRowElement, handle: number, msgId: number, sig: DbcSignal) {
+    // A plot row directly under the signal row means it's open: toggle off.
+    const next = sigRow.nextElementSibling as HTMLTableRowElement | null;
+    if (next?.dataset.sigplot) {
+        destroyTracePlot(next);
+        return;
     }
 
-    const container = expandTr.querySelector<HTMLElement>(".trace-expand-plot");
-    if (!container) return;
-    container.hidden = false;
-    container.innerHTML = "";
+    // Full-width, fixed-height plot row under the clicked signal. The cell
+    // content is a zero-width anchor so the plot (absolutely positioned,
+    // extending right past the signal table) can't stretch the table columns.
+    const plotTr = document.createElement("tr");
+    plotTr.dataset.sigplot = "1";
+    const td = document.createElement("td");
+    td.colSpan = sigRow.cells.length;
+    td.className = "te-plot-cell";
+    const anchor = document.createElement("div");
+    anchor.className = "te-plot-anchor";
+    const container = document.createElement("div");
+    container.className = "te-plot";
     const canvas = document.createElement("canvas");
     container.appendChild(canvas);
+    anchor.appendChild(container);
+    td.appendChild(anchor);
+    plotTr.appendChild(td);
+    sigRow.after(plotTr);
 
     const sigKey = plotKey(handle, msgId, sig.name);
     const data: { x: number; y: number }[] = [];
@@ -4216,10 +4217,10 @@ async function toggleTracePlot(
     } as any);
 
     sigRow.classList.add("te-plotted");
-    const tp: TracePlot = { chart, sigKey, signalName: sig.name, data, lastTs: 0, row: sigRow };
-    tracePlots.set(expandTr, tp);
+    const tp: TracePlot = { chart, sigKey, data, lastTs: 0, sigRow };
+    tracePlots.set(plotTr, tp);
     rebuildTracePlotKeys();
-    ensureTracePlotTicker();
+    startTracePlotLoop();
 
     // Seed with buffered history. Live points arriving while we await are
     // appended by onCanFrameBatch and are newer than anything returned here.
@@ -4227,7 +4228,7 @@ async function toggleTracePlot(
         const history = await invoke<Array<{ timestamp_ms: number; value: number }>>(
             "get_signal_history", { handle, messageId: msgId, signalName: sig.name, sinceMs: 0 },
         );
-        if (tracePlots.get(expandTr) !== tp) return; // closed/replaced while awaiting
+        if (tracePlots.get(plotTr) !== tp) return; // closed while awaiting
         const liveStart = tp.data[0]?.x ?? Infinity;
         const older = history
             .map(s => ({ ts: s.timestamp_ms, x: (s.timestamp_ms - appStartTime) / 1000, y: s.value }))
@@ -4264,7 +4265,7 @@ function expandTraceRow(tr: HTMLTableRowElement) {
     td.className = "trace-expand-cell";
 
     const hasEnums = msg.signals.some((s: DbcSignal) => (s.enum_values ?? []).length > 0);
-    let html = '<div class="trace-expand-wrap"><table class="trace-expand-table"><thead><tr>'
+    let html = '<table class="trace-expand-table"><thead><tr>'
         + '<th>Signal</th><th>Value</th><th>Min</th><th>Max</th><th>Unit</th>'
         + (hasEnums ? '<th>Name</th>' : '')
         + '</tr></thead><tbody>';
@@ -4287,7 +4288,7 @@ function expandTraceRow(tr: HTMLTableRowElement) {
             + (hasEnums ? `<td class="te-enum">${hasVal ? (enumLabelForRaw(sig, vals[2 * i + 1]) || "—") : "—"}</td>` : "")
             + `</tr>`;
     }
-    html += '</tbody></table><div class="trace-expand-plot" hidden></div></div>';
+    html += '</tbody></table>';
     td.innerHTML = html;
     expandTr.appendChild(td);
     tr.after(expandTr);
@@ -4295,7 +4296,10 @@ function expandTraceRow(tr: HTMLTableRowElement) {
 }
 
 function collapseTraceRow(tr: HTMLTableRowElement, expandTr: HTMLTableRowElement) {
-    destroyTracePlot(expandTr);
+    // Destroy any inline signal plots living inside this expansion.
+    for (const plotTr of [...tracePlots.keys()]) {
+        if (expandTr.contains(plotTr)) destroyTracePlot(plotTr);
+    }
     expandTr.remove();
     tr.classList.remove("trace-row-expanded");
 }
@@ -4387,7 +4391,7 @@ function setupTrace() {
                 const msgId = parseInt(expandTr.dataset.msgid ?? "0");
                 const sig = channels.get(handle)?.dbc?.messages[msgId]?.signals
                     .find((s: DbcSignal) => s.name === sigRow.dataset.sig);
-                if (sig) toggleTracePlot(expandTr, sigRow, handle, msgId, sig);
+                if (sig) toggleTracePlot(sigRow, handle, msgId, sig);
             }
             return;
         }

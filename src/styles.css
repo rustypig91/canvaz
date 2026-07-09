@@ -966,31 +966,26 @@ body.col-resizing { cursor: col-resize !important; user-select: none; }
 /* Expanded rows and their expansion cell are excluded: once a message is
    opened, hovering it (or the signal table / plot area) should not repaint the
    whole block. The signal rows inside the expansion keep their own hover. */
-#trace-table tbody tr:not(.trace-row-expanded):not([data-expand]):hover td { background: var(--bg3); }
+#trace-table tbody tr:not(.trace-row-expanded):not([data-expand]):not([data-sigplot]):hover td { background: var(--bg3); }
 #trace-table tbody tr.dbc-match td:nth-child(5) { color: var(--accent); }
 #trace-table tbody tr.dbc-match { cursor: pointer; }
 #trace-table tbody tr.trace-row-expanded td { background: var(--bg3); }
 .trace-expand-cell { padding: 0 !important; border-bottom: 2px solid var(--accent) !important; }
-/* Signal table on the left, inline signal plot filling the free space right of it. */
-.trace-expand-wrap { display: flex; gap: 16px; align-items: stretch; }
 .trace-expand-table {
   border-collapse: collapse;
   font-size: 12px;
   margin: 6px 16px 8px 32px;
-  flex: 0 0 auto;
 }
-.trace-expand-plot {
-  flex: 1 1 auto;
-  position: relative;
-  min-width: 240px;
-  min-height: 150px;
-  margin: 6px 16px 8px 0;
-}
-/* Absolute so the chart canvas cannot feed back into the flex row's height. */
-.trace-expand-plot canvas { position: absolute; inset: 0; }
-.trace-expand-table tbody tr { cursor: pointer; }
-.trace-expand-table tbody tr:hover td { background: rgba(255, 255, 255, 0.05); }
+.trace-expand-table tbody tr:not([data-sigplot]) { cursor: pointer; }
+.trace-expand-table tbody tr:not([data-sigplot]):hover td { background: rgba(255, 255, 255, 0.05); }
 .trace-expand-table tbody tr.te-plotted .te-name { color: var(--accent); font-weight: 600; }
+/* Inline signal plot: a fixed-height row under the clicked signal. The cell
+   holds a zero-width anchor and the plot is absolutely positioned from it, so
+   its width extends past the signal table without stretching the columns.
+   overflow must be forced visible against the global "#trace-table td" clip. */
+#trace-table .trace-expand-table td.te-plot-cell { padding: 0; overflow: visible; }
+.te-plot-anchor { position: relative; width: 0; height: 172px; overflow: visible; }
+.te-plot { position: absolute; left: 0; top: 6px; width: min(680px, 55vw); height: 160px; }
 .trace-expand-table thead th {
   text-align: left;
   padding: 0 16px 4px 0;
