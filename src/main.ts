@@ -72,6 +72,7 @@ interface FrameInfo {
     timestamp_ms: number;
     direction: "rx" | "tx";
     message_name: string | null;
+    j1939?: J1939Info | null;
     signals: FrameSignal[];
 }
 
@@ -83,16 +84,20 @@ interface CanFrameEvent {
     data: number[];
     timestamp_ms: number;
     direction: "rx" | "tx";
+    // J1939 breakdown of the identifier; only present on J1939 channels.
+    j1939?: J1939Info | null;
     // Decoded signals as interleaved [value, raw, value, raw, …] pairs in DBC
     // message signal order. Names/units/message name are derived from the DBC by
     // position — no strings on the per-frame wire (they dominated GC churn).
     signals: number[];
 }
 
+interface J1939Info { pgn: number; priority: number; sa: number; da: number; }
+
 interface PlotSignalEntry { signal_name: string; channel: string; message_id?: number; }
 interface PlotPaneConfig { signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean; }
 interface ChannelInfo { backend: string; name: string; }
-interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate: number | null; }
+interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate: number | null; protocol: string | null; }
 // Everything the app tracks about one channel, keyed by its u32 handle in `channels`.
 interface Channel {
     info: ChannelInfo;       // backend + hardware name (immutable identity)
@@ -296,6 +301,40 @@ function sigKeysFor(handle: number, msg: DbcMessage): string[] {
         byMsg.set(msg.id, keys);
     }
     return keys;
+}
+
+// ── J1939 helpers ─────────────────────────────────────────────────────────────
+
+// 18-bit PGN of a 29-bit identifier (EDP/DP included; PS folded in for PDU2).
+function j1939Pgn(canId: number): number {
+    const pf = (canId >> 16) & 0xFF;
+    let pgn = (canId >> 8) & 0x3ff00;
+    if (pf >= 240) pgn |= (canId >> 8) & 0xFF;
+    return pgn;
+}
+
+// Per-channel PGN → DBC message map for J1939 channels, so frames match their
+// DBC message regardless of the priority/source-address bits in the wire id.
+// Built lazily; invalidated alongside sigKeyCache whenever a DBC is reloaded.
+const pgnMapCache = new Map<number, Map<number, DbcMessage>>();
+
+// DBC message for a frame: exact id match first, then (on J1939 channels) by PGN.
+function dbcMessageFor(handle: number, canId: number, isExtended: boolean): DbcMessage | null {
+    const ch = channels.get(handle);
+    const dbc = ch?.dbc;
+    if (!dbc) return null;
+    const exact = dbc.messages[canId];
+    if (exact) return exact;
+    if (ch!.config.protocol !== "j1939" || !isExtended) return null;
+    let map = pgnMapCache.get(handle);
+    if (!map) {
+        map = new Map();
+        for (const m of Object.values(dbc.messages)) {
+            if (m.id > 0x7FF) map.set(j1939Pgn(m.id), m);
+        }
+        pgnMapCache.set(handle, map);
+    }
+    return map.get(j1939Pgn(canId)) ?? null;
 }
 
 function formatSigValue(value: number, unit: string): string {
@@ -1065,6 +1104,14 @@ function getBitrateFromDialog(): number | null {
     return parseInt(sel);
 }
 
+function getProtocolFromDialog(): string | null {
+    return (document.getElementById("select-protocol") as HTMLSelectElement).value || null;
+}
+
+function setProtocolInDialog(protocol: string | null) {
+    (document.getElementById("select-protocol") as HTMLSelectElement).value = protocol ?? "";
+}
+
 function setBitrateInDialog(bitrate: number | null, isVcan: boolean) {
     const sel = document.getElementById("select-bitrate") as HTMLSelectElement;
     const custom = document.getElementById("input-bitrate-custom") as HTMLInputElement;
@@ -1103,6 +1150,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         dialogPendingDbc = null;
         setDbcLabel(null);
         setBitrateInDialog(500000, false);
+        setProtocolInDialog(null);
         const ifaces = await invoke<ChannelInfo[]>("list_can_interfaces").catch(() => [] as ChannelInfo[]);
         availableIfaces = ifaces;
 
@@ -1139,6 +1187,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         dialogPendingDbc = ch?.config.dbc_path ?? null;
         setDbcLabel(dialogPendingDbc);
         setBitrateInDialog(ch?.config.bitrate ?? null, displayName.startsWith("vcan"));
+        setProtocolInDialog(ch?.config.protocol ?? null);
         selectChannel(handle!);
     }
 
@@ -1182,6 +1231,7 @@ async function loadChannelDbc(handle: number): Promise<void> {
     const ch = channels.get(handle);
     if (!ch) return;
     sigKeyCache.delete(handle); // key tables are derived from the DBC being replaced
+    pgnMapCache.delete(handle);
     if (!ch.config.dbc_path) { ch.dbc = null; return; }
     try {
         ch.dbc = await invoke<ParsedDbc>("parse_dbc", { path: ch.config.dbc_path });
@@ -1204,9 +1254,11 @@ async function openChannelByHandle(handle: number): Promise<boolean> {
             channelHandle: handle,
             bitrate: ch.config.bitrate ?? 500000,
             dbcPath: ch.config.dbc_path ?? null,
+            protocol: ch.config.protocol ?? null,
         });
         ch.dbc = dbc ?? null;
         sigKeyCache.delete(handle); // key tables are derived from the DBC just replaced
+        pgnMapCache.delete(handle);
         ch.open = true;
         return true;
     } catch (e) {
@@ -1223,6 +1275,7 @@ async function openChannelByHandle(handle: number): Promise<boolean> {
 async function applyChannelDialog() {
     const dialog = document.getElementById("dialog-channel") as HTMLDialogElement;
     const bitrate = getBitrateFromDialog();
+    const protocol = getProtocolFromDialog();
 
     if (dialogMode === "add") {
         const custom = (document.getElementById("input-iface-custom") as HTMLInputElement).value.trim();
@@ -1245,13 +1298,14 @@ async function applyChannelDialog() {
 
         channels.set(handle, {
             info: { backend, name },
-            config: { name, backend, dbc_path: dialogPendingDbc, bitrate },
+            config: { name, backend, dbc_path: dialogPendingDbc, bitrate, protocol },
             dbc: null,
             open: false,
         });
         await loadChannelDbc(handle);
 
         refreshChannelList();
+        rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === handle) renderDbcTree();
         setStatus(`Added channel: ${name}`);
         scheduleAutoSave();
@@ -1265,10 +1319,12 @@ async function applyChannelDialog() {
         if (ch) {
             ch.config.dbc_path = dialogPendingDbc;
             ch.config.bitrate = bitrate;
+            ch.config.protocol = protocol;
             await loadChannelDbc(h);
         }
 
         refreshChannelList();
+        rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === h) renderDbcTree();
         setStatus(`Updated channel: ${name}`);
         scheduleAutoSave();
@@ -1500,6 +1556,7 @@ async function renderChannelList() {
         const backend = ch.info.backend;
         const isSelected = h === selectedChannel;
         const bitrateLabel = name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
+        const protoLabel = ch.config.protocol === "j1939" ? " · J1939" : "";
         const item = document.createElement("div");
         item.className = `channel-item${isSelected ? " selected" : ""}`;
         item.dataset.channelHandle = String(h);
@@ -1507,7 +1564,7 @@ async function renderChannelList() {
       <span class="dot${ch.open ? "" : " closed"}"></span>
       <span class="ch-name" title="${name}">${name}<span class="ch-backend label-muted"> ${backend}</span></span>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
-      <span class="ch-baud label-muted">${bitrateLabel}</span>
+      <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}</span>
       <button class="btn-close-ch" title="Remove channel">×</button>
     `;
         item.addEventListener("click", (e) => {
@@ -1529,6 +1586,7 @@ async function renderChannelList() {
                         channels.delete(h);
                         if (selectedChannel === h) selectChannel(null);
                         renderChannelList();
+                        rebuildTraceColumns();
                         scheduleAutoSave();
                     }
                 },
@@ -1548,6 +1606,7 @@ async function renderChannelList() {
             if (selectedChannel === h) selectChannel(null);
 
             renderChannelList();
+            rebuildTraceColumns();
             scheduleAutoSave();
         });
         list.appendChild(item);
@@ -1558,19 +1617,21 @@ async function renderChannelList() {
         const dbcPath = config.dbc_path;
         const bitrate = config.bitrate;
         const bitrateLabel = config.name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
+        const protoLabel = config.protocol === "j1939" ? " · J1939" : "";
         const item = document.createElement("div");
         item.className = "channel-item";
         item.innerHTML = `
       <span class="dot error" title="${error}"></span>
       <span class="ch-name" title="${config.name}">${config.name}<span class="ch-backend label-muted"> ${config.backend}</span></span>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
-      <span class="ch-baud label-muted">${bitrateLabel}</span>
+      <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}</span>
       <button class="btn-close-ch" title="Remove channel">×</button>
     `;
         item.querySelector(".btn-close-ch")!.addEventListener("click", (e) => {
             e.stopPropagation();
             ghostChannels.splice(ghostChannels.indexOf(ghost), 1);
             renderChannelList();
+            rebuildTraceColumns();
             scheduleAutoSave();
         });
         list.appendChild(item);
@@ -1979,12 +2040,14 @@ function buildProject(): Project {
                 backend: ch.info.backend,
                 dbc_path: ch.config.dbc_path,
                 bitrate: ch.config.bitrate,
+                protocol: ch.config.protocol,
             })),
             ...ghostChannels.map(g => ({
                 name: g.config.name,
                 backend: g.config.backend,
                 dbc_path: g.config.dbc_path,
                 bitrate: g.config.bitrate,
+                protocol: g.config.protocol,
             })),
         ],
         plot_panes: plotPanes.map(pane => ({
@@ -2062,6 +2125,7 @@ async function newProject() {
     sessionFilePath = null;
     updateWindowTitle();
     refreshChannelList();
+    rebuildTraceColumns();
     renderDbcTree();
     setStatus("New project");
 }
@@ -2119,7 +2183,7 @@ async function applyProject(project: Project) {
     for (const ch of project.channels) {
         const backend = ch.backend ?? "socketcan";
         const bitrate = ch.bitrate ?? null;
-        const config: ChannelConfig = { name: ch.name, backend, dbc_path: ch.dbc_path ?? null, bitrate };
+        const config: ChannelConfig = { name: ch.name, backend, dbc_path: ch.dbc_path ?? null, bitrate, protocol: ch.protocol ?? null };
         let handle: number | null = null;
         let errMsg = "";
         try {
@@ -2138,6 +2202,7 @@ async function applyProject(project: Project) {
 
     refreshChannelList();
     renderDbcTree();
+    rebuildTraceColumns(); // J1939 columns follow the loaded channels' protocols
 
     // Remove existing panes and create blank placeholders with correct settings.
     // Signals are added after startApp opens channels and the DBC is available.
@@ -2311,7 +2376,7 @@ async function startApp() {
             if (name !== "" && !validNames.has(name)) traceFilterMsgNames.delete(name);
         }
         if (traceFilterMsgNames.size === 0) traceFilterMsgNames = null;
-        traceHeaderEls[4]?.classList.toggle("th-filtered", traceFilterMsgNames !== null);
+        syncFilteredHeaders();
     }
 
     appRunning = true;
@@ -2896,6 +2961,7 @@ interface TraceEntry {
     timestampMs: number;
     cycleTimeMs: number | null;
     direction: "rx" | "tx";
+    j1939: J1939Info | null;
     // Interleaved [value, raw] pairs in DBC message signal order (see CanFrameEvent).
     signals: number[];
 }
@@ -2919,11 +2985,31 @@ const TRACE_COL_DEFS: TraceColDef[] = [
     { key: "dir", label: "Dir", defaultWidth: 56 },
     { key: "channel", label: "Channel", defaultWidth: 80 },
     { key: "canId", label: "CAN ID", defaultWidth: 90 },
+    { key: "pgn", label: "PGN", defaultWidth: 70 },
+    { key: "prio", label: "Prio", defaultWidth: 48 },
+    { key: "sa", label: "Src", defaultWidth: 52 },
+    { key: "da", label: "Dst", defaultWidth: 52 },
     { key: "msg", label: "Message", defaultWidth: 160 },
     { key: "dlc", label: "DLC", defaultWidth: 56 },
     { key: "data", label: "Data", defaultWidth: 0 },
     { key: "cycle", label: "Cycle (ms)", defaultWidth: 90 },
 ];
+// Columns that only carry data on J1939 channels; they exist in the table
+// (order, widths, hidden state all persist) but are only rendered while at
+// least one configured channel uses the J1939 protocol.
+const J1939_COL_KEYS = new Set(["pgn", "prio", "sa", "da"]);
+
+function anyJ1939Channel(): boolean {
+    for (const ch of channels.values()) if (ch.config.protocol === "j1939") return true;
+    return ghostChannels.some(g => g.config.protocol === "j1939");
+}
+
+// Trace columns to render, in order: user-hidden columns are dropped, and the
+// J1939 columns only appear when a J1939 channel is configured.
+function visibleTraceCols(): string[] {
+    const j1939 = anyJ1939Channel();
+    return traceColOrder.filter(k => !traceColHidden.has(k) && (j1939 || !J1939_COL_KEYS.has(k)));
+}
 let traceColOrder: string[] = TRACE_COL_DEFS.map(d => d.key);
 let traceColHidden = new Set<string>();
 let traceColWidths: Record<string, number> = {};
@@ -2948,7 +3034,7 @@ let traceFilterCycleMax: number | null = null;
 let traceFilterDlcMin: number | null = null;
 let traceFilterDlcMax: number | null = null;
 let traceFilterDir: Set<string> | null = null;
-type TraceSortCol = "ts" | "dir" | "channel" | "canId" | "msg" | "dlc" | "data" | "cycle" | null;
+type TraceSortCol = "ts" | "dir" | "channel" | "canId" | "pgn" | "prio" | "sa" | "da" | "msg" | "dlc" | "data" | "cycle" | null;
 let traceSortCol: TraceSortCol = null;
 let traceSortDir: "asc" | "desc" = "asc";
 let traceLocalBuffer: TraceEntry[] = [];
@@ -3058,6 +3144,10 @@ function applyTraceSort() {
             case "dir": cmp = (a.dataset.dir ?? "").localeCompare(b.dataset.dir ?? ""); break;
             case "channel": cmp = channelName(parseInt(a.dataset.channelHandle ?? "0")).localeCompare(channelName(parseInt(b.dataset.channelHandle ?? "0"))); break;
             case "canId": cmp = parseInt(a.dataset.canid ?? "0") - parseInt(b.dataset.canid ?? "0"); break;
+            case "pgn": cmp = parseInt(a.dataset.pgn ?? "-1") - parseInt(b.dataset.pgn ?? "-1"); break;
+            case "prio": cmp = parseInt(a.dataset.prio ?? "-1") - parseInt(b.dataset.prio ?? "-1"); break;
+            case "sa": cmp = parseInt(a.dataset.sa ?? "-1") - parseInt(b.dataset.sa ?? "-1"); break;
+            case "da": cmp = parseInt(a.dataset.da ?? "-1") - parseInt(b.dataset.da ?? "-1"); break;
             case "msg": cmp = (a.dataset.msg ?? "").localeCompare(b.dataset.msg ?? ""); break;
             case "dlc": cmp = parseInt(a.dataset.dlc ?? "0") - parseInt(b.dataset.dlc ?? "0"); break;
             case "data": {
@@ -3086,7 +3176,12 @@ function applyTraceSort() {
 
 function buildTraceCellHtml(key: string, entry: TraceEntry): string {
     const dirClass = entry.direction === "tx" ? "dir-tx" : "dir-rx";
+    const j = entry.j1939;
     switch (key) {
+        case "pgn": return `<td data-col="pgn" class="td-canid"${j ? ` title="PGN ${j.pgn} (0x${j.pgn.toString(16).toUpperCase()})"` : ""}>${j ? j.pgn.toString(16).toUpperCase().padStart(4, "0") + "h" : "—"}</td>`;
+        case "prio": return `<td data-col="prio" style="text-align:center">${j ? j.priority : "—"}</td>`;
+        case "sa": return `<td data-col="sa" class="td-canid">${j ? j.sa.toString(16).toUpperCase().padStart(2, "0") + "h" : "—"}</td>`;
+        case "da": return `<td data-col="da" class="td-canid">${j ? (j.da === 0xFF ? "All" : j.da.toString(16).toUpperCase().padStart(2, "0") + "h") : "—"}</td>`;
         case "ts": return `<td data-col="ts" class="td-ts">${fmtElapsed(entry.timestampMs)}</td>`;
         case "dir": return `<td data-col="dir"><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>`;
         case "channel": return `<td data-col="channel">${channelName(entry.channelHandle)}</td>`;
@@ -3110,6 +3205,14 @@ function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
         messageName: tr.dataset.msg || null,
         dlc: parseInt(tr.dataset.dlc ?? "0"),
         cycleTimeMs: tr.dataset.cycle ? parseFloat(tr.dataset.cycle) : null,
+        j1939: tr.dataset.pgn
+            ? {
+                pgn: parseInt(tr.dataset.pgn),
+                priority: parseInt(tr.dataset.prio ?? "0"),
+                sa: parseInt(tr.dataset.sa ?? "0"),
+                da: parseInt(tr.dataset.da ?? "255"),
+            }
+            : null,
         signals: traceRowSignals.get(tr) ?? [],
     };
 }
@@ -3126,10 +3229,15 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
     tr.dataset.msg = entry.messageName ?? "";
     tr.dataset.dlc = String(entry.dlc);
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
+    if (entry.j1939) {
+        tr.dataset.pgn = String(entry.j1939.pgn);
+        tr.dataset.prio = String(entry.j1939.priority);
+        tr.dataset.sa = String(entry.j1939.sa);
+        tr.dataset.da = String(entry.j1939.da);
+    }
     if (entry.messageName) tr.classList.add("dbc-match");
     if (!traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) tr.style.display = "none";
-    const visible = traceColOrder.filter(k => !traceColHidden.has(k));
-    tr.innerHTML = visible.map(k => buildTraceCellHtml(k, entry)).join("");
+    tr.innerHTML = visibleTraceCols().map(k => buildTraceCellHtml(k, entry)).join("");
     return tr;
 }
 
@@ -3149,7 +3257,7 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     // Refresh open expansion row with updated signal values + current min/max
     const next = tr.nextElementSibling as HTMLTableRowElement | null;
     if (next?.dataset.expand) {
-        const msg = channels.get(entry.channelHandle)?.dbc?.messages[entry.canId];
+        const msg = dbcMessageFor(entry.channelHandle, entry.canId, entry.isExtended);
         if (msg) {
             const vals = entry.signals; // interleaved [value, raw], index-aligned with msg.signals
             const valCells = next.querySelectorAll<HTMLElement>(".te-val");
@@ -3162,7 +3270,9 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
                     valCells[i].textContent = hasVal ? formatSigValue(vals[2 * i], "") : "—";
                     if (hasVal) valCells[i].dataset.tip = `Raw: ${vals[2 * i + 1]}`;
                 }
-                const key = plotKey(entry.channelHandle, entry.canId, sig.name);
+                // Keyed by the DBC message id (not the wire id): J1939 frames from
+                // different senders share the same signal series.
+                const key = plotKey(entry.channelHandle, msg.id, sig.name);
                 const mn = signalMinValues.get(key);
                 const mx = signalMaxValues.get(key);
                 if (minCells[i]) {
@@ -3191,8 +3301,9 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
 
     for (const ev of events) {
         // Message identity comes from the frontend's copy of the DBC (the event
-        // carries no strings); both sides parsed the same file at open.
-        const msg = channels.get(ev.channel_handle)?.dbc?.messages[ev.can_id] ?? null;
+        // carries no strings); both sides parsed the same file at open. On J1939
+        // channels the lookup falls back to PGN matching, mirroring the backend.
+        const msg = dbcMessageFor(ev.channel_handle, ev.can_id, ev.is_extended);
         const messageName = msg?.name ?? null;
 
         // Update seen sets (for filter autocomplete) and cycle timing.
@@ -3248,6 +3359,7 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
             timestampMs: ev.timestamp_ms,
             cycleTimeMs: cycleTime,
             direction,
+            j1939: ev.j1939 ?? null,
             signals: ev.signals,
         };
 
@@ -3332,6 +3444,7 @@ async function loadTraceFrames() {
             timestampMs: f.timestamp_ms,
             cycleTimeMs,
             direction: f.direction,
+            j1939: f.j1939 ?? null,
             // get_frames returns named signals; flatten to the interleaved
             // [value, raw] layout used everywhere else (same DBC order).
             signals: f.signals.flatMap(s => [s.value, s.raw]),
@@ -3437,7 +3550,7 @@ function hideColDropIndicator() {
 }
 
 function rebuildTraceColumns() {
-    const visible = traceColOrder.filter(k => !traceColHidden.has(k));
+    const visible = visibleTraceCols();
 
     const colgroup = document.querySelector("#trace-table colgroup")!;
     colgroup.innerHTML = visible.map(k => {
@@ -3686,7 +3799,9 @@ function setupTrace() {
         menu.style.left = `${rect.left}px`;
         menu.style.top = `${rect.bottom + 4}px`;
         menu.addEventListener("click", ev => ev.stopPropagation());
+        const showJ1939 = anyJ1939Channel();
         for (const def of TRACE_COL_DEFS) {
+            if (!showJ1939 && J1939_COL_KEYS.has(def.key)) continue;
             const item = document.createElement("label");
             item.className = "ctx-col-item";
             const cb = document.createElement("input");
@@ -3735,7 +3850,7 @@ function setupTrace() {
 
         const trHandle = parseInt(tr.dataset.channelHandle ?? "0");
         const canId = parseInt(tr.dataset.canid ?? "0");
-        const msg = channels.get(trHandle)?.dbc?.messages[canId];
+        const msg = dbcMessageFor(trHandle, canId, tr.dataset.ext === "1");
         if (!msg) return;
         // Interleaved [value, raw] pairs, index-aligned with msg.signals.
         const vals = traceRowSignals.get(tr) ?? [];
@@ -3743,7 +3858,7 @@ function setupTrace() {
         const expandTr = document.createElement("tr");
         expandTr.dataset.expand = "1";
         const td = document.createElement("td");
-        td.colSpan = traceColOrder.filter(k => !traceColHidden.has(k)).length;
+        td.colSpan = visibleTraceCols().length;
         td.className = "trace-expand-cell";
 
         const hasEnums = msg.signals.some((s: DbcSignal) => (s.enum_values ?? []).length > 0);
@@ -3754,7 +3869,9 @@ function setupTrace() {
         for (let i = 0; i < msg.signals.length; i++) {
             const sig = msg.signals[i];
             const hasVal = 2 * i + 1 < vals.length;
-            const key = plotKey(trHandle, canId, sig.name);
+            // DBC message id, not the wire id — matches the keys written by
+            // onCanFrameBatch (J1939 wire ids embed the sender's address).
+            const key = plotKey(trHandle, msg.id, sig.name);
             const mn = signalMinValues.get(key);
             const mx = signalMaxValues.get(key);
             const fmt = (v: number | undefined) => v !== undefined ? formatSigValue(v, "") : "—";

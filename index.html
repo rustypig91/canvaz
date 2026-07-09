@@ -182,6 +182,14 @@
         </div>
 
         <div class="form-row">
+          <label>Protocol</label>
+          <select id="select-protocol">
+            <option value="" selected>None (raw CAN)</option>
+            <option value="j1939">SAE J1939</option>
+          </select>
+        </div>
+
+        <div class="form-row">
           <label>DBC File</label>
           <span id="lbl-dbc-path" class="label-muted dbc-path-label">None</span>
           <button type="button" id="btn-browse-dbc" class="btn btn-sm">Browse…</button>

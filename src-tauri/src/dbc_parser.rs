@@ -10,6 +10,11 @@ pub struct ParsedDbc {
     pub path: String,
     /// Keyed by CAN id. Serializes to a JSON object; the frontend treats it as a map.
     pub messages: HashMap<u32, ParsedMessage>,
+    /// J1939 PGN → key into `messages`, for PGN-based matching on J1939 channels
+    /// (the frame's priority/source-address bits vary while the DBC lists one
+    /// fixed 29-bit id per message). Rebuilt on load, never serialized.
+    #[serde(skip)]
+    pgn_index: HashMap<u32, u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,16 +74,21 @@ impl ParsedMessage {
         if frame.can_id != self.id {
             return Err(format!("Frame CAN ID {} does not match message ID {}", frame.can_id, self.id));
         }
+        Ok(self.decode_data(&frame.data))
+    }
 
+    /// Decode this message's signals out of a raw data buffer, without any CAN
+    /// id check (J1939 frames match by PGN, not by exact id).
+    pub fn decode_data(&self, data: &[u8]) -> DecodedCanMessage {
         let mut decoded_signals = Vec::new();
         for sig in &self.signals {
             let raw = raw_signed(
-                extract_bits(&frame.data, sig.start_bit, sig.length, sig.little_endian),
+                extract_bits(data, sig.start_bit, sig.length, sig.little_endian),
                 sig.length,
                 sig.signed,
             );
             let physical = decode(
-                &frame.data,
+                data,
                 sig.start_bit,
                 sig.length,
                 sig.little_endian,
@@ -93,10 +103,10 @@ impl ParsedMessage {
                 unit: sig.unit.clone(),
             });
         }
-        Ok(DecodedCanMessage {
+        DecodedCanMessage {
             name: self.name.clone(),
             signals: decoded_signals,
-        })
+        }
     }
 
     /// Encode the given signal values into a buffer sized to this message's DLC.
@@ -116,6 +126,7 @@ impl ParsedDbc {
         let mut dbc = Self {
             path: path.to_string(),
             messages: HashMap::new(),
+            pgn_index: HashMap::new(),
         };
         dbc.reload()?;
 
@@ -185,6 +196,11 @@ impl ParsedDbc {
             );
         }
 
+        self.pgn_index = messages
+            .keys()
+            .filter(|&&id| id > 0x7FF)
+            .map(|&id| (crate::j1939::decode_id(id).pgn, id))
+            .collect();
         self.messages = messages;
 
         Ok(())
@@ -193,6 +209,22 @@ impl ParsedDbc {
     /// Decode a raw frame against the matching message, if one exists.
     pub fn decode_frame(&self, frame: &CanFrame) -> Option<DecodedCanMessage> {
         self.messages.get(&frame.can_id).and_then(|msg| msg.decode_frame(frame).ok())
+    }
+
+    /// Decode a frame on a J1939 channel: exact id match first, then by PGN
+    /// (ignoring priority and source address). Returns the decoded message and
+    /// the DBC message id it matched, which callers store so signal-history
+    /// queries keyed on the DBC id can find these frames.
+    pub fn decode_frame_j1939(&self, frame: &CanFrame) -> Option<(DecodedCanMessage, u32)> {
+        if let Some(msg) = self.messages.get(&frame.can_id) {
+            return Some((msg.decode_data(&frame.data), msg.id));
+        }
+        if !frame.is_extended {
+            return None;
+        }
+        let pgn = crate::j1939::decode_id(frame.can_id).pgn;
+        let msg = self.pgn_index.get(&pgn).and_then(|id| self.messages.get(id))?;
+        Some((msg.decode_data(&frame.data), msg.id))
     }
 
     /// Encode signal values for `msg_id` into a data buffer.

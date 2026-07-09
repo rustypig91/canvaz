@@ -30,6 +30,9 @@ pub struct ChannelConfig {
     pub dbc_path: Option<String>,
     #[serde(default = "default_bitrate")]
     pub bitrate: u32,
+    /// Protocol interpretation for received frames ("j1939"); None = raw CAN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 }
 
 fn default_bitrate() -> u32 {
