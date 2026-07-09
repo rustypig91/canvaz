@@ -270,7 +270,7 @@ function markPaneDirty(pane: PlotPane, force = false) {
 
 let appRunning = false;
 let appStartTime = Date.now();
-let plotTabActive = true; // plot tab is the default active tab
+let plotTabActive = false; // trace tab is the default active tab (see index.html)
 
 // Signals/sim entries to restore into panes after the next startApp (DBC comes from open_channel)
 let pendingPaneSignals: PlotSignalEntry[][] = [];
@@ -3028,7 +3028,7 @@ type TraceMode = "overwrite" | "append";
 type TraceDataFormat = "hex" | "dec" | "ascii";
 let traceMode: TraceMode = "overwrite";
 let traceDataFormat: TraceDataFormat = "hex";
-let traceTabActive = false; // plot tab is the default active tab
+let traceTabActive = true; // trace tab is the default active tab (see index.html)
 let traceMaxRows = 1000;
 let traceHeaderEls: HTMLTableCellElement[] = [];
 
@@ -4154,22 +4154,19 @@ async function toggleTracePlot(sigRow: HTMLTableRowElement, handle: number, msgI
         return;
     }
 
-    // Full-width, fixed-height plot row under the clicked signal. The cell
-    // content is a zero-width anchor so the plot (absolutely positioned,
-    // extending right past the signal table) can't stretch the table columns.
+    // Full-width, fixed-height plot row under the clicked signal. The signal
+    // table spans the whole expansion width (filler column), so the plot cell
+    // simply fills the row.
     const plotTr = document.createElement("tr");
     plotTr.dataset.sigplot = "1";
     const td = document.createElement("td");
     td.colSpan = sigRow.cells.length;
     td.className = "te-plot-cell";
-    const anchor = document.createElement("div");
-    anchor.className = "te-plot-anchor";
     const container = document.createElement("div");
     container.className = "te-plot";
     const canvas = document.createElement("canvas");
     container.appendChild(canvas);
-    anchor.appendChild(container);
-    td.appendChild(anchor);
+    td.appendChild(container);
     plotTr.appendChild(td);
     sigRow.after(plotTr);
 
@@ -4206,12 +4203,6 @@ async function toggleTracePlot(sigRow: HTMLTableRowElement, handle: number, msgI
             plugins: {
                 legend: { display: false },
                 tooltip: { enabled: false },
-                title: {
-                    display: true,
-                    text: sig.unit ? `${sig.name} (${sig.unit})` : sig.name,
-                    color: "#a1a1aa",
-                    font: { size: 11 },
-                },
             },
         },
     } as any);
@@ -4265,9 +4256,12 @@ function expandTraceRow(tr: HTMLTableRowElement) {
     td.className = "trace-expand-cell";
 
     const hasEnums = msg.signals.some((s: DbcSignal) => (s.enum_values ?? []).length > 0);
+    // The trailing filler column absorbs the leftover width so the table (and
+    // with it row backgrounds and inline plot rows) spans the whole expansion.
     let html = '<table class="trace-expand-table"><thead><tr>'
         + '<th>Signal</th><th>Value</th><th>Min</th><th>Max</th><th>Unit</th>'
         + (hasEnums ? '<th>Name</th>' : '')
+        + '<th class="te-fill"></th>'
         + '</tr></thead><tbody>';
     for (let i = 0; i < msg.signals.length; i++) {
         const sig = msg.signals[i];
@@ -4286,6 +4280,7 @@ function expandTraceRow(tr: HTMLTableRowElement) {
         <td class="te-max"${rawTip(mx)}>${fmt(mx)}</td>
         <td class="te-unit">${sig.unit || "—"}</td>`
             + (hasEnums ? `<td class="te-enum">${hasVal ? (enumLabelForRaw(sig, vals[2 * i + 1]) || "—") : "—"}</td>` : "")
+            + '<td class="te-fill"></td>'
             + `</tr>`;
     }
     html += '</tbody></table>';

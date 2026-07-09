@@ -975,17 +975,20 @@ body.col-resizing { cursor: col-resize !important; user-select: none; }
   border-collapse: collapse;
   font-size: 12px;
   margin: 6px 16px 8px 32px;
+  /* Span the whole expansion (minus the margins) so row backgrounds and inline
+     plot rows reach the right edge — no visible table seam behind a plot. The
+     te-fill column absorbs the extra width, keeping the data columns compact. */
+  width: calc(100% - 48px);
 }
+.trace-expand-table th.te-fill,
+.trace-expand-table td.te-fill { width: 100%; padding: 0; }
 .trace-expand-table tbody tr:not([data-sigplot]) { cursor: pointer; }
 .trace-expand-table tbody tr:not([data-sigplot]):hover td { background: rgba(255, 255, 255, 0.05); }
 .trace-expand-table tbody tr.te-plotted .te-name { color: var(--accent); font-weight: 600; }
-/* Inline signal plot: a fixed-height row under the clicked signal. The cell
-   holds a zero-width anchor and the plot is absolutely positioned from it, so
-   its width extends past the signal table without stretching the columns.
-   overflow must be forced visible against the global "#trace-table td" clip. */
-#trace-table .trace-expand-table td.te-plot-cell { padding: 0; overflow: visible; }
-.te-plot-anchor { position: relative; width: 0; height: 172px; overflow: visible; }
-.te-plot { position: absolute; left: 0; top: 6px; width: min(680px, 55vw); height: 160px; }
+/* Inline signal plot: a fixed-height row under the clicked signal, filling the
+   full (now table-wide) row. */
+#trace-table .trace-expand-table td.te-plot-cell { padding: 0; }
+.te-plot { position: relative; height: 160px; margin: 4px 0 8px; }
 .trace-expand-table thead th {
   text-align: left;
   padding: 0 16px 4px 0;
