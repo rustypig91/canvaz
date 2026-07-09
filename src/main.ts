@@ -3103,6 +3103,7 @@ function applyTraceFilter() {
                 tbody.appendChild(buildTraceRow(entry));
             }
         }
+        applyTraceSort();
         return;
     }
     // Overwrite mode: toggle visibility on the fixed set of rows.
@@ -3127,51 +3128,75 @@ function applyTraceFilter() {
     scheduleAutoSave();
 }
 
+// Sort key of one row for the given column, read from the row's datasets.
+// Extracted once per row per sort pass (not per comparison) — the sort runs
+// after every frame batch, so the comparator must stay cheap.
+type TraceSortKey = number | string | number[];
+function traceRowSortKey(tr: HTMLTableRowElement, col: Exclude<TraceSortCol, null>): TraceSortKey {
+    switch (col) {
+        case "ts": return parseInt(tr.dataset.ts ?? "0");
+        case "dir": return tr.dataset.dir ?? "";
+        case "channel": return channelName(parseInt(tr.dataset.channelHandle ?? "0"));
+        case "canId": return parseInt(tr.dataset.canid ?? "0");
+        case "pgn": return parseInt(tr.dataset.pgn ?? "-1");
+        case "prio": return parseInt(tr.dataset.prio ?? "-1");
+        case "sa": return parseInt(tr.dataset.sa ?? "-1");
+        case "da": return parseInt(tr.dataset.da ?? "-1");
+        case "msg": return tr.dataset.msg ?? "";
+        case "dlc": return parseInt(tr.dataset.dlc ?? "0");
+        case "data": return JSON.parse(tr.dataset.bytes ?? "[]");
+        // Missing cycle sorts last ascending (first descending), as before.
+        case "cycle": {
+            const c = parseFloat(tr.dataset.cycle ?? "");
+            return isNaN(c) ? Infinity : c;
+        }
+    }
+}
+
+function compareSortKeys(a: TraceSortKey, b: TraceSortKey): number {
+    if (typeof a === "string") return a.localeCompare(b as string);
+    if (Array.isArray(a)) {
+        const bb = b as number[];
+        for (let i = 0; i < Math.max(a.length, bb.length); i++) {
+            const d = (a[i] ?? -1) - (bb[i] ?? -1);
+            if (d !== 0) return d;
+        }
+        return 0;
+    }
+    if (a === b) return 0; // also covers Infinity vs Infinity (subtraction gives NaN)
+    return (a as number) - (b as number);
+}
+
+// Re-order the trace rows by the active sort column. Called after every frame
+// batch and after bulk rebuilds, so it exits without touching the DOM when the
+// rows are already in order. Rows move together with their open expansion row.
 function applyTraceSort() {
     if (!traceSortCol) return;
     const col = traceSortCol;
     const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
-    // Close any open expansion rows — they'd get orphaned during sort
-    tbody.querySelectorAll<HTMLTableRowElement>("tr[data-expand]").forEach(r => {
-        (r.previousElementSibling as HTMLTableRowElement | null)?.classList.remove("trace-row-expanded");
-        r.remove();
-    });
+
     const rows = Array.from(tbody.rows).filter(r => !(r as HTMLTableRowElement).dataset.expand) as HTMLTableRowElement[];
-    rows.sort((a, b) => {
-        let cmp = 0;
-        switch (col) {
-            case "ts": cmp = parseInt(a.dataset.ts ?? "0") - parseInt(b.dataset.ts ?? "0"); break;
-            case "dir": cmp = (a.dataset.dir ?? "").localeCompare(b.dataset.dir ?? ""); break;
-            case "channel": cmp = channelName(parseInt(a.dataset.channelHandle ?? "0")).localeCompare(channelName(parseInt(b.dataset.channelHandle ?? "0"))); break;
-            case "canId": cmp = parseInt(a.dataset.canid ?? "0") - parseInt(b.dataset.canid ?? "0"); break;
-            case "pgn": cmp = parseInt(a.dataset.pgn ?? "-1") - parseInt(b.dataset.pgn ?? "-1"); break;
-            case "prio": cmp = parseInt(a.dataset.prio ?? "-1") - parseInt(b.dataset.prio ?? "-1"); break;
-            case "sa": cmp = parseInt(a.dataset.sa ?? "-1") - parseInt(b.dataset.sa ?? "-1"); break;
-            case "da": cmp = parseInt(a.dataset.da ?? "-1") - parseInt(b.dataset.da ?? "-1"); break;
-            case "msg": cmp = (a.dataset.msg ?? "").localeCompare(b.dataset.msg ?? ""); break;
-            case "dlc": cmp = parseInt(a.dataset.dlc ?? "0") - parseInt(b.dataset.dlc ?? "0"); break;
-            case "data": {
-                const ba: number[] = JSON.parse(a.dataset.bytes ?? "[]");
-                const bb: number[] = JSON.parse(b.dataset.bytes ?? "[]");
-                for (let i = 0; i < Math.max(ba.length, bb.length); i++) {
-                    cmp = (ba[i] ?? -1) - (bb[i] ?? -1);
-                    if (cmp !== 0) break;
-                }
-                break;
-            }
-            case "cycle": {
-                const ca = parseFloat(a.dataset.cycle ?? "");
-                const cb = parseFloat(b.dataset.cycle ?? "");
-                if (isNaN(ca) && isNaN(cb)) cmp = 0;
-                else if (isNaN(ca)) cmp = 1;
-                else if (isNaN(cb)) cmp = -1;
-                else cmp = ca - cb;
-                break;
-            }
-        }
-        return traceSortDir === "asc" ? cmp : -cmp;
-    });
-    for (const row of rows) tbody.appendChild(row);
+    const dir = traceSortDir === "asc" ? 1 : -1;
+    const keyed = rows.map(r => ({ r, k: traceRowSortKey(r, col) }));
+    // Array.sort is stable, so ties keep their arrival order and don't jitter.
+    keyed.sort((a, b) => dir * compareSortKeys(a.k, b.k));
+
+    if (keyed.every((e, i) => e.r === rows[i])) return; // already sorted
+
+    // Capture parent → expansion pairs before moving anything; the sibling
+    // relationships change as rows are re-appended.
+    const expansions = new Map<HTMLTableRowElement, HTMLTableRowElement>();
+    for (const r of Array.from(tbody.querySelectorAll<HTMLTableRowElement>("tr[data-expand]"))) {
+        const parent = r.previousElementSibling as HTMLTableRowElement | null;
+        if (parent) expansions.set(parent, r);
+    }
+    const frag = document.createDocumentFragment();
+    for (const { r } of keyed) {
+        frag.appendChild(r);
+        const exp = expansions.get(r);
+        if (exp) frag.appendChild(exp);
+    }
+    tbody.appendChild(frag);
 }
 
 function buildTraceCellHtml(key: string, entry: TraceEntry): string {
@@ -3418,8 +3443,26 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
             }
         }
         tbody.insertBefore(frag, tbody.firstChild);
-        while (tbody.rows.length > traceMaxRows) tbody.deleteRow(-1);
+        // Cap the row count by dropping the oldest rows. Unsorted, the oldest
+        // sit at the bottom; with an active column sort the bottom row is just
+        // whatever sorts last, so evict by timestamp instead.
+        if (!traceSortCol) {
+            while (tbody.rows.length > traceMaxRows) tbody.deleteRow(-1);
+        } else if (tbody.rows.length > traceMaxRows) {
+            const rows = (Array.from(tbody.rows) as HTMLTableRowElement[]).filter(r => !r.dataset.expand);
+            rows.sort((a, b) => parseInt(a.dataset.ts ?? "0") - parseInt(b.dataset.ts ?? "0"));
+            const excess = tbody.rows.length - traceMaxRows;
+            for (let i = 0; i < excess && i < rows.length; i++) {
+                const next = rows[i].nextElementSibling as HTMLTableRowElement | null;
+                if (next?.dataset.expand) next.remove();
+                rows[i].remove();
+            }
+        }
     }
+
+    // Keep the user's column sort applied as rows arrive and update in place
+    // (no-op when no sort is active or the order is already correct).
+    if (latestOverwrite.size > 0 || appendEntries.length > 0) applyTraceSort();
 }
 
 async function loadTraceFrames() {
@@ -3953,6 +3996,7 @@ function resumeFromPause() {
             }
         }
         tracePendingOverwrite.clear();
+        applyTraceSort();
     } else {
         // Re-render visible rows from the backend (newest first after refresh).
         loadTraceFrames().then(() => {
@@ -3967,6 +4011,7 @@ function resumeFromPause() {
                 }
             }
             tbody.appendChild(frag);
+            applyTraceSort();
         });
     }
 
