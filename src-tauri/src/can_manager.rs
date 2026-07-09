@@ -10,6 +10,7 @@ use tauri::{AppHandle, Emitter};
 use crate::app_state::AppState;
 use crate::can_communication::{Can, CanFrame};
 use crate::dbc_parser::ParsedDbc;
+use crate::j1939::{self, J1939Info, TpReassembler};
 
 #[cfg(feature = "kvaser")]
 use crate::can_communication::KvaserBackend;
@@ -28,15 +29,37 @@ static NEXT_CHANNEL_HANDLE: AtomicU32 = AtomicU32::new(1);
 
 // ── Public event / query types ────────────────────────────────────────────────
 
+/// Per-channel protocol interpretation of received frames.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    #[default]
+    None,
+    J1939,
+}
+
+impl Protocol {
+    pub fn from_config(s: Option<&str>) -> Self {
+        match s {
+            Some("j1939") => Protocol::J1939,
+            _ => Protocol::None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct CanFrameEvent {
     channel_handle: u32,
     can_id: u32,
     is_extended: bool,
-    dlc: u8,
+    /// u16: reassembled J1939 transport messages carry up to 1785 data bytes.
+    dlc: u16,
     data: Vec<u8>,
     timestamp_ms: u64,
     direction: &'static str,
+    /// J1939 breakdown of the identifier; only set on J1939 channels.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    j1939: Option<J1939Info>,
     /// Decoded signals as interleaved [value, raw, value, raw, …] pairs in DBC
     /// message signal order. Names/units/message name are NOT sent: the frontend
     /// holds the same parsed DBC and derives them by position, which keeps the
@@ -51,11 +74,13 @@ pub struct FrameInfo {
     pub channel_handle: u32,
     pub can_id: u32,
     pub is_extended: bool,
-    pub dlc: u8,
+    pub dlc: u16,
     pub data: Vec<u8>,
     pub timestamp_ms: u64,
     pub direction: &'static str,
     pub message_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub j1939: Option<J1939Info>,
     pub signals: Vec<FrameSignal>,
 }
 
@@ -97,6 +122,11 @@ struct StoredFrame {
     timestamp_ms: u64,
     direction: &'static str,
     message_name: Option<String>,
+    j1939: Option<J1939Info>,
+    /// DBC message id this frame decoded against. On J1939 channels it can
+    /// differ from `can_id` (PGN match ignores priority/source-address bits);
+    /// signal-history queries key on it.
+    dbc_msg_id: Option<u32>,
     signals: Vec<StoredSignal>,
 }
 
@@ -106,6 +136,8 @@ struct ChannelData {
     frames: VecDeque<StoredFrame>,
     dbc: Option<Arc<ParsedDbc>>,
     info: ChannelInfo,
+    protocol: Protocol,
+    tp: TpReassembler,
 }
 
 impl ChannelData {
@@ -114,6 +146,8 @@ impl ChannelData {
             frames: VecDeque::new(),
             dbc: None,
             info,
+            protocol: Protocol::None,
+            tp: TpReassembler::default(),
         }
     }
 
@@ -141,7 +175,8 @@ impl ChannelData {
                 channel_handle: handle,
                 can_id: f.can_id,
                 is_extended: f.is_extended,
-                dlc: f.data.len() as u8,
+                dlc: f.data.len() as u16,
+                j1939: f.j1939,
                 data: f.data.clone(),
                 timestamp_ms: f.timestamp_ms,
                 direction: f.direction,
@@ -163,7 +198,9 @@ impl ChannelData {
     fn get_signal_history(&self, can_id: u32, signal_name: &str, since_ms: u64) -> Vec<SignalSample> {
         self.frames
             .iter()
-            .filter(|f| f.timestamp_ms >= since_ms && f.can_id == can_id)
+            // dbc_msg_id covers J1939 frames whose wire id differs from the DBC
+            // id the caller knows (priority/SA bits vary per sender).
+            .filter(|f| f.timestamp_ms >= since_ms && (f.can_id == can_id || f.dbc_msg_id == Some(can_id)))
             .filter_map(|f| {
                 f.signals.iter().find(|s| s.name == signal_name).map(|s| SignalSample {
                     timestamp_ms: f.timestamp_ms,
@@ -371,7 +408,13 @@ impl CanManager {
     /// Open the hardware for a channel registered with `create_channel`, loading
     /// the given DBC (parsed fresh from disk) for decode/encode. Returns the
     /// parsed DBC so the frontend can populate its signal tree.
-    pub fn open_channel(&mut self, handle: u32, bitrate: u32, dbc_path: Option<&str>) -> Result<Option<ParsedDbc>, String> {
+    pub fn open_channel(
+        &mut self,
+        handle: u32,
+        bitrate: u32,
+        dbc_path: Option<&str>,
+        protocol: Protocol,
+    ) -> Result<Option<ParsedDbc>, String> {
         let (backend_name, hw_index) = self.backend_index(handle)?;
 
         // Parse the DBC before touching hardware so a bad path fails fast.
@@ -382,6 +425,8 @@ impl CanManager {
             if let Some(ch) = lock.channels.get_mut(&handle) {
                 ch.frames.clear();
                 ch.dbc = dbc.clone();
+                ch.protocol = protocol;
+                ch.tp = TpReassembler::default();
             }
         }
 
@@ -600,7 +645,8 @@ impl CanManager {
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         let mut writer = BufWriter::new(file);
 
-        writeln!(writer, "timestamp_ms,elapsed_s,channel,can_id,direction,dlc,data,message").map_err(|e| e.to_string())?;
+        writeln!(writer, "timestamp_ms,elapsed_s,channel,can_id,direction,dlc,data,message,pgn,src,dst,prio")
+            .map_err(|e| e.to_string())?;
 
         for (ts, ch_name, f) in &frames {
             let elapsed = (*ts as f64 - start_ms as f64) / 1000.0;
@@ -611,9 +657,13 @@ impl CanManager {
             };
             let data_str = f.data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
             let msg_str = f.message_name.as_deref().unwrap_or("").replace('"', "\"\"");
+            let j1939_str = f
+                .j1939
+                .map(|j| format!("{:X},{:02X},{:02X},{}", j.pgn, j.sa, j.da, j.priority))
+                .unwrap_or_else(|| ",,,".to_string());
             writeln!(
                 writer,
-                "{},{:.3},{},{},{},{},\"{}\",\"{}\"",
+                "{},{:.3},{},{},{},{},\"{}\",\"{}\",{}",
                 ts,
                 elapsed,
                 ch_name,
@@ -621,7 +671,8 @@ impl CanManager {
                 f.direction,
                 f.data.len(),
                 data_str,
-                msg_str
+                msg_str,
+                j1939_str
             )
             .map_err(|e| e.to_string())?;
         }
@@ -722,61 +773,105 @@ fn make_frame_callback(
             None => return,
         };
 
-        let window_ms = lock.window_ms;
-        let dbc = match lock.channels.get(&handle) {
-            Some(ch) => ch.dbc.clone(),
+        let (protocol, dbc) = match lock.channels.get(&handle) {
+            Some(ch) => (ch.protocol, ch.dbc.clone()),
             None => return,
         };
 
-        let decoded_msg = dbc.as_ref().and_then(|d| d.decode_frame(&raw));
-        let message_name = decoded_msg.as_ref().map(|m| m.name.clone());
-
-        let stored = StoredFrame {
-            can_id: raw.can_id,
-            is_extended: raw.is_extended,
-            data: raw.data.clone(),
-            timestamp_ms: ts,
-            direction,
-            message_name,
-            signals: decoded_msg
-                .map(|m| {
-                    m.signals
-                        .into_iter()
-                        .map(|s| StoredSignal {
-                            name: s.name,
-                            value: s.physical,
-                            raw: s.raw,
-                            unit: s.unit,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default(),
-        };
-
-        // Interleaved [value, raw] pairs, in the same order the DBC lists the
-        // message's signals (decode_frame preserves it).
-        let mut sig_data: Vec<f64> = Vec::with_capacity(stored.signals.len() * 2);
-        for s in &stored.signals {
-            sig_data.push(s.value);
-            sig_data.push(s.raw as f64);
+        // J1939: feed transport-protocol frames to the reassembler. A completed
+        // transfer yields a synthetic frame (announced PGN as id, data longer
+        // than 8 bytes) ingested right after the raw frame that completed it.
+        let mut completed: Option<CanFrame> = None;
+        if protocol == Protocol::J1939 && raw.is_extended {
+            let pgn = j1939::decode_id(raw.can_id).pgn;
+            if pgn == j1939::PGN_TP_CM || pgn == j1939::PGN_TP_DT {
+                if let Some(ch) = lock.channels.get_mut(&handle) {
+                    completed = ch.tp.handle_frame(&raw, ts);
+                }
+            }
         }
 
-        let event = CanFrameEvent {
-            channel_handle: handle,
-            can_id: raw.can_id,
-            is_extended: raw.is_extended,
-            dlc: raw.data.len() as u8,
-            data: raw.data,
-            timestamp_ms: ts,
-            direction,
-            signals: sig_data,
-        };
-
-        if let Some(ch) = lock.channels.get_mut(&handle) {
-            ch.push(stored, window_ms);
+        ingest_frame(&mut lock, handle, protocol, dbc.as_deref(), raw, ts, direction);
+        if let Some(frame) = completed {
+            ingest_frame(&mut lock, handle, protocol, dbc.as_deref(), frame, ts, direction);
         }
-        lock.pending_events.push(event);
     }
+}
+
+/// Decode a frame, store it in the channel's ring buffer and queue its webview
+/// event. Called once per raw frame and once more for each reassembled J1939
+/// transport message.
+fn ingest_frame(
+    lock: &mut ManagerShared,
+    handle: u32,
+    protocol: Protocol,
+    dbc: Option<&ParsedDbc>,
+    raw: CanFrame,
+    ts: u64,
+    direction: &'static str,
+) {
+    let window_ms = lock.window_ms;
+
+    let j1939_info = (protocol == Protocol::J1939 && raw.is_extended).then(|| j1939::decode_id(raw.can_id));
+
+    let decoded = match protocol {
+        Protocol::J1939 => dbc.and_then(|d| d.decode_frame_j1939(&raw)),
+        Protocol::None => dbc.and_then(|d| d.decode_frame(&raw)).map(|m| (m, raw.can_id)),
+    };
+    let (decoded_msg, dbc_msg_id) = match decoded {
+        Some((m, id)) => (Some(m), Some(id)),
+        None => (None, None),
+    };
+    let message_name = decoded_msg.as_ref().map(|m| m.name.clone());
+
+    let stored = StoredFrame {
+        can_id: raw.can_id,
+        is_extended: raw.is_extended,
+        data: raw.data.clone(),
+        timestamp_ms: ts,
+        direction,
+        message_name,
+        j1939: j1939_info,
+        dbc_msg_id,
+        signals: decoded_msg
+            .map(|m| {
+                m.signals
+                    .into_iter()
+                    .map(|s| StoredSignal {
+                        name: s.name,
+                        value: s.physical,
+                        raw: s.raw,
+                        unit: s.unit,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+
+    // Interleaved [value, raw] pairs, in the same order the DBC lists the
+    // message's signals (decode preserves it).
+    let mut sig_data: Vec<f64> = Vec::with_capacity(stored.signals.len() * 2);
+    for s in &stored.signals {
+        sig_data.push(s.value);
+        sig_data.push(s.raw as f64);
+    }
+
+    let event = CanFrameEvent {
+        channel_handle: handle,
+        can_id: raw.can_id,
+        is_extended: raw.is_extended,
+        dlc: raw.data.len() as u16,
+        data: raw.data,
+        timestamp_ms: ts,
+        direction,
+        j1939: j1939_info,
+        signals: sig_data,
+    };
+
+    if let Some(ch) = lock.channels.get_mut(&handle) {
+        ch.push(stored, window_ms);
+    }
+    lock.pending_events.push(event);
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -787,3 +882,4 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
+

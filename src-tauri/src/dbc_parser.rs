@@ -10,6 +10,14 @@ pub struct ParsedDbc {
     pub path: String,
     /// Keyed by CAN id. Serializes to a JSON object; the frontend treats it as a map.
     pub messages: HashMap<u32, ParsedMessage>,
+    /// J1939 (PGN, source address) → key into `messages`, for matching on J1939
+    /// channels where the frame's priority bits (and destination address for
+    /// PDU1 groups) vary while the DBC lists one fixed 29-bit id per message.
+    /// The source address stays part of the identity: the same PGN sent by two
+    /// nodes can be two different DBC messages. Keys are `(pgn << 8) | sa`.
+    /// Rebuilt on load, never serialized.
+    #[serde(skip)]
+    pgn_index: HashMap<u32, u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,16 +77,21 @@ impl ParsedMessage {
         if frame.can_id != self.id {
             return Err(format!("Frame CAN ID {} does not match message ID {}", frame.can_id, self.id));
         }
+        Ok(self.decode_data(&frame.data))
+    }
 
+    /// Decode this message's signals out of a raw data buffer, without any CAN
+    /// id check (J1939 frames match by PGN, not by exact id).
+    pub fn decode_data(&self, data: &[u8]) -> DecodedCanMessage {
         let mut decoded_signals = Vec::new();
         for sig in &self.signals {
             let raw = raw_signed(
-                extract_bits(&frame.data, sig.start_bit, sig.length, sig.little_endian),
+                extract_bits(data, sig.start_bit, sig.length, sig.little_endian),
                 sig.length,
                 sig.signed,
             );
             let physical = decode(
-                &frame.data,
+                data,
                 sig.start_bit,
                 sig.length,
                 sig.little_endian,
@@ -93,10 +106,10 @@ impl ParsedMessage {
                 unit: sig.unit.clone(),
             });
         }
-        Ok(DecodedCanMessage {
+        DecodedCanMessage {
             name: self.name.clone(),
             signals: decoded_signals,
-        })
+        }
     }
 
     /// Encode the given signal values into a buffer sized to this message's DLC.
@@ -116,6 +129,7 @@ impl ParsedDbc {
         let mut dbc = Self {
             path: path.to_string(),
             messages: HashMap::new(),
+            pgn_index: HashMap::new(),
         };
         dbc.reload()?;
 
@@ -185,6 +199,14 @@ impl ParsedDbc {
             );
         }
 
+        self.pgn_index = messages
+            .keys()
+            .filter(|&&id| id > 0x7FF)
+            .map(|&id| {
+                let j = crate::j1939::decode_id(id);
+                ((j.pgn << 8) | j.sa as u32, id)
+            })
+            .collect();
         self.messages = messages;
 
         Ok(())
@@ -193,6 +215,24 @@ impl ParsedDbc {
     /// Decode a raw frame against the matching message, if one exists.
     pub fn decode_frame(&self, frame: &CanFrame) -> Option<DecodedCanMessage> {
         self.messages.get(&frame.can_id).and_then(|msg| msg.decode_frame(frame).ok())
+    }
+
+    /// Decode a frame on a J1939 channel: exact id match first, then by
+    /// (PGN, source address) — ignoring only the priority bits and, for PDU1
+    /// groups, the destination address. Returns the decoded message and the
+    /// DBC message id it matched, which callers store so signal-history
+    /// queries keyed on the DBC id can find these frames.
+    pub fn decode_frame_j1939(&self, frame: &CanFrame) -> Option<(DecodedCanMessage, u32)> {
+        if let Some(msg) = self.messages.get(&frame.can_id) {
+            return Some((msg.decode_data(&frame.data), msg.id));
+        }
+        if !frame.is_extended {
+            return None;
+        }
+        let j = crate::j1939::decode_id(frame.can_id);
+        let key = (j.pgn << 8) | j.sa as u32;
+        let msg = self.pgn_index.get(&key).and_then(|id| self.messages.get(id))?;
+        Some((msg.decode_data(&frame.data), msg.id))
     }
 
     /// Encode signal values for `msg_id` into a data buffer.
@@ -316,5 +356,42 @@ fn numeric_to_f64(v: NumericValue) -> f64 {
         NumericValue::Uint(n) => n as f64,
         NumericValue::Int(n) => n as f64,
         NumericValue::Double(n) => n,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Parse a minimal J1939 DBC (one message, PGN 0xF004, SA 0x00) written to
+    /// a temp file, since ParsedDbc only constructs from disk.
+    fn j1939_dbc() -> ParsedDbc {
+        let path = std::env::temp_dir().join("canvaz_test_pgn_sa.dbc");
+        // BO_ id: 0x0CF00400 (prio 3, PGN F004, SA 00) with the DBC extended-id
+        // flag (bit 31) set.
+        let content = format!(
+            "VERSION \"\"\n\nNS_ :\n\nBS_:\n\nBU_:\n\nBO_ {} EEC1: 8 Vector__XXX\n SG_ EngSpeed : 24|16@1+ (0.125,0) [0|8031.875] \"rpm\" Vector__XXX\n",
+            0x8CF00400u32
+        );
+        std::fs::write(&path, content).expect("write temp dbc");
+        ParsedDbc::new(path.to_str().unwrap()).expect("parse dbc")
+    }
+
+    fn frame(can_id: u32) -> CanFrame {
+        CanFrame { can_id, is_extended: true, data: vec![0; 8], timestamp_ms: None }
+    }
+
+    #[test]
+    fn j1939_match_ignores_priority_but_not_source_address() {
+        let dbc = j1939_dbc();
+        // Same PGN and SA, different priority (6 instead of 3): must match.
+        let hit = dbc.decode_frame_j1939(&frame(0x18F00400));
+        assert!(hit.is_some(), "same PGN+SA with different priority should match");
+        assert_eq!(hit.unwrap().0.name, "EEC1");
+        // Same PGN from a different source address: must NOT match.
+        assert!(
+            dbc.decode_frame_j1939(&frame(0x18F00417)).is_none(),
+            "same PGN from another source address must not match"
+        );
     }
 }

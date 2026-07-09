@@ -30,6 +30,9 @@ pub struct ChannelConfig {
     pub dbc_path: Option<String>,
     #[serde(default = "default_bitrate")]
     pub bitrate: u32,
+    /// Protocol interpretation for received frames ("j1939"); None = raw CAN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
 }
 
 fn default_bitrate() -> u32 {
@@ -97,6 +100,18 @@ pub struct TraceFiltersConfig {
     pub msg_names: Option<Vec<String>>,
     #[serde(default)]
     pub dir: Option<Vec<String>>,
+    /// J1939 column filters; -1 stands for frames without J1939 info.
+    #[serde(default)]
+    pub pgns: Option<Vec<i64>>,
+    #[serde(default)]
+    pub prios: Option<Vec<i64>>,
+    #[serde(default)]
+    pub sas: Option<Vec<i64>>,
+    #[serde(default)]
+    pub das: Option<Vec<i64>>,
+    /// true = broadcast (PDU2) PGNs only, false = destination-specific only.
+    #[serde(default)]
+    pub broadcast: Option<bool>,
     #[serde(default)]
     pub dlc_min: Option<u32>,
     #[serde(default)]
@@ -122,14 +137,14 @@ fn default_true() -> bool {
     true
 }
 
+/// Column widths are intentionally not part of this: sessions always start at
+/// the default widths (a `widths` key in older project files is ignored).
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TraceColumnsConfig {
     #[serde(default)]
     pub order: Vec<String>,
     #[serde(default)]
     pub hidden: Vec<String>,
-    #[serde(default)]
-    pub widths: std::collections::HashMap<String, u32>,
 }
 
 #[allow(dead_code)]

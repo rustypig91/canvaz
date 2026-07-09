@@ -72,6 +72,7 @@ interface FrameInfo {
     timestamp_ms: number;
     direction: "rx" | "tx";
     message_name: string | null;
+    j1939?: J1939Info | null;
     signals: FrameSignal[];
 }
 
@@ -83,16 +84,20 @@ interface CanFrameEvent {
     data: number[];
     timestamp_ms: number;
     direction: "rx" | "tx";
+    // J1939 breakdown of the identifier; only present on J1939 channels.
+    j1939?: J1939Info | null;
     // Decoded signals as interleaved [value, raw, value, raw, …] pairs in DBC
     // message signal order. Names/units/message name are derived from the DBC by
     // position — no strings on the per-frame wire (they dominated GC churn).
     signals: number[];
 }
 
+interface J1939Info { pgn: number; priority: number; sa: number; da: number; }
+
 interface PlotSignalEntry { signal_name: string; channel: string; message_id?: number; }
 interface PlotPaneConfig { signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean; }
 interface ChannelInfo { backend: string; name: string; }
-interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate: number | null; }
+interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate: number | null; protocol: string | null; }
 // Everything the app tracks about one channel, keyed by its u32 handle in `channels`.
 interface Channel {
     info: ChannelInfo;       // backend + hardware name (immutable identity)
@@ -116,20 +121,28 @@ interface TraceFiltersConfig {
     can_ids?: number[] | null;
     msg_names?: string[] | null;
     dir?: string[] | null;
+    // J1939 column filters; -1 stands for frames without J1939 info.
+    pgns?: number[] | null;
+    prios?: number[] | null;
+    sas?: number[] | null;
+    das?: number[] | null;
+    broadcast?: boolean | null;
     dlc_min?: number | null;
     dlc_max?: number | null;
     cycle_min?: number | null;
     cycle_max?: number | null;
+    // Length doubles as the "bytes to check" count of the data filter.
     data?: (number | null)[];
     data_format?: string;
     overwrite?: boolean;
     max_rows?: number | null;
 }
 
+// Column widths are deliberately not persisted: every session starts at the
+// default widths and resizes last only until the app is reloaded.
 interface TraceColumnsConfig {
     order?: string[];
     hidden?: string[];
-    widths?: Record<string, number>;
 }
 
 interface Project {
@@ -257,7 +270,7 @@ function markPaneDirty(pane: PlotPane, force = false) {
 
 let appRunning = false;
 let appStartTime = Date.now();
-let plotTabActive = true; // plot tab is the default active tab
+let plotTabActive = false; // trace tab is the default active tab (see index.html)
 
 // Signals/sim entries to restore into panes after the next startApp (DBC comes from open_channel)
 let pendingPaneSignals: PlotSignalEntry[][] = [];
@@ -296,6 +309,61 @@ function sigKeysFor(handle: number, msg: DbcMessage): string[] {
         byMsg.set(msg.id, keys);
     }
     return keys;
+}
+
+// ── J1939 helpers ─────────────────────────────────────────────────────────────
+
+// 18-bit PGN of a 29-bit identifier (EDP/DP included; PS folded in for PDU2).
+function j1939Pgn(canId: number): number {
+    const pf = (canId >> 16) & 0xFF;
+    let pgn = (canId >> 8) & 0x3ff00;
+    if (pf >= 240) pgn |= (canId >> 8) & 0xFF;
+    return pgn;
+}
+
+// PDU2 (PF ≥ 240) parameter groups are broadcast; PDU1 are destination-specific.
+function j1939IsBroadcast(pgn: number): boolean {
+    return ((pgn >> 8) & 0xFF) >= 240;
+}
+
+function fmtPgn(pgn: number): string {
+    return pgn.toString(16).toUpperCase().padStart(4, "0") + "h";
+}
+
+function fmtJ1939Addr(addr: number): string {
+    return addr.toString(16).toUpperCase().padStart(2, "0") + "h";
+}
+
+// Per-channel (PGN, source address) → DBC message map for J1939 channels, so
+// frames match their DBC message regardless of the priority bits (and, for
+// PDU1 groups, the destination address) in the wire id. The source address
+// stays part of the identity — the same PGN from two nodes can be two
+// different DBC messages. Keys are (pgn << 8) | sa. Built lazily; invalidated
+// alongside sigKeyCache whenever a DBC is reloaded.
+const pgnMapCache = new Map<number, Map<number, DbcMessage>>();
+
+function j1939MatchKey(canId: number): number {
+    return (j1939Pgn(canId) << 8) | (canId & 0xFF);
+}
+
+// DBC message for a frame: exact id match first, then (on J1939 channels) by
+// PGN + source address.
+function dbcMessageFor(handle: number, canId: number, isExtended: boolean): DbcMessage | null {
+    const ch = channels.get(handle);
+    const dbc = ch?.dbc;
+    if (!dbc) return null;
+    const exact = dbc.messages[canId];
+    if (exact) return exact;
+    if (ch!.config.protocol !== "j1939" || !isExtended) return null;
+    let map = pgnMapCache.get(handle);
+    if (!map) {
+        map = new Map();
+        for (const m of Object.values(dbc.messages)) {
+            if (m.id > 0x7FF) map.set(j1939MatchKey(m.id), m);
+        }
+        pgnMapCache.set(handle, map);
+    }
+    return map.get(j1939MatchKey(canId)) ?? null;
 }
 
 function formatSigValue(value: number, unit: string): string {
@@ -1065,6 +1133,14 @@ function getBitrateFromDialog(): number | null {
     return parseInt(sel);
 }
 
+function getProtocolFromDialog(): string | null {
+    return (document.getElementById("select-protocol") as HTMLSelectElement).value || null;
+}
+
+function setProtocolInDialog(protocol: string | null) {
+    (document.getElementById("select-protocol") as HTMLSelectElement).value = protocol ?? "";
+}
+
 function setBitrateInDialog(bitrate: number | null, isVcan: boolean) {
     const sel = document.getElementById("select-bitrate") as HTMLSelectElement;
     const custom = document.getElementById("input-bitrate-custom") as HTMLInputElement;
@@ -1103,6 +1179,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         dialogPendingDbc = null;
         setDbcLabel(null);
         setBitrateInDialog(500000, false);
+        setProtocolInDialog(null);
         const ifaces = await invoke<ChannelInfo[]>("list_can_interfaces").catch(() => [] as ChannelInfo[]);
         availableIfaces = ifaces;
 
@@ -1139,6 +1216,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         dialogPendingDbc = ch?.config.dbc_path ?? null;
         setDbcLabel(dialogPendingDbc);
         setBitrateInDialog(ch?.config.bitrate ?? null, displayName.startsWith("vcan"));
+        setProtocolInDialog(ch?.config.protocol ?? null);
         selectChannel(handle!);
     }
 
@@ -1182,6 +1260,7 @@ async function loadChannelDbc(handle: number): Promise<void> {
     const ch = channels.get(handle);
     if (!ch) return;
     sigKeyCache.delete(handle); // key tables are derived from the DBC being replaced
+    pgnMapCache.delete(handle);
     if (!ch.config.dbc_path) { ch.dbc = null; return; }
     try {
         ch.dbc = await invoke<ParsedDbc>("parse_dbc", { path: ch.config.dbc_path });
@@ -1204,9 +1283,11 @@ async function openChannelByHandle(handle: number): Promise<boolean> {
             channelHandle: handle,
             bitrate: ch.config.bitrate ?? 500000,
             dbcPath: ch.config.dbc_path ?? null,
+            protocol: ch.config.protocol ?? null,
         });
         ch.dbc = dbc ?? null;
         sigKeyCache.delete(handle); // key tables are derived from the DBC just replaced
+        pgnMapCache.delete(handle);
         ch.open = true;
         return true;
     } catch (e) {
@@ -1223,6 +1304,7 @@ async function openChannelByHandle(handle: number): Promise<boolean> {
 async function applyChannelDialog() {
     const dialog = document.getElementById("dialog-channel") as HTMLDialogElement;
     const bitrate = getBitrateFromDialog();
+    const protocol = getProtocolFromDialog();
 
     if (dialogMode === "add") {
         const custom = (document.getElementById("input-iface-custom") as HTMLInputElement).value.trim();
@@ -1245,13 +1327,14 @@ async function applyChannelDialog() {
 
         channels.set(handle, {
             info: { backend, name },
-            config: { name, backend, dbc_path: dialogPendingDbc, bitrate },
+            config: { name, backend, dbc_path: dialogPendingDbc, bitrate, protocol },
             dbc: null,
             open: false,
         });
         await loadChannelDbc(handle);
 
         refreshChannelList();
+        rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === handle) renderDbcTree();
         setStatus(`Added channel: ${name}`);
         scheduleAutoSave();
@@ -1265,10 +1348,12 @@ async function applyChannelDialog() {
         if (ch) {
             ch.config.dbc_path = dialogPendingDbc;
             ch.config.bitrate = bitrate;
+            ch.config.protocol = protocol;
             await loadChannelDbc(h);
         }
 
         refreshChannelList();
+        rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === h) renderDbcTree();
         setStatus(`Updated channel: ${name}`);
         scheduleAutoSave();
@@ -1370,11 +1455,14 @@ function showFilterMenu(
     items: { label: string; key: string }[],
     active: Set<string> | null,
     onFilter: (active: Set<string> | null) => void,
+    topContent?: HTMLElement,
 ) {
     if (ctxMenu) ctxMenu.remove();
     const menu = document.createElement("div");
     menu.className = "ctx-menu filter-menu";
     menu.addEventListener("click", e => e.stopPropagation());
+
+    if (topContent) menu.appendChild(topContent);
 
     const controls = document.createElement("div");
     controls.className = "filter-controls";
@@ -1500,6 +1588,7 @@ async function renderChannelList() {
         const backend = ch.info.backend;
         const isSelected = h === selectedChannel;
         const bitrateLabel = name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
+        const protoLabel = ch.config.protocol === "j1939" ? " · J1939" : "";
         const item = document.createElement("div");
         item.className = `channel-item${isSelected ? " selected" : ""}`;
         item.dataset.channelHandle = String(h);
@@ -1507,7 +1596,7 @@ async function renderChannelList() {
       <span class="dot${ch.open ? "" : " closed"}"></span>
       <span class="ch-name" title="${name}">${name}<span class="ch-backend label-muted"> ${backend}</span></span>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
-      <span class="ch-baud label-muted">${bitrateLabel}</span>
+      <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}</span>
       <button class="btn-close-ch" title="Remove channel">×</button>
     `;
         item.addEventListener("click", (e) => {
@@ -1529,6 +1618,7 @@ async function renderChannelList() {
                         channels.delete(h);
                         if (selectedChannel === h) selectChannel(null);
                         renderChannelList();
+                        rebuildTraceColumns();
                         scheduleAutoSave();
                     }
                 },
@@ -1548,6 +1638,7 @@ async function renderChannelList() {
             if (selectedChannel === h) selectChannel(null);
 
             renderChannelList();
+            rebuildTraceColumns();
             scheduleAutoSave();
         });
         list.appendChild(item);
@@ -1558,19 +1649,21 @@ async function renderChannelList() {
         const dbcPath = config.dbc_path;
         const bitrate = config.bitrate;
         const bitrateLabel = config.name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
+        const protoLabel = config.protocol === "j1939" ? " · J1939" : "";
         const item = document.createElement("div");
         item.className = "channel-item";
         item.innerHTML = `
       <span class="dot error" title="${error}"></span>
       <span class="ch-name" title="${config.name}">${config.name}<span class="ch-backend label-muted"> ${config.backend}</span></span>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
-      <span class="ch-baud label-muted">${bitrateLabel}</span>
+      <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}</span>
       <button class="btn-close-ch" title="Remove channel">×</button>
     `;
         item.querySelector(".btn-close-ch")!.addEventListener("click", (e) => {
             e.stopPropagation();
             ghostChannels.splice(ghostChannels.indexOf(ghost), 1);
             renderChannelList();
+            rebuildTraceColumns();
             scheduleAutoSave();
         });
         list.appendChild(item);
@@ -1979,12 +2072,14 @@ function buildProject(): Project {
                 backend: ch.info.backend,
                 dbc_path: ch.config.dbc_path,
                 bitrate: ch.config.bitrate,
+                protocol: ch.config.protocol,
             })),
             ...ghostChannels.map(g => ({
                 name: g.config.name,
                 backend: g.config.backend,
                 dbc_path: g.config.dbc_path,
                 bitrate: g.config.bitrate,
+                protocol: g.config.protocol,
             })),
         ],
         plot_panes: plotPanes.map(pane => ({
@@ -2009,6 +2104,11 @@ function buildProject(): Project {
             can_ids: traceFilterCanIds ? [...traceFilterCanIds] : null,
             msg_names: traceFilterMsgNames ? [...traceFilterMsgNames] : null,
             dir: traceFilterDir ? [...traceFilterDir] : null,
+            pgns: traceFilterPgns ? [...traceFilterPgns] : null,
+            prios: traceFilterPrios ? [...traceFilterPrios] : null,
+            sas: traceFilterSas ? [...traceFilterSas] : null,
+            das: traceFilterDas ? [...traceFilterDas] : null,
+            broadcast: traceFilterBroadcast,
             dlc_min: traceFilterDlcMin,
             dlc_max: traceFilterDlcMax,
             cycle_min: traceFilterCycleMin,
@@ -2022,7 +2122,6 @@ function buildProject(): Project {
         trace_columns: {
             order: traceColOrder,
             hidden: [...traceColHidden],
-            widths: { ...traceColWidths },
         },
     };
 }
@@ -2062,6 +2161,7 @@ async function newProject() {
     sessionFilePath = null;
     updateWindowTitle();
     refreshChannelList();
+    rebuildTraceColumns();
     renderDbcTree();
     setStatus("New project");
 }
@@ -2119,7 +2219,7 @@ async function applyProject(project: Project) {
     for (const ch of project.channels) {
         const backend = ch.backend ?? "socketcan";
         const bitrate = ch.bitrate ?? null;
-        const config: ChannelConfig = { name: ch.name, backend, dbc_path: ch.dbc_path ?? null, bitrate };
+        const config: ChannelConfig = { name: ch.name, backend, dbc_path: ch.dbc_path ?? null, bitrate, protocol: ch.protocol ?? null };
         let handle: number | null = null;
         let errMsg = "";
         try {
@@ -2138,6 +2238,7 @@ async function applyProject(project: Project) {
 
     refreshChannelList();
     renderDbcTree();
+    rebuildTraceColumns(); // J1939 columns follow the loaded channels' protocols
 
     // Remove existing panes and create blank placeholders with correct settings.
     // Signals are added after startApp opens channels and the DBC is available.
@@ -2192,7 +2293,6 @@ async function applyProject(project: Project) {
             traceColOrder = [...saved, ...missing];
         }
         if (tc.hidden) traceColHidden = new Set(tc.hidden.filter(k => validKeys.has(k)));
-        if (tc.widths) traceColWidths = Object.fromEntries(Object.entries(tc.widths).filter(([k]) => validKeys.has(k)));
         rebuildTraceColumns();
     }
 
@@ -2206,6 +2306,10 @@ function syncFilteredHeaders() {
     th("canId")?.classList.toggle("th-filtered", traceFilterCanIds !== null);
     th("msg")?.classList.toggle("th-filtered", traceFilterMsgNames !== null);
     th("dir")?.classList.toggle("th-filtered", traceFilterDir !== null);
+    th("pgn")?.classList.toggle("th-filtered", traceFilterPgns !== null || traceFilterBroadcast !== null);
+    th("prio")?.classList.toggle("th-filtered", traceFilterPrios !== null);
+    th("sa")?.classList.toggle("th-filtered", traceFilterSas !== null);
+    th("da")?.classList.toggle("th-filtered", traceFilterDas !== null);
     th("dlc")?.classList.toggle("th-filtered", traceFilterDlcMin !== null || traceFilterDlcMax !== null);
     th("cycle")?.classList.toggle("th-filtered", traceFilterCycleMin !== null || traceFilterCycleMax !== null);
     th("data")?.classList.toggle("th-filtered", traceFilterData.some(v => v !== null));
@@ -2220,12 +2324,20 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
     traceFilterCanIds = f.can_ids ? new Set(f.can_ids) : null;
     traceFilterMsgNames = f.msg_names ? new Set(f.msg_names) : null;
     traceFilterDir = f.dir ? new Set(f.dir) : null;
+    traceFilterPgns = f.pgns ? new Set(f.pgns) : null;
+    traceFilterPrios = f.prios ? new Set(f.prios) : null;
+    traceFilterSas = f.sas ? new Set(f.sas) : null;
+    traceFilterDas = f.das ? new Set(f.das) : null;
+    traceFilterBroadcast = f.broadcast ?? null;
     traceFilterDlcMin = f.dlc_min ?? null;
     traceFilterDlcMax = f.dlc_max ?? null;
     traceFilterCycleMin = f.cycle_min ?? null;
     traceFilterCycleMax = f.cycle_max ?? null;
+    // The saved array's length is the "bytes to check" count (older projects
+    // always saved 8).
     const savedData = f.data ?? [];
-    traceFilterData = Array.from({ length: 8 }, (_, i) => savedData[i] ?? null);
+    const dataLen = Math.min(MAX_DATA_FILTER_BYTES, Math.max(1, savedData.length || 8));
+    traceFilterData = Array.from({ length: dataLen }, (_, i) => savedData[i] ?? null);
 
     if (f.data_format === "hex" || f.data_format === "dec" || f.data_format === "ascii")
         traceDataFormat = f.data_format;
@@ -2245,6 +2357,12 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
     if (traceFilterMsgNames) {
         traceFilterMsgNames.forEach(v => { if (v === "") traceSeenNoMsg = true; else traceSeenMsgNames.add(v); });
     }
+    const seedJ1939 = (filter: Set<number> | null, seen: Set<number>) =>
+        filter?.forEach(v => { if (v === -1) traceSeenNoJ1939 = true; else seen.add(v); });
+    seedJ1939(traceFilterPgns, traceSeenPgns);
+    seedJ1939(traceFilterPrios, traceSeenPrios);
+    seedJ1939(traceFilterSas, traceSeenSas);
+    seedJ1939(traceFilterDas, traceSeenDas);
 
     syncFilteredHeaders();
     updateClearFiltersBtn();
@@ -2311,7 +2429,7 @@ async function startApp() {
             if (name !== "" && !validNames.has(name)) traceFilterMsgNames.delete(name);
         }
         if (traceFilterMsgNames.size === 0) traceFilterMsgNames = null;
-        traceHeaderEls[4]?.classList.toggle("th-filtered", traceFilterMsgNames !== null);
+        syncFilteredHeaders();
     }
 
     appRunning = true;
@@ -2896,6 +3014,7 @@ interface TraceEntry {
     timestampMs: number;
     cycleTimeMs: number | null;
     direction: "rx" | "tx";
+    j1939: J1939Info | null;
     // Interleaved [value, raw] pairs in DBC message signal order (see CanFrameEvent).
     signals: number[];
 }
@@ -2909,7 +3028,7 @@ type TraceMode = "overwrite" | "append";
 type TraceDataFormat = "hex" | "dec" | "ascii";
 let traceMode: TraceMode = "overwrite";
 let traceDataFormat: TraceDataFormat = "hex";
-let traceTabActive = false; // plot tab is the default active tab
+let traceTabActive = true; // trace tab is the default active tab (see index.html)
 let traceMaxRows = 1000;
 let traceHeaderEls: HTMLTableCellElement[] = [];
 
@@ -2919,11 +3038,31 @@ const TRACE_COL_DEFS: TraceColDef[] = [
     { key: "dir", label: "Dir", defaultWidth: 56 },
     { key: "channel", label: "Channel", defaultWidth: 80 },
     { key: "canId", label: "CAN ID", defaultWidth: 90 },
+    { key: "pgn", label: "PGN", defaultWidth: 70 },
+    { key: "prio", label: "Prio", defaultWidth: 48 },
+    { key: "sa", label: "Src", defaultWidth: 52 },
+    { key: "da", label: "Dst", defaultWidth: 52 },
     { key: "msg", label: "Message", defaultWidth: 160 },
     { key: "dlc", label: "DLC", defaultWidth: 56 },
-    { key: "data", label: "Data", defaultWidth: 0 },
+    { key: "data", label: "Data", defaultWidth: 220 },
     { key: "cycle", label: "Cycle (ms)", defaultWidth: 90 },
 ];
+// Columns that only carry data on J1939 channels; they exist in the table
+// (order, widths, hidden state all persist) but are only rendered while at
+// least one configured channel uses the J1939 protocol.
+const J1939_COL_KEYS = new Set(["pgn", "prio", "sa", "da"]);
+
+function anyJ1939Channel(): boolean {
+    for (const ch of channels.values()) if (ch.config.protocol === "j1939") return true;
+    return ghostChannels.some(g => g.config.protocol === "j1939");
+}
+
+// Trace columns to render, in order: user-hidden columns are dropped, and the
+// J1939 columns only appear when a J1939 channel is configured.
+function visibleTraceCols(): string[] {
+    const j1939 = anyJ1939Channel();
+    return traceColOrder.filter(k => !traceColHidden.has(k) && (j1939 || !J1939_COL_KEYS.has(k)));
+}
 let traceColOrder: string[] = TRACE_COL_DEFS.map(d => d.key);
 let traceColHidden = new Set<string>();
 let traceColWidths: Record<string, number> = {};
@@ -2939,16 +3078,32 @@ const traceSeenChannels = new Set<number>();
 const traceSeenCanIds = new Set<number>();
 const traceSeenMsgNames = new Set<string>();
 let traceSeenNoMsg = false;
+// Seen J1939 values feed the pgn/prio/sa/da filter menus; frames without J1939
+// info (standard frames on a J1939 channel) are represented by -1 / "(non-J1939)".
+const traceSeenPgns = new Set<number>();
+const traceSeenPrios = new Set<number>();
+const traceSeenSas = new Set<number>();
+const traceSeenDas = new Set<number>();
+let traceSeenNoJ1939 = false;
 let traceFilterChannels: Set<number> | null = null;
 let traceFilterCanIds: Set<number> | null = null;
 let traceFilterMsgNames: Set<string> | null = null;
+let traceFilterPgns: Set<number> | null = null;
+let traceFilterPrios: Set<number> | null = null;
+let traceFilterSas: Set<number> | null = null;
+let traceFilterDas: Set<number> | null = null;
+// null = any; true = broadcast (PDU2) PGNs only; false = destination-specific only.
+let traceFilterBroadcast: boolean | null = null;
+// One optional expected value per data byte position; the array length is the
+// user-configurable "bytes to check" count (default 8, up to MAX_DATA_FILTER_BYTES).
+const MAX_DATA_FILTER_BYTES = 64;
 let traceFilterData: (number | null)[] = new Array(8).fill(null);
 let traceFilterCycleMin: number | null = null;
 let traceFilterCycleMax: number | null = null;
 let traceFilterDlcMin: number | null = null;
 let traceFilterDlcMax: number | null = null;
 let traceFilterDir: Set<string> | null = null;
-type TraceSortCol = "ts" | "dir" | "channel" | "canId" | "msg" | "dlc" | "data" | "cycle" | null;
+type TraceSortCol = "ts" | "dir" | "channel" | "canId" | "pgn" | "prio" | "sa" | "da" | "msg" | "dlc" | "data" | "cycle" | null;
 let traceSortCol: TraceSortCol = null;
 let traceSortDir: "asc" | "desc" = "asc";
 let traceLocalBuffer: TraceEntry[] = [];
@@ -2990,11 +3145,17 @@ function parseByte(s: string): number | null {
     return (isNaN(n) || n < 0 || n > 255) ? null : n;
 }
 
-function traceRowVisible(channelHandle: number, canId: number, bytes: number[], dir: string, cycleMs: number | null, dlc: number, msgName: string | null = null): boolean {
+function traceRowVisible(channelHandle: number, canId: number, bytes: number[], dir: string, cycleMs: number | null, dlc: number, msgName: string | null = null, j1939: J1939Info | null = null): boolean {
     if (traceFilterChannels !== null && !traceFilterChannels.has(channelHandle)) return false;
     if (traceFilterCanIds !== null && !traceFilterCanIds.has(canId)) return false;
     if (traceFilterDir !== null && !traceFilterDir.has(dir)) return false;
     if (traceFilterMsgNames !== null && !traceFilterMsgNames.has(msgName ?? "")) return false;
+    // J1939 filters: frames without J1939 info match the -1 "(non-J1939)" key.
+    if (traceFilterPgns !== null && !traceFilterPgns.has(j1939 ? j1939.pgn : -1)) return false;
+    if (traceFilterPrios !== null && !traceFilterPrios.has(j1939 ? j1939.priority : -1)) return false;
+    if (traceFilterSas !== null && !traceFilterSas.has(j1939 ? j1939.sa : -1)) return false;
+    if (traceFilterDas !== null && !traceFilterDas.has(j1939 ? j1939.da : -1)) return false;
+    if (traceFilterBroadcast !== null && (!j1939 || j1939IsBroadcast(j1939.pgn) !== traceFilterBroadcast)) return false;
     for (let i = 0; i < traceFilterData.length; i++) {
         const expected = traceFilterData[i];
         if (expected === null) continue;
@@ -3011,12 +3172,14 @@ function applyTraceFilter() {
     const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
     if (traceMode === "append") {
         // Rebuild DOM entirely from the in-memory buffer — never keep invisible rows in the DOM.
+        destroyAllTracePlots();
         tbody.innerHTML = "";
         for (const entry of traceLocalBuffer) {
-            if (traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) {
+            if (traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName, entry.j1939)) {
                 tbody.appendChild(buildTraceRow(entry));
             }
         }
+        applyTraceSort();
         return;
     }
     // Overwrite mode: toggle visibility on the fixed set of rows.
@@ -3029,69 +3192,110 @@ function applyTraceFilter() {
         const cycleMs = tr.dataset.cycle ? parseFloat(tr.dataset.cycle) : null;
         const dlc = parseInt(tr.dataset.dlc ?? "0");
         const msgName = tr.dataset.msg || null;
-        const visible = traceRowVisible(ch, id, bytes, dir, cycleMs, dlc, msgName);
+        const j1939: J1939Info | null = tr.dataset.pgn
+            ? {
+                pgn: parseInt(tr.dataset.pgn),
+                priority: parseInt(tr.dataset.prio ?? "0"),
+                sa: parseInt(tr.dataset.sa ?? "0"),
+                da: parseInt(tr.dataset.da ?? "255"),
+            }
+            : null;
+        const visible = traceRowVisible(ch, id, bytes, dir, cycleMs, dlc, msgName, j1939);
         tr.style.display = visible ? "" : "none";
         // If hiding a row that has an open expansion, close it
         if (!visible) {
             const next = tr.nextElementSibling as HTMLTableRowElement | null;
-            if (next?.dataset.expand) { next.remove(); tr.classList.remove("trace-row-expanded"); }
+            if (next?.dataset.expand) collapseTraceRow(tr, next);
         }
     }
     updateClearFiltersBtn();
     scheduleAutoSave();
 }
 
+// Sort key of one row for the given column, read from the row's datasets.
+// Extracted once per row per sort pass (not per comparison) — the sort runs
+// after every frame batch, so the comparator must stay cheap.
+type TraceSortKey = number | string | number[];
+function traceRowSortKey(tr: HTMLTableRowElement, col: Exclude<TraceSortCol, null>): TraceSortKey {
+    switch (col) {
+        case "ts": return parseInt(tr.dataset.ts ?? "0");
+        case "dir": return tr.dataset.dir ?? "";
+        case "channel": return channelName(parseInt(tr.dataset.channelHandle ?? "0"));
+        case "canId": return parseInt(tr.dataset.canid ?? "0");
+        case "pgn": return parseInt(tr.dataset.pgn ?? "-1");
+        case "prio": return parseInt(tr.dataset.prio ?? "-1");
+        case "sa": return parseInt(tr.dataset.sa ?? "-1");
+        case "da": return parseInt(tr.dataset.da ?? "-1");
+        case "msg": return tr.dataset.msg ?? "";
+        case "dlc": return parseInt(tr.dataset.dlc ?? "0");
+        case "data": return JSON.parse(tr.dataset.bytes ?? "[]");
+        // Missing cycle sorts last ascending (first descending), as before.
+        case "cycle": {
+            const c = parseFloat(tr.dataset.cycle ?? "");
+            return isNaN(c) ? Infinity : c;
+        }
+    }
+}
+
+function compareSortKeys(a: TraceSortKey, b: TraceSortKey): number {
+    if (typeof a === "string") return a.localeCompare(b as string);
+    if (Array.isArray(a)) {
+        const bb = b as number[];
+        for (let i = 0; i < Math.max(a.length, bb.length); i++) {
+            const d = (a[i] ?? -1) - (bb[i] ?? -1);
+            if (d !== 0) return d;
+        }
+        return 0;
+    }
+    if (a === b) return 0; // also covers Infinity vs Infinity (subtraction gives NaN)
+    return (a as number) - (b as number);
+}
+
+// Re-order the trace rows by the active sort column. Called after every frame
+// batch and after bulk rebuilds, so it exits without touching the DOM when the
+// rows are already in order. Rows move together with their open expansion row.
 function applyTraceSort() {
     if (!traceSortCol) return;
     const col = traceSortCol;
     const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
-    // Close any open expansion rows — they'd get orphaned during sort
-    tbody.querySelectorAll<HTMLTableRowElement>("tr[data-expand]").forEach(r => {
-        (r.previousElementSibling as HTMLTableRowElement | null)?.classList.remove("trace-row-expanded");
-        r.remove();
-    });
+
     const rows = Array.from(tbody.rows).filter(r => !(r as HTMLTableRowElement).dataset.expand) as HTMLTableRowElement[];
-    rows.sort((a, b) => {
-        let cmp = 0;
-        switch (col) {
-            case "ts": cmp = parseInt(a.dataset.ts ?? "0") - parseInt(b.dataset.ts ?? "0"); break;
-            case "dir": cmp = (a.dataset.dir ?? "").localeCompare(b.dataset.dir ?? ""); break;
-            case "channel": cmp = channelName(parseInt(a.dataset.channelHandle ?? "0")).localeCompare(channelName(parseInt(b.dataset.channelHandle ?? "0"))); break;
-            case "canId": cmp = parseInt(a.dataset.canid ?? "0") - parseInt(b.dataset.canid ?? "0"); break;
-            case "msg": cmp = (a.dataset.msg ?? "").localeCompare(b.dataset.msg ?? ""); break;
-            case "dlc": cmp = parseInt(a.dataset.dlc ?? "0") - parseInt(b.dataset.dlc ?? "0"); break;
-            case "data": {
-                const ba: number[] = JSON.parse(a.dataset.bytes ?? "[]");
-                const bb: number[] = JSON.parse(b.dataset.bytes ?? "[]");
-                for (let i = 0; i < Math.max(ba.length, bb.length); i++) {
-                    cmp = (ba[i] ?? -1) - (bb[i] ?? -1);
-                    if (cmp !== 0) break;
-                }
-                break;
-            }
-            case "cycle": {
-                const ca = parseFloat(a.dataset.cycle ?? "");
-                const cb = parseFloat(b.dataset.cycle ?? "");
-                if (isNaN(ca) && isNaN(cb)) cmp = 0;
-                else if (isNaN(ca)) cmp = 1;
-                else if (isNaN(cb)) cmp = -1;
-                else cmp = ca - cb;
-                break;
-            }
-        }
-        return traceSortDir === "asc" ? cmp : -cmp;
-    });
-    for (const row of rows) tbody.appendChild(row);
+    const dir = traceSortDir === "asc" ? 1 : -1;
+    const keyed = rows.map(r => ({ r, k: traceRowSortKey(r, col) }));
+    // Array.sort is stable, so ties keep their arrival order and don't jitter.
+    keyed.sort((a, b) => dir * compareSortKeys(a.k, b.k));
+
+    if (keyed.every((e, i) => e.r === rows[i])) return; // already sorted
+
+    // Capture parent → expansion pairs before moving anything; the sibling
+    // relationships change as rows are re-appended.
+    const expansions = new Map<HTMLTableRowElement, HTMLTableRowElement>();
+    for (const r of Array.from(tbody.querySelectorAll<HTMLTableRowElement>("tr[data-expand]"))) {
+        const parent = r.previousElementSibling as HTMLTableRowElement | null;
+        if (parent) expansions.set(parent, r);
+    }
+    const frag = document.createDocumentFragment();
+    for (const { r } of keyed) {
+        frag.appendChild(r);
+        const exp = expansions.get(r);
+        if (exp) frag.appendChild(exp);
+    }
+    tbody.appendChild(frag);
 }
 
 function buildTraceCellHtml(key: string, entry: TraceEntry): string {
     const dirClass = entry.direction === "tx" ? "dir-tx" : "dir-rx";
+    const j = entry.j1939;
     switch (key) {
+        case "pgn": return `<td data-col="pgn" class="td-canid"${j ? ` data-tip="PGN ${j.pgn} (0x${j.pgn.toString(16).toUpperCase()})"` : ""}>${j ? fmtPgn(j.pgn) : "—"}</td>`;
+        case "prio": return `<td data-col="prio">${j ? j.priority : "—"}</td>`;
+        case "sa": return `<td data-col="sa" class="td-canid">${j ? fmtJ1939Addr(j.sa) : "—"}</td>`;
+        case "da": return `<td data-col="da" class="td-canid">${j ? (j.da === 0xFF ? "All" : fmtJ1939Addr(j.da)) : "—"}</td>`;
         case "ts": return `<td data-col="ts" class="td-ts">${fmtElapsed(entry.timestampMs)}</td>`;
         case "dir": return `<td data-col="dir"><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>`;
         case "channel": return `<td data-col="channel">${channelName(entry.channelHandle)}</td>`;
         case "canId": return `<td data-col="canId" class="td-canid">${fmtId(entry.canId, entry.isExtended)}</td>`;
-        case "msg": return `<td data-col="msg"${entry.messageName ? ` title="${entry.messageName}"` : ""}>${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>`;
+        case "msg": return `<td data-col="msg">${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>`;
         case "dlc": return `<td data-col="dlc" style="text-align:center">${entry.dlc}</td>`;
         case "data": return `<td data-col="data" class="td-data">${fmtData(entry.data)}</td>`;
         case "cycle": return `<td data-col="cycle" class="td-cycle">${entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—"}</td>`;
@@ -3110,6 +3314,14 @@ function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
         messageName: tr.dataset.msg || null,
         dlc: parseInt(tr.dataset.dlc ?? "0"),
         cycleTimeMs: tr.dataset.cycle ? parseFloat(tr.dataset.cycle) : null,
+        j1939: tr.dataset.pgn
+            ? {
+                pgn: parseInt(tr.dataset.pgn),
+                priority: parseInt(tr.dataset.prio ?? "0"),
+                sa: parseInt(tr.dataset.sa ?? "0"),
+                da: parseInt(tr.dataset.da ?? "255"),
+            }
+            : null,
         signals: traceRowSignals.get(tr) ?? [],
     };
 }
@@ -3126,10 +3338,15 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
     tr.dataset.msg = entry.messageName ?? "";
     tr.dataset.dlc = String(entry.dlc);
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
+    if (entry.j1939) {
+        tr.dataset.pgn = String(entry.j1939.pgn);
+        tr.dataset.prio = String(entry.j1939.priority);
+        tr.dataset.sa = String(entry.j1939.sa);
+        tr.dataset.da = String(entry.j1939.da);
+    }
     if (entry.messageName) tr.classList.add("dbc-match");
-    if (!traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName)) tr.style.display = "none";
-    const visible = traceColOrder.filter(k => !traceColHidden.has(k));
-    tr.innerHTML = visible.map(k => buildTraceCellHtml(k, entry)).join("");
+    if (!traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName, entry.j1939)) tr.style.display = "none";
+    tr.innerHTML = visibleTraceCols().map(k => buildTraceCellHtml(k, entry)).join("");
     return tr;
 }
 
@@ -3139,7 +3356,7 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     tr.dataset.ts = String(entry.timestampMs);
     tr.dataset.dlc = String(entry.dlc);
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
-    tr.style.display = traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName) ? "" : "none";
+    tr.style.display = traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName, entry.j1939) ? "" : "none";
     const gc = (k: string) => tr.querySelector<HTMLTableCellElement>(`[data-col="${k}"]`);
     const tsCell = gc("ts"); if (tsCell) tsCell.textContent = fmtElapsed(entry.timestampMs);
     const dlcCell = gc("dlc"); if (dlcCell) dlcCell.textContent = String(entry.dlc);
@@ -3149,7 +3366,7 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     // Refresh open expansion row with updated signal values + current min/max
     const next = tr.nextElementSibling as HTMLTableRowElement | null;
     if (next?.dataset.expand) {
-        const msg = channels.get(entry.channelHandle)?.dbc?.messages[entry.canId];
+        const msg = dbcMessageFor(entry.channelHandle, entry.canId, entry.isExtended);
         if (msg) {
             const vals = entry.signals; // interleaved [value, raw], index-aligned with msg.signals
             const valCells = next.querySelectorAll<HTMLElement>(".te-val");
@@ -3162,7 +3379,9 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
                     valCells[i].textContent = hasVal ? formatSigValue(vals[2 * i], "") : "—";
                     if (hasVal) valCells[i].dataset.tip = `Raw: ${vals[2 * i + 1]}`;
                 }
-                const key = plotKey(entry.channelHandle, entry.canId, sig.name);
+                // Keyed by the DBC message id (not the wire id): J1939 frames from
+                // different senders share the same signal series.
+                const key = plotKey(entry.channelHandle, msg.id, sig.name);
                 const mn = signalMinValues.get(key);
                 const mx = signalMaxValues.get(key);
                 if (minCells[i]) {
@@ -3191,8 +3410,10 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
 
     for (const ev of events) {
         // Message identity comes from the frontend's copy of the DBC (the event
-        // carries no strings); both sides parsed the same file at open.
-        const msg = channels.get(ev.channel_handle)?.dbc?.messages[ev.can_id] ?? null;
+        // carries no strings); both sides parsed the same file at open. On J1939
+        // channels the lookup falls back to PGN + source-address matching,
+        // mirroring the backend.
+        const msg = dbcMessageFor(ev.channel_handle, ev.can_id, ev.is_extended);
         const messageName = msg?.name ?? null;
 
         // Update seen sets (for filter autocomplete) and cycle timing.
@@ -3200,6 +3421,14 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
         traceSeenCanIds.add(ev.can_id);
         if (messageName) traceSeenMsgNames.add(messageName);
         else traceSeenNoMsg = true;
+        if (ev.j1939) {
+            traceSeenPgns.add(ev.j1939.pgn);
+            traceSeenPrios.add(ev.j1939.priority);
+            traceSeenSas.add(ev.j1939.sa);
+            traceSeenDas.add(ev.j1939.da);
+        } else {
+            traceSeenNoJ1939 = true;
+        }
 
         const direction = ev.direction ?? "rx";
         const key = traceKey(ev.channel_handle, ev.can_id, direction);
@@ -3235,6 +3464,7 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
                     series.lastValue = value;
                     markPaneDirty(pane); // no-op while viewPaused; data accumulates in series
                 }
+                if (tracePlotSigKeys.has(sigKey)) pushTracePlotPoint(sigKey, ev.timestamp_ms, x, value);
             }
         }
 
@@ -3248,6 +3478,7 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
             timestampMs: ev.timestamp_ms,
             cycleTimeMs: cycleTime,
             direction,
+            j1939: ev.j1939 ?? null,
             signals: ev.signals,
         };
 
@@ -3301,13 +3532,31 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
         const frag = document.createDocumentFragment();
         for (let i = appendEntries.length - 1; i >= 0; i--) {
             const e = appendEntries[i];
-            if (traceRowVisible(e.channelHandle, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName)) {
+            if (traceRowVisible(e.channelHandle, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName, e.j1939)) {
                 frag.appendChild(buildTraceRow(e));
             }
         }
         tbody.insertBefore(frag, tbody.firstChild);
-        while (tbody.rows.length > traceMaxRows) tbody.deleteRow(-1);
+        // Cap the row count by dropping the oldest rows. Unsorted, the oldest
+        // sit at the bottom; with an active column sort the bottom row is just
+        // whatever sorts last, so evict by timestamp instead.
+        if (!traceSortCol) {
+            while (tbody.rows.length > traceMaxRows) tbody.deleteRow(-1);
+        } else if (tbody.rows.length > traceMaxRows) {
+            const rows = (Array.from(tbody.rows) as HTMLTableRowElement[]).filter(r => !r.dataset.expand);
+            rows.sort((a, b) => parseInt(a.dataset.ts ?? "0") - parseInt(b.dataset.ts ?? "0"));
+            const excess = tbody.rows.length - traceMaxRows;
+            for (let i = 0; i < excess && i < rows.length; i++) {
+                const next = rows[i].nextElementSibling as HTMLTableRowElement | null;
+                if (next?.dataset.expand) next.remove();
+                rows[i].remove();
+            }
+        }
     }
+
+    // Keep the user's column sort applied as rows arrive and update in place
+    // (no-op when no sort is active or the order is already correct).
+    if (latestOverwrite.size > 0 || appendEntries.length > 0) applyTraceSort();
 }
 
 async function loadTraceFrames() {
@@ -3322,6 +3571,14 @@ async function loadTraceFrames() {
         if (f.message_name) traceSeenMsgNames.add(f.message_name);
         traceSeenChannels.add(f.channel_handle);
         traceSeenCanIds.add(f.can_id);
+        if (f.j1939) {
+            traceSeenPgns.add(f.j1939.pgn);
+            traceSeenPrios.add(f.j1939.priority);
+            traceSeenSas.add(f.j1939.sa);
+            traceSeenDas.add(f.j1939.da);
+        } else {
+            traceSeenNoJ1939 = true;
+        }
         return {
             channelHandle: f.channel_handle,
             canId: f.can_id,
@@ -3332,6 +3589,7 @@ async function loadTraceFrames() {
             timestampMs: f.timestamp_ms,
             cycleTimeMs,
             direction: f.direction,
+            j1939: f.j1939 ?? null,
             // get_frames returns named signals; flatten to the interleaved
             // [value, raw] layout used everywhere else (same DBC order).
             signals: f.signals.flatMap(s => [s.value, s.raw]),
@@ -3340,6 +3598,7 @@ async function loadTraceFrames() {
 }
 
 function clearTrace() {
+    destroyAllTracePlots();
     (document.getElementById("trace-tbody") as HTMLTableSectionElement).innerHTML = "";
     traceRowEls.clear();
     tracePendingOverwrite.clear();
@@ -3348,6 +3607,11 @@ function clearTrace() {
     traceSeenCanIds.clear();
     traceSeenMsgNames.clear();
     traceSeenNoMsg = false;
+    traceSeenPgns.clear();
+    traceSeenPrios.clear();
+    traceSeenSas.clear();
+    traceSeenDas.clear();
+    traceSeenNoJ1939 = false;
     traceLocalBuffer = [];
 }
 
@@ -3365,6 +3629,11 @@ function anyFilterActive(): boolean {
         || traceFilterCanIds !== null
         || traceFilterMsgNames !== null
         || traceFilterDir !== null
+        || traceFilterPgns !== null
+        || traceFilterPrios !== null
+        || traceFilterSas !== null
+        || traceFilterDas !== null
+        || traceFilterBroadcast !== null
         || traceFilterDlcMin !== null
         || traceFilterDlcMax !== null
         || traceFilterCycleMin !== null
@@ -3382,6 +3651,11 @@ function clearAllFilters() {
     traceFilterCanIds = null;
     traceFilterMsgNames = null;
     traceFilterDir = null;
+    traceFilterPgns = null;
+    traceFilterPrios = null;
+    traceFilterSas = null;
+    traceFilterDas = null;
+    traceFilterBroadcast = null;
     traceFilterDlcMin = null;
     traceFilterDlcMax = null;
     traceFilterCycleMin = null;
@@ -3436,11 +3710,28 @@ function hideColDropIndicator() {
     if (colDropIndicator) colDropIndicator.style.display = "none";
 }
 
+// The one column rendered WITHOUT a width. The table is `table-layout: fixed;
+// width: 100%`: when every column has a specified width and the sum doesn't
+// match the table width, the browser rescales all columns proportionally —
+// specified and rendered widths then disagree, which makes resize drags jump
+// and overshoot the mouse. Keeping exactly one width-less column absorbs the
+// slack so every other column renders at exactly its specified width.
+//
+// It must be the RIGHTMOST visible column: a drag on any handle left of the
+// absorber is compensated by the absorber, so all edges left of it track the
+// mouse 1:1. A column right of the absorber would instead have its left edge
+// shift while the dragged right edge stays put.
+function traceAbsorberCol(visible: string[]): string {
+    return visible[visible.length - 1] ?? "";
+}
+
 function rebuildTraceColumns() {
-    const visible = traceColOrder.filter(k => !traceColHidden.has(k));
+    const visible = visibleTraceCols();
+    const absorber = traceAbsorberCol(visible);
 
     const colgroup = document.querySelector("#trace-table colgroup")!;
     colgroup.innerHTML = visible.map(k => {
+        if (k === absorber) return `<col>`;
         const w = traceColWidths[k] ?? TRACE_COL_DEFS.find(d => d.key === k)!.defaultWidth;
         return w ? `<col style="width:${w}px">` : `<col>`;
     }).join("");
@@ -3466,33 +3757,50 @@ function rebuildTraceColumns() {
 function setupTraceHeaders() {
     const ths = traceHeaderEls;
     const traceCols = Array.from(document.querySelectorAll<HTMLElement>("#trace-table colgroup col"));
+    const absorber = traceAbsorberCol(visibleTraceCols());
 
     ths.forEach((th, i) => {
         const key = th.dataset.col ?? "";
 
-        // Resize handle
-        const handle = document.createElement("span");
-        handle.className = "col-resizer";
-        handle.addEventListener("click", (e) => e.stopPropagation());
-        handle.addEventListener("mousedown", (e) => {
-            e.preventDefault(); e.stopPropagation();
-            const startX = e.clientX, startW = th.offsetWidth;
-            handle.classList.add("active");
-            document.body.classList.add("col-resizing");
-            const onMove = (ev: MouseEvent) => {
-                const w = Math.max(40, startW + ev.clientX - startX);
-                if (traceCols[i]) traceCols[i].style.width = `${w}px`;
-                traceColWidths[key] = w;
-            };
-            const onUp = () => {
-                handle.classList.remove("active"); document.body.classList.remove("col-resizing");
-                document.removeEventListener("mousemove", onMove);
-                document.removeEventListener("mouseup", onUp);
-            };
-            document.addEventListener("mousemove", onMove);
-            document.addEventListener("mouseup", onUp);
-        });
-        th.appendChild(handle);
+        // Resize handle. The absorber column gets none: its width is whatever
+        // the fixed columns leave over, so it cannot be sized directly.
+        if (key !== absorber) {
+            const handle = document.createElement("span");
+            handle.className = "col-resizer";
+            handle.addEventListener("click", (e) => e.stopPropagation());
+            handle.addEventListener("mousedown", (e) => {
+                e.preventDefault(); e.stopPropagation();
+                // Freeze every fixed column at its currently rendered width
+                // before the drag. If any specified width disagrees with the
+                // rendered one (widths restored from a project saved at another
+                // window size, or an over-full table), the first width write
+                // would rescale the whole layout at once: the table jumps and
+                // the drag no longer tracks the mouse 1:1.
+                ths.forEach((h, j) => {
+                    const k = h.dataset.col ?? "";
+                    if (k === absorber || !traceCols[j]) return;
+                    const wj = h.offsetWidth;
+                    traceCols[j].style.width = `${wj}px`;
+                    traceColWidths[k] = wj;
+                });
+                const startX = e.clientX, startW = th.offsetWidth;
+                handle.classList.add("active");
+                document.body.classList.add("col-resizing");
+                const onMove = (ev: MouseEvent) => {
+                    const w = Math.max(40, startW + ev.clientX - startX);
+                    if (traceCols[i]) traceCols[i].style.width = `${w}px`;
+                    traceColWidths[key] = w;
+                };
+                const onUp = () => {
+                    handle.classList.remove("active"); document.body.classList.remove("col-resizing");
+                    document.removeEventListener("mousemove", onMove);
+                    document.removeEventListener("mouseup", onUp);
+                };
+                document.addEventListener("mousemove", onMove);
+                document.addEventListener("mouseup", onUp);
+            });
+            th.appendChild(handle);
+        }
 
         // Sort on click
         th.addEventListener("click", () => {
@@ -3580,6 +3888,64 @@ function setupTraceHeaders() {
                         syncFilteredHeaders(); applyTraceFilter();
                     });
             });
+        } else if (key === "pgn") {
+            th.addEventListener("contextmenu", (e) => {
+                e.preventDefault();
+                const items = [...traceSeenPgns].sort((a, b) => a - b)
+                    .map(p => ({ label: `${fmtPgn(p)}${j1939IsBroadcast(p) ? "" : " (dest.)"}`, key: String(p) }));
+                if (traceSeenNoJ1939) items.push({ label: "(non-J1939)", key: "-1" });
+                if (!items.length) return;
+                // Broadcast / destination-specific selector shown above the PGN list.
+                const bRow = document.createElement("div");
+                bRow.className = "data-fmt-row";
+                for (const [value, label] of [[null, "Any"], [true, "Broadcast"], [false, "Dest."]] as const) {
+                    const btn = document.createElement("button");
+                    btn.textContent = label;
+                    btn.className = "data-fmt-btn" + (traceFilterBroadcast === value ? " active" : "");
+                    btn.addEventListener("click", () => {
+                        traceFilterBroadcast = value;
+                        bRow.querySelectorAll<HTMLButtonElement>(".data-fmt-btn").forEach(b => b.classList.remove("active"));
+                        btn.classList.add("active");
+                        syncFilteredHeaders(); applyTraceFilter();
+                    });
+                    bRow.appendChild(btn);
+                }
+                showFilterMenu(e.clientX, e.clientY, items,
+                    traceFilterPgns !== null ? new Set([...traceFilterPgns].map(String)) : null,
+                    (active) => {
+                        traceFilterPgns = active !== null ? new Set([...active].map(Number)) : null;
+                        syncFilteredHeaders(); applyTraceFilter();
+                    }, bRow);
+            });
+        } else if (key === "prio" || key === "sa" || key === "da") {
+            // Shared seen-value filter for the remaining J1939 columns.
+            const cfg = {
+                prio: {
+                    seen: traceSeenPrios, fmt: (v: number) => String(v),
+                    get: () => traceFilterPrios, set: (v: Set<number> | null) => { traceFilterPrios = v; },
+                },
+                sa: {
+                    seen: traceSeenSas, fmt: fmtJ1939Addr,
+                    get: () => traceFilterSas, set: (v: Set<number> | null) => { traceFilterSas = v; },
+                },
+                da: {
+                    seen: traceSeenDas, fmt: (v: number) => v === 0xFF ? "All (FFh)" : fmtJ1939Addr(v),
+                    get: () => traceFilterDas, set: (v: Set<number> | null) => { traceFilterDas = v; },
+                },
+            }[key];
+            th.addEventListener("contextmenu", (e) => {
+                e.preventDefault();
+                const items = [...cfg.seen].sort((a, b) => a - b).map(v => ({ label: cfg.fmt(v), key: String(v) }));
+                if (traceSeenNoJ1939) items.push({ label: "(non-J1939)", key: "-1" });
+                if (!items.length) return;
+                const current = cfg.get();
+                showFilterMenu(e.clientX, e.clientY, items,
+                    current !== null ? new Set([...current].map(String)) : null,
+                    (active) => {
+                        cfg.set(active !== null ? new Set([...active].map(Number)) : null);
+                        syncFilteredHeaders(); applyTraceFilter();
+                    });
+            });
         } else if (key === "data") {
             th.addEventListener("contextmenu", (e) => {
                 e.preventDefault();
@@ -3603,23 +3969,51 @@ function setupTraceHeaders() {
                 }
                 menu.appendChild(fmtRow);
                 const sep = document.createElement("div"); sep.className = "data-filter-sep"; menu.appendChild(sep);
+
+                // How many data byte positions to filter on. Default 8; raise it
+                // to match reassembled J1939 transport messages (dlc > 8).
+                const countRow = document.createElement("div"); countRow.className = "range-filter-row";
+                const countLbl = document.createElement("span"); countLbl.className = "range-filter-lbl"; countLbl.textContent = "Bytes:";
+                const countInp = document.createElement("input");
+                countInp.type = "number"; countInp.min = "1"; countInp.max = String(MAX_DATA_FILTER_BYTES);
+                countInp.className = "range-filter-inp";
+                countInp.value = String(traceFilterData.length);
+                countRow.append(countLbl, countInp);
+                menu.appendChild(countRow);
+
                 const inputs: HTMLInputElement[] = [];
                 const grid = document.createElement("div"); grid.className = "data-filter-grid";
-                for (let idx = 0; idx < 8; idx++) {
-                    const cell = document.createElement("div"); cell.className = "data-filter-cell";
-                    const lbl = document.createElement("span"); lbl.className = "data-filter-lbl"; lbl.textContent = String(idx);
-                    const inp = document.createElement("input");
-                    inp.type = "text"; inp.className = "data-filter-inp"; inp.placeholder = "—"; inp.maxLength = 4;
-                    const cur = traceFilterData[idx];
-                    if (cur !== null) inp.value = cur.toString(16).toUpperCase().padStart(2, "0");
-                    inp.addEventListener("input", () => {
-                        const val = parseByte(inp.value);
-                        traceFilterData[idx] = val;
-                        inp.classList.toggle("data-filter-invalid", inp.value.trim() !== "" && val === null);
-                        syncFilteredHeaders(); applyTraceFilter();
-                    });
-                    cell.append(lbl, inp); grid.appendChild(cell); inputs.push(inp);
-                }
+                grid.style.maxHeight = "40vh"; grid.style.overflowY = "auto";
+                const buildGrid = () => {
+                    grid.innerHTML = "";
+                    inputs.length = 0;
+                    for (let idx = 0; idx < traceFilterData.length; idx++) {
+                        const cell = document.createElement("div"); cell.className = "data-filter-cell";
+                        const lbl = document.createElement("span"); lbl.className = "data-filter-lbl"; lbl.textContent = String(idx);
+                        const inp = document.createElement("input");
+                        inp.type = "text"; inp.className = "data-filter-inp"; inp.placeholder = "—"; inp.maxLength = 4;
+                        const cur = traceFilterData[idx];
+                        if (cur !== null) inp.value = cur.toString(16).toUpperCase().padStart(2, "0");
+                        inp.addEventListener("input", () => {
+                            const val = parseByte(inp.value);
+                            traceFilterData[idx] = val;
+                            inp.classList.toggle("data-filter-invalid", inp.value.trim() !== "" && val === null);
+                            syncFilteredHeaders(); applyTraceFilter();
+                        });
+                        cell.append(lbl, inp); grid.appendChild(cell); inputs.push(inp);
+                    }
+                };
+                buildGrid();
+                countInp.addEventListener("change", () => {
+                    const n = Math.max(1, Math.min(MAX_DATA_FILTER_BYTES, parseInt(countInp.value) || 8));
+                    countInp.value = String(n);
+                    if (n === traceFilterData.length) return;
+                    // Values at surviving positions are kept; truncated positions
+                    // lose their filter.
+                    traceFilterData = Array.from({ length: n }, (_, i) => traceFilterData[i] ?? null);
+                    buildGrid();
+                    syncFilteredHeaders(); applyTraceFilter(); scheduleAutoSave();
+                });
                 menu.appendChild(grid);
                 const hint = document.createElement("div"); hint.className = "data-filter-hint";
                 hint.textContent = "hex (FF) or decimal (255), empty = any"; menu.appendChild(hint);
@@ -3666,10 +4060,270 @@ function setupTraceHeaders() {
     syncFilteredHeaders();
 }
 
+// ── Inline trace plots ────────────────────────────────────────────────────────
+// Clicking a signal row inside a trace row expansion opens a live plot of that
+// signal in a fixed-height row inserted directly under it. Each signal of a
+// message can have its own plot open at the same time; clicking the signal
+// again closes it. The charts scroll continuously (requestAnimationFrame),
+// like the panes in the plot tab.
+
+interface TracePlot {
+    chart: Chart;
+    sigKey: string;
+    data: { x: number; y: number }[];
+    lastTs: number;
+    /// Highlighted signal row the plot sits under.
+    sigRow: HTMLTableRowElement;
+}
+
+// Keyed by the plot's own <tr> inside the expansion's signal table.
+const tracePlots = new Map<HTMLTableRowElement, TracePlot>();
+// Membership test used in the hot per-frame decode loop.
+let tracePlotSigKeys = new Set<string>();
+let tracePlotRaf: number | null = null;
+
+function rebuildTracePlotKeys() {
+    tracePlotSigKeys = new Set([...tracePlots.values()].map(tp => tp.sigKey));
+}
+
+function pushTracePlotPoint(sigKey: string, tsMs: number, x: number, value: number) {
+    for (const tp of tracePlots.values()) {
+        if (tp.sigKey !== sigKey || tsMs <= tp.lastTs) continue;
+        tp.lastTs = tsMs;
+        tp.data.push({ x, y: value });
+    }
+}
+
+function destroyTracePlot(plotTr: HTMLTableRowElement) {
+    const tp = tracePlots.get(plotTr);
+    if (!tp) return;
+    tp.chart.destroy();
+    tp.sigRow.classList.remove("te-plotted");
+    tracePlots.delete(plotTr);
+    plotTr.remove();
+    rebuildTracePlotKeys();
+}
+
+function destroyAllTracePlots() {
+    for (const tp of tracePlots.values()) tp.chart.destroy();
+    tracePlots.clear();
+    rebuildTracePlotKeys();
+}
+
+// Continuous scroll loop for the inline plots, mirroring the plot tab: advance
+// the x window by wall time every animation frame and redraw. Also
+// garbage-collects plots whose row left the DOM through a path without an
+// explicit destroy (row eviction, bulk table rebuilds).
+function tracePlotTick() {
+    if (tracePlots.size === 0) {
+        tracePlotRaf = null;
+        return;
+    }
+    const now = (Date.now() - appStartTime) / 1000;
+    const cutoffX = now - windowSizeSec;
+    let removed = false;
+    for (const [plotTr, tp] of tracePlots) {
+        if (!plotTr.isConnected) {
+            tp.chart.destroy();
+            tracePlots.delete(plotTr);
+            removed = true;
+            continue;
+        }
+        // Stopped, frozen (pause) or hidden (other tab): no scrolling; data
+        // keeps accumulating and the chart catches up when visible again.
+        if (!appRunning || viewPaused || !traceTabActive) continue;
+        while (tp.data.length > 0 && tp.data[0].x < cutoffX) tp.data.shift();
+        const xs = (tp.chart.options.scales as any)["x"];
+        xs.min = Math.max(0, now - windowSizeSec);
+        xs.max = Math.max(windowSizeSec, now);
+        tp.chart.update("none");
+    }
+    if (removed) rebuildTracePlotKeys();
+    tracePlotRaf = requestAnimationFrame(tracePlotTick);
+}
+
+function startTracePlotLoop() {
+    if (tracePlotRaf === null) tracePlotRaf = requestAnimationFrame(tracePlotTick);
+}
+
+async function toggleTracePlot(sigRow: HTMLTableRowElement, handle: number, msgId: number, sig: DbcSignal) {
+    // A plot row directly under the signal row means it's open: toggle off.
+    const next = sigRow.nextElementSibling as HTMLTableRowElement | null;
+    if (next?.dataset.sigplot) {
+        destroyTracePlot(next);
+        return;
+    }
+
+    // Full-width, fixed-height plot row under the clicked signal. The signal
+    // table spans the whole expansion width (filler column), so the plot cell
+    // simply fills the row.
+    const plotTr = document.createElement("tr");
+    plotTr.dataset.sigplot = "1";
+    const td = document.createElement("td");
+    td.colSpan = sigRow.cells.length;
+    td.className = "te-plot-cell";
+    const container = document.createElement("div");
+    container.className = "te-plot";
+    const canvas = document.createElement("canvas");
+    container.appendChild(canvas);
+    td.appendChild(container);
+    plotTr.appendChild(td);
+    sigRow.after(plotTr);
+
+    const sigKey = plotKey(handle, msgId, sig.name);
+    const data: { x: number; y: number }[] = [];
+    const now = (Date.now() - appStartTime) / 1000;
+    const chart = new Chart(canvas, {
+        type: "line",
+        data: {
+            datasets: [{
+                label: sig.name,
+                data,
+                borderColor: PLOT_COLORS[0],
+                backgroundColor: "transparent",
+                borderWidth: 1.5,
+                // Every sample is marked and the line steps between them — the
+                // inline plot never interpolates.
+                pointRadius: 3,
+                pointBackgroundColor: PLOT_COLORS[0],
+                tension: 0,
+                stepped: "before",
+            }],
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            scales: {
+                x: {
+                    type: "linear",
+                    min: Math.max(0, now - windowSizeSec),
+                    max: Math.max(windowSizeSec, now),
+                    ticks: { color: "#71717a", maxTicksLimit: 6, callback: (v: any) => `${Math.round(Number(v))}s` },
+                    grid: { color: "#2a2b30" },
+                },
+                y: { ticks: { color: "#71717a" }, grid: { color: "#2a2b30" } },
+            },
+            plugins: {
+                legend: { display: false },
+                tooltip: { enabled: false },
+            },
+        },
+    } as any);
+
+    sigRow.classList.add("te-plotted");
+    const tp: TracePlot = { chart, sigKey, data, lastTs: 0, sigRow };
+    tracePlots.set(plotTr, tp);
+    rebuildTracePlotKeys();
+    startTracePlotLoop();
+
+    // Seed with buffered history. Live points arriving while we await are
+    // appended by onCanFrameBatch and are newer than anything returned here.
+    try {
+        const history = await invoke<Array<{ timestamp_ms: number; value: number }>>(
+            "get_signal_history", { handle, messageId: msgId, signalName: sig.name, sinceMs: 0 },
+        );
+        if (tracePlots.get(plotTr) !== tp) return; // closed while awaiting
+        const liveStart = tp.data[0]?.x ?? Infinity;
+        const older = history
+            .map(s => ({ ts: s.timestamp_ms, x: (s.timestamp_ms - appStartTime) / 1000, y: s.value }))
+            .filter(p => p.x < liveStart);
+        if (older.length > 0) {
+            tp.data.unshift(...older.map(p => ({ x: p.x, y: p.y })));
+            tp.lastTs = Math.max(tp.lastTs, older[older.length - 1].ts);
+        }
+        tp.chart.update("none");
+    } catch {
+        // History is best-effort; the plot still fills from live frames.
+    }
+}
+
+// Build and insert the signal-detail expansion under a trace row. No-op when
+// the row has no DBC match or is already expanded.
+function expandTraceRow(tr: HTMLTableRowElement) {
+    if (!tr.classList.contains("dbc-match") || tr.classList.contains("trace-row-expanded")) return;
+
+    const trHandle = parseInt(tr.dataset.channelHandle ?? "0");
+    const canId = parseInt(tr.dataset.canid ?? "0");
+    const msg = dbcMessageFor(trHandle, canId, tr.dataset.ext === "1");
+    if (!msg) return;
+    // Interleaved [value, raw] pairs, index-aligned with msg.signals.
+    const vals = traceRowSignals.get(tr) ?? [];
+
+    const expandTr = document.createElement("tr");
+    expandTr.dataset.expand = "1";
+    // Identity for the inline signal plots (DBC message id, not the wire id).
+    expandTr.dataset.handle = String(trHandle);
+    expandTr.dataset.msgid = String(msg.id);
+    const td = document.createElement("td");
+    td.colSpan = visibleTraceCols().length;
+    td.className = "trace-expand-cell";
+
+    const hasEnums = msg.signals.some((s: DbcSignal) => (s.enum_values ?? []).length > 0);
+    // The trailing filler column absorbs the leftover width so the table (and
+    // with it row backgrounds and inline plot rows) spans the whole expansion.
+    let html = '<table class="trace-expand-table"><thead><tr>'
+        + '<th>Signal</th><th>Value</th><th>Min</th><th>Max</th><th>Unit</th>'
+        + (hasEnums ? '<th>Name</th>' : '')
+        + '<th class="te-fill"></th>'
+        + '</tr></thead><tbody>';
+    for (let i = 0; i < msg.signals.length; i++) {
+        const sig = msg.signals[i];
+        const hasVal = 2 * i + 1 < vals.length;
+        // DBC message id, not the wire id — matches the keys written by
+        // onCanFrameBatch (J1939 wire ids embed the sender's address).
+        const key = plotKey(trHandle, msg.id, sig.name);
+        const mn = signalMinValues.get(key);
+        const mx = signalMaxValues.get(key);
+        const fmt = (v: number | undefined) => v !== undefined ? formatSigValue(v, "") : "—";
+        const rawTip = (v: number | undefined) => v !== undefined ? ` data-tip="Raw: ${physToRaw(sig, v)}"` : "";
+        html += `<tr data-sig="${sig.name}">
+        <td class="te-name" title="Click to plot">${sig.name}</td>
+        <td class="te-val"${hasVal ? ` data-tip="Raw: ${vals[2 * i + 1]}"` : ""}>${hasVal ? formatSigValue(vals[2 * i], "") : "—"}</td>
+        <td class="te-min"${rawTip(mn)}>${fmt(mn)}</td>
+        <td class="te-max"${rawTip(mx)}>${fmt(mx)}</td>
+        <td class="te-unit">${sig.unit || "—"}</td>`
+            + (hasEnums ? `<td class="te-enum">${hasVal ? (enumLabelForRaw(sig, vals[2 * i + 1]) || "—") : "—"}</td>` : "")
+            + '<td class="te-fill"></td>'
+            + `</tr>`;
+    }
+    html += '</tbody></table>';
+    td.innerHTML = html;
+    expandTr.appendChild(td);
+    tr.after(expandTr);
+    tr.classList.add("trace-row-expanded");
+}
+
+function collapseTraceRow(tr: HTMLTableRowElement, expandTr: HTMLTableRowElement) {
+    // Destroy any inline signal plots living inside this expansion.
+    for (const plotTr of [...tracePlots.keys()]) {
+        if (expandTr.contains(plotTr)) destroyTracePlot(plotTr);
+    }
+    expandTr.remove();
+    tr.classList.remove("trace-row-expanded");
+}
+
 function setupTrace() {
     rebuildTraceColumns();
 
     document.getElementById("btn-clear-trace")!.addEventListener("click", clearTrace);
+
+    // Expand/collapse every decoded (DBC-matched) row currently in the table.
+    document.getElementById("btn-trace-expand-all")!.addEventListener("click", () => {
+        const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
+        for (const tr of Array.from(tbody.rows) as HTMLTableRowElement[]) {
+            if (tr.dataset.expand || tr.style.display === "none") continue;
+            expandTraceRow(tr);
+        }
+    });
+    document.getElementById("btn-trace-collapse-all")!.addEventListener("click", () => {
+        const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
+        for (const tr of Array.from(tbody.querySelectorAll<HTMLTableRowElement>("tr[data-expand]"))) {
+            const parent = tr.previousElementSibling as HTMLTableRowElement | null;
+            if (parent) collapseTraceRow(parent, tr);
+            else { destroyTracePlot(tr); tr.remove(); }
+        }
+    });
     document.getElementById("btn-clear-filters")!.addEventListener("click", () => {
         clearAllFilters();
         scheduleAutoSave();
@@ -3686,7 +4340,9 @@ function setupTrace() {
         menu.style.left = `${rect.left}px`;
         menu.style.top = `${rect.bottom + 4}px`;
         menu.addEventListener("click", ev => ev.stopPropagation());
+        const showJ1939 = anyJ1939Channel();
         for (const def of TRACE_COL_DEFS) {
+            if (!showJ1939 && J1939_COL_KEYS.has(def.key)) continue;
             const item = document.createElement("label");
             item.className = "ctx-col-item";
             const cb = document.createElement("input");
@@ -3723,56 +4379,31 @@ function setupTrace() {
 
     // ── Trace row expansion ───────────────────────────────────────────────────
     document.getElementById("trace-tbody")!.addEventListener("click", (e) => {
-        const tr = (e.target as HTMLElement).closest("tr") as HTMLTableRowElement | null;
+        const target = e.target as HTMLElement;
+
+        // Click on a signal row inside an expansion: toggle its inline plot.
+        const sigRow = target.closest<HTMLTableRowElement>(".trace-expand-table tbody tr");
+        if (sigRow) {
+            const expandTr = sigRow.closest<HTMLTableCellElement>("td.trace-expand-cell")?.parentElement as HTMLTableRowElement | null;
+            if (expandTr?.dataset.expand && sigRow.dataset.sig) {
+                const handle = parseInt(expandTr.dataset.handle ?? "0");
+                const msgId = parseInt(expandTr.dataset.msgid ?? "0");
+                const sig = channels.get(handle)?.dbc?.messages[msgId]?.signals
+                    .find((s: DbcSignal) => s.name === sigRow.dataset.sig);
+                if (sig) toggleTracePlot(sigRow, handle, msgId, sig);
+            }
+            return;
+        }
+
+        const tr = target.closest("tr") as HTMLTableRowElement | null;
         if (!tr || tr.dataset.expand || !tr.classList.contains("dbc-match")) return;
 
         const next = tr.nextElementSibling as HTMLTableRowElement | null;
         if (next?.dataset.expand) {
-            next.remove();
-            tr.classList.remove("trace-row-expanded");
+            collapseTraceRow(tr, next);
             return;
         }
-
-        const trHandle = parseInt(tr.dataset.channelHandle ?? "0");
-        const canId = parseInt(tr.dataset.canid ?? "0");
-        const msg = channels.get(trHandle)?.dbc?.messages[canId];
-        if (!msg) return;
-        // Interleaved [value, raw] pairs, index-aligned with msg.signals.
-        const vals = traceRowSignals.get(tr) ?? [];
-
-        const expandTr = document.createElement("tr");
-        expandTr.dataset.expand = "1";
-        const td = document.createElement("td");
-        td.colSpan = traceColOrder.filter(k => !traceColHidden.has(k)).length;
-        td.className = "trace-expand-cell";
-
-        const hasEnums = msg.signals.some((s: DbcSignal) => (s.enum_values ?? []).length > 0);
-        let html = '<table class="trace-expand-table"><thead><tr>'
-            + '<th>Signal</th><th>Value</th><th>Min</th><th>Max</th><th>Unit</th>'
-            + (hasEnums ? '<th>Name</th>' : '')
-            + '</tr></thead><tbody>';
-        for (let i = 0; i < msg.signals.length; i++) {
-            const sig = msg.signals[i];
-            const hasVal = 2 * i + 1 < vals.length;
-            const key = plotKey(trHandle, canId, sig.name);
-            const mn = signalMinValues.get(key);
-            const mx = signalMaxValues.get(key);
-            const fmt = (v: number | undefined) => v !== undefined ? formatSigValue(v, "") : "—";
-            const rawTip = (v: number | undefined) => v !== undefined ? ` data-tip="Raw: ${physToRaw(sig, v)}"` : "";
-            html += `<tr>
-        <td class="te-name">${sig.name}</td>
-        <td class="te-val"${hasVal ? ` data-tip="Raw: ${vals[2 * i + 1]}"` : ""}>${hasVal ? formatSigValue(vals[2 * i], "") : "—"}</td>
-        <td class="te-min"${rawTip(mn)}>${fmt(mn)}</td>
-        <td class="te-max"${rawTip(mx)}>${fmt(mx)}</td>
-        <td class="te-unit">${sig.unit || "—"}</td>`
-                + (hasEnums ? `<td class="te-enum">${hasVal ? (enumLabelForRaw(sig, vals[2 * i + 1]) || "—") : "—"}</td>` : "")
-                + `</tr>`;
-        }
-        html += '</tbody></table>';
-        td.innerHTML = html;
-        expandTr.appendChild(td);
-        tr.after(expandTr);
-        tr.classList.add("trace-row-expanded");
+        expandTraceRow(tr);
     });
 
     document.getElementById("btn-trace-overwrite")!.addEventListener("click", function () {
@@ -3788,6 +4419,24 @@ function setupTrace() {
         scheduleAutoSave();
     });
 
+    // Cell content clipped by the fixed column layout (long payloads, message
+    // names, …) is shown in full as a tooltip, on any trace cell. Capture phase
+    // so data-tip is set before the document-level tooltip handler (bubble
+    // phase) looks for it. Cells carrying a static data-tip of their own (the
+    // PGN decimal value) are left alone; dynamically added clip-tips are marked
+    // with data-clip-tip so they can be distinguished and removed again.
+    document.getElementById("trace-container")!.addEventListener("mouseover", (e) => {
+        const td = (e.target as HTMLElement).closest<HTMLTableCellElement>("td[data-col]");
+        if (!td) return;
+        if (td.dataset.tip !== undefined && td.dataset.clipTip === undefined) return;
+        if (td.scrollWidth > td.clientWidth) {
+            td.dataset.tip = td.textContent ?? "";
+            td.dataset.clipTip = "1";
+        } else {
+            delete td.dataset.tip;
+            delete td.dataset.clipTip;
+        }
+    }, true);
 }
 
 // ── Global pause ─────────────────────────────────────────────────────────────
@@ -3836,20 +4485,23 @@ function resumeFromPause() {
             }
         }
         tracePendingOverwrite.clear();
+        applyTraceSort();
     } else {
         // Re-render visible rows from the backend (newest first after refresh).
         loadTraceFrames().then(() => {
+            destroyAllTracePlots();
             tbody.innerHTML = "";
             const frag = document.createDocumentFragment();
             let count = 0;
             for (const e of traceLocalBuffer) {
                 if (count >= traceMaxRows) break;
-                if (traceRowVisible(e.channelHandle, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName)) {
+                if (traceRowVisible(e.channelHandle, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName, e.j1939)) {
                     frag.appendChild(buildTraceRow(e));
                     count++;
                 }
             }
             tbody.appendChild(frag);
+            applyTraceSort();
         });
     }
 
