@@ -3699,11 +3699,24 @@ function hideColDropIndicator() {
     if (colDropIndicator) colDropIndicator.style.display = "none";
 }
 
+// The one column rendered WITHOUT a width. The table is `table-layout: fixed;
+// width: 100%`: when every column has a specified width and the sum doesn't
+// match the table width, the browser rescales all columns proportionally —
+// specified and rendered widths then disagree, which makes resize drags jump
+// and overshoot the mouse. Keeping exactly one width-less column (Data, or the
+// last visible column when Data is hidden) absorbs the slack so every other
+// column renders at exactly its specified width.
+function traceAbsorberCol(visible: string[]): string {
+    return visible.includes("data") ? "data" : visible[visible.length - 1] ?? "";
+}
+
 function rebuildTraceColumns() {
     const visible = visibleTraceCols();
+    const absorber = traceAbsorberCol(visible);
 
     const colgroup = document.querySelector("#trace-table colgroup")!;
     colgroup.innerHTML = visible.map(k => {
+        if (k === absorber) return `<col>`;
         const w = traceColWidths[k] ?? TRACE_COL_DEFS.find(d => d.key === k)!.defaultWidth;
         return w ? `<col style="width:${w}px">` : `<col>`;
     }).join("");
@@ -3729,33 +3742,51 @@ function rebuildTraceColumns() {
 function setupTraceHeaders() {
     const ths = traceHeaderEls;
     const traceCols = Array.from(document.querySelectorAll<HTMLElement>("#trace-table colgroup col"));
+    const absorber = traceAbsorberCol(visibleTraceCols());
 
     ths.forEach((th, i) => {
         const key = th.dataset.col ?? "";
 
-        // Resize handle
-        const handle = document.createElement("span");
-        handle.className = "col-resizer";
-        handle.addEventListener("click", (e) => e.stopPropagation());
-        handle.addEventListener("mousedown", (e) => {
-            e.preventDefault(); e.stopPropagation();
-            const startX = e.clientX, startW = th.offsetWidth;
-            handle.classList.add("active");
-            document.body.classList.add("col-resizing");
-            const onMove = (ev: MouseEvent) => {
-                const w = Math.max(40, startW + ev.clientX - startX);
-                if (traceCols[i]) traceCols[i].style.width = `${w}px`;
-                traceColWidths[key] = w;
-            };
-            const onUp = () => {
-                handle.classList.remove("active"); document.body.classList.remove("col-resizing");
-                document.removeEventListener("mousemove", onMove);
-                document.removeEventListener("mouseup", onUp);
-            };
-            document.addEventListener("mousemove", onMove);
-            document.addEventListener("mouseup", onUp);
-        });
-        th.appendChild(handle);
+        // Resize handle. The absorber column gets none: its width is whatever
+        // the fixed columns leave over, so it cannot be sized directly.
+        if (key !== absorber) {
+            const handle = document.createElement("span");
+            handle.className = "col-resizer";
+            handle.addEventListener("click", (e) => e.stopPropagation());
+            handle.addEventListener("mousedown", (e) => {
+                e.preventDefault(); e.stopPropagation();
+                // Freeze every fixed column at its currently rendered width
+                // before the drag. If any specified width disagrees with the
+                // rendered one (widths restored from a project saved at another
+                // window size, or an over-full table), the first width write
+                // would rescale the whole layout at once: the table jumps and
+                // the drag no longer tracks the mouse 1:1.
+                ths.forEach((h, j) => {
+                    const k = h.dataset.col ?? "";
+                    if (k === absorber || !traceCols[j]) return;
+                    const wj = h.offsetWidth;
+                    traceCols[j].style.width = `${wj}px`;
+                    traceColWidths[k] = wj;
+                });
+                const startX = e.clientX, startW = th.offsetWidth;
+                handle.classList.add("active");
+                document.body.classList.add("col-resizing");
+                const onMove = (ev: MouseEvent) => {
+                    const w = Math.max(40, startW + ev.clientX - startX);
+                    if (traceCols[i]) traceCols[i].style.width = `${w}px`;
+                    traceColWidths[key] = w;
+                };
+                const onUp = () => {
+                    handle.classList.remove("active"); document.body.classList.remove("col-resizing");
+                    document.removeEventListener("mousemove", onMove);
+                    document.removeEventListener("mouseup", onUp);
+                    scheduleAutoSave();
+                };
+                document.addEventListener("mousemove", onMove);
+                document.addEventListener("mouseup", onUp);
+            });
+            th.appendChild(handle);
+        }
 
         // Sort on click
         th.addEventListener("click", () => {
