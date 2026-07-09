@@ -3037,7 +3037,7 @@ const TRACE_COL_DEFS: TraceColDef[] = [
     { key: "da", label: "Dst", defaultWidth: 52 },
     { key: "msg", label: "Message", defaultWidth: 160 },
     { key: "dlc", label: "DLC", defaultWidth: 56 },
-    { key: "data", label: "Data", defaultWidth: 0 },
+    { key: "data", label: "Data", defaultWidth: 220 },
     { key: "cycle", label: "Cycle (ms)", defaultWidth: 90 },
 ];
 // Columns that only carry data on J1939 channels; they exist in the table
@@ -3703,11 +3703,15 @@ function hideColDropIndicator() {
 // width: 100%`: when every column has a specified width and the sum doesn't
 // match the table width, the browser rescales all columns proportionally —
 // specified and rendered widths then disagree, which makes resize drags jump
-// and overshoot the mouse. Keeping exactly one width-less column (Data, or the
-// last visible column when Data is hidden) absorbs the slack so every other
-// column renders at exactly its specified width.
+// and overshoot the mouse. Keeping exactly one width-less column absorbs the
+// slack so every other column renders at exactly its specified width.
+//
+// It must be the RIGHTMOST visible column: a drag on any handle left of the
+// absorber is compensated by the absorber, so all edges left of it track the
+// mouse 1:1. A column right of the absorber would instead have its left edge
+// shift while the dragged right edge stays put.
 function traceAbsorberCol(visible: string[]): string {
-    return visible.includes("data") ? "data" : visible[visible.length - 1] ?? "";
+    return visible[visible.length - 1] ?? "";
 }
 
 function rebuildTraceColumns() {
