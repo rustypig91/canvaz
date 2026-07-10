@@ -1187,23 +1187,21 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         const configured = new Set([...channels.values()].map(c => `${c.info.backend}:${c.info.name}`));
         const available = ifaces.filter(i => !configured.has(`${i.backend}:${i.name}`));
 
-        if (available.length === 0) {
-            setStatus("All detected interfaces are already added.");
-            dialog.close();
-            return;
-        }
-
-        // Group remaining interfaces by backend into <optgroup> elements
+        // Group remaining interfaces by backend into <optgroup> elements.
+        // With nothing available, show a disabled placeholder instead; a
+        // custom name can still be typed in.
         const byBackend = new Map<string, string[]>();
         for (const i of available) {
             const group = byBackend.get(i.backend) ?? [];
             group.push(i.name);
             byBackend.set(i.backend, group);
         }
-        sel.innerHTML = [...byBackend.entries()]
-            .map(([backend, names]) =>
-                `<optgroup label="${backend}">${names.map(n => `<option value="${n}">${n}</option>`).join("")}</optgroup>`
-            ).join("");
+        sel.innerHTML = available.length === 0
+            ? `<option value="" disabled selected>No interfaces found</option>`
+            : [...byBackend.entries()]
+                .map(([backend, names]) =>
+                    `<optgroup label="${backend}">${names.map(n => `<option value="${n}">${n}</option>`).join("")}</optgroup>`
+                ).join("");
 
         // Auto-detect vcan from first available item
         if (available[0]?.name.startsWith("vcan")) setBitrateInDialog(null, true);
@@ -1314,20 +1312,31 @@ async function applyChannelDialog() {
             return;
         };
         const backend = availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
+        const config: ChannelConfig = { name, backend, dbc_path: dialogPendingDbc, bitrate, protocol };
         // Register channel with backend (allocates handle); hardware opens (and the
-        // DBC is loaded) on Start.
-        let handle: number;
+        // DBC is loaded) on Start. If the interface doesn't exist the channel is
+        // still added, as a ghost — same as a project channel whose hardware is
+        // absent — and recovers once the hardware shows up.
+        let handle: number | null = null;
+        let errMsg = "";
         try {
             handle = await invoke<number>("create_channel", { backendName: backend, channelName: name });
         } catch (e) {
-            const msg = String(e);
-            setError(`Failed to create channel: ${msg}`);
+            errMsg = String(e);
+        }
+        if (handle === null) {
+            ghostChannels.push({ config, error: errMsg });
+            refreshChannelList();
+            rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
+            setStatus(`Added channel: ${name} (hardware not available)`);
+            scheduleAutoSave();
+            dialog.close();
             return;
         }
 
         channels.set(handle, {
             info: { backend, name },
-            config: { name, backend, dbc_path: dialogPendingDbc, bitrate, protocol },
+            config,
             dbc: null,
             open: false,
         });
@@ -2371,10 +2380,16 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
 // ── App recording start / stop ────────────────────────────────────────────────
 
 async function startApp() {
-    // Retry channels that failed create_channel during applyProject (hardware
-    // may have been plugged in since then). Successfully recovered ghosts are
-    // moved into `channels` so they open normally below.
+    // Retry ghost channels (hardware may have been plugged in since they were
+    // added). Successfully recovered ghosts are moved into `channels` so they
+    // open normally below. The backend is re-resolved by interface name first:
+    // a hand-typed channel was saved with a guessed backend.
+    const ghostIfaces = ghostChannels.length > 0
+        ? await invoke<ChannelInfo[]>("list_can_interfaces").catch(() => [] as ChannelInfo[])
+        : [];
     for (const ghost of [...ghostChannels]) {
+        const match = ghostIfaces.find(i => i.name === ghost.config.name);
+        if (match) ghost.config.backend = match.backend;
         let handle: number | null = null;
         let errMsg = "";
         try {
@@ -4661,9 +4676,15 @@ window.addEventListener("DOMContentLoaded", async () => {
             }
         }
 
-        // Promote ghost channels whose hardware is now available.
+        // Promote ghost channels whose hardware is now available, re-resolving
+        // the backend by interface name (hand-typed channels carry a guess).
         const recovered: GhostChannel[] = [];
+        const ghostIfaces = ghostChannels.length > 0
+            ? await invoke<ChannelInfo[]>("list_can_interfaces").catch(() => [] as ChannelInfo[])
+            : [];
         for (const ghost of [...ghostChannels]) {
+            const match = ghostIfaces.find(i => i.name === ghost.config.name);
+            if (match) ghost.config.backend = match.backend;
             try {
                 const handle = await invoke<number>("create_channel", { backendName: ghost.config.backend, channelName: ghost.config.name });
                 channels.set(handle, { info: { backend: ghost.config.backend, name: ghost.config.name }, config: ghost.config, dbc: null, open: false });
