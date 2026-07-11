@@ -1110,11 +1110,9 @@ body.col-resizing { cursor: col-resize !important; user-select: none; }
 
 .tp-badge {
   display: inline-block;
-  font-size: 10px;
   font-weight: 700;
-  padding: 1px 5px;
+  padding: 0 4px;
   border-radius: 3px;
-  letter-spacing: 0.04em;
   background: rgba(168,85,247,0.15);
   color: #c084fc;
 }
