@@ -1199,16 +1199,27 @@ let sessionFilePath: string | null = null;
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 let projectDirty = false;
-function
-    scheduleAutoSave() {
+function scheduleAutoSave() {
     if (!sessionFilePath) return;
-    projectDirty = true;
-    updateWindowTitle();
-    if (autoSaveTimer) clearTimeout(autoSaveTimer);
+    const project = buildProject();
 
+    // Derive dirty state from an actual content comparison against the saved
+    // project file, rather than assuming every edit leaves the project
+    // unsaved — e.g. an edit that's undone back to the saved state shouldn't
+    // keep the title's dirty marker lit.
+    if (projectPath) {
+        invoke<boolean>("project_has_changes", { path: projectPath, project })
+            .then(changed => { projectDirty = changed; updateWindowTitle(); })
+            .catch(e => log("debug", `Dirty check failed: ${e}`));
+    } else {
+        projectDirty = true;
+        updateWindowTitle();
+    }
+
+    if (autoSaveTimer) clearTimeout(autoSaveTimer);
     autoSaveTimer = setTimeout(async () => {
         try {
-            await invoke("save_project", { path: sessionFilePath, project: buildProject() });
+            await invoke("save_project", { path: sessionFilePath, project });
         }
         // warn, not error: don't light up the error badge for a transient miss,
         // but the user should still see their session isn't being persisted.

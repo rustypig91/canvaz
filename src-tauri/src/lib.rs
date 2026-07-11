@@ -461,6 +461,7 @@ pub fn run() {
             export_frames_csv,
             export_signals_csv,
             save_project,
+            project_has_changes,
             load_project,
             system_resources,
         ])
