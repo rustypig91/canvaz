@@ -110,6 +110,9 @@ fn reset_backend(state: State<'_, TauriState>) -> Result<(), String> {
 struct RemappedChannel {
     old_handle: u32,
     new_handle: u32,
+    /// Backend the channel resolved to after the reload — may differ from the
+    /// backend it had before when the name moved backends.
+    backend: String,
 }
 
 #[tauri::command]
@@ -117,7 +120,7 @@ fn reload_backends(state: State<'_, TauriState>) -> Result<Vec<RemappedChannel>,
     let remapped = state.can_manager.lock().map_err(|e| e.to_string())?.reload_backends();
     Ok(remapped
         .into_iter()
-        .map(|(old_handle, new_handle)| RemappedChannel { old_handle, new_handle })
+        .map(|(old_handle, created)| RemappedChannel { old_handle, new_handle: created.handle, backend: created.backend })
         .collect())
 }
 

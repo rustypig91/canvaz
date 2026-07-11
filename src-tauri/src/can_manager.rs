@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc, Mutex,
@@ -242,8 +242,10 @@ const FLUSH_INTERVAL_MS: u64 = 33;
 
 // ── CanManager ────────────────────────────────────────────────────────────────
 
-fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
-    let mut cans: HashMap<String, Can> = HashMap::new();
+// BTreeMap so the fallback search in `create_channel` visits backends in a
+// deterministic (alphabetical) order when a channel name exists in several.
+fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
+    let mut cans: BTreeMap<String, Can> = BTreeMap::new();
 
     #[cfg(feature = "kvaser")]
     match KvaserBackend::new() {
@@ -294,7 +296,7 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
 pub struct CanManager {
     app_state: Arc<AppState>,
     shared: Arc<Mutex<ManagerShared>>,
-    cans: HashMap<String, Can>,
+    cans: BTreeMap<String, Can>,
 }
 
 impl CanManager {
@@ -349,11 +351,12 @@ impl CanManager {
 
     /// Register a channel (allocate data stores) without opening the hardware.
     /// The channel is looked up by name in the hinted backend first, then in
-    /// every other backend — the frontend's backend can be a guess for
-    /// hand-typed channel names. Returns the handle used for all subsequent
-    /// calls plus the backend the channel was actually found in. The DBC is
-    /// loaded later by `open_channel`. Calling `create_channel` again for the
-    /// same channel returns the existing handle.
+    /// every other backend — the backend stored in a saved project can be
+    /// stale (e.g. the same channel name moved to different hardware). Returns
+    /// the handle used for all subsequent calls plus the backend the channel
+    /// was actually found in. The DBC is loaded later by `open_channel`.
+    /// Calling `create_channel` again for the same channel returns the
+    /// existing handle.
     pub fn create_channel(&mut self, backend_name: &str, channel_name: &str) -> Result<CreatedChannel, String> {
         let find = |can: &Can| {
             can.list_channels().iter().position(|n| n == channel_name).map(|i| i as u8)
@@ -365,6 +368,7 @@ impl CanManager {
             .or_else(|| {
                 self.cans
                     .iter()
+                    .filter(|(name, _)| name.as_str() != backend_name)
                     .find_map(|(name, can)| find(can).map(|i| (name.clone(), i)))
             })
             .ok_or_else(|| format!("Channel '{channel_name}' not found in any backend"))?;
@@ -490,10 +494,12 @@ impl CanManager {
     }
 
     /// Re-enumerate hardware in every backend and re-register all previously
-    /// created channels (leaving them closed). Returns the old→new handle mapping.
+    /// created channels (leaving them closed). Returns the old handle together
+    /// with the re-registration result — the resolved backend can differ from
+    /// the original when the channel name moved backends across the reload.
     /// On Kvaser this calls canUnloadLibrary()+canInitializeLibrary() which is the
     /// documented way to detect hardware connected after the initial library init.
-    pub fn reload_backends(&mut self) -> Vec<(u32, u32)> {
+    pub fn reload_backends(&mut self) -> Vec<(u32, CreatedChannel)> {
         let previous: Vec<(u32, ChannelInfo)> = self.shared.lock().ok().map(|lock| {
             lock.channels.iter().map(|(&h, d)| (h, d.info.clone())).collect()
         }).unwrap_or_default();
@@ -511,7 +517,7 @@ impl CanManager {
         let mut remapped = Vec::new();
         for (old_handle, info) in previous {
             match self.create_channel(&info.backend, &info.name) {
-                Ok(created) => remapped.push((old_handle, created.handle)),
+                Ok(created) => remapped.push((old_handle, created)),
                 Err(e) => warn!("Could not re-register {} {} after reload: {e}", info.backend, info.name),
             }
         }

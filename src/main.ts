@@ -1177,7 +1177,6 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         title.textContent = "Add CAN Channel";
         applyBtn.textContent = "Add";
         ifaceRow.style.display = "";
-        (document.getElementById("input-iface-custom") as HTMLInputElement).value = "";
         sel.innerHTML = "";
         dialogPendingDbc = null;
         setDbcLabel(null);
@@ -1190,21 +1189,23 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         const configured = new Set([...channels.values()].map(c => `${c.info.backend}:${c.info.name}`));
         const available = ifaces.filter(i => !configured.has(`${i.backend}:${i.name}`));
 
-        // Group remaining interfaces by backend into <optgroup> elements.
-        // With nothing available, show a disabled placeholder instead; a
-        // custom name can still be typed in.
+        if (available.length === 0) {
+            setStatus(ifaces.length > 0 ? "All detected interfaces are already added." : "No CAN interfaces found.");
+            dialog.close();
+            return;
+        }
+
+        // Group remaining interfaces by backend into <optgroup> elements
         const byBackend = new Map<string, string[]>();
         for (const i of available) {
             const group = byBackend.get(i.backend) ?? [];
             group.push(i.name);
             byBackend.set(i.backend, group);
         }
-        sel.innerHTML = available.length === 0
-            ? `<option value="" disabled selected>No interfaces found</option>`
-            : [...byBackend.entries()]
-                .map(([backend, names]) =>
-                    `<optgroup label="${backend}">${names.map(n => `<option value="${n}">${n}</option>`).join("")}</optgroup>`
-                ).join("");
+        sel.innerHTML = [...byBackend.entries()]
+            .map(([backend, names]) =>
+                `<optgroup label="${escapeHtml(backend)}">${names.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join("")}</optgroup>`
+            ).join("");
 
         // Auto-detect vcan from first available item
         if (available[0]?.name.startsWith("vcan")) setBitrateInDialog(null, true);
@@ -1271,6 +1272,37 @@ async function loadChannelDbc(handle: number): Promise<void> {
     }
 }
 
+// Result of registerChannel: `handle` is set on success. On failure `error`
+// says why, and `notFound` marks the "exists in no backend" case that should
+// become a ghost; other failures (duplicate, backend error) should not.
+interface RegisterResult { handle?: number; error?: string; notFound?: boolean; }
+
+// Register `config`'s channel with the backend and store it in `channels`.
+// Owns everything every create-site needs to agree on: the invoke, writing the
+// resolved backend back into config (create_channel searches all backends, so
+// it can differ from the hint), the Channel shape, and the DBC preload. The
+// same config object is stored on the channel, so ghost promotion keeps its
+// saved settings.
+async function registerChannel(config: ChannelConfig): Promise<RegisterResult> {
+    let created: CreatedChannel;
+    try {
+        created = await invoke<CreatedChannel>("create_channel", { backendName: config.backend, channelName: config.name });
+    } catch (e) {
+        const error = String(e);
+        return { error, notFound: error.includes("not found in any backend") };
+    }
+    // create_channel returns the existing handle when the name resolves to an
+    // already-registered channel; overwriting it would clobber its config.
+    const existing = channels.get(created.handle);
+    if (existing) {
+        return { error: `'${config.name}' resolves to already-configured channel ${existing.info.backend}:${existing.info.name}` };
+    }
+    config.backend = created.backend;
+    channels.set(created.handle, { info: { backend: created.backend, name: config.name }, config, dbc: null, open: false });
+    await loadChannelDbc(created.handle);
+    return { handle: created.handle };
+}
+
 // Open a channel by its u32 handle. If root is required the Rust side emits
 // "request-admin-password", the global listener shows the dialog, and open_channel
 // unblocks automatically.
@@ -1308,28 +1340,29 @@ async function applyChannelDialog() {
     const protocol = getProtocolFromDialog();
 
     if (dialogMode === "add") {
-        const custom = (document.getElementById("input-iface-custom") as HTMLInputElement).value.trim();
-        const name = custom || (document.getElementById("select-iface") as HTMLSelectElement).value;
+        const name = (document.getElementById("select-iface") as HTMLSelectElement).value;
         if (!name) {
             setError("Channel name not set");
             return;
         };
+        if (ghostChannels.some(g => g.config.name === name)) {
+            setError(`Channel '${name}' is already added (hardware not available)`);
+            return;
+        }
         const backend = availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
         const config: ChannelConfig = { name, backend, dbc_path: dialogPendingDbc, bitrate, protocol };
         // Register channel with backend (allocates handle); hardware opens (and
-        // the DBC is loaded) on Start. The backend searches every CAN backend
-        // for the name; if it exists nowhere the channel is still added, as a
-        // ghost — same as a project channel whose hardware is absent — and
-        // recovers once the hardware shows up.
-        let created: CreatedChannel | null = null;
-        let errMsg = "";
-        try {
-            created = await invoke<CreatedChannel>("create_channel", { backendName: backend, channelName: name });
-        } catch (e) {
-            errMsg = String(e);
-        }
-        if (created === null) {
-            ghostChannels.push({ config, error: errMsg });
+        // the DBC is loaded) on Start. If the name exists in no backend the
+        // channel is still added, as a ghost — same as a project channel whose
+        // hardware is absent — and recovers once the hardware shows up. Any
+        // other failure (duplicate, backend error) is a real error.
+        const res = await registerChannel(config);
+        if (res.handle === undefined) {
+            if (!res.notFound) {
+                setError(`Failed to add channel: ${res.error}`);
+                return;
+            }
+            ghostChannels.push({ config, error: res.error! });
             refreshChannelList();
             rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
             setStatus(`Added channel: ${name} (hardware not available)`);
@@ -1338,16 +1371,7 @@ async function applyChannelDialog() {
             return;
         }
 
-        const handle = created.handle;
-        config.backend = created.backend;
-        channels.set(handle, {
-            info: { backend: created.backend, name },
-            config,
-            dbc: null,
-            open: false,
-        });
-        await loadChannelDbc(handle);
-
+        const handle = res.handle;
         refreshChannelList();
         rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === handle) renderDbcTree();
@@ -2235,20 +2259,14 @@ async function applyProject(project: Project) {
         const backend = ch.backend ?? "socketcan";
         const bitrate = ch.bitrate ?? null;
         const config: ChannelConfig = { name: ch.name, backend, dbc_path: ch.dbc_path ?? null, bitrate, protocol: ch.protocol ?? null };
-        let created: CreatedChannel | null = null;
-        let errMsg = "";
-        try {
-            created = await invoke<CreatedChannel>("create_channel", { backendName: backend, channelName: ch.name });
-        } catch (e) {
-            errMsg = String(e);
-        }
-        if (created !== null) {
-            config.backend = created.backend;
-            channels.set(created.handle, { info: { backend: created.backend, name: ch.name }, config, dbc: null, open: false });
-            await loadChannelDbc(created.handle);
-        } else {
-            console.warn(`Channel ${ch.name} (${backend}) inactive: ${errMsg}`);
-            ghostChannels.push({ config, error: errMsg });
+        // Any failure keeps the saved config as a ghost — including a name that
+        // currently resolves to an already-added channel (a duplicate ghost
+        // recovers under its own backend once that hardware appears, since
+        // create_channel searches the hinted backend first).
+        const res = await registerChannel(config);
+        if (res.handle === undefined) {
+            console.warn(`Channel ${ch.name} (${backend}) inactive: ${res.error}`);
+            ghostChannels.push({ config, error: res.error! });
         }
     }
 
@@ -2390,23 +2408,14 @@ async function startApp() {
     // Retry ghost channels (hardware may have been plugged in since they were
     // added). Successfully recovered ghosts are moved into `channels` so they
     // open normally below. create_channel searches every backend for the name,
-    // so a hand-typed channel saved with a guessed backend still recovers.
+    // so a project channel saved with a stale backend still recovers.
     for (const ghost of [...ghostChannels]) {
-        let created: CreatedChannel | null = null;
-        let errMsg = "";
-        try {
-            created = await invoke<CreatedChannel>("create_channel", { backendName: ghost.config.backend, channelName: ghost.config.name });
-        } catch (e) {
-            errMsg = String(e);
-        }
-        if (created !== null) {
-            ghost.config.backend = created.backend;
-            channels.set(created.handle, { info: { backend: created.backend, name: ghost.config.name }, config: ghost.config, dbc: null, open: false });
+        const res = await registerChannel(ghost.config);
+        if (res.handle !== undefined) {
             ghostChannels.splice(ghostChannels.indexOf(ghost), 1);
-            await loadChannelDbc(created.handle);
         } else {
-            ghost.error = errMsg;
-            setError(`Channel ${ghost.config.name} (${ghost.config.backend}) not available: ${errMsg}`);
+            ghost.error = res.error!;
+            setError(`Channel ${ghost.config.name} (${ghost.config.backend}) not available: ${res.error}`);
         }
     }
 
@@ -4554,6 +4563,13 @@ function updateWindowTitle() {
     getCurrentWindow().setTitle(projectDirty ? `${base} ●` : base);
 }
 
+// Escape a string for interpolation into innerHTML (element text or a
+// double-quoted attribute) — device/driver-supplied names are not guaranteed
+// free of HTML metacharacters.
+function escapeHtml(s: string): string {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
 function setStatus(msg: string, isError = false) {
     const el = document.getElementById("status-bar")!;
     el.textContent = msg;
@@ -4657,23 +4673,26 @@ window.addEventListener("DOMContentLoaded", async () => {
     });
     document.getElementById("btn-reload-backends")!.addEventListener("click", async () => {
         if (!await confirmAndStop("Stop live capture to reload CAN backends?")) return;
-        let remapped: { old_handle: number; new_handle: number }[];
+        let remapped: { old_handle: number; new_handle: number; backend: string }[];
         try {
-            remapped = await invoke<{ old_handle: number; new_handle: number }[]>("reload_backends");
+            remapped = await invoke<{ old_handle: number; new_handle: number; backend: string }[]>("reload_backends");
         } catch (e) {
             setError(`Backend reload failed: ${e}`);
             return;
         }
 
-        // Apply old→new handle remapping. Channels not in the remapping failed
-        // to re-register (hardware absent) and become ghosts.
-        const handleMap = new Map(remapped.map(r => [r.old_handle, r.new_handle]));
+        // Apply old→new handle remapping. The resolved backend can differ from
+        // the previous one (the name is searched in every backend), so take it
+        // from the remap entry. Channels not in the remapping failed to
+        // re-register (hardware absent) and become ghosts.
+        const handleMap = new Map(remapped.map(r => [r.old_handle, r]));
         const oldEntries = [...channels.entries()];
         channels.clear();
         for (const [oldHandle, ch] of oldEntries) {
-            const newHandle = handleMap.get(oldHandle);
-            if (newHandle !== undefined) {
-                channels.set(newHandle, { ...ch, open: false });
+            const remap = handleMap.get(oldHandle);
+            if (remap !== undefined) {
+                ch.config.backend = remap.backend;
+                channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend }, open: false });
             } else {
                 ghostChannels.push({ config: ch.config, error: "Not found after backend reload" });
             }
@@ -4683,15 +4702,9 @@ window.addEventListener("DOMContentLoaded", async () => {
         // searches every backend for the name, so a guessed backend still works.
         const recovered: GhostChannel[] = [];
         for (const ghost of [...ghostChannels]) {
-            try {
-                const created = await invoke<CreatedChannel>("create_channel", { backendName: ghost.config.backend, channelName: ghost.config.name });
-                ghost.config.backend = created.backend;
-                channels.set(created.handle, { info: { backend: created.backend, name: ghost.config.name }, config: ghost.config, dbc: null, open: false });
-                recovered.push(ghost);
-                await loadChannelDbc(created.handle);
-            } catch (_) {
-                // stays as ghost
-            }
+            const res = await registerChannel(ghost.config);
+            if (res.handle !== undefined) recovered.push(ghost);
+            else ghost.error = res.error!; // stays as ghost
         }
         for (const g of recovered) ghostChannels.splice(ghostChannels.indexOf(g), 1);
         renderChannelList();
