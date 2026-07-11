@@ -51,9 +51,6 @@ BO_ 512 BodyControl: 6 BODY_ECU
  SG_ AmbientTemp : 32|8@1- (0.5,0) [-40|87.5] "degC" DASH
 
 BO_ 768 DashRequest: 4 DASH
- SG_ RequestedGear : 0|4@1+ (1,0) [0|7] "" ENGINE_ECU
- SG_ TurnSignal : 4|2@1+ (1,0) [0|3] "" BODY_ECU
- SG_ WiperSpeed : 8|3@1+ (1,0) [0|4] "" BODY_ECU
 
 
 

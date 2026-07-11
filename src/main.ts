@@ -53,6 +53,8 @@ interface ParsedDbc {
     path: string;
     // Keyed by CAN id (matches the Rust HashMap serialization).
     messages: Record<number, DbcMessage>;
+    // All BU_ nodes declared in the DBC, including ones with no messages.
+    nodes: string[];
 }
 
 // Per-frame decoded signal carried for trace display (value + raw from Rust).
@@ -717,6 +719,19 @@ async function addSignalToPane(pane: PlotPane, handle: number, sig: DbcSignal) {
     scheduleAutoSave();
 }
 
+// Add every signal of a message to a specific pane (dropped onto that pane).
+async function addMessageSignalsToPane(pane: PlotPane, handle: number, msg: DbcMessage) {
+    if (!msg.signals.length) { log("warn", `${msg.name} has no signals to plot`); return; }
+    for (const sig of msg.signals) await addSignalToPane(pane, handle, sig);
+}
+
+// Whole message dropped somewhere with no specific pane target (the "new
+// plot" drop zone, or double-click): create a fresh pane for it.
+async function addMessageToNewPane(handle: number, msg: DbcMessage) {
+    if (!msg.signals.length) { log("warn", `${msg.name} has no signals to plot`); return; }
+    await addMessageSignalsToPane(createPlotPane(), handle, msg);
+}
+
 function syncDatasets(pane: PlotPane) {
     const tension = pane.interpolation === 'smooth' ? 0.4 : 0;
     const stepped: 'before' | false = pane.interpolation === 'none' ? 'before' : false;
@@ -836,10 +851,13 @@ function renderDbcTree(filter = "") {
     };
 
     const buildMsgDetails = (msg: DbcMessage, container: HTMLElement) => {
+        const noSignals = msg.signals.length === 0;
         const visibleSignals = msg.signals.filter(s =>
             !lc || s.name.toLowerCase().includes(lc) || msg.name.toLowerCase().includes(lc)
         );
-        if (!visibleSignals.length) return;
+        // A message with no signals has nothing to filter against but its own
+        // name, so it stays visible whenever the filter matches (or is empty).
+        if (noSignals ? (lc && !msg.name.toLowerCase().includes(lc)) : !visibleSignals.length) return;
 
         const details = document.createElement("details");
         details.className = "msg-group";
@@ -847,7 +865,10 @@ function renderDbcTree(filter = "") {
         details.dataset.messageId = String(msg.id);
 
         const summary = document.createElement("summary");
-        summary.innerHTML = `${msg.name}<span class="msg-id-badge">0x${msg.id.toString(16).toUpperCase().padStart(3, "0")}</span>`;
+        const emptyHint = noSignals ? `<span class="msg-empty-hint">(no signals)</span>` : "";
+        summary.innerHTML = `${msg.name}${emptyHint}<span class="msg-id-badge">0x${msg.id.toString(16).toUpperCase().padStart(3, "0")}</span>`;
+        // Drag / double-click behaviour is delegated on #dbc-tree (setupDbcTree).
+        summary.setAttribute("draggable", "true");
         details.appendChild(summary);
 
         // Signal rows are built on first expand. A large DBC would otherwise keep
@@ -873,6 +894,11 @@ function renderDbcTree(filter = "") {
         if (!byEcu.has(ecu)) byEcu.set(ecu, []);
         byEcu.get(ecu)!.push(msg);
     }
+    // Nodes declared in the DBC but never used as a transmitter still get a
+    // (message-less) group, so the tree reflects the full BU_ node list.
+    for (const node of dbc.nodes ?? []) {
+        if (!byEcu.has(node)) byEcu.set(node, []);
+    }
 
     const hasNamedEcus = [...byEcu.keys()].some(k => k !== "");
 
@@ -890,7 +916,17 @@ function renderDbcTree(filter = "") {
             ecuSummary.textContent = ecu;
             ecuDetails.appendChild(ecuSummary);
             for (const msg of msgs) buildMsgDetails(msg, ecuDetails);
-            if (ecuDetails.childElementCount > 1) tree.appendChild(ecuDetails);
+            // A genuinely message-less ECU (not just filtered out) stays
+            // visible with a hint, but only outside an active search filter.
+            if (ecuDetails.childElementCount > 1) {
+                tree.appendChild(ecuDetails);
+            } else if (msgs.length === 0 && !lc) {
+                const hint = document.createElement("span");
+                hint.className = "ecu-empty-hint";
+                hint.textContent = "(no messages)";
+                ecuSummary.appendChild(hint);
+                tree.appendChild(ecuDetails);
+            }
         }
 
         if (unnamed.length > 0) {
@@ -922,8 +958,20 @@ interface DragSignal {
     sig: DbcSignal;
 }
 
+interface DragMessage {
+    channel: number;
+    messageId: number;
+    messageName: string;
+    msg: DbcMessage;
+}
+
 function parseDragSignal(e: DragEvent): DragSignal | null {
     try { return JSON.parse(e.dataTransfer?.getData("application/can-signal") ?? "null"); }
+    catch { return null; }
+}
+
+function parseDragMessage(e: DragEvent): DragMessage | null {
+    try { return JSON.parse(e.dataTransfer?.getData("application/can-message") ?? "null"); }
     catch { return null; }
 }
 
@@ -936,51 +984,99 @@ function sigFromRow(row: HTMLElement): { handle: number; sig: DbcSignal } | null
     return sig ? { handle, sig } : null;
 }
 
+// Resolve a sidebar message summary back to its DBC definition. The
+// containing <details class="msg-group"> carries the identifiers.
+function msgFromSummary(summary: HTMLElement): { handle: number; msg: DbcMessage } | null {
+    const details = summary.closest<HTMLElement>(".msg-group");
+    if (!details) return null;
+    const handle = parseInt(details.dataset.channel ?? "");
+    const msgId = parseInt(details.dataset.messageId ?? "");
+    const msg = channels.get(handle)?.dbc?.messages[msgId];
+    return msg ? { handle, msg } : null;
+}
+
 // One delegated dragstart/dblclick pair for the whole tree instead of two
 // listeners per signal row.
 function setupDbcTree() {
     const tree = document.getElementById("dbc-tree")!;
     tree.addEventListener("dragstart", (e) => {
-        const row = (e.target as HTMLElement).closest<HTMLElement>(".signal-row");
-        if (!row) return;
-        const found = sigFromRow(row);
-        if (!found) { e.preventDefault(); return; }
-        const payload: DragSignal = {
-            channel: found.handle,
-            signalName: found.sig.name,
-            messageName: found.sig.message_name,
-            unit: found.sig.unit,
-            sig: found.sig,
-        };
-        e.dataTransfer!.setData("application/can-signal", JSON.stringify(payload));
-        e.dataTransfer!.effectAllowed = "copy";
-    });
-    tree.addEventListener("dblclick", (e) => {
-        const row = (e.target as HTMLElement).closest<HTMLElement>(".signal-row");
-        if (!row) return;
-        const found = sigFromRow(row);
-        if (!found) return;
-        const activeTab = document.querySelector(".tab-btn.active")?.getAttribute("data-tab");
-        if (activeTab === "plot") {
-            const pane = plotPanes[0] ?? createPlotPane();
-            addSignalToPane(pane, found.handle, found.sig);
-        } else if (activeTab === "simulate") {
-            addSimSignal(found.handle, found.sig);
+        const target = e.target as HTMLElement;
+        const row = target.closest<HTMLElement>(".signal-row");
+        if (row) {
+            const found = sigFromRow(row);
+            if (!found) { e.preventDefault(); return; }
+            const payload: DragSignal = {
+                channel: found.handle,
+                signalName: found.sig.name,
+                messageName: found.sig.message_name,
+                unit: found.sig.unit,
+                sig: found.sig,
+            };
+            e.dataTransfer!.setData("application/can-signal", JSON.stringify(payload));
+            e.dataTransfer!.effectAllowed = "copy";
+            return;
+        }
+        const summary = target.closest<HTMLElement>(".msg-group > summary");
+        if (summary) {
+            const found = msgFromSummary(summary);
+            if (!found) { e.preventDefault(); return; }
+            const payload: DragMessage = {
+                channel: found.handle,
+                messageId: found.msg.id,
+                messageName: found.msg.name,
+                msg: found.msg,
+            };
+            e.dataTransfer!.setData("application/can-message", JSON.stringify(payload));
+            e.dataTransfer!.effectAllowed = "copy";
         }
     });
+    tree.addEventListener("dblclick", (e) => {
+        const target = e.target as HTMLElement;
+        const row = target.closest<HTMLElement>(".signal-row");
+        if (row) {
+            const found = sigFromRow(row);
+            if (!found) return;
+            const activeTab = document.querySelector(".tab-btn.active")?.getAttribute("data-tab");
+            if (activeTab === "plot") {
+                const pane = plotPanes[0] ?? createPlotPane();
+                addSignalToPane(pane, found.handle, found.sig);
+            } else if (activeTab === "simulate") {
+                addSimSignal(found.handle, found.sig);
+            }
+            return;
+        }
+        const summary = target.closest<HTMLElement>(".msg-group > summary");
+        if (summary) {
+            const found = msgFromSummary(summary);
+            if (!found) return;
+            const activeTab = document.querySelector(".tab-btn.active")?.getAttribute("data-tab");
+            if (activeTab === "plot") {
+                const pane = plotPanes[0] ?? createPlotPane();
+                addMessageSignalsToPane(pane, found.handle, found.msg);
+            } else if (activeTab === "simulate") {
+                addSimMessage(found.handle, found.msg);
+            }
+        }
+    });
+}
+
+// Both a lone signal and a whole message are draggable; drop targets accept either.
+function isCanDragEvent(e: DragEvent): boolean {
+    const types = e.dataTransfer?.types;
+    return !!types && (types.includes("application/can-signal") || types.includes("application/can-message"));
 }
 
 function setupPaneDrop(el: HTMLElement, pane: PlotPane) {
     let dragDepth = 0;
     el.addEventListener("dragenter", (e) => {
-        if (!e.dataTransfer?.types.includes("application/can-signal")) return;
+        if (!isCanDragEvent(e)) return;
         e.preventDefault();
         if (++dragDepth === 1) el.classList.add("drag-over");
     });
     el.addEventListener("dragover", (e) => {
-        if (!e.dataTransfer?.types.includes("application/can-signal")) return;
+        if (!isCanDragEvent(e)) return;
         e.preventDefault();
-        e.dataTransfer.dropEffect = "copy";
+        e.dataTransfer!.dropEffect = "copy";
     });
     el.addEventListener("dragleave", () => {
         if (--dragDepth === 0) el.classList.remove("drag-over");
@@ -989,6 +1085,8 @@ function setupPaneDrop(el: HTMLElement, pane: PlotPane) {
         e.preventDefault();
         dragDepth = 0;
         el.classList.remove("drag-over");
+        const msgData = parseDragMessage(e);
+        if (msgData) { addMessageSignalsToPane(pane, msgData.channel, msgData.msg); return; }
         const data = parseDragSignal(e);
         if (data) addSignalToPane(pane, data.channel, data.sig);
     });
@@ -998,14 +1096,14 @@ function setupDropZone() {
     const zone = document.getElementById("drop-zone-new")!;
     let dragDepth = 0;
     zone.addEventListener("dragenter", (e) => {
-        if (!e.dataTransfer?.types.includes("application/can-signal")) return;
+        if (!isCanDragEvent(e)) return;
         e.preventDefault();
         if (++dragDepth === 1) zone.classList.add("drag-over");
     });
     zone.addEventListener("dragover", (e) => {
-        if (!e.dataTransfer?.types.includes("application/can-signal")) return;
+        if (!isCanDragEvent(e)) return;
         e.preventDefault();
-        e.dataTransfer.dropEffect = "copy";
+        e.dataTransfer!.dropEffect = "copy";
     });
     zone.addEventListener("dragleave", () => {
         if (--dragDepth === 0) zone.classList.remove("drag-over");
@@ -1014,6 +1112,8 @@ function setupDropZone() {
         e.preventDefault();
         dragDepth = 0;
         zone.classList.remove("drag-over");
+        const msgData = parseDragMessage(e);
+        if (msgData) { addMessageToNewPane(msgData.channel, msgData.msg); return; }
         const data = parseDragSignal(e);
         if (!data) return;
         const pane = createPlotPane();
@@ -1025,14 +1125,14 @@ function setupSimDrop() {
     const zone = document.getElementById("drop-zone-sim")!;
     let dragDepth = 0;
     zone.addEventListener("dragenter", (e) => {
-        if (!e.dataTransfer?.types.includes("application/can-signal")) return;
+        if (!isCanDragEvent(e)) return;
         e.preventDefault();
         if (++dragDepth === 1) zone.classList.add("drag-over");
     });
     zone.addEventListener("dragover", (e) => {
-        if (!e.dataTransfer?.types.includes("application/can-signal")) return;
+        if (!isCanDragEvent(e)) return;
         e.preventDefault();
-        e.dataTransfer.dropEffect = "copy";
+        e.dataTransfer!.dropEffect = "copy";
     });
     zone.addEventListener("dragleave", () => {
         if (--dragDepth === 0) zone.classList.remove("drag-over");
@@ -1041,6 +1141,8 @@ function setupSimDrop() {
         e.preventDefault();
         dragDepth = 0;
         zone.classList.remove("drag-over");
+        const msgData = parseDragMessage(e);
+        if (msgData) { addSimMessage(msgData.channel, msgData.msg); return; }
         const data = parseDragSignal(e);
         if (data) addSimSignal(data.channel, data.sig);
     });
@@ -2010,7 +2112,13 @@ function addSimSignal(handle: number, sig: DbcSignal) {
     if (!dbc) { log("warn", "No DBC loaded for this channel"); return; }
     const msg = dbc.messages[sig.message_id];
     if (!msg) return;
+    addSimMessage(handle, msg);
+}
 
+// A message is always simulated as a whole (one entry, all its signals);
+// this also covers messages with zero signals — they get an entry with an
+// empty signal list, sending a zero-filled frame of the message's DLC.
+function addSimMessage(handle: number, msg: DbcMessage) {
     const key = `msg::${++msgEntryCounter}`;
 
     const entry: SimMessageEntry = {
@@ -3332,7 +3440,7 @@ function buildTraceCellHtml(key: string, entry: TraceEntry): string {
         case "channel": return `<td data-col="channel">${channelName(entry.channelHandle)}</td>`;
         case "canId": return `<td data-col="canId" class="td-canid">${fmtId(entry.canId, entry.isExtended)}</td>`;
         case "msg": return `<td data-col="msg">${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>`;
-        case "dlc": return `<td data-col="dlc" style="text-align:center">${entry.dlc}</td>`;
+        case "dlc": return `<td data-col="dlc">${entry.dlc}</td>`;
         case "data": return `<td data-col="data" class="td-data">${fmtData(entry.data)}</td>`;
         case "cycle": return `<td data-col="cycle" class="td-cycle">${entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—"}</td>`;
         default: return `<td data-col="${key}"></td>`;

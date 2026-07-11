@@ -18,6 +18,11 @@ pub struct ParsedDbc {
     /// Rebuilt on load, never serialized.
     #[serde(skip)]
     pgn_index: HashMap<u32, u32>,
+    /// All CAN network nodes (`BU_`) declared in the DBC, including ones that
+    /// transmit no messages. `#[serde(default)]` so projects saved before this
+    /// field existed still deserialize.
+    #[serde(default)]
+    pub nodes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +135,7 @@ impl ParsedDbc {
             path: path.to_string(),
             messages: HashMap::new(),
             pgn_index: HashMap::new(),
+            nodes: Vec::new(),
         };
         dbc.reload()?;
 
@@ -208,6 +214,7 @@ impl ParsedDbc {
             })
             .collect();
         self.messages = messages;
+        self.nodes = dbc.nodes.iter().map(|n| n.0.clone()).collect();
 
         Ok(())
     }
