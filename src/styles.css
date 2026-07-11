@@ -193,8 +193,10 @@ kbd {
   flex-shrink: 0;
 }
 
-#btn-pin-log { font-size: 12px; }
+/* Tilted while floating, upright + accent once pinned. */
+#btn-pin-log svg { transform: rotate(45deg); transition: transform 0.15s; }
 #btn-pin-log.active { color: var(--accent); }
+#btn-pin-log.active svg { transform: none; }
 
 #log-panel-header {
   display: flex;
