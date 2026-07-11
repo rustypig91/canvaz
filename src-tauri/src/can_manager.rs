@@ -278,7 +278,7 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
             );
             info!("Kvaser backend initialized successfully");
         }
-        Err(e) => warn!("Kvaser backend unavailable: {e}"),
+        Err(e) => warn!("Kvaser backend unavailable (install from https://www.kvaser.com/download/): {e}"),
     }
 
     #[cfg(feature = "pcan")]
@@ -296,7 +296,9 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
             );
             info!("PCAN backend initialized successfully");
         }
-        Err(e) => warn!("PCAN backend unavailable: {e}"),
+        Err(e) => warn!(
+            "PCAN backend unavailable (install from https://www.peak-system.com/products/software/development-packages/pcan-basic/): {e}"
+        ),
     }
 
     #[cfg(any(feature = "linux-can", target_os = "linux"))]
