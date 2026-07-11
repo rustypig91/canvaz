@@ -454,6 +454,7 @@ function removeSigFromPane(pane: PlotPane, key: string) {
     syncDatasets(pane);
     updatePaneTitle(pane);
     updateSignalHighlights();
+    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -490,11 +491,13 @@ function createPlotPane(): PlotPane {
         btn.classList.toggle("active", pane.showPoints);
         btn.title = `Show data points: ${pane.showPoints ? "on" : "off"}`;
         syncDatasets(pane);
+        console.log("Scheduling autosave");
         scheduleAutoSave();
     });
     el.querySelector<HTMLSelectElement>(".sel-interp")!.addEventListener("change", (e) => {
         pane.interpolation = (e.currentTarget as HTMLSelectElement).value as PlotPane["interpolation"];
         syncDatasets(pane);
+        console.log("Scheduling autosave");
         scheduleAutoSave();
     });
     const resetZoomBtn = el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!;
@@ -661,6 +664,7 @@ function closePlotPane(id: string) {
     pane.chart.destroy();
     pane.el.remove();
     updateSignalHighlights();
+    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -714,6 +718,7 @@ async function addSignalToPane(pane: PlotPane, handle: number, sig: DbcSignal) {
     syncDatasets(pane);
     updatePaneTitle(pane);
     updateSignalHighlights();
+    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -1098,13 +1103,17 @@ let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 let projectDirty = false;
 
-function scheduleAutoSave() {
+console.log("Scheduling autosave");function
+scheduleAutoSave() {
     if (!sessionFilePath) return;
     projectDirty = true;
     updateWindowTitle();
     if (autoSaveTimer) clearTimeout(autoSaveTimer);
+
     autoSaveTimer = setTimeout(async () => {
-        try { await invoke("save_project", { path: sessionFilePath, project: buildProject() }); }
+        try {
+            await invoke("save_project", { path: sessionFilePath, project: buildProject() });
+        }
         catch { /* silent — auto-save failures should not interrupt the user */ }
     }, 1000);
 }
@@ -1366,6 +1375,7 @@ async function applyChannelDialog() {
             refreshChannelList();
             rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
             setStatus(`Added channel: ${name} (hardware not available)`);
+            console.log("Scheduling autosave");
             scheduleAutoSave();
             dialog.close();
             return;
@@ -1376,6 +1386,7 @@ async function applyChannelDialog() {
         rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === handle) renderDbcTree();
         setStatus(`Added channel: ${name}`);
+        console.log("Scheduling autosave");
         scheduleAutoSave();
     } else {
         const h = dialogEditTarget!;
@@ -1395,6 +1406,7 @@ async function applyChannelDialog() {
         rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === h) renderDbcTree();
         setStatus(`Updated channel: ${name}`);
+        console.log("Scheduling autosave");
         scheduleAutoSave();
     }
 
@@ -1658,6 +1670,7 @@ async function renderChannelList() {
                         if (selectedChannel === h) selectChannel(null);
                         renderChannelList();
                         rebuildTraceColumns();
+                        console.log("Scheduling autosave");
                         scheduleAutoSave();
                     }
                 },
@@ -1678,6 +1691,7 @@ async function renderChannelList() {
 
             renderChannelList();
             rebuildTraceColumns();
+            console.log("Scheduling autosave");
             scheduleAutoSave();
         });
         list.appendChild(item);
@@ -1703,6 +1717,7 @@ async function renderChannelList() {
             ghostChannels.splice(ghostChannels.indexOf(ghost), 1);
             renderChannelList();
             rebuildTraceColumns();
+            console.log("Scheduling autosave");
             scheduleAutoSave();
         });
         list.appendChild(item);
@@ -1877,6 +1892,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             rawInp.value = String(raw);
             if (enumSel) enumSel.value = (s.def.enum_values ?? []).some(e => e.value === raw) ? String(raw) : "";
             if (entry.running) { await stopSim(key); await startSim(key); }
+            console.log("Scheduling autosave");
             scheduleAutoSave();
         };
 
@@ -2016,6 +2032,7 @@ function addSimSignal(handle: number, sig: DbcSignal) {
     simEntries.set(key, entry);
     document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
     updateSignalHighlights();
+    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -2030,6 +2047,7 @@ function addRawFrame() {
     };
     simEntries.set(key, entry);
     document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
+    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -2039,6 +2057,7 @@ async function removeSimEntry(key: string) {
     simEntries.delete(key);
     document.querySelector(`[data-sim-key="${key}"]`)?.remove();
     updateSignalHighlights();
+    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -2052,6 +2071,7 @@ async function startSim(key: string) {
     entry.running = true;
     const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
     if (btn) { btn.textContent = "Stop"; btn.classList.add("running"); }
+    console.log("Scheduling autosave");
     scheduleAutoSave();
 
     // Register with backend only when the app (and its channels) is live.
@@ -2069,6 +2089,7 @@ async function startSim(key: string) {
         setError(`Sim start error: ${e}`);
         entry.running = false;
         if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
+        console.log("Scheduling autosave");
         scheduleAutoSave();
     }
 }
@@ -2083,6 +2104,7 @@ async function stopSim(key: string) {
     entry.running = false;
     const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
     if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
+    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -2211,7 +2233,6 @@ async function saveProject() {
             await invoke("save_project", { path: projectPath, project: buildProject() });
             projectDirty = false;
             updateWindowTitle();
-            setStatus(`Saved: ${projectPath}`);
         } catch (e) { setError(`Save error: ${e}`); }
     } else { await saveProjectAs(); }
 }
@@ -2230,7 +2251,6 @@ async function saveProjectAs() {
         updateWindowTitle();
         persistLastProjectPath(path);
         await invoke("save_project", { path, project: buildProject() });
-        setStatus(`Saved: ${path}`);
     } catch (e) { setError(`Save error: ${e}`); }
 }
 
@@ -2881,6 +2901,7 @@ function setWindowSize(sec: number) {
 // User changed the control: apply and mark the project dirty.
 function applyWindowSize(sec: number) {
     setWindowSize(sec);
+    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -3236,6 +3257,7 @@ function applyTraceFilter() {
         }
     }
     updateClearFiltersBtn();
+    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -3872,6 +3894,7 @@ function setupTraceHeaders() {
                         const idx = before === null ? traceColOrder.length : traceColOrder.indexOf(before as string);
                         traceColOrder.splice(idx >= 0 ? idx : traceColOrder.length, 0, key);
                         rebuildTraceColumns();
+                        console.log("Scheduling autosave");
                         scheduleAutoSave();
                     }
                 } else { colDragKey = null; colDropBefore = undefined; }
@@ -3990,7 +4013,8 @@ function setupTraceHeaders() {
                         traceDataFormat = value;
                         fmtRow.querySelectorAll<HTMLButtonElement>(".data-fmt-btn").forEach(b => b.classList.remove("active"));
                         btn.classList.add("active");
-                        refreshTraceFormat(); scheduleAutoSave();
+                        console.log("Scheduling autosave");refreshTraceFormat();
+                        scheduleAutoSave();
                     });
                     fmtRow.appendChild(btn);
                 }
@@ -4039,7 +4063,8 @@ function setupTraceHeaders() {
                     // lose their filter.
                     traceFilterData = Array.from({ length: n }, (_, i) => traceFilterData[i] ?? null);
                     buildGrid();
-                    syncFilteredHeaders(); applyTraceFilter(); scheduleAutoSave();
+                    console.log("Scheduling autosave");syncFilteredHeaders(); applyTraceFilter();
+                    scheduleAutoSave();
                 });
                 menu.appendChild(grid);
                 const hint = document.createElement("div"); hint.className = "data-filter-hint";
@@ -4178,6 +4203,14 @@ async function toggleTracePlot(sigRow: HTMLTableRowElement, handle: number, msgI
     const next = sigRow.nextElementSibling as HTMLTableRowElement | null;
     if (next?.dataset.sigplot) {
         destroyTracePlot(next);
+        return;
+    }
+
+    // Inline plots only work in overwrite mode, where the signal row is a
+    // stable slot that keeps receiving updates. In append mode each row is a
+    // historical snapshot that scrolls away, so there is nothing to plot onto.
+    if (traceMode !== "overwrite") {
+        setStatus("Inline plots require Overwrite mode.");
         return;
     }
 
@@ -4353,6 +4386,7 @@ function setupTrace() {
     });
     document.getElementById("btn-clear-filters")!.addEventListener("click", () => {
         clearAllFilters();
+        console.log("Scheduling autosave");
         scheduleAutoSave();
     });
 
@@ -4379,6 +4413,7 @@ function setupTrace() {
                 if (cb.checked) traceColHidden.delete(def.key);
                 else traceColHidden.add(def.key);
                 rebuildTraceColumns();
+                console.log("Scheduling autosave");
                 scheduleAutoSave();
             });
             item.append(cb, " ", def.label);
@@ -4396,6 +4431,7 @@ function setupTrace() {
             traceColHidden = new Set();
             traceColWidths = {};
             rebuildTraceColumns();
+            console.log("Scheduling autosave");
             scheduleAutoSave();
             ctxMenu?.remove(); ctxMenu = null;
         });
@@ -4437,12 +4473,14 @@ function setupTrace() {
         const active = this.classList.toggle("active");
         traceMode = active ? "overwrite" : "append";
         clearTrace();
+        console.log("Scheduling autosave");
         scheduleAutoSave();
     });
 
     document.getElementById("input-trace-max")!.addEventListener("change", (e) => {
         traceMaxRows = parseInt((e.target as HTMLInputElement).value) || 100;
         while (traceLocalBuffer.length > traceMaxRows) traceLocalBuffer.pop();
+        console.log("Scheduling autosave");
         scheduleAutoSave();
     });
 
@@ -4552,7 +4590,8 @@ function resumeFromPause() {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
-interface LogEntry { ts: string; text: string; isError: boolean; }
+type LogLevel = "debug" | "info" | "warn" | "error";
+interface LogEntry { ts: string; text: string; level: LogLevel; }
 const messageLog: LogEntry[] = [];
 // Oldest entries are dropped past this point so a long session can't grow the
 // log (array + DOM) without bound.
@@ -4570,27 +4609,32 @@ function escapeHtml(s: string): string {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-function setStatus(msg: string, isError = false) {
-    const el = document.getElementById("status-bar")!;
-    el.textContent = msg;
-    el.classList.toggle("status-error", isError);
-    console.log(isError ? "Error: " : "Status: ", msg);
-
-    const entry: LogEntry = { ts: new Date().toLocaleTimeString(), text: msg, isError };
+// Record an entry in the message-log panel (without touching the status bar).
+function appendToMessageLog(ts: string, text: string, level: LogLevel) {
+    const entry: LogEntry = { ts, text, level };
     messageLog.push(entry);
     if (messageLog.length > MAX_LOG_ENTRIES) messageLog.shift();
     appendLogEntry(entry);
-
-    if (isError) {
+    if (level === "error") {
         document.getElementById("btn-show-log")?.classList.add("log-has-error");
     }
+    console.log(level, text);
 
+    if (level === "debug") return; // don't show debug messages in the status bar
+
+    const el = document.getElementById("status-bar")!;
+    el.textContent = text;
+    el.classList.toggle("status-error", level === "error");
     setTimeout(() => {
-        if (el.textContent === msg) {
+        if (el.textContent === text) {
             el.textContent = "";
             el.classList.remove("status-error");
         }
     }, 4000);
+}
+
+function setStatus(msg: string, isError = false) {
+    appendToMessageLog(new Date().toLocaleTimeString(), msg, isError ? "error" : "info");
 }
 
 function setError(msg: string) { setStatus(msg, true); }
@@ -4599,7 +4643,7 @@ function appendLogEntry(entry: LogEntry) {
     const container = document.getElementById("log-entries");
     if (!container) return;
     const div = document.createElement("div");
-    div.className = `log-entry${entry.isError ? " log-error" : ""}`;
+    div.className = `log-entry log-${entry.level}`;
     const ts = document.createElement("span");
     ts.className = "log-ts";
     ts.textContent = entry.ts;
@@ -4626,6 +4670,49 @@ window.addEventListener("unhandledrejection", (e) => {
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 window.addEventListener("DOMContentLoaded", async () => {
+    // Pipe Rust log output into the message-log panel and the devtools
+    // console (the console line also carries the module name; the panel just
+    // shows the message). The backend keeps the full (ring-buffered) history,
+    // so fetch that first — it includes everything logged before this page
+    // existed (e.g. backend init during startup) — then follow live
+    // "rust-log" events. Live events that arrive while the history fetch is
+    // in flight are buffered and deduped against it by `seq`.
+    interface RustLog { seq: number; ts: string; level: string; module: string; message: string; }
+    // Rust timestamps are UTC HH:MM:SS.mmm; the panel shows local time.
+    const rustTsToLocal = (utc: string) => {
+        const m = utc.match(/^(\d+):(\d+):(\d+)\.(\d+)$/);
+        if (!m) return utc;
+        const d = new Date();
+        d.setUTCHours(+m[1], +m[2], +m[3], +m[4]);
+        return d.toLocaleTimeString();
+    };
+    const logRust = (e: RustLog) => {
+        const line = `[rust ${e.ts} ${e.module}] ${e.message}`;
+        if (e.level === "ERROR") console.error(line);
+        else if (e.level === "WARN") console.warn(line);
+        else if (e.level === "INFO") console.info(line);
+        else console.log(line);
+        const level: LogLevel =
+            e.level === "ERROR" ? "error" :
+                e.level === "WARN" ? "warn" :
+                    e.level === "INFO" ? "info" : "debug";
+        appendToMessageLog(rustTsToLocal(e.ts), e.message, level);
+    };
+    let lastRustSeq = -1;
+    let rustLogPending: RustLog[] | null = [];
+    await listen<RustLog>("rust-log", (ev) => {
+        if (rustLogPending) rustLogPending.push(ev.payload);
+        else if (ev.payload.seq > lastRustSeq) { lastRustSeq = ev.payload.seq; logRust(ev.payload); }
+    });
+    const backlog = [
+        ...await invoke<RustLog[]>("get_logs").catch(() => [] as RustLog[]),
+        ...rustLogPending,
+    ];
+    rustLogPending = null;
+    for (const e of backlog) {
+        if (e.seq > lastRustSeq) { lastRustSeq = e.seq; logRust(e); }
+    }
+
     // The Rust backend outlives a page reload, so any channels opened by the
     // previous load are still registered/open. Reset it before we rebuild state.
     await invoke("reset_backend").catch(() => { });

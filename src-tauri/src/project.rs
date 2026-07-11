@@ -1,4 +1,4 @@
-use log::info;
+use log::{info, debug};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -157,12 +157,18 @@ impl Project {
     }
 
     pub fn save(&self, path: &str) -> Result<(), String> {
-        info!("Saving project to '{}'", path);
         let p = std::path::Path::new(path);
         if let Some(parent) = p.parent() {
             std::fs::create_dir_all(parent).map_err(|e| format!("Dir error: {e}"))?;
         }
         let json = serde_json::to_string_pretty(self).map_err(|e| format!("Serialize error: {e}"))?;
+        let current_json = std::fs::read_to_string(path).unwrap_or_default();
+
+        if json == current_json {
+            debug!("Project file at '{}' unchanged, skipping write", path);
+            return Ok(());
+        }
+        info!("Saving project to '{}'", path);
         std::fs::write(path, json).map_err(|e| format!("Write error: {e}"))
     }
 

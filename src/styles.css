@@ -153,7 +153,7 @@ kbd {
   top: var(--menubar-height);
   right: 0;
   width: 520px;
-  max-height: 280px;
+  max-height: calc(100vh - var(--menubar-height));
   background: var(--bg2);
   border: 1px solid var(--border);
   border-top: none;
@@ -208,6 +208,8 @@ kbd {
 }
 .log-entry:last-child { border-bottom: none; }
 .log-entry.log-error { color: var(--danger); }
+.log-entry.log-warn { color: var(--warning); }
+.log-entry.log-debug { opacity: 0.55; }
 .log-entry .log-ts { flex-shrink: 0; opacity: 0.6; }
 
 #btn-app-run {

@@ -490,7 +490,6 @@ impl CanManager {
             lock.index_to_handle.clear();
             lock.handle_to_index.clear();
         }
-        info!("Reset CAN manager: all channels closed and unregistered");
     }
 
     /// Re-enumerate hardware in every backend and re-register all previously

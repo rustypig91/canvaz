@@ -98,6 +98,13 @@ fn close_channel(channel_handle: u32, state: State<'_, TauriState>) -> Result<()
     state.can_manager.lock().map_err(|e| e.to_string())?.close_channel(channel_handle)
 }
 
+/// Full Rust log history (ring-buffered). The frontend fetches this on every
+/// load and follows live "rust-log" events from there, deduping by `seq`.
+#[tauri::command]
+fn get_logs() -> Vec<logger::LogEntry> {
+    logger::history()
+}
+
 /// Close all hardware and forget every channel. Called by the frontend on startup
 /// so a page reload doesn't collide with channels left open by the previous load.
 #[tauri::command]
@@ -406,6 +413,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
+            logger::set_app(app.handle().clone());
             let app_state = AppState::new(app.handle().clone());
             let manager = CanManager::new(Arc::clone(&app_state));
             app.manage(TauriState {
@@ -423,6 +431,7 @@ pub fn run() {
             read_text_file,
             file_exists,
             provide_admin_password,
+            get_logs,
             list_can_interfaces,
             create_channel,
             remove_channel,

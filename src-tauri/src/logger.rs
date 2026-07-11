@@ -1,11 +1,80 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 
 use log::{Level, Metadata, Record};
+use serde::Serialize;
+use tauri::{AppHandle, Emitter};
 
 struct Logger;
 
 static USE_COLORS: AtomicBool = AtomicBool::new(true);
 static LOGGER: Logger = Logger;
+
+// ── Frontend pipe ─────────────────────────────────────────────────────────────
+
+/// One log record as delivered to the frontend console. `seq` increases
+/// monotonically so the frontend can dedup history against live events.
+#[derive(Clone, Serialize)]
+pub struct LogEntry {
+    pub seq: u64,
+    pub ts: String,
+    pub level: String,
+    pub module: String,
+    pub message: String,
+}
+
+/// Every record is kept in a ring buffer (so the frontend can fetch the full
+/// history whenever it starts or reloads) and, once the app handle is set,
+/// also emitted live as a "rust-log" event.
+struct Pipe {
+    next_seq: u64,
+    history: VecDeque<LogEntry>,
+    app: Option<AppHandle>,
+}
+
+/// Ring-buffer capacity. Startup records sit at the front and are only
+/// evicted once a long session has produced this many newer ones — by which
+/// point every frontend load has long since fetched them.
+const LOG_HISTORY_MAX: usize = 1000;
+
+static PIPE: Mutex<Pipe> = Mutex::new(Pipe {
+    next_seq: 0,
+    history: VecDeque::new(),
+    app: None,
+});
+
+fn publish(mut entry: LogEntry) {
+    // Clone the handle out of the lock before emitting: emit can itself log,
+    // and re-entering publish() while holding the lock would deadlock.
+    let app = {
+        let Ok(mut pipe) = PIPE.lock() else { return };
+        entry.seq = pipe.next_seq;
+        pipe.next_seq += 1;
+        if pipe.history.len() >= LOG_HISTORY_MAX {
+            pipe.history.pop_front();
+        }
+        pipe.history.push_back(entry.clone());
+        pipe.app.clone()
+    };
+    if let Some(app) = app {
+        let _ = app.emit("rust-log", &entry);
+    }
+}
+
+/// Enable live "rust-log" events. Called once from the Tauri setup hook;
+/// records logged before the webview listens are only in the history.
+pub fn set_app(app: AppHandle) {
+    if let Ok(mut pipe) = PIPE.lock() {
+        pipe.app = Some(app);
+    }
+}
+
+/// Full log history, oldest first. The frontend calls this on every load and
+/// dedups against live events via `seq`.
+pub fn history() -> Vec<LogEntry> {
+    PIPE.lock().map(|p| p.history.iter().cloned().collect()).unwrap_or_default()
+}
 
 impl log::Log for Logger {
     fn enabled(&self, metadata: &Metadata) -> bool {
@@ -30,6 +99,14 @@ impl log::Log for Logger {
         } else {
             println!("{ts} {:<5} {module:<18} {}", record.level(), record.args());
         }
+
+        publish(LogEntry {
+            seq: 0, // assigned by publish() under the pipe lock
+            ts,
+            level: record.level().to_string(),
+            module: module.to_string(),
+            message: record.args().to_string(),
+        });
     }
 
     fn flush(&self) {}
