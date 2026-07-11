@@ -53,6 +53,8 @@ interface ParsedDbc {
     path: string;
     // Keyed by CAN id (matches the Rust HashMap serialization).
     messages: Record<number, DbcMessage>;
+    // All BU_ nodes declared in the DBC, including ones with no messages.
+    nodes: string[];
 }
 
 // Per-frame decoded signal carried for trace display (value + raw from Rust).
@@ -73,6 +75,9 @@ interface FrameInfo {
     direction: "rx" | "tx";
     message_name: string | null;
     j1939?: J1939Info | null;
+    // True if this row is a synthetic frame reassembled from a J1939 TP.CM /
+    // TP.DT transfer rather than a frame that actually appeared on the bus.
+    reassembled?: boolean;
     signals: FrameSignal[];
 }
 
@@ -86,6 +91,9 @@ interface CanFrameEvent {
     direction: "rx" | "tx";
     // J1939 breakdown of the identifier; only present on J1939 channels.
     j1939?: J1939Info | null;
+    // True if this row is a synthetic frame reassembled from a J1939 TP.CM /
+    // TP.DT transfer rather than a frame that actually appeared on the bus.
+    reassembled?: boolean;
     // Decoded signals as interleaved [value, raw, value, raw, …] pairs in DBC
     // message signal order. Names/units/message name are derived from the DBC by
     // position — no strings on the per-frame wire (they dominated GC churn).
@@ -97,6 +105,9 @@ interface J1939Info { pgn: number; priority: number; sa: number; da: number; }
 interface PlotSignalEntry { signal_name: string; channel: string; message_id?: number; }
 interface PlotPaneConfig { signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean; }
 interface ChannelInfo { backend: string; name: string; }
+// create_channel result: the backend is where the name was actually found —
+// the backend searches all of them, so it can differ from the hint we sent.
+interface CreatedChannel { handle: number; backend: string; }
 interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate: number | null; protocol: string | null; }
 // Everything the app tracks about one channel, keyed by its u32 handle in `channels`.
 interface Channel {
@@ -134,7 +145,6 @@ interface TraceFiltersConfig {
     // Length doubles as the "bytes to check" count of the data filter.
     data?: (number | null)[];
     data_format?: string;
-    overwrite?: boolean;
     max_rows?: number | null;
 }
 
@@ -451,7 +461,7 @@ function removeSigFromPane(pane: PlotPane, key: string) {
     syncDatasets(pane);
     updatePaneTitle(pane);
     updateSignalHighlights();
-    scheduleAutoSave();
+    scheduleAutoSave("plot signal removed");
 }
 
 function createPlotPane(): PlotPane {
@@ -487,12 +497,12 @@ function createPlotPane(): PlotPane {
         btn.classList.toggle("active", pane.showPoints);
         btn.title = `Show data points: ${pane.showPoints ? "on" : "off"}`;
         syncDatasets(pane);
-        scheduleAutoSave();
+        scheduleAutoSave("plot show-points toggled");
     });
     el.querySelector<HTMLSelectElement>(".sel-interp")!.addEventListener("change", (e) => {
         pane.interpolation = (e.currentTarget as HTMLSelectElement).value as PlotPane["interpolation"];
         syncDatasets(pane);
-        scheduleAutoSave();
+        scheduleAutoSave("plot interpolation changed");
     });
     const resetZoomBtn = el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!;
     resetZoomBtn.addEventListener("click", () => resetAllZoom());
@@ -658,7 +668,7 @@ function closePlotPane(id: string) {
     pane.chart.destroy();
     pane.el.remove();
     updateSignalHighlights();
-    scheduleAutoSave();
+    scheduleAutoSave("plot pane closed");
 }
 
 // ── Signal → pane ─────────────────────────────────────────────────────────────
@@ -711,7 +721,20 @@ async function addSignalToPane(pane: PlotPane, handle: number, sig: DbcSignal) {
     syncDatasets(pane);
     updatePaneTitle(pane);
     updateSignalHighlights();
-    scheduleAutoSave();
+    scheduleAutoSave("signal added to plot");
+}
+
+// Add every signal of a message to a specific pane (dropped onto that pane).
+async function addMessageSignalsToPane(pane: PlotPane, handle: number, msg: DbcMessage) {
+    if (!msg.signals.length) { log("warn", `${msg.name} has no signals to plot`); return; }
+    for (const sig of msg.signals) await addSignalToPane(pane, handle, sig);
+}
+
+// Whole message dropped somewhere with no specific pane target (the "new
+// plot" drop zone, or double-click): create a fresh pane for it.
+async function addMessageToNewPane(handle: number, msg: DbcMessage) {
+    if (!msg.signals.length) { log("warn", `${msg.name} has no signals to plot`); return; }
+    await addMessageSignalsToPane(createPlotPane(), handle, msg);
 }
 
 function syncDatasets(pane: PlotPane) {
@@ -833,10 +856,13 @@ function renderDbcTree(filter = "") {
     };
 
     const buildMsgDetails = (msg: DbcMessage, container: HTMLElement) => {
+        const noSignals = msg.signals.length === 0;
         const visibleSignals = msg.signals.filter(s =>
             !lc || s.name.toLowerCase().includes(lc) || msg.name.toLowerCase().includes(lc)
         );
-        if (!visibleSignals.length) return;
+        // A message with no signals has nothing to filter against but its own
+        // name, so it stays visible whenever the filter matches (or is empty).
+        if (noSignals ? (lc && !msg.name.toLowerCase().includes(lc)) : !visibleSignals.length) return;
 
         const details = document.createElement("details");
         details.className = "msg-group";
@@ -844,7 +870,10 @@ function renderDbcTree(filter = "") {
         details.dataset.messageId = String(msg.id);
 
         const summary = document.createElement("summary");
-        summary.innerHTML = `${msg.name}<span class="msg-id-badge">0x${msg.id.toString(16).toUpperCase().padStart(3, "0")}</span>`;
+        const emptyHint = noSignals ? `<span class="msg-empty-hint">(no signals)</span>` : "";
+        summary.innerHTML = `${msg.name}${emptyHint}<span class="msg-id-badge">0x${msg.id.toString(16).toUpperCase().padStart(3, "0")}</span>`;
+        // Drag / double-click behaviour is delegated on #dbc-tree (setupDbcTree).
+        summary.setAttribute("draggable", "true");
         details.appendChild(summary);
 
         // Signal rows are built on first expand. A large DBC would otherwise keep
@@ -870,6 +899,11 @@ function renderDbcTree(filter = "") {
         if (!byEcu.has(ecu)) byEcu.set(ecu, []);
         byEcu.get(ecu)!.push(msg);
     }
+    // Nodes declared in the DBC but never used as a transmitter still get a
+    // (message-less) group, so the tree reflects the full BU_ node list.
+    for (const node of dbc.nodes ?? []) {
+        if (!byEcu.has(node)) byEcu.set(node, []);
+    }
 
     const hasNamedEcus = [...byEcu.keys()].some(k => k !== "");
 
@@ -887,7 +921,17 @@ function renderDbcTree(filter = "") {
             ecuSummary.textContent = ecu;
             ecuDetails.appendChild(ecuSummary);
             for (const msg of msgs) buildMsgDetails(msg, ecuDetails);
-            if (ecuDetails.childElementCount > 1) tree.appendChild(ecuDetails);
+            // A genuinely message-less ECU (not just filtered out) stays
+            // visible with a hint, but only outside an active search filter.
+            if (ecuDetails.childElementCount > 1) {
+                tree.appendChild(ecuDetails);
+            } else if (msgs.length === 0 && !lc) {
+                const hint = document.createElement("span");
+                hint.className = "ecu-empty-hint";
+                hint.textContent = "(no messages)";
+                ecuSummary.appendChild(hint);
+                tree.appendChild(ecuDetails);
+            }
         }
 
         if (unnamed.length > 0) {
@@ -919,8 +963,20 @@ interface DragSignal {
     sig: DbcSignal;
 }
 
+interface DragMessage {
+    channel: number;
+    messageId: number;
+    messageName: string;
+    msg: DbcMessage;
+}
+
 function parseDragSignal(e: DragEvent): DragSignal | null {
     try { return JSON.parse(e.dataTransfer?.getData("application/can-signal") ?? "null"); }
+    catch { return null; }
+}
+
+function parseDragMessage(e: DragEvent): DragMessage | null {
+    try { return JSON.parse(e.dataTransfer?.getData("application/can-message") ?? "null"); }
     catch { return null; }
 }
 
@@ -933,51 +989,99 @@ function sigFromRow(row: HTMLElement): { handle: number; sig: DbcSignal } | null
     return sig ? { handle, sig } : null;
 }
 
+// Resolve a sidebar message summary back to its DBC definition. The
+// containing <details class="msg-group"> carries the identifiers.
+function msgFromSummary(summary: HTMLElement): { handle: number; msg: DbcMessage } | null {
+    const details = summary.closest<HTMLElement>(".msg-group");
+    if (!details) return null;
+    const handle = parseInt(details.dataset.channel ?? "");
+    const msgId = parseInt(details.dataset.messageId ?? "");
+    const msg = channels.get(handle)?.dbc?.messages[msgId];
+    return msg ? { handle, msg } : null;
+}
+
 // One delegated dragstart/dblclick pair for the whole tree instead of two
 // listeners per signal row.
 function setupDbcTree() {
     const tree = document.getElementById("dbc-tree")!;
     tree.addEventListener("dragstart", (e) => {
-        const row = (e.target as HTMLElement).closest<HTMLElement>(".signal-row");
-        if (!row) return;
-        const found = sigFromRow(row);
-        if (!found) { e.preventDefault(); return; }
-        const payload: DragSignal = {
-            channel: found.handle,
-            signalName: found.sig.name,
-            messageName: found.sig.message_name,
-            unit: found.sig.unit,
-            sig: found.sig,
-        };
-        e.dataTransfer!.setData("application/can-signal", JSON.stringify(payload));
-        e.dataTransfer!.effectAllowed = "copy";
-    });
-    tree.addEventListener("dblclick", (e) => {
-        const row = (e.target as HTMLElement).closest<HTMLElement>(".signal-row");
-        if (!row) return;
-        const found = sigFromRow(row);
-        if (!found) return;
-        const activeTab = document.querySelector(".tab-btn.active")?.getAttribute("data-tab");
-        if (activeTab === "plot") {
-            const pane = plotPanes[0] ?? createPlotPane();
-            addSignalToPane(pane, found.handle, found.sig);
-        } else if (activeTab === "simulate") {
-            addSimSignal(found.handle, found.sig);
+        const target = e.target as HTMLElement;
+        const row = target.closest<HTMLElement>(".signal-row");
+        if (row) {
+            const found = sigFromRow(row);
+            if (!found) { e.preventDefault(); return; }
+            const payload: DragSignal = {
+                channel: found.handle,
+                signalName: found.sig.name,
+                messageName: found.sig.message_name,
+                unit: found.sig.unit,
+                sig: found.sig,
+            };
+            e.dataTransfer!.setData("application/can-signal", JSON.stringify(payload));
+            e.dataTransfer!.effectAllowed = "copy";
+            return;
+        }
+        const summary = target.closest<HTMLElement>(".msg-group > summary");
+        if (summary) {
+            const found = msgFromSummary(summary);
+            if (!found) { e.preventDefault(); return; }
+            const payload: DragMessage = {
+                channel: found.handle,
+                messageId: found.msg.id,
+                messageName: found.msg.name,
+                msg: found.msg,
+            };
+            e.dataTransfer!.setData("application/can-message", JSON.stringify(payload));
+            e.dataTransfer!.effectAllowed = "copy";
         }
     });
+    tree.addEventListener("dblclick", (e) => {
+        const target = e.target as HTMLElement;
+        const row = target.closest<HTMLElement>(".signal-row");
+        if (row) {
+            const found = sigFromRow(row);
+            if (!found) return;
+            const activeTab = document.querySelector(".tab-btn.active")?.getAttribute("data-tab");
+            if (activeTab === "plot") {
+                const pane = plotPanes[0] ?? createPlotPane();
+                addSignalToPane(pane, found.handle, found.sig);
+            } else if (activeTab === "simulate") {
+                addSimSignal(found.handle, found.sig);
+            }
+            return;
+        }
+        const summary = target.closest<HTMLElement>(".msg-group > summary");
+        if (summary) {
+            const found = msgFromSummary(summary);
+            if (!found) return;
+            const activeTab = document.querySelector(".tab-btn.active")?.getAttribute("data-tab");
+            if (activeTab === "plot") {
+                const pane = plotPanes[0] ?? createPlotPane();
+                addMessageSignalsToPane(pane, found.handle, found.msg);
+            } else if (activeTab === "simulate") {
+                addSimMessage(found.handle, found.msg);
+            }
+        }
+    });
+}
+
+// Both a lone signal and a whole message are draggable; drop targets accept either.
+function isCanDragEvent(e: DragEvent): boolean {
+    const types = e.dataTransfer?.types;
+    return !!types && (types.includes("application/can-signal") || types.includes("application/can-message"));
 }
 
 function setupPaneDrop(el: HTMLElement, pane: PlotPane) {
     let dragDepth = 0;
     el.addEventListener("dragenter", (e) => {
-        if (!e.dataTransfer?.types.includes("application/can-signal")) return;
+        if (!isCanDragEvent(e)) return;
         e.preventDefault();
         if (++dragDepth === 1) el.classList.add("drag-over");
     });
     el.addEventListener("dragover", (e) => {
-        if (!e.dataTransfer?.types.includes("application/can-signal")) return;
+        if (!isCanDragEvent(e)) return;
         e.preventDefault();
-        e.dataTransfer.dropEffect = "copy";
+        e.dataTransfer!.dropEffect = "copy";
     });
     el.addEventListener("dragleave", () => {
         if (--dragDepth === 0) el.classList.remove("drag-over");
@@ -986,6 +1090,8 @@ function setupPaneDrop(el: HTMLElement, pane: PlotPane) {
         e.preventDefault();
         dragDepth = 0;
         el.classList.remove("drag-over");
+        const msgData = parseDragMessage(e);
+        if (msgData) { addMessageSignalsToPane(pane, msgData.channel, msgData.msg); return; }
         const data = parseDragSignal(e);
         if (data) addSignalToPane(pane, data.channel, data.sig);
     });
@@ -995,14 +1101,14 @@ function setupDropZone() {
     const zone = document.getElementById("drop-zone-new")!;
     let dragDepth = 0;
     zone.addEventListener("dragenter", (e) => {
-        if (!e.dataTransfer?.types.includes("application/can-signal")) return;
+        if (!isCanDragEvent(e)) return;
         e.preventDefault();
         if (++dragDepth === 1) zone.classList.add("drag-over");
     });
     zone.addEventListener("dragover", (e) => {
-        if (!e.dataTransfer?.types.includes("application/can-signal")) return;
+        if (!isCanDragEvent(e)) return;
         e.preventDefault();
-        e.dataTransfer.dropEffect = "copy";
+        e.dataTransfer!.dropEffect = "copy";
     });
     zone.addEventListener("dragleave", () => {
         if (--dragDepth === 0) zone.classList.remove("drag-over");
@@ -1011,6 +1117,8 @@ function setupDropZone() {
         e.preventDefault();
         dragDepth = 0;
         zone.classList.remove("drag-over");
+        const msgData = parseDragMessage(e);
+        if (msgData) { addMessageToNewPane(msgData.channel, msgData.msg); return; }
         const data = parseDragSignal(e);
         if (!data) return;
         const pane = createPlotPane();
@@ -1022,14 +1130,14 @@ function setupSimDrop() {
     const zone = document.getElementById("drop-zone-sim")!;
     let dragDepth = 0;
     zone.addEventListener("dragenter", (e) => {
-        if (!e.dataTransfer?.types.includes("application/can-signal")) return;
+        if (!isCanDragEvent(e)) return;
         e.preventDefault();
         if (++dragDepth === 1) zone.classList.add("drag-over");
     });
     zone.addEventListener("dragover", (e) => {
-        if (!e.dataTransfer?.types.includes("application/can-signal")) return;
+        if (!isCanDragEvent(e)) return;
         e.preventDefault();
-        e.dataTransfer.dropEffect = "copy";
+        e.dataTransfer!.dropEffect = "copy";
     });
     zone.addEventListener("dragleave", () => {
         if (--dragDepth === 0) zone.classList.remove("drag-over");
@@ -1038,6 +1146,8 @@ function setupSimDrop() {
         e.preventDefault();
         dragDepth = 0;
         zone.classList.remove("drag-over");
+        const msgData = parseDragMessage(e);
+        if (msgData) { addSimMessage(msgData.channel, msgData.msg); return; }
         const data = parseDragSignal(e);
         if (data) addSimSignal(data.channel, data.sig);
     });
@@ -1094,15 +1204,36 @@ let sessionFilePath: string | null = null;
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 let projectDirty = false;
-
-function scheduleAutoSave() {
+function scheduleAutoSave(reason: string) {
+    if (import.meta.env.DEV) {
+        // stack[0] = "Error", [1] = scheduleAutoSave itself, [2] = the caller.
+        const caller = new Error().stack?.split("\n")[2]?.trim().replace(/^at\s+/, "") ?? "unknown";
+        log("debug", `Autosave scheduled: ${reason} (${caller})`);
+    }
     if (!sessionFilePath) return;
-    projectDirty = true;
-    updateWindowTitle();
+    const project = buildProject();
+
+    // Derive dirty state from an actual content comparison against the saved
+    // project file, rather than assuming every edit leaves the project
+    // unsaved — e.g. an edit that's undone back to the saved state shouldn't
+    // keep the title's dirty marker lit.
+    if (projectPath) {
+        invoke<boolean>("project_has_changes", { path: projectPath, project })
+            .then(changed => { projectDirty = changed; updateWindowTitle(); })
+            .catch(e => log("debug", `Dirty check failed: ${e}`));
+    } else {
+        projectDirty = true;
+        updateWindowTitle();
+    }
+
     if (autoSaveTimer) clearTimeout(autoSaveTimer);
     autoSaveTimer = setTimeout(async () => {
-        try { await invoke("save_project", { path: sessionFilePath, project: buildProject() }); }
-        catch { /* silent — auto-save failures should not interrupt the user */ }
+        try {
+            await invoke("save_project", { path: sessionFilePath, project });
+        }
+        // warn, not error: don't light up the error badge for a transient miss,
+        // but the user should still see their session isn't being persisted.
+        catch (e) { log("warn", `Session auto-save failed: ${e}`); }
     }, 1000);
 }
 let projectPath: string | null = null;
@@ -1110,7 +1241,8 @@ let lastProjectIndexPath: string | null = null;
 
 function persistLastProjectPath(path: string) {
     if (lastProjectIndexPath)
-        invoke("write_text_file", { path: lastProjectIndexPath, content: path }).catch(() => { });
+        invoke("write_text_file", { path: lastProjectIndexPath, content: path })
+            .catch(e => log("debug", `Failed to record last project path: ${e}`));
 }
 
 // ── Channel dialog ────────────────────────────────────────────────────────────
@@ -1174,7 +1306,6 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         title.textContent = "Add CAN Channel";
         applyBtn.textContent = "Add";
         ifaceRow.style.display = "";
-        (document.getElementById("input-iface-custom") as HTMLInputElement).value = "";
         sel.innerHTML = "";
         dialogPendingDbc = null;
         setDbcLabel(null);
@@ -1188,7 +1319,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         const available = ifaces.filter(i => !configured.has(`${i.backend}:${i.name}`));
 
         if (available.length === 0) {
-            setStatus("All detected interfaces are already added.");
+            log("warn", ifaces.length > 0 ? "All detected interfaces are already added." : "No CAN interfaces found.");
             dialog.close();
             return;
         }
@@ -1202,7 +1333,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         }
         sel.innerHTML = [...byBackend.entries()]
             .map(([backend, names]) =>
-                `<optgroup label="${backend}">${names.map(n => `<option value="${n}">${n}</option>`).join("")}</optgroup>`
+                `<optgroup label="${escapeHtml(backend)}">${names.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join("")}</optgroup>`
             ).join("");
 
         // Auto-detect vcan from first available item
@@ -1266,8 +1397,39 @@ async function loadChannelDbc(handle: number): Promise<void> {
         ch.dbc = await invoke<ParsedDbc>("parse_dbc", { path: ch.config.dbc_path });
     } catch (e) {
         ch.dbc = null;
-        setError(`Failed to parse DBC: ${e}`);
+        log("error", `Failed to parse DBC: ${e}`);
     }
+}
+
+// Result of registerChannel: `handle` is set on success. On failure `error`
+// says why, and `notFound` marks the "exists in no backend" case that should
+// become a ghost; other failures (duplicate, backend error) should not.
+interface RegisterResult { handle?: number; error?: string; notFound?: boolean; }
+
+// Register `config`'s channel with the backend and store it in `channels`.
+// Owns everything every create-site needs to agree on: the invoke, writing the
+// resolved backend back into config (create_channel searches all backends, so
+// it can differ from the hint), the Channel shape, and the DBC preload. The
+// same config object is stored on the channel, so ghost promotion keeps its
+// saved settings.
+async function registerChannel(config: ChannelConfig): Promise<RegisterResult> {
+    let created: CreatedChannel;
+    try {
+        created = await invoke<CreatedChannel>("create_channel", { backendName: config.backend, channelName: config.name });
+    } catch (e) {
+        const error = String(e);
+        return { error, notFound: error.includes("not found in any backend") };
+    }
+    // create_channel returns the existing handle when the name resolves to an
+    // already-registered channel; overwriting it would clobber its config.
+    const existing = channels.get(created.handle);
+    if (existing) {
+        return { error: `'${config.name}' resolves to already-configured channel ${existing.info.backend}:${existing.info.name}` };
+    }
+    config.backend = created.backend;
+    channels.set(created.handle, { info: { backend: created.backend, name: config.name }, config, dbc: null, open: false });
+    await loadChannelDbc(created.handle);
+    return { handle: created.handle };
 }
 
 // Open a channel by its u32 handle. If root is required the Rust side emits
@@ -1293,9 +1455,9 @@ async function openChannelByHandle(handle: number): Promise<boolean> {
     } catch (e) {
         const msg = String(e);
         if (msg === "Sudo authentication cancelled") {
-            setError("Cancelled — sudo password required.");
+            log("warn", "Cancelled — sudo password required.");
         } else {
-            setError(`Channel error: ${msg}`);
+            log("error", `Channel error: ${msg}`);
         }
         return false;
     }
@@ -1307,37 +1469,43 @@ async function applyChannelDialog() {
     const protocol = getProtocolFromDialog();
 
     if (dialogMode === "add") {
-        const custom = (document.getElementById("input-iface-custom") as HTMLInputElement).value.trim();
-        const name = custom || (document.getElementById("select-iface") as HTMLSelectElement).value;
+        const name = (document.getElementById("select-iface") as HTMLSelectElement).value;
         if (!name) {
-            setError("Channel name not set");
+            log("error", "Channel name not set");
             return;
         };
+        if (ghostChannels.some(g => g.config.name === name)) {
+            log("error", `Channel '${name}' is already added (hardware not available)`);
+            return;
+        }
         const backend = availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
-        // Register channel with backend (allocates handle); hardware opens (and the
-        // DBC is loaded) on Start.
-        let handle: number;
-        try {
-            handle = await invoke<number>("create_channel", { backendName: backend, channelName: name });
-        } catch (e) {
-            const msg = String(e);
-            setError(`Failed to create channel: ${msg}`);
+        const config: ChannelConfig = { name, backend, dbc_path: dialogPendingDbc, bitrate, protocol };
+        // Register channel with backend (allocates handle); hardware opens (and
+        // the DBC is loaded) on Start. If the name exists in no backend the
+        // channel is still added, as a ghost — same as a project channel whose
+        // hardware is absent — and recovers once the hardware shows up. Any
+        // other failure (duplicate, backend error) is a real error.
+        const res = await registerChannel(config);
+        if (res.handle === undefined) {
+            if (!res.notFound) {
+                log("error", `Failed to add channel: ${res.error}`);
+                return;
+            }
+            ghostChannels.push({ config, error: res.error! });
+            refreshChannelList();
+            rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
+            log("warn", `Added channel: ${name} (hardware not available)`);
+            scheduleAutoSave("channel added (hardware unavailable)");
+            dialog.close();
             return;
         }
 
-        channels.set(handle, {
-            info: { backend, name },
-            config: { name, backend, dbc_path: dialogPendingDbc, bitrate, protocol },
-            dbc: null,
-            open: false,
-        });
-        await loadChannelDbc(handle);
-
+        const handle = res.handle;
         refreshChannelList();
         rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === handle) renderDbcTree();
-        setStatus(`Added channel: ${name}`);
-        scheduleAutoSave();
+        log("info", `Added channel: ${name}`);
+        scheduleAutoSave("channel added");
     } else {
         const h = dialogEditTarget!;
         const ch = channels.get(h);
@@ -1355,8 +1523,8 @@ async function applyChannelDialog() {
         refreshChannelList();
         rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === h) renderDbcTree();
-        setStatus(`Updated channel: ${name}`);
-        scheduleAutoSave();
+        log("info", `Updated channel: ${name}`);
+        scheduleAutoSave("channel updated");
     }
 
     dialog.close();
@@ -1619,7 +1787,7 @@ async function renderChannelList() {
                         if (selectedChannel === h) selectChannel(null);
                         renderChannelList();
                         rebuildTraceColumns();
-                        scheduleAutoSave();
+                        scheduleAutoSave("channel removed");
                     }
                 },
             ]);
@@ -1630,7 +1798,7 @@ async function renderChannelList() {
 
             try { await invoke("remove_channel", { channelHandle: h }); }
             catch (e) {
-                setError(`Remove channel error: ${e}`);
+                log("error", `Remove channel error: ${e}`);
                 return;
             }
             channels.delete(h);
@@ -1639,7 +1807,7 @@ async function renderChannelList() {
 
             renderChannelList();
             rebuildTraceColumns();
-            scheduleAutoSave();
+            scheduleAutoSave("channel closed");
         });
         list.appendChild(item);
     }
@@ -1664,7 +1832,7 @@ async function renderChannelList() {
             ghostChannels.splice(ghostChannels.indexOf(ghost), 1);
             renderChannelList();
             rebuildTraceColumns();
-            scheduleAutoSave();
+            scheduleAutoSave("ghost channel removed");
         });
         list.appendChild(item);
     }
@@ -1838,7 +2006,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             rawInp.value = String(raw);
             if (enumSel) enumSel.value = (s.def.enum_values ?? []).some(e => e.value === raw) ? String(raw) : "";
             if (entry.running) { await stopSim(key); await startSim(key); }
-            scheduleAutoSave();
+            scheduleAutoSave("sim signal value changed");
         };
 
         el.querySelectorAll<HTMLInputElement>(".sim-phys-input").forEach(inp => {
@@ -1862,7 +2030,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         });
         el.querySelector(".sim-send-once")!.addEventListener("click", async () => {
             try { await invoke("send_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry) } }); }
-            catch (e) { setError(`Send error: ${e}`); }
+            catch (e) { log("error", `Send error: ${e}`); }
         });
 
     } else {
@@ -1939,7 +2107,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         });
         el.querySelector(".sim-send-once")!.addEventListener("click", async () => {
             try { await invoke("send_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc) } }); }
-            catch (e) { setError(`Send error: ${e}`); }
+            catch (e) { log("error", `Send error: ${e}`); }
         });
     }
 
@@ -1962,10 +2130,16 @@ function renderSimEntries() {
 
 function addSimSignal(handle: number, sig: DbcSignal) {
     const dbc = channels.get(handle)?.dbc;
-    if (!dbc) { setStatus("No DBC loaded for this channel"); return; }
+    if (!dbc) { log("warn", "No DBC loaded for this channel"); return; }
     const msg = dbc.messages[sig.message_id];
     if (!msg) return;
+    addSimMessage(handle, msg);
+}
 
+// A message is always simulated as a whole (one entry, all its signals);
+// this also covers messages with zero signals — they get an entry with an
+// empty signal list, sending a zero-filled frame of the message's DLC.
+function addSimMessage(handle: number, msg: DbcMessage) {
     const key = `msg::${++msgEntryCounter}`;
 
     const entry: SimMessageEntry = {
@@ -1977,7 +2151,7 @@ function addSimSignal(handle: number, sig: DbcSignal) {
     simEntries.set(key, entry);
     document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
     updateSignalHighlights();
-    scheduleAutoSave();
+    scheduleAutoSave("sim message added");
 }
 
 function addRawFrame() {
@@ -1991,7 +2165,7 @@ function addRawFrame() {
     };
     simEntries.set(key, entry);
     document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
-    scheduleAutoSave();
+    scheduleAutoSave("sim raw entry added");
 }
 
 async function removeSimEntry(key: string) {
@@ -2000,20 +2174,20 @@ async function removeSimEntry(key: string) {
     simEntries.delete(key);
     document.querySelector(`[data-sim-key="${key}"]`)?.remove();
     updateSignalHighlights();
-    scheduleAutoSave();
+    scheduleAutoSave("sim entry removed");
 }
 
 async function startSim(key: string) {
     const entry = simEntries.get(key);
     // Guard: already sending (backend periodic registered).
     if (!entry || entry.periodicHandle !== null) return;
-    if (!entry.channel) { setStatus("Select a channel first"); return; }
+    if (!entry.channel) { log("warn", "Select a channel first"); return; }
 
     // Mark user intent immediately — button shows "Stop" even while app is stopped.
     entry.running = true;
     const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
     if (btn) { btn.textContent = "Stop"; btn.classList.add("running"); }
-    scheduleAutoSave();
+    scheduleAutoSave("sim started");
 
     // Register with backend only when the app (and its channels) is live.
     if (!appRunning) return;
@@ -2027,10 +2201,10 @@ async function startSim(key: string) {
         }
         entry.periodicHandle = handle;
     } catch (e) {
-        setError(`Sim start error: ${e}`);
+        log("error", `Sim start error: ${e}`);
         entry.running = false;
         if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
-        scheduleAutoSave();
+        scheduleAutoSave("sim start failed");
     }
 }
 
@@ -2044,7 +2218,7 @@ async function stopSim(key: string) {
     entry.running = false;
     const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
     if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
-    scheduleAutoSave();
+    scheduleAutoSave("sim stopped");
 }
 
 // ── Project ───────────────────────────────────────────────────────────────────
@@ -2115,7 +2289,6 @@ function buildProject(): Project {
             cycle_max: traceFilterCycleMax,
             data: traceFilterData,
             data_format: traceDataFormat,
-            overwrite: traceMode === "overwrite",
             max_rows: traceMaxRows,
         },
         window_size_sec: windowSizeSec,
@@ -2163,7 +2336,7 @@ async function newProject() {
     refreshChannelList();
     rebuildTraceColumns();
     renderDbcTree();
-    setStatus("New project");
+    log("info", "New project");
 }
 
 async function saveProject() {
@@ -2172,8 +2345,8 @@ async function saveProject() {
             await invoke("save_project", { path: projectPath, project: buildProject() });
             projectDirty = false;
             updateWindowTitle();
-            setStatus(`Saved: ${projectPath}`);
-        } catch (e) { setError(`Save error: ${e}`); }
+            log("info", `Saved: ${projectPath}`);
+        } catch (e) { log("error", `Save error: ${e}`); }
     } else { await saveProjectAs(); }
 }
 
@@ -2191,8 +2364,8 @@ async function saveProjectAs() {
         updateWindowTitle();
         persistLastProjectPath(path);
         await invoke("save_project", { path, project: buildProject() });
-        setStatus(`Saved: ${path}`);
-    } catch (e) { setError(`Save error: ${e}`); }
+        log("info", `Saved: ${path}`);
+    } catch (e) { log("error", `Save error: ${e}`); }
 }
 
 async function openProject() {
@@ -2205,8 +2378,8 @@ async function openProject() {
         updateWindowTitle();
         persistLastProjectPath(path);
         await applyProject(project);
-        setStatus(`Loaded: ${path}`);
-    } catch (e) { setError(`Load error: ${e}`); }
+        log("info", `Loaded: ${path}`);
+    } catch (e) { log("error", `Load error: ${e}`); }
 }
 
 async function applyProject(project: Project) {
@@ -2220,19 +2393,14 @@ async function applyProject(project: Project) {
         const backend = ch.backend ?? "socketcan";
         const bitrate = ch.bitrate ?? null;
         const config: ChannelConfig = { name: ch.name, backend, dbc_path: ch.dbc_path ?? null, bitrate, protocol: ch.protocol ?? null };
-        let handle: number | null = null;
-        let errMsg = "";
-        try {
-            handle = await invoke<number>("create_channel", { backendName: backend, channelName: ch.name });
-        } catch (e) {
-            errMsg = String(e);
-        }
-        if (handle !== null) {
-            channels.set(handle, { info: { backend, name: ch.name }, config, dbc: null, open: false });
-            await loadChannelDbc(handle);
-        } else {
-            console.warn(`Channel ${ch.name} (${backend}) inactive: ${errMsg}`);
-            ghostChannels.push({ config, error: errMsg });
+        // Any failure keeps the saved config as a ghost — including a name that
+        // currently resolves to an already-added channel (a duplicate ghost
+        // recovers under its own backend once that hardware appears, since
+        // create_channel searches the hinted backend first).
+        const res = await registerChannel(config);
+        if (res.handle === undefined) {
+            console.warn(`Channel ${ch.name} (${backend}) inactive: ${res.error}`);
+            ghostChannels.push({ config, error: res.error! });
         }
     }
 
@@ -2342,10 +2510,6 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
     if (f.data_format === "hex" || f.data_format === "dec" || f.data_format === "ascii")
         traceDataFormat = f.data_format;
 
-    traceMode = (f.overwrite ?? true) ? "overwrite" : "append";
-    const overwriteBtn = document.getElementById("btn-trace-overwrite")!;
-    overwriteBtn.classList.toggle("active", traceMode === "overwrite");
-
     if (f.max_rows != null) {
         traceMaxRows = f.max_rows;
         (document.getElementById("input-trace-max") as HTMLInputElement).value = String(traceMaxRows);
@@ -2371,24 +2535,17 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
 // ── App recording start / stop ────────────────────────────────────────────────
 
 async function startApp() {
-    // Retry channels that failed create_channel during applyProject (hardware
-    // may have been plugged in since then). Successfully recovered ghosts are
-    // moved into `channels` so they open normally below.
+    // Retry ghost channels (hardware may have been plugged in since they were
+    // added). Successfully recovered ghosts are moved into `channels` so they
+    // open normally below. create_channel searches every backend for the name,
+    // so a project channel saved with a stale backend still recovers.
     for (const ghost of [...ghostChannels]) {
-        let handle: number | null = null;
-        let errMsg = "";
-        try {
-            handle = await invoke<number>("create_channel", { backendName: ghost.config.backend, channelName: ghost.config.name });
-        } catch (e) {
-            errMsg = String(e);
-        }
-        if (handle !== null) {
-            channels.set(handle, { info: { backend: ghost.config.backend, name: ghost.config.name }, config: ghost.config, dbc: null, open: false });
+        const res = await registerChannel(ghost.config);
+        if (res.handle !== undefined) {
             ghostChannels.splice(ghostChannels.indexOf(ghost), 1);
-            await loadChannelDbc(handle);
         } else {
-            ghost.error = errMsg;
-            setError(`Channel ${ghost.config.name} (${ghost.config.backend}) not available: ${errMsg}`);
+            ghost.error = res.error!;
+            log("error", `Channel ${ghost.config.name} (${ghost.config.backend}) not available: ${res.error}`);
         }
     }
 
@@ -2516,7 +2673,7 @@ async function startApp() {
     btn.textContent = "■ Stop";
     btn.classList.add("running");
     btn.title = "Pause live capture";
-    setStatus("Live capture started");
+    log("info", "Live capture started");
 }
 
 async function stopApp() {
@@ -2531,7 +2688,8 @@ async function stopApp() {
     // Close hardware connections; they will reopen on the next Start.
     for (const [handle, ch] of channels) {
         if (!ch.open) continue;
-        try { await invoke("close_channel", { channelHandle: handle }); } catch { }
+        try { await invoke("close_channel", { channelHandle: handle }); }
+        catch (e) { log("debug", `Failed to close channel ${ch.info.name}: ${e}`); }
         ch.open = false;
     }
     // Channels are closed so backend periodics are gone; preserve running intent so
@@ -2544,7 +2702,7 @@ async function stopApp() {
     btn.textContent = "▶ Start";
     btn.classList.remove("running");
     btn.title = "Start live capture";
-    setStatus("Stopped");
+    log("info", "Stopped");
 }
 
 function showConfirm(message: string): Promise<boolean> {
@@ -2589,8 +2747,8 @@ async function exportCsv() {
     if (!path) return;
     try {
         const count = await invoke<number>("export_signals_csv", { path, startMs: appStartTime });
-        setStatus(count > 0 ? `Exported ${count} signal samples to CSV` : "No signal data to export");
-    } catch (e) { setError(`Export error: ${e}`); }
+        log("info", count > 0 ? `Exported ${count} signal samples to CSV` : "No signal data to export");
+    } catch (e) { log("error", `Export error: ${e}`); }
 }
 
 async function exportTraceCsv() {
@@ -2601,8 +2759,8 @@ async function exportTraceCsv() {
     if (!path) return;
     try {
         const count = await invoke<number>("export_frames_csv", { path, startMs: appStartTime });
-        setStatus(count > 0 ? `Exported ${count} frames to CSV` : "No trace data to export");
-    } catch (e) { setError(`Export error: ${e}`); }
+        log("info", count > 0 ? `Exported ${count} frames to CSV` : "No trace data to export");
+    } catch (e) { log("error", `Export error: ${e}`); }
 }
 
 // ── Preferences ─────────────────────────────────────────────────────────────
@@ -2616,6 +2774,8 @@ interface Preferences {
     // Latest release version the user chose to skip. While this matches the
     // newest release we won't prompt at startup; a newer release clears it.
     skippedVersion?: string;
+    // Message log docked into the layout (and kept open) instead of floating.
+    logPinned?: boolean;
 }
 
 let preferencesPath: string | null = null;
@@ -2637,7 +2797,7 @@ function savePreferences() {
     invoke("write_text_file", {
         path: preferencesPath,
         content: JSON.stringify(preferences, null, 2),
-    }).catch(() => { });
+    }).catch(e => log("debug", `Failed to save preferences: ${e}`));
 }
 
 // ── Update checker ────────────────────────────────────────────────────────────
@@ -2763,7 +2923,7 @@ function openSysResDialog() {
 // always reports a result and ignores the skip preference) from the silent
 // startup check (which only surfaces a brand-new, non-skipped release).
 async function checkForUpdates(manual: boolean) {
-    if (manual) setStatus("Checking for updates…");
+    if (manual) log("info", "Checking for updates…");
 
     let latest: LatestRelease;
     try {
@@ -2854,7 +3014,7 @@ function setWindowSize(sec: number) {
 // User changed the control: apply and mark the project dirty.
 function applyWindowSize(sec: number) {
     setWindowSize(sec);
-    scheduleAutoSave();
+    scheduleAutoSave("window size changed");
 }
 
 function setupWindowSize() {
@@ -3015,6 +3175,9 @@ interface TraceEntry {
     cycleTimeMs: number | null;
     direction: "rx" | "tx";
     j1939: J1939Info | null;
+    // True if this row is a synthetic frame reassembled from a J1939 TP.CM /
+    // TP.DT transfer rather than a frame that actually appeared on the bus.
+    reassembled: boolean;
     // Interleaved [value, raw] pairs in DBC message signal order (see CanFrameEvent).
     signals: number[];
 }
@@ -3209,7 +3372,7 @@ function applyTraceFilter() {
         }
     }
     updateClearFiltersBtn();
-    scheduleAutoSave();
+    scheduleAutoSave("trace filter changed");
 }
 
 // Sort key of one row for the given column, read from the row's datasets.
@@ -3294,9 +3457,9 @@ function buildTraceCellHtml(key: string, entry: TraceEntry): string {
         case "ts": return `<td data-col="ts" class="td-ts">${fmtElapsed(entry.timestampMs)}</td>`;
         case "dir": return `<td data-col="dir"><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>`;
         case "channel": return `<td data-col="channel">${channelName(entry.channelHandle)}</td>`;
-        case "canId": return `<td data-col="canId" class="td-canid">${fmtId(entry.canId, entry.isExtended)}</td>`;
+        case "canId": return `<td data-col="canId" class="td-canid">${entry.reassembled ? `<span class="tp-badge" data-tip="Reassembled from J1939 TP.CM/TP.DT — this frame did not appear on the bus in this form">${fmtId(entry.canId, entry.isExtended)}</span>` : fmtId(entry.canId, entry.isExtended)}</td>`;
         case "msg": return `<td data-col="msg">${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>`;
-        case "dlc": return `<td data-col="dlc" style="text-align:center">${entry.dlc}</td>`;
+        case "dlc": return `<td data-col="dlc">${entry.dlc}</td>`;
         case "data": return `<td data-col="data" class="td-data">${fmtData(entry.data)}</td>`;
         case "cycle": return `<td data-col="cycle" class="td-cycle">${entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—"}</td>`;
         default: return `<td data-col="${key}"></td>`;
@@ -3314,6 +3477,7 @@ function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
         messageName: tr.dataset.msg || null,
         dlc: parseInt(tr.dataset.dlc ?? "0"),
         cycleTimeMs: tr.dataset.cycle ? parseFloat(tr.dataset.cycle) : null,
+        reassembled: tr.dataset.reassembled === "1",
         j1939: tr.dataset.pgn
             ? {
                 pgn: parseInt(tr.dataset.pgn),
@@ -3338,6 +3502,7 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
     tr.dataset.msg = entry.messageName ?? "";
     tr.dataset.dlc = String(entry.dlc);
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
+    if (entry.reassembled) tr.dataset.reassembled = "1";
     if (entry.j1939) {
         tr.dataset.pgn = String(entry.j1939.pgn);
         tr.dataset.prio = String(entry.j1939.priority);
@@ -3356,12 +3521,14 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     tr.dataset.ts = String(entry.timestampMs);
     tr.dataset.dlc = String(entry.dlc);
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
+    if (entry.reassembled) tr.dataset.reassembled = "1"; else delete tr.dataset.reassembled;
     tr.style.display = traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName, entry.j1939) ? "" : "none";
     const gc = (k: string) => tr.querySelector<HTMLTableCellElement>(`[data-col="${k}"]`);
     const tsCell = gc("ts"); if (tsCell) tsCell.textContent = fmtElapsed(entry.timestampMs);
     const dlcCell = gc("dlc"); if (dlcCell) dlcCell.textContent = String(entry.dlc);
     const dataCell = gc("data"); if (dataCell) dataCell.textContent = fmtData(entry.data);
     const cycleCell = gc("cycle"); if (cycleCell) cycleCell.textContent = entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—";
+    const canIdCell = gc("canId"); if (canIdCell) canIdCell.outerHTML = buildTraceCellHtml("canId", entry);
 
     // Refresh open expansion row with updated signal values + current min/max
     const next = tr.nextElementSibling as HTMLTableRowElement | null;
@@ -3479,6 +3646,7 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
             cycleTimeMs: cycleTime,
             direction,
             j1939: ev.j1939 ?? null,
+            reassembled: ev.reassembled ?? false,
             signals: ev.signals,
         };
 
@@ -3590,6 +3758,7 @@ async function loadTraceFrames() {
             cycleTimeMs,
             direction: f.direction,
             j1939: f.j1939 ?? null,
+            reassembled: f.reassembled ?? false,
             // get_frames returns named signals; flatten to the interleaved
             // [value, raw] layout used everywhere else (same DBC order).
             signals: f.signals.flatMap(s => [s.value, s.raw]),
@@ -3845,7 +4014,7 @@ function setupTraceHeaders() {
                         const idx = before === null ? traceColOrder.length : traceColOrder.indexOf(before as string);
                         traceColOrder.splice(idx >= 0 ? idx : traceColOrder.length, 0, key);
                         rebuildTraceColumns();
-                        scheduleAutoSave();
+                        scheduleAutoSave("trace column reordered");
                     }
                 } else { colDragKey = null; colDropBefore = undefined; }
             };
@@ -3962,8 +4131,8 @@ function setupTraceHeaders() {
                     btn.addEventListener("click", () => {
                         traceDataFormat = value;
                         fmtRow.querySelectorAll<HTMLButtonElement>(".data-fmt-btn").forEach(b => b.classList.remove("active"));
-                        btn.classList.add("active");
-                        refreshTraceFormat(); scheduleAutoSave();
+                        btn.classList.add("active"); refreshTraceFormat();
+                        scheduleAutoSave("trace data format changed");
                     });
                     fmtRow.appendChild(btn);
                 }
@@ -4012,7 +4181,9 @@ function setupTraceHeaders() {
                     // lose their filter.
                     traceFilterData = Array.from({ length: n }, (_, i) => traceFilterData[i] ?? null);
                     buildGrid();
-                    syncFilteredHeaders(); applyTraceFilter(); scheduleAutoSave();
+                    syncFilteredHeaders();
+                    applyTraceFilter();
+                    scheduleAutoSave("trace data filter length changed");
                 });
                 menu.appendChild(grid);
                 const hint = document.createElement("div"); hint.className = "data-filter-hint";
@@ -4151,6 +4322,14 @@ async function toggleTracePlot(sigRow: HTMLTableRowElement, handle: number, msgI
     const next = sigRow.nextElementSibling as HTMLTableRowElement | null;
     if (next?.dataset.sigplot) {
         destroyTracePlot(next);
+        return;
+    }
+
+    // Inline plots only work in overwrite mode, where the signal row is a
+    // stable slot that keeps receiving updates. In append mode each row is a
+    // historical snapshot that scrolls away, so there is nothing to plot onto.
+    if (traceMode !== "overwrite") {
+        log("warn", "Inline plots require Overwrite mode.");
         return;
     }
 
@@ -4326,7 +4505,7 @@ function setupTrace() {
     });
     document.getElementById("btn-clear-filters")!.addEventListener("click", () => {
         clearAllFilters();
-        scheduleAutoSave();
+        scheduleAutoSave("trace filters cleared");
     });
 
     // ── Columns visibility button ─────────────────────────────────────────────
@@ -4352,7 +4531,7 @@ function setupTrace() {
                 if (cb.checked) traceColHidden.delete(def.key);
                 else traceColHidden.add(def.key);
                 rebuildTraceColumns();
-                scheduleAutoSave();
+                scheduleAutoSave("trace column visibility toggled");
             });
             item.append(cb, " ", def.label);
             menu.appendChild(item);
@@ -4369,7 +4548,7 @@ function setupTrace() {
             traceColHidden = new Set();
             traceColWidths = {};
             rebuildTraceColumns();
-            scheduleAutoSave();
+            scheduleAutoSave("trace columns reset");
             ctxMenu?.remove(); ctxMenu = null;
         });
         menu.appendChild(resetBtn);
@@ -4410,13 +4589,12 @@ function setupTrace() {
         const active = this.classList.toggle("active");
         traceMode = active ? "overwrite" : "append";
         clearTrace();
-        scheduleAutoSave();
     });
 
     document.getElementById("input-trace-max")!.addEventListener("change", (e) => {
         traceMaxRows = parseInt((e.target as HTMLInputElement).value) || 100;
         while (traceLocalBuffer.length > traceMaxRows) traceLocalBuffer.pop();
-        scheduleAutoSave();
+        scheduleAutoSave("trace max rows changed");
     });
 
     // Cell content clipped by the fixed column layout (long payloads, message
@@ -4525,7 +4703,8 @@ function resumeFromPause() {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 
-interface LogEntry { ts: string; text: string; isError: boolean; }
+type LogLevel = "debug" | "info" | "warn" | "error";
+interface LogEntry { ts: string; text: string; level: LogLevel; }
 const messageLog: LogEntry[] = [];
 // Oldest entries are dropped past this point so a long session can't grow the
 // log (array + DOM) without bound.
@@ -4536,36 +4715,99 @@ function updateWindowTitle() {
     getCurrentWindow().setTitle(projectDirty ? `${base} ●` : base);
 }
 
-function setStatus(msg: string, isError = false) {
-    const el = document.getElementById("status-bar")!;
-    el.textContent = msg;
-    el.classList.toggle("status-error", isError);
-    console.log(isError ? "Error: " : "Status: ", msg);
+// Escape a string for interpolation into innerHTML (element text or a
+// double-quoted attribute) — device/driver-supplied names are not guaranteed
+// free of HTML metacharacters.
+function escapeHtml(s: string): string {
+    return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
 
-    const entry: LogEntry = { ts: new Date().toLocaleTimeString(), text: msg, isError };
+// Record an entry in the message log (array + panel DOM + console) and, unless
+// suppressed, rotate it through the status bar. `ts` defaults to now; the
+// rust-log relay passes the backend timestamp and writes its own (richer)
+// console line, and suppresses the status bar when replaying the backlog.
+function log(level: LogLevel, message: string, opts?: { ts?: string; toConsole?: boolean; toStatus?: boolean }) {
+    // Debug messages are for development only — dropped entirely in release builds.
+    if (level === "debug" && !import.meta.env.DEV) return;
+    const entry: LogEntry = { ts: opts?.ts ?? new Date().toLocaleTimeString(), text: message, level };
     messageLog.push(entry);
     if (messageLog.length > MAX_LOG_ENTRIES) messageLog.shift();
     appendLogEntry(entry);
-
-    if (isError) {
+    if (level === "error") {
         document.getElementById("btn-show-log")?.classList.add("log-has-error");
     }
-
-    setTimeout(() => {
-        if (el.textContent === msg) {
-            el.textContent = "";
-            el.classList.remove("status-error");
-        }
-    }, 4000);
+    if (opts?.toConsole !== false) {
+        const fn = level === "error" ? console.error
+            : level === "warn" ? console.warn
+                : level === "info" ? console.info : console.debug;
+        fn(message);
+    }
+    if (level !== "debug" && opts?.toStatus !== false) queueStatus(message, level);
 }
 
-function setError(msg: string) { setStatus(msg, true); }
+// ── Status bar ────────────────────────────────────────────────────────────────
+// Messages rotate through the status bar: each is shown for at least
+// STATUS_MIN_MS (so a burst can't overwrite one instantly) and at most
+// STATUS_MAX_MS, then slides out to the right — towards the full log, where
+// every message already landed the moment it was logged.
+
+const STATUS_MIN_MS = 1500;
+const STATUS_MAX_MS = 4000;
+const STATUS_EXIT_MS = 250; // keep in sync with the status-slide-out animation
+const STATUS_MAX_QUEUE = 5;
+
+const statusQueue: { text: string; level: LogLevel }[] = [];
+let statusTimer: ReturnType<typeof setTimeout> | null = null;
+let statusShownAt = 0;
+let statusShowing = false;
+let statusExiting = false;
+
+function queueStatus(text: string, level: LogLevel) {
+    statusQueue.push({ text, level });
+    // A burst shouldn't back the bar up forever — dropped entries are in the log.
+    while (statusQueue.length > STATUS_MAX_QUEUE) statusQueue.shift();
+    if (!statusShowing) showNextStatus();
+    // Current message already had its minimum time on screen — advance now.
+    else if (!statusExiting && Date.now() - statusShownAt >= STATUS_MIN_MS) exitStatus();
+}
+
+function showNextStatus() {
+    const bar = document.getElementById("status-bar")!;
+    const text = document.getElementById("status-text")!;
+    text.classList.remove("status-exit");
+    const next = statusQueue.shift();
+    if (!next) {
+        statusShowing = false;
+        text.textContent = "";
+        bar.classList.remove("status-error", "status-warn");
+        return;
+    }
+    statusShowing = true;
+    statusShownAt = Date.now();
+    text.textContent = next.text;
+    bar.classList.toggle("status-error", next.level === "error");
+    bar.classList.toggle("status-warn", next.level === "warn");
+    if (statusTimer) clearTimeout(statusTimer);
+    statusTimer = setTimeout(() => {
+        if (statusQueue.length > 0) exitStatus();
+        else statusTimer = setTimeout(exitStatus, STATUS_MAX_MS - STATUS_MIN_MS);
+    }, STATUS_MIN_MS);
+}
+
+// Slide the current message out to the right, then show the next queued one.
+function exitStatus() {
+    if (statusExiting) return;
+    statusExiting = true;
+    if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; }
+    document.getElementById("status-text")!.classList.add("status-exit");
+    setTimeout(() => { statusExiting = false; showNextStatus(); }, STATUS_EXIT_MS);
+}
 
 function appendLogEntry(entry: LogEntry) {
     const container = document.getElementById("log-entries");
     if (!container) return;
     const div = document.createElement("div");
-    div.className = `log-entry${entry.isError ? " log-error" : ""}`;
+    div.className = `log-entry log-${entry.level}`;
     const ts = document.createElement("span");
     ts.className = "log-ts";
     ts.textContent = entry.ts;
@@ -4582,19 +4824,64 @@ function appendLogEntry(entry: LogEntry) {
 // isn't visible in a packaged build.
 window.addEventListener("error", (e) => {
     const loc = e.filename ? ` (${e.filename.split("/").pop()}:${e.lineno}:${e.colno})` : "";
-    setError(`Frontend error: ${e.message}${loc}`);
+    log("error", `Frontend error: ${e.message}${loc}`);
 });
 window.addEventListener("unhandledrejection", (e) => {
     const reason = e.reason instanceof Error ? (e.reason.stack ?? e.reason.message) : String(e.reason);
-    setError(`Unhandled promise rejection: ${reason}`);
+    log("error", `Unhandled promise rejection: ${reason}`);
 });
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
 
 window.addEventListener("DOMContentLoaded", async () => {
+    // Pipe Rust log output into the message-log panel and the devtools
+    // console (the console line also carries the module name; the panel just
+    // shows the message). The backend keeps the full (ring-buffered) history,
+    // so fetch that first — it includes everything logged before this page
+    // existed (e.g. backend init during startup) — then follow live
+    // "rust-log" events. Live events that arrive while the history fetch is
+    // in flight are buffered and deduped against it by `seq`.
+    interface RustLog { seq: number; ts: string; level: string; module: string; message: string; }
+    // Rust timestamps are UTC HH:MM:SS.mmm; the panel shows local time.
+    const rustTsToLocal = (utc: string) => {
+        const m = utc.match(/^(\d+):(\d+):(\d+)\.(\d+)$/);
+        if (!m) return utc;
+        const d = new Date();
+        d.setUTCHours(+m[1], +m[2], +m[3], +m[4]);
+        return d.toLocaleTimeString();
+    };
+    // `live` distinguishes events from backlog replay: historical messages go
+    // to the panel/console only, not through the status bar.
+    const logRust = (e: RustLog, live: boolean) => {
+        const line = `[rust ${e.ts} ${e.module}] ${e.message}`;
+        if (e.level === "ERROR") console.error(line);
+        else if (e.level === "WARN") console.warn(line);
+        else if (e.level === "INFO") console.info(line);
+        else console.log(line);
+        const level: LogLevel =
+            e.level === "ERROR" ? "error" :
+                e.level === "WARN" ? "warn" :
+                    e.level === "INFO" ? "info" : "debug";
+        log(level, e.message, { ts: rustTsToLocal(e.ts), toConsole: false, toStatus: live });
+    };
+    let lastRustSeq = -1;
+    let rustLogPending: RustLog[] | null = [];
+    await listen<RustLog>("rust-log", (ev) => {
+        if (rustLogPending) rustLogPending.push(ev.payload);
+        else if (ev.payload.seq > lastRustSeq) { lastRustSeq = ev.payload.seq; logRust(ev.payload, true); }
+    });
+    const backlog = [
+        ...await invoke<RustLog[]>("get_logs").catch(() => [] as RustLog[]),
+        ...rustLogPending,
+    ];
+    rustLogPending = null;
+    for (const e of backlog) {
+        if (e.seq > lastRustSeq) { lastRustSeq = e.seq; logRust(e, false); }
+    }
+
     // The Rust backend outlives a page reload, so any channels opened by the
     // previous load are still registered/open. Reset it before we rebuild state.
-    await invoke("reset_backend").catch(() => { });
+    await invoke("reset_backend").catch(e => log("debug", `Backend reset failed: ${e}`));
 
     // Tab switching
     document.querySelectorAll<HTMLButtonElement>(".tab-btn").forEach(btn => {
@@ -4639,39 +4926,38 @@ window.addEventListener("DOMContentLoaded", async () => {
     });
     document.getElementById("btn-reload-backends")!.addEventListener("click", async () => {
         if (!await confirmAndStop("Stop live capture to reload CAN backends?")) return;
-        let remapped: { old_handle: number; new_handle: number }[];
+        let remapped: { old_handle: number; new_handle: number; backend: string }[];
         try {
-            remapped = await invoke<{ old_handle: number; new_handle: number }[]>("reload_backends");
+            remapped = await invoke<{ old_handle: number; new_handle: number; backend: string }[]>("reload_backends");
         } catch (e) {
-            setError(`Backend reload failed: ${e}`);
+            log("error", `Backend reload failed: ${e}`);
             return;
         }
 
-        // Apply old→new handle remapping. Channels not in the remapping failed
-        // to re-register (hardware absent) and become ghosts.
-        const handleMap = new Map(remapped.map(r => [r.old_handle, r.new_handle]));
+        // Apply old→new handle remapping. The resolved backend can differ from
+        // the previous one (the name is searched in every backend), so take it
+        // from the remap entry. Channels not in the remapping failed to
+        // re-register (hardware absent) and become ghosts.
+        const handleMap = new Map(remapped.map(r => [r.old_handle, r]));
         const oldEntries = [...channels.entries()];
         channels.clear();
         for (const [oldHandle, ch] of oldEntries) {
-            const newHandle = handleMap.get(oldHandle);
-            if (newHandle !== undefined) {
-                channels.set(newHandle, { ...ch, open: false });
+            const remap = handleMap.get(oldHandle);
+            if (remap !== undefined) {
+                ch.config.backend = remap.backend;
+                channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend }, open: false });
             } else {
                 ghostChannels.push({ config: ch.config, error: "Not found after backend reload" });
             }
         }
 
-        // Promote ghost channels whose hardware is now available.
+        // Promote ghost channels whose hardware is now available. create_channel
+        // searches every backend for the name, so a guessed backend still works.
         const recovered: GhostChannel[] = [];
         for (const ghost of [...ghostChannels]) {
-            try {
-                const handle = await invoke<number>("create_channel", { backendName: ghost.config.backend, channelName: ghost.config.name });
-                channels.set(handle, { info: { backend: ghost.config.backend, name: ghost.config.name }, config: ghost.config, dbc: null, open: false });
-                recovered.push(ghost);
-                await loadChannelDbc(handle);
-            } catch (_) {
-                // stays as ghost
-            }
+            const res = await registerChannel(ghost.config);
+            if (res.handle !== undefined) recovered.push(ghost);
+            else ghost.error = res.error!; // stays as ghost
         }
         for (const g of recovered) ghostChannels.splice(ghostChannels.indexOf(g), 1);
         renderChannelList();
@@ -4715,31 +5001,47 @@ window.addEventListener("DOMContentLoaded", async () => {
     });
 
     // Log panel
+    const logPanel = document.getElementById("log-panel")!;
+    const pinLogBtn = document.getElementById("btn-pin-log")!;
+    let logPinned = false;
+    // Pinned, the panel docks into the layout as a right-hand pane and stays
+    // put; unpinned it is the transient overlay that closes on outside click.
+    // The element always lives in #layout — position:fixed lifts it out of the
+    // flex flow while unpinned, so only the class needs toggling.
+    const setLogPinned = (pinned: boolean) => {
+        logPinned = pinned;
+        logPanel.classList.toggle("pinned", pinned);
+        pinLogBtn.classList.toggle("active", pinned);
+        pinLogBtn.title = pinned ? "Unpin log panel" : "Pin log panel to the layout";
+    };
+    pinLogBtn.addEventListener("click", () => {
+        setLogPinned(!logPinned);
+        preferences.logPinned = logPinned;
+        savePreferences();
+    });
     document.getElementById("btn-show-log")!.addEventListener("click", () => {
-        const panel = document.getElementById("log-panel")!;
-        panel.hidden = !panel.hidden;
-        if (!panel.hidden) {
+        logPanel.hidden = !logPanel.hidden;
+        if (!logPanel.hidden) {
             document.getElementById("btn-show-log")!.classList.remove("log-has-error");
             const entries = document.getElementById("log-entries")!;
             entries.scrollTop = entries.scrollHeight;
         }
     });
     document.getElementById("btn-close-log")!.addEventListener("click", () => {
-        document.getElementById("log-panel")!.hidden = true;
+        logPanel.hidden = true;
     });
     document.getElementById("btn-clear-log")!.addEventListener("click", () => {
         messageLog.length = 0;
         document.getElementById("log-entries")!.innerHTML = "";
     });
     document.addEventListener("pointerdown", (e) => {
-        const panel = document.getElementById("log-panel")!;
-        if (panel.hidden) return;
-        if (!panel.contains(e.target as Node) && e.target !== document.getElementById("btn-show-log")) {
-            panel.hidden = true;
+        if (logPanel.hidden || logPinned) return;
+        if (!logPanel.contains(e.target as Node) && e.target !== document.getElementById("btn-show-log")) {
+            logPanel.hidden = true;
         }
     });
     document.addEventListener("keydown", (e) => {
-        if (e.key === "Escape") document.getElementById("log-panel")!.hidden = true;
+        if (e.key === "Escape" && !logPinned) logPanel.hidden = true;
     });
 
     // Menu bar
@@ -4747,6 +5049,10 @@ window.addEventListener("DOMContentLoaded", async () => {
 
     // Preferences (per-user, persisted across restarts)
     await loadPreferences();
+    if (preferences.logPinned) {
+        setLogPinned(true);
+        logPanel.hidden = false;
+    }
 
     // Check for a newer release. Only nag on real release builds; dev builds can
     // still check manually via About → Check for Updates. Fire-and-forget so a
@@ -4802,7 +5108,7 @@ window.addEventListener("DOMContentLoaded", async () => {
             projectDirty = false;
         }
         updateWindowTitle();
-        setStatus("Session restored");
+        log("info", "Session restored");
     } else {
         sessionFilePath = sess;
         // No previous session — start fresh with one empty pane

@@ -4,13 +4,11 @@ use std::sync::{Condvar, Mutex};
 
 use tauri::{AppHandle, Emitter};
 
-
 enum PasswordRequestState {
     Idle,
     Waiting,
     Done,
 }
-
 
 struct PwdState {
     cached: Mutex<Option<String>>,
@@ -81,10 +79,7 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(app: AppHandle) -> Arc<Self> {
-        Arc::new(Self {
-            app,
-            pwd: PwdState::new(),
-        })
+        Arc::new(Self { app, pwd: PwdState::new() })
     }
 
     pub fn get_admin_password(&self) -> Result<String, String> {

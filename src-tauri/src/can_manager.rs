@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc, Mutex,
@@ -16,7 +16,7 @@ use crate::j1939::{self, J1939Info, TpReassembler};
 use crate::can_communication::KvaserBackend;
 #[cfg(feature = "pcan")]
 use crate::can_communication::PcanBackend;
-#[cfg(feature = "linux-can")]
+#[cfg(any(feature = "linux-can", target_os = "linux"))]
 use crate::can_communication::SocketCanBackend;
 
 use log::*;
@@ -60,6 +60,10 @@ struct CanFrameEvent {
     /// J1939 breakdown of the identifier; only set on J1939 channels.
     #[serde(skip_serializing_if = "Option::is_none")]
     j1939: Option<J1939Info>,
+    /// True if this row is a synthetic frame reassembled from a J1939 TP.CM /
+    /// TP.DT transfer rather than a frame that actually appeared on the bus.
+    #[serde(skip_serializing_if = "is_false")]
+    reassembled: bool,
     /// Decoded signals as interleaved [value, raw, value, raw, …] pairs in DBC
     /// message signal order. Names/units/message name are NOT sent: the frontend
     /// holds the same parsed DBC and derives them by position, which keeps the
@@ -67,6 +71,10 @@ struct CanFrameEvent {
     /// frame rates). Raw values survive the f64 round-trip up to 2^53 — the same
     /// limit JSON numbers already imposed.
     signals: Vec<f64>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,6 +89,10 @@ pub struct FrameInfo {
     pub message_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub j1939: Option<J1939Info>,
+    /// True if this row is a synthetic frame reassembled from a J1939 TP.CM /
+    /// TP.DT transfer rather than a frame that actually appeared on the bus.
+    #[serde(skip_serializing_if = "is_false")]
+    pub reassembled: bool,
     pub signals: Vec<FrameSignal>,
 }
 
@@ -104,6 +116,14 @@ pub struct ChannelInfo {
     pub name: String,
 }
 
+/// Result of `create_channel`: the allocated handle plus the backend the
+/// channel name was actually found in (which may differ from the hint).
+#[derive(Debug, Clone, Serialize)]
+pub struct CreatedChannel {
+    pub handle: u32,
+    pub backend: String,
+}
+
 // ── Internal frame storage ────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -123,6 +143,9 @@ struct StoredFrame {
     direction: &'static str,
     message_name: Option<String>,
     j1939: Option<J1939Info>,
+    /// True if this row is a synthetic frame reassembled from a J1939 TP.CM /
+    /// TP.DT transfer rather than a frame that actually appeared on the bus.
+    reassembled: bool,
     /// DBC message id this frame decoded against. On J1939 channels it can
     /// differ from `can_id` (PGN match ignores priority/source-address bits);
     /// signal-history queries key on it.
@@ -177,6 +200,7 @@ impl ChannelData {
                 is_extended: f.is_extended,
                 dlc: f.data.len() as u16,
                 j1939: f.j1939,
+                reassembled: f.reassembled,
                 data: f.data.clone(),
                 timestamp_ms: f.timestamp_ms,
                 direction: f.direction,
@@ -234,8 +258,10 @@ const FLUSH_INTERVAL_MS: u64 = 33;
 
 // ── CanManager ────────────────────────────────────────────────────────────────
 
-fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
-    let mut cans: HashMap<String, Can> = HashMap::new();
+// BTreeMap so the fallback search in `create_channel` visits backends in a
+// deterministic (alphabetical) order when a channel name exists in several.
+fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
+    let mut cans: BTreeMap<String, Can> = BTreeMap::new();
 
     #[cfg(feature = "kvaser")]
     match KvaserBackend::new() {
@@ -244,11 +270,15 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
             let sh_tx = Arc::clone(shared);
             cans.insert(
                 "kvaser".to_string(),
-                Can::new(backend, make_frame_callback("kvaser".into(), sh_rx, "rx"), make_frame_callback("kvaser".into(), sh_tx, "tx")),
+                Can::new(
+                    backend,
+                    make_frame_callback("kvaser".into(), sh_rx, "rx"),
+                    make_frame_callback("kvaser".into(), sh_tx, "tx"),
+                ),
             );
             info!("Kvaser backend initialized successfully");
         }
-        Err(e) => warn!("Kvaser backend unavailable: {e}"),
+        Err(e) => warn!("Kvaser backend unavailable (install from https://www.kvaser.com/download/): {e}"),
     }
 
     #[cfg(feature = "pcan")]
@@ -258,14 +288,20 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
             let sh_tx = Arc::clone(shared);
             cans.insert(
                 "pcan".to_string(),
-                Can::new(backend, make_frame_callback("pcan".into(), sh_rx, "rx"), make_frame_callback("pcan".into(), sh_tx, "tx")),
+                Can::new(
+                    backend,
+                    make_frame_callback("pcan".into(), sh_rx, "rx"),
+                    make_frame_callback("pcan".into(), sh_tx, "tx"),
+                ),
             );
             info!("PCAN backend initialized successfully");
         }
-        Err(e) => warn!("PCAN backend unavailable: {e}"),
+        Err(e) => warn!(
+            "PCAN backend unavailable (install from https://www.peak-system.com/products/software/development-packages/pcan-basic/): {e}"
+        ),
     }
 
-    #[cfg(feature = "linux-can")]
+    #[cfg(any(feature = "linux-can", target_os = "linux"))]
     {
         let sh_rx = Arc::clone(shared);
         let sh_tx = Arc::clone(shared);
@@ -286,7 +322,7 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> HashMap<String, Can> {
 pub struct CanManager {
     app_state: Arc<AppState>,
     shared: Arc<Mutex<ManagerShared>>,
-    cans: HashMap<String, Can>,
+    cans: BTreeMap<String, Can>,
 }
 
 impl CanManager {
@@ -340,36 +376,50 @@ impl CanManager {
     }
 
     /// Register a channel (allocate data stores) without opening the hardware.
-    /// Returns a `u32` handle used for all subsequent calls. The DBC is loaded
-    /// later by `open_channel`. Calling `create_channel` again for the same
-    /// channel returns the existing handle.
-    pub fn create_channel(&mut self, backend_name: &str, channel_name: &str) -> Result<u32, String> {
-        let hw_index = self
+    /// The channel is looked up by name in the hinted backend first, then in
+    /// every other backend — the backend stored in a saved project can be
+    /// stale (e.g. the same channel name moved to different hardware). Returns
+    /// the handle used for all subsequent calls plus the backend the channel
+    /// was actually found in. The DBC is loaded later by `open_channel`.
+    /// Calling `create_channel` again for the same channel returns the
+    /// existing handle.
+    pub fn create_channel(&mut self, backend_name: &str, channel_name: &str) -> Result<CreatedChannel, String> {
+        let find = |can: &Can| can.list_channels().iter().position(|n| n == channel_name).map(|i| i as u8);
+        let (backend_name, hw_index) = self
             .cans
             .get(backend_name)
-            .ok_or_else(|| format!("No backend '{backend_name}'"))?
-            .list_channels()
-            .iter()
-            .position(|n| n == channel_name)
-            .ok_or_else(|| format!("Channel '{channel_name}' not found in '{backend_name}'"))? as u8;
+            .and_then(|can| find(can).map(|i| (backend_name.to_string(), i)))
+            .or_else(|| {
+                self.cans
+                    .iter()
+                    .filter(|(name, _)| name.as_str() != backend_name)
+                    .find_map(|(name, can)| find(can).map(|i| (name.clone(), i)))
+            })
+            .ok_or_else(|| format!("Channel '{channel_name}' not found in any backend"))?;
 
         let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
 
         // Already registered — return existing handle.
-        if let Some(&handle) = lock.index_to_handle.get(&(backend_name.to_string(), hw_index)) {
-            return Ok(handle);
+        if let Some(&handle) = lock.index_to_handle.get(&(backend_name.clone(), hw_index)) {
+            return Ok(CreatedChannel {
+                handle,
+                backend: backend_name,
+            });
         }
 
         let handle = NEXT_CHANNEL_HANDLE.fetch_add(1, Ordering::Relaxed);
         let info = ChannelInfo {
-            backend: backend_name.to_string(),
+            backend: backend_name.clone(),
             name: channel_name.to_string(),
         };
-        lock.index_to_handle.insert((backend_name.to_string(), hw_index), handle);
-        lock.handle_to_index.insert(handle, (backend_name.to_string(), hw_index));
+        lock.index_to_handle.insert((backend_name.clone(), hw_index), handle);
+        lock.handle_to_index.insert(handle, (backend_name.clone(), hw_index));
         lock.channels.insert(handle, ChannelData::new(info));
         info!("Created {backend_name} channel {channel_name} (handle: {handle})");
-        Ok(handle)
+        Ok(CreatedChannel {
+            handle,
+            backend: backend_name,
+        })
     }
 
     pub fn remove_channel(&mut self, handle: u32) -> Result<(), String> {
@@ -470,17 +520,21 @@ impl CanManager {
             lock.index_to_handle.clear();
             lock.handle_to_index.clear();
         }
-        info!("Reset CAN manager: all channels closed and unregistered");
     }
 
     /// Re-enumerate hardware in every backend and re-register all previously
-    /// created channels (leaving them closed). Returns the old→new handle mapping.
+    /// created channels (leaving them closed). Returns the old handle together
+    /// with the re-registration result — the resolved backend can differ from
+    /// the original when the channel name moved backends across the reload.
     /// On Kvaser this calls canUnloadLibrary()+canInitializeLibrary() which is the
     /// documented way to detect hardware connected after the initial library init.
-    pub fn reload_backends(&mut self) -> Vec<(u32, u32)> {
-        let previous: Vec<(u32, ChannelInfo)> = self.shared.lock().ok().map(|lock| {
-            lock.channels.iter().map(|(&h, d)| (h, d.info.clone())).collect()
-        }).unwrap_or_default();
+    pub fn reload_backends(&mut self) -> Vec<(u32, CreatedChannel)> {
+        let previous: Vec<(u32, ChannelInfo)> = self
+            .shared
+            .lock()
+            .ok()
+            .map(|lock| lock.channels.iter().map(|(&h, d)| (h, d.info.clone())).collect())
+            .unwrap_or_default();
 
         self.reset();
 
@@ -495,7 +549,7 @@ impl CanManager {
         let mut remapped = Vec::new();
         for (old_handle, info) in previous {
             match self.create_channel(&info.backend, &info.name) {
-                Ok(new_handle) => remapped.push((old_handle, new_handle)),
+                Ok(created) => remapped.push((old_handle, created)),
                 Err(e) => warn!("Could not re-register {} {} after reload: {e}", info.backend, info.name),
             }
         }
@@ -645,8 +699,11 @@ impl CanManager {
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         let mut writer = BufWriter::new(file);
 
-        writeln!(writer, "timestamp_ms,elapsed_s,channel,can_id,direction,dlc,data,message,pgn,src,dst,prio")
-            .map_err(|e| e.to_string())?;
+        writeln!(
+            writer,
+            "timestamp_ms,elapsed_s,channel,can_id,direction,dlc,data,message,pgn,src,dst,prio,reassembled"
+        )
+        .map_err(|e| e.to_string())?;
 
         for (ts, ch_name, f) in &frames {
             let elapsed = (*ts as f64 - start_ms as f64) / 1000.0;
@@ -663,7 +720,7 @@ impl CanManager {
                 .unwrap_or_else(|| ",,,".to_string());
             writeln!(
                 writer,
-                "{},{:.3},{},{},{},{},\"{}\",\"{}\",{}",
+                "{},{:.3},{},{},{},{},\"{}\",\"{}\",{},{}",
                 ts,
                 elapsed,
                 ch_name,
@@ -672,7 +729,8 @@ impl CanManager {
                 f.data.len(),
                 data_str,
                 msg_str,
-                j1939_str
+                j1939_str,
+                f.reassembled as u8
             )
             .map_err(|e| e.to_string())?;
         }
@@ -713,7 +771,12 @@ impl CanManager {
 
         for (ts, ch_name, msg_name, sig_name, value, unit) in &rows {
             let elapsed = (*ts as f64 - start_ms as f64) / 1000.0;
-            writeln!(writer, "{},{:.3},{},{},{},{},{}", ts, elapsed, ch_name, msg_name, sig_name, value, unit).map_err(|e| e.to_string())?;
+            writeln!(
+                writer,
+                "{},{:.3},{},{},{},{},{}",
+                ts, elapsed, ch_name, msg_name, sig_name, value, unit
+            )
+            .map_err(|e| e.to_string())?;
         }
 
         writer.flush().map_err(|e| e.to_string())?;
@@ -791,16 +854,16 @@ fn make_frame_callback(
             }
         }
 
-        ingest_frame(&mut lock, handle, protocol, dbc.as_deref(), raw, ts, direction);
+        ingest_frame(&mut lock, handle, protocol, dbc.as_deref(), raw, ts, direction, false);
         if let Some(frame) = completed {
-            ingest_frame(&mut lock, handle, protocol, dbc.as_deref(), frame, ts, direction);
+            ingest_frame(&mut lock, handle, protocol, dbc.as_deref(), frame, ts, direction, true);
         }
     }
 }
 
 /// Decode a frame, store it in the channel's ring buffer and queue its webview
 /// event. Called once per raw frame and once more for each reassembled J1939
-/// transport message.
+/// transport message (`reassembled = true` in that second call).
 fn ingest_frame(
     lock: &mut ManagerShared,
     handle: u32,
@@ -809,6 +872,7 @@ fn ingest_frame(
     raw: CanFrame,
     ts: u64,
     direction: &'static str,
+    reassembled: bool,
 ) {
     let window_ms = lock.window_ms;
 
@@ -832,6 +896,7 @@ fn ingest_frame(
         direction,
         message_name,
         j1939: j1939_info,
+        reassembled,
         dbc_msg_id,
         signals: decoded_msg
             .map(|m| {
@@ -865,6 +930,7 @@ fn ingest_frame(
         timestamp_ms: ts,
         direction,
         j1939: j1939_info,
+        reassembled,
         signals: sig_data,
     };
 
@@ -882,4 +948,3 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-

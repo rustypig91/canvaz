@@ -48,7 +48,7 @@ fn list_can_interfaces(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>,
 }
 
 #[tauri::command]
-fn create_channel(backend_name: String, channel_name: String, state: State<'_, TauriState>) -> Result<u32, String> {
+fn create_channel(backend_name: String, channel_name: String, state: State<'_, TauriState>) -> Result<can_manager::CreatedChannel, String> {
     state
         .can_manager
         .lock()
@@ -98,6 +98,13 @@ fn close_channel(channel_handle: u32, state: State<'_, TauriState>) -> Result<()
     state.can_manager.lock().map_err(|e| e.to_string())?.close_channel(channel_handle)
 }
 
+/// Full Rust log history (ring-buffered). The frontend fetches this on every
+/// load and follows live "rust-log" events from there, deduping by `seq`.
+#[tauri::command]
+fn get_logs() -> Vec<logger::LogEntry> {
+    logger::history()
+}
+
 /// Close all hardware and forget every channel. Called by the frontend on startup
 /// so a page reload doesn't collide with channels left open by the previous load.
 #[tauri::command]
@@ -110,6 +117,9 @@ fn reset_backend(state: State<'_, TauriState>) -> Result<(), String> {
 struct RemappedChannel {
     old_handle: u32,
     new_handle: u32,
+    /// Backend the channel resolved to after the reload — may differ from the
+    /// backend it had before when the name moved backends.
+    backend: String,
 }
 
 #[tauri::command]
@@ -117,7 +127,11 @@ fn reload_backends(state: State<'_, TauriState>) -> Result<Vec<RemappedChannel>,
     let remapped = state.can_manager.lock().map_err(|e| e.to_string())?.reload_backends();
     Ok(remapped
         .into_iter()
-        .map(|(old_handle, new_handle)| RemappedChannel { old_handle, new_handle })
+        .map(|(old_handle, created)| RemappedChannel {
+            old_handle,
+            new_handle: created.handle,
+            backend: created.backend,
+        })
         .collect())
 }
 
@@ -311,6 +325,11 @@ fn save_project(path: String, project: Project) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn project_has_changes(path: String, project: Project) -> bool {
+    project.has_changes(&path)
+}
+
+#[tauri::command]
 fn load_project(path: String) -> Result<Project, String> {
     Project::load(&path)
 }
@@ -403,6 +422,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
+            logger::set_app(app.handle().clone());
             let app_state = AppState::new(app.handle().clone());
             let manager = CanManager::new(Arc::clone(&app_state));
             app.manage(TauriState {
@@ -420,6 +440,7 @@ pub fn run() {
             read_text_file,
             file_exists,
             provide_admin_password,
+            get_logs,
             list_can_interfaces,
             create_channel,
             remove_channel,
@@ -440,6 +461,7 @@ pub fn run() {
             export_frames_csv,
             export_signals_csv,
             save_project,
+            project_has_changes,
             load_project,
             system_resources,
         ])

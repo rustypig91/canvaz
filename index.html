@@ -63,19 +63,9 @@
         </select>
         <input id="input-window-custom" type="number" min="1" placeholder="sec" />
       </div>
-      <span id="status-bar"></span>
+      <span id="status-bar"><span id="status-text"></span></span>
       <button id="btn-show-log" title="View message log">Log</button>
     </header>
-
-    <!-- Message log panel -->
-    <div id="log-panel" hidden>
-      <div id="log-panel-header">
-        <span>Message Log</span>
-        <button id="btn-clear-log" class="btn btn-sm">Clear</button>
-        <button id="btn-close-log" class="btn-icon" title="Close">✕</button>
-      </div>
-      <div id="log-entries"></div>
-    </div>
 
     <!-- Main layout -->
     <div id="layout">
@@ -120,7 +110,7 @@
           <div id="plot-panes-container">
             <!-- plot panes injected here by JS -->
             <div id="drop-zone-new" class="drop-zone">
-              <span>↓ Drop signal here to create a new plot</span>
+              <span>↓ Drop a signal or message here to create a new plot</span>
             </div>
           </div>
         </div>
@@ -129,10 +119,10 @@
         <div id="tab-simulate" class="tab-content">
           <div id="sim-toolbar">
             <button id="btn-add-raw-frame" class="btn btn-sm">+ Raw Frame</button>
-            <span class="hint">Drag or double-click a DBC signal to add its entire message</span>
+            <span class="hint">Drag or double-click a DBC signal or message to add its message</span>
           </div>
           <div id="drop-zone-sim" class="drop-zone">
-            <span>↓ Drop signal here to add its message</span>
+            <span>↓ Drop a signal or message here to add it</span>
           </div>
           <div id="sim-entries"></div>
         </div>
@@ -157,6 +147,22 @@
           </div>
         </div>
       </main>
+
+      <!-- Message log panel: floating overlay by default, docked right pane
+           when pinned (position:fixed escapes the flex flow while unpinned) -->
+      <div id="log-panel" hidden>
+        <div id="log-panel-header">
+          <span>Message Log</span>
+          <button id="btn-clear-log" class="btn btn-sm">Clear</button>
+          <button id="btn-pin-log" class="btn-icon" title="Pin log panel to the layout">
+            <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
+              <path d="M5 1h6v1l-1 1v3l2 2v1H9v4l-1 2-1-2V9H4V8l2-2V3L5 2V1z"/>
+            </svg>
+          </button>
+          <button id="btn-close-log" class="btn-icon" title="Close">✕</button>
+        </div>
+        <div id="log-entries"></div>
+      </div>
     </div>
 
     <!-- Channel dialog (add + edit) -->
@@ -167,7 +173,6 @@
         <div class="form-row" id="row-iface">
           <label>Interface</label>
           <select id="select-iface"></select>
-          <input id="input-iface-custom" type="text" placeholder="or type name…" />
         </div>
 
         <div class="form-row">
@@ -180,7 +185,7 @@
             <option value="custom">Custom…</option>
             <option value="vcan">Virtual (vcan)</option>
           </select>
-          <input id="input-bitrate-custom" type="number" placeholder="bits/s" class="small-input" style="display:none" />
+          <input id="input-bitrate-custom" type="number" placeholder="bits/s" style="display:none" />
         </div>
 
         <div class="form-row">

@@ -179,7 +179,12 @@ mod tests {
     use super::*;
 
     fn frame(can_id: u32, data: Vec<u8>) -> CanFrame {
-        CanFrame { can_id, is_extended: true, data, timestamp_ms: None }
+        CanFrame {
+            can_id,
+            is_extended: true,
+            data,
+            timestamp_ms: None,
+        }
     }
 
     #[test]
@@ -213,7 +218,9 @@ mod tests {
         let mut tp = TpReassembler::default();
         // BAM from SA 0x21: PGN 0xFECA (DM1), 12 bytes in 2 packets.
         let cm_id = build_id(7, PGN_TP_CM, 0xFF, 0x21);
-        assert!(tp.handle_frame(&frame(cm_id, vec![32, 12, 0, 2, 0xFF, 0xCA, 0xFE, 0x00]), 0).is_none());
+        assert!(tp
+            .handle_frame(&frame(cm_id, vec![32, 12, 0, 2, 0xFF, 0xCA, 0xFE, 0x00]), 0)
+            .is_none());
 
         let dt_id = build_id(7, PGN_TP_DT, 0xFF, 0x21);
         assert!(tp.handle_frame(&frame(dt_id, vec![1, 1, 2, 3, 4, 5, 6, 7]), 10).is_none());
@@ -233,7 +240,9 @@ mod tests {
 
         let dt_id = build_id(6, PGN_TP_DT, 0x20, 0x10);
         assert!(tp.handle_frame(&frame(dt_id, vec![1, 1, 2, 3, 4, 5, 6, 7]), 1).is_none());
-        let done = tp.handle_frame(&frame(dt_id, vec![2, 8, 9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), 2).unwrap();
+        let done = tp
+            .handle_frame(&frame(dt_id, vec![2, 8, 9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), 2)
+            .unwrap();
 
         assert_eq!(done.can_id, build_id(6, 0xEF00, 0x20, 0x10));
         assert_eq!(done.data.len(), 9);
@@ -270,6 +279,8 @@ mod tests {
         tp.handle_frame(&frame(cm_id, vec![255, 1, 0xFF, 0xFF, 0xFF, 0x00, 0xEF, 0x00]), 1);
         let dt_id = build_id(6, PGN_TP_DT, 0x20, 0x10);
         assert!(tp.handle_frame(&frame(dt_id, vec![1, 1, 2, 3, 4, 5, 6, 7]), 2).is_none());
-        assert!(tp.handle_frame(&frame(dt_id, vec![2, 8, 9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), 3).is_none());
+        assert!(tp
+            .handle_frame(&frame(dt_id, vec![2, 8, 9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), 3)
+            .is_none());
     }
 }

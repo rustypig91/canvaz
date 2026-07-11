@@ -18,6 +18,11 @@ pub struct ParsedDbc {
     /// Rebuilt on load, never serialized.
     #[serde(skip)]
     pgn_index: HashMap<u32, u32>,
+    /// All CAN network nodes (`BU_`) declared in the DBC, including ones that
+    /// transmit no messages. `#[serde(default)]` so projects saved before this
+    /// field existed still deserialize.
+    #[serde(default)]
+    pub nodes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +135,7 @@ impl ParsedDbc {
             path: path.to_string(),
             messages: HashMap::new(),
             pgn_index: HashMap::new(),
+            nodes: Vec::new(),
         };
         dbc.reload()?;
 
@@ -208,6 +214,7 @@ impl ParsedDbc {
             })
             .collect();
         self.messages = messages;
+        self.nodes = dbc.nodes.iter().map(|n| n.0.clone()).collect();
 
         Ok(())
     }
@@ -252,7 +259,11 @@ fn decode(data: &[u8], start_bit: u64, length: u64, little_endian: bool, signed:
 fn encode(data: &mut [u8], value: f64, start_bit: u64, length: u64, little_endian: bool, factor: f64, offset: f64) {
     // A degenerate factor of 0 means every raw value encodes the same physical
     // (the offset) — use raw 0 rather than dividing to ±inf and saturating.
-    let raw = if factor == 0.0 { 0 } else { ((value - offset) / factor).round() as i64 };
+    let raw = if factor == 0.0 {
+        0
+    } else {
+        ((value - offset) / factor).round() as i64
+    };
     let mask = if length >= 64 { u64::MAX } else { (1u64 << length) - 1 };
     let raw_u64 = (raw as u64) & mask;
     pack_bits(data, raw_u64, start_bit, length, little_endian);
@@ -378,7 +389,12 @@ mod tests {
     }
 
     fn frame(can_id: u32) -> CanFrame {
-        CanFrame { can_id, is_extended: true, data: vec![0; 8], timestamp_ms: None }
+        CanFrame {
+            can_id,
+            is_extended: true,
+            data: vec![0; 8],
+            timestamp_ms: None,
+        }
     }
 
     #[test]

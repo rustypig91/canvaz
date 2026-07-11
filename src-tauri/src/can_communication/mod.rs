@@ -2,7 +2,10 @@
 mod kvaser;
 #[cfg(feature = "pcan")]
 mod pcan;
-#[cfg(feature = "linux-can")]
+// SocketCAN is always compiled in on Linux (the socketcan crate is a
+// non-optional target dependency there); the feature only exists to force it
+// on elsewhere.
+#[cfg(any(feature = "linux-can", target_os = "linux"))]
 mod socketcan;
 
 use log::{debug, error, info};
@@ -11,7 +14,7 @@ use log::{debug, error, info};
 pub use kvaser::KvaserBackend;
 #[cfg(feature = "pcan")]
 pub use pcan::PcanBackend;
-#[cfg(feature = "linux-can")]
+#[cfg(any(feature = "linux-can", target_os = "linux"))]
 pub use socketcan::SocketCanBackend;
 
 use std::collections::HashMap;
