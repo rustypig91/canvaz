@@ -16,7 +16,7 @@ use crate::j1939::{self, J1939Info, TpReassembler};
 use crate::can_communication::KvaserBackend;
 #[cfg(feature = "pcan")]
 use crate::can_communication::PcanBackend;
-#[cfg(feature = "linux-can")]
+#[cfg(any(feature = "linux-can", target_os = "linux"))]
 use crate::can_communication::SocketCanBackend;
 
 use log::*;
@@ -275,7 +275,7 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
         Err(e) => warn!("PCAN backend unavailable: {e}"),
     }
 
-    #[cfg(feature = "linux-can")]
+    #[cfg(any(feature = "linux-can", target_os = "linux"))]
     {
         let sh_rx = Arc::clone(shared);
         let sh_tx = Arc::clone(shared);

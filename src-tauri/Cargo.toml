@@ -26,9 +26,11 @@ thiserror = "1"
 log = "0.4"
 sysinfo = "0.37"
 
-# Platform defaults: on each target the crate is non-optional so it compiles
-# without requiring --features. The feature flags are still used in cfg() guards
-# and can be activated manually (e.g. --features kvaser on Linux).
+# Platform defaults: on each target these crates are non-optional, and the
+# backend cfg() gates accept target_os = "linux" as well, so a plain build gets
+# Kvaser + PCAN everywhere (default features) and SocketCAN on Linux without
+# any --features flag. The linux-can feature only forces SocketCAN on for
+# other targets.
 [target.'cfg(windows)'.dependencies]
 libloading = { version = "0.8" }
 
