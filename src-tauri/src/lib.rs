@@ -48,7 +48,7 @@ fn list_can_interfaces(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>,
 }
 
 #[tauri::command]
-fn create_channel(backend_name: String, channel_name: String, state: State<'_, TauriState>) -> Result<u32, String> {
+fn create_channel(backend_name: String, channel_name: String, state: State<'_, TauriState>) -> Result<can_manager::CreatedChannel, String> {
     state
         .can_manager
         .lock()

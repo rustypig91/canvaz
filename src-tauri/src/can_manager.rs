@@ -104,6 +104,14 @@ pub struct ChannelInfo {
     pub name: String,
 }
 
+/// Result of `create_channel`: the allocated handle plus the backend the
+/// channel name was actually found in (which may differ from the hint).
+#[derive(Debug, Clone, Serialize)]
+pub struct CreatedChannel {
+    pub handle: u32,
+    pub backend: String,
+}
+
 // ── Internal frame storage ────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -340,36 +348,44 @@ impl CanManager {
     }
 
     /// Register a channel (allocate data stores) without opening the hardware.
-    /// Returns a `u32` handle used for all subsequent calls. The DBC is loaded
-    /// later by `open_channel`. Calling `create_channel` again for the same
-    /// channel returns the existing handle.
-    pub fn create_channel(&mut self, backend_name: &str, channel_name: &str) -> Result<u32, String> {
-        let hw_index = self
+    /// The channel is looked up by name in the hinted backend first, then in
+    /// every other backend — the frontend's backend can be a guess for
+    /// hand-typed channel names. Returns the handle used for all subsequent
+    /// calls plus the backend the channel was actually found in. The DBC is
+    /// loaded later by `open_channel`. Calling `create_channel` again for the
+    /// same channel returns the existing handle.
+    pub fn create_channel(&mut self, backend_name: &str, channel_name: &str) -> Result<CreatedChannel, String> {
+        let find = |can: &Can| {
+            can.list_channels().iter().position(|n| n == channel_name).map(|i| i as u8)
+        };
+        let (backend_name, hw_index) = self
             .cans
             .get(backend_name)
-            .ok_or_else(|| format!("No backend '{backend_name}'"))?
-            .list_channels()
-            .iter()
-            .position(|n| n == channel_name)
-            .ok_or_else(|| format!("Channel '{channel_name}' not found in '{backend_name}'"))? as u8;
+            .and_then(|can| find(can).map(|i| (backend_name.to_string(), i)))
+            .or_else(|| {
+                self.cans
+                    .iter()
+                    .find_map(|(name, can)| find(can).map(|i| (name.clone(), i)))
+            })
+            .ok_or_else(|| format!("Channel '{channel_name}' not found in any backend"))?;
 
         let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
 
         // Already registered — return existing handle.
-        if let Some(&handle) = lock.index_to_handle.get(&(backend_name.to_string(), hw_index)) {
-            return Ok(handle);
+        if let Some(&handle) = lock.index_to_handle.get(&(backend_name.clone(), hw_index)) {
+            return Ok(CreatedChannel { handle, backend: backend_name });
         }
 
         let handle = NEXT_CHANNEL_HANDLE.fetch_add(1, Ordering::Relaxed);
         let info = ChannelInfo {
-            backend: backend_name.to_string(),
+            backend: backend_name.clone(),
             name: channel_name.to_string(),
         };
-        lock.index_to_handle.insert((backend_name.to_string(), hw_index), handle);
-        lock.handle_to_index.insert(handle, (backend_name.to_string(), hw_index));
+        lock.index_to_handle.insert((backend_name.clone(), hw_index), handle);
+        lock.handle_to_index.insert(handle, (backend_name.clone(), hw_index));
         lock.channels.insert(handle, ChannelData::new(info));
         info!("Created {backend_name} channel {channel_name} (handle: {handle})");
-        Ok(handle)
+        Ok(CreatedChannel { handle, backend: backend_name })
     }
 
     pub fn remove_channel(&mut self, handle: u32) -> Result<(), String> {
@@ -495,7 +511,7 @@ impl CanManager {
         let mut remapped = Vec::new();
         for (old_handle, info) in previous {
             match self.create_channel(&info.backend, &info.name) {
-                Ok(new_handle) => remapped.push((old_handle, new_handle)),
+                Ok(created) => remapped.push((old_handle, created.handle)),
                 Err(e) => warn!("Could not re-register {} {} after reload: {e}", info.backend, info.name),
             }
         }

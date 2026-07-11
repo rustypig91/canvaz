@@ -97,6 +97,9 @@ interface J1939Info { pgn: number; priority: number; sa: number; da: number; }
 interface PlotSignalEntry { signal_name: string; channel: string; message_id?: number; }
 interface PlotPaneConfig { signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean; }
 interface ChannelInfo { backend: string; name: string; }
+// create_channel result: the backend is where the name was actually found —
+// the backend searches all of them, so it can differ from the hint we sent.
+interface CreatedChannel { handle: number; backend: string; }
 interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate: number | null; protocol: string | null; }
 // Everything the app tracks about one channel, keyed by its u32 handle in `channels`.
 interface Channel {
@@ -1313,18 +1316,19 @@ async function applyChannelDialog() {
         };
         const backend = availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
         const config: ChannelConfig = { name, backend, dbc_path: dialogPendingDbc, bitrate, protocol };
-        // Register channel with backend (allocates handle); hardware opens (and the
-        // DBC is loaded) on Start. If the interface doesn't exist the channel is
-        // still added, as a ghost — same as a project channel whose hardware is
-        // absent — and recovers once the hardware shows up.
-        let handle: number | null = null;
+        // Register channel with backend (allocates handle); hardware opens (and
+        // the DBC is loaded) on Start. The backend searches every CAN backend
+        // for the name; if it exists nowhere the channel is still added, as a
+        // ghost — same as a project channel whose hardware is absent — and
+        // recovers once the hardware shows up.
+        let created: CreatedChannel | null = null;
         let errMsg = "";
         try {
-            handle = await invoke<number>("create_channel", { backendName: backend, channelName: name });
+            created = await invoke<CreatedChannel>("create_channel", { backendName: backend, channelName: name });
         } catch (e) {
             errMsg = String(e);
         }
-        if (handle === null) {
+        if (created === null) {
             ghostChannels.push({ config, error: errMsg });
             refreshChannelList();
             rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
@@ -1334,8 +1338,10 @@ async function applyChannelDialog() {
             return;
         }
 
+        const handle = created.handle;
+        config.backend = created.backend;
         channels.set(handle, {
-            info: { backend, name },
+            info: { backend: created.backend, name },
             config,
             dbc: null,
             open: false,
@@ -2229,16 +2235,17 @@ async function applyProject(project: Project) {
         const backend = ch.backend ?? "socketcan";
         const bitrate = ch.bitrate ?? null;
         const config: ChannelConfig = { name: ch.name, backend, dbc_path: ch.dbc_path ?? null, bitrate, protocol: ch.protocol ?? null };
-        let handle: number | null = null;
+        let created: CreatedChannel | null = null;
         let errMsg = "";
         try {
-            handle = await invoke<number>("create_channel", { backendName: backend, channelName: ch.name });
+            created = await invoke<CreatedChannel>("create_channel", { backendName: backend, channelName: ch.name });
         } catch (e) {
             errMsg = String(e);
         }
-        if (handle !== null) {
-            channels.set(handle, { info: { backend, name: ch.name }, config, dbc: null, open: false });
-            await loadChannelDbc(handle);
+        if (created !== null) {
+            config.backend = created.backend;
+            channels.set(created.handle, { info: { backend: created.backend, name: ch.name }, config, dbc: null, open: false });
+            await loadChannelDbc(created.handle);
         } else {
             console.warn(`Channel ${ch.name} (${backend}) inactive: ${errMsg}`);
             ghostChannels.push({ config, error: errMsg });
@@ -2382,25 +2389,21 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
 async function startApp() {
     // Retry ghost channels (hardware may have been plugged in since they were
     // added). Successfully recovered ghosts are moved into `channels` so they
-    // open normally below. The backend is re-resolved by interface name first:
-    // a hand-typed channel was saved with a guessed backend.
-    const ghostIfaces = ghostChannels.length > 0
-        ? await invoke<ChannelInfo[]>("list_can_interfaces").catch(() => [] as ChannelInfo[])
-        : [];
+    // open normally below. create_channel searches every backend for the name,
+    // so a hand-typed channel saved with a guessed backend still recovers.
     for (const ghost of [...ghostChannels]) {
-        const match = ghostIfaces.find(i => i.name === ghost.config.name);
-        if (match) ghost.config.backend = match.backend;
-        let handle: number | null = null;
+        let created: CreatedChannel | null = null;
         let errMsg = "";
         try {
-            handle = await invoke<number>("create_channel", { backendName: ghost.config.backend, channelName: ghost.config.name });
+            created = await invoke<CreatedChannel>("create_channel", { backendName: ghost.config.backend, channelName: ghost.config.name });
         } catch (e) {
             errMsg = String(e);
         }
-        if (handle !== null) {
-            channels.set(handle, { info: { backend: ghost.config.backend, name: ghost.config.name }, config: ghost.config, dbc: null, open: false });
+        if (created !== null) {
+            ghost.config.backend = created.backend;
+            channels.set(created.handle, { info: { backend: created.backend, name: ghost.config.name }, config: ghost.config, dbc: null, open: false });
             ghostChannels.splice(ghostChannels.indexOf(ghost), 1);
-            await loadChannelDbc(handle);
+            await loadChannelDbc(created.handle);
         } else {
             ghost.error = errMsg;
             setError(`Channel ${ghost.config.name} (${ghost.config.backend}) not available: ${errMsg}`);
@@ -4676,20 +4679,16 @@ window.addEventListener("DOMContentLoaded", async () => {
             }
         }
 
-        // Promote ghost channels whose hardware is now available, re-resolving
-        // the backend by interface name (hand-typed channels carry a guess).
+        // Promote ghost channels whose hardware is now available. create_channel
+        // searches every backend for the name, so a guessed backend still works.
         const recovered: GhostChannel[] = [];
-        const ghostIfaces = ghostChannels.length > 0
-            ? await invoke<ChannelInfo[]>("list_can_interfaces").catch(() => [] as ChannelInfo[])
-            : [];
         for (const ghost of [...ghostChannels]) {
-            const match = ghostIfaces.find(i => i.name === ghost.config.name);
-            if (match) ghost.config.backend = match.backend;
             try {
-                const handle = await invoke<number>("create_channel", { backendName: ghost.config.backend, channelName: ghost.config.name });
-                channels.set(handle, { info: { backend: ghost.config.backend, name: ghost.config.name }, config: ghost.config, dbc: null, open: false });
+                const created = await invoke<CreatedChannel>("create_channel", { backendName: ghost.config.backend, channelName: ghost.config.name });
+                ghost.config.backend = created.backend;
+                channels.set(created.handle, { info: { backend: created.backend, name: ghost.config.name }, config: ghost.config, dbc: null, open: false });
                 recovered.push(ghost);
-                await loadChannelDbc(handle);
+                await loadChannelDbc(created.handle);
             } catch (_) {
                 // stays as ghost
             }
