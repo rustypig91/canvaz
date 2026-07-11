@@ -145,7 +145,6 @@ interface TraceFiltersConfig {
     // Length doubles as the "bytes to check" count of the data filter.
     data?: (number | null)[];
     data_format?: string;
-    overwrite?: boolean;
     max_rows?: number | null;
 }
 
@@ -2285,7 +2284,6 @@ function buildProject(): Project {
             cycle_max: traceFilterCycleMax,
             data: traceFilterData,
             data_format: traceDataFormat,
-            overwrite: traceMode === "overwrite",
             max_rows: traceMaxRows,
         },
         window_size_sec: windowSizeSec,
@@ -2506,10 +2504,6 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
 
     if (f.data_format === "hex" || f.data_format === "dec" || f.data_format === "ascii")
         traceDataFormat = f.data_format;
-
-    traceMode = (f.overwrite ?? true) ? "overwrite" : "append";
-    const overwriteBtn = document.getElementById("btn-trace-overwrite")!;
-    overwriteBtn.classList.toggle("active", traceMode === "overwrite");
 
     if (f.max_rows != null) {
         traceMaxRows = f.max_rows;
@@ -4590,7 +4584,6 @@ function setupTrace() {
         const active = this.classList.toggle("active");
         traceMode = active ? "overwrite" : "append";
         clearTrace();
-        scheduleAutoSave();
     });
 
     document.getElementById("input-trace-max")!.addEventListener("change", (e) => {
