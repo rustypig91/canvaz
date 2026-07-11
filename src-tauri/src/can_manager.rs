@@ -159,6 +159,9 @@ struct ChannelData {
     frames: VecDeque<StoredFrame>,
     dbc: Option<Arc<ParsedDbc>>,
     info: ChannelInfo,
+    /// User-chosen display name used in CSV exports; `info.name` stays the
+    /// hardware identity used for lookup.
+    display_name: Option<String>,
     protocol: Protocol,
     tp: TpReassembler,
 }
@@ -169,9 +172,16 @@ impl ChannelData {
             frames: VecDeque::new(),
             dbc: None,
             info,
+            display_name: None,
             protocol: Protocol::None,
             tp: TpReassembler::default(),
         }
+    }
+
+    /// Name shown to the user: the custom display name when set, else the
+    /// hardware name.
+    fn display_name(&self) -> &str {
+        self.display_name.as_deref().unwrap_or(&self.info.name)
     }
 
     /// Push a frame, evicting frames older than `window_ms` first.
@@ -455,6 +465,19 @@ impl CanManager {
         Ok(())
     }
 
+    /// Set or clear the user-chosen display name for a channel. Used wherever
+    /// the channel is shown to the user (e.g. CSV exports); the hardware name
+    /// in `info` remains the identity.
+    pub fn set_channel_display_name(&self, handle: u32, display_name: Option<String>) -> Result<(), String> {
+        let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
+        let ch = lock
+            .channels
+            .get_mut(&handle)
+            .ok_or_else(|| format!("channel handle {handle} not found"))?;
+        ch.display_name = display_name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        Ok(())
+    }
+
     /// Open the hardware for a channel registered with `create_channel`, loading
     /// the given DBC (parsed fresh from disk) for decode/encode. Returns the
     /// parsed DBC so the frontend can populate its signal tree.
@@ -692,7 +715,7 @@ impl CanManager {
         let mut frames: Vec<(u64, &str, &StoredFrame)> = lock
             .channels
             .values()
-            .flat_map(|ch| ch.frames.iter().map(move |f| (f.timestamp_ms, ch.info.name.as_str(), f)))
+            .flat_map(|ch| ch.frames.iter().map(move |f| (f.timestamp_ms, ch.display_name(), f)))
             .collect();
         frames.sort_unstable_by_key(|r| r.0);
 
@@ -753,7 +776,7 @@ impl CanManager {
                 for sig in &f.signals {
                     rows.push((
                         f.timestamp_ms,
-                        ch.info.name.as_str(),
+                        ch.display_name(),
                         msg_name,
                         sig.name.as_str(),
                         sig.value,

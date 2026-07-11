@@ -25,6 +25,10 @@ pub struct Project {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelConfig {
     pub name: String,
+    /// Optional user-chosen display name shown in the UI and used in CSV
+    /// exports; `name` stays the hardware identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     #[serde(default = "default_backend")]
     pub backend: String,
     pub dbc_path: Option<String>,
