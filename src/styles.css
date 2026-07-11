@@ -129,8 +129,22 @@ kbd {
   font-size: 11px;
   color: var(--text-muted);
   transition: color 0.15s;
+  overflow: hidden;      /* the frame the text slides out of */
+  white-space: nowrap;
+  min-width: 0;
 }
 #status-bar.status-error { color: var(--danger); }
+#status-bar.status-warn { color: var(--warning); }
+
+#status-text { display: inline-block; }
+/* Retiring message slides right out of the bar, towards the log it lives in.
+   Duration must match STATUS_EXIT_MS in main.ts. */
+#status-text.status-exit {
+  animation: status-slide-out 0.25s ease-in forwards;
+}
+@keyframes status-slide-out {
+  to { transform: translateX(calc(100% + 12px)); opacity: 0; }
+}
 
 #btn-show-log {
   background: none;
@@ -164,6 +178,23 @@ kbd {
   box-shadow: -4px 4px 20px rgba(0,0,0,0.5);
 }
 #log-panel[hidden] { display: none; }
+
+/* Pinned: docked into #layout as a right-hand sidebar instead of floating. */
+#log-panel.pinned {
+  position: static;
+  width: 380px;
+  min-width: 240px;
+  height: auto;
+  max-height: none;
+  border: none;
+  border-left: 1px solid var(--border);
+  border-radius: 0;
+  box-shadow: none;
+  flex-shrink: 0;
+}
+
+#btn-pin-log { font-size: 12px; }
+#btn-pin-log.active { color: var(--accent); }
 
 #log-panel-header {
   display: flex;

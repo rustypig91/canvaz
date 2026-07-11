@@ -1108,7 +1108,9 @@ function
         try {
             await invoke("save_project", { path: sessionFilePath, project: buildProject() });
         }
-        catch { /* silent — auto-save failures should not interrupt the user */ }
+        // warn, not error: don't light up the error badge for a transient miss,
+        // but the user should still see their session isn't being persisted.
+        catch (e) { log("warn", `Session auto-save failed: ${e}`); }
     }, 1000);
 }
 let projectPath: string | null = null;
@@ -1116,7 +1118,8 @@ let lastProjectIndexPath: string | null = null;
 
 function persistLastProjectPath(path: string) {
     if (lastProjectIndexPath)
-        invoke("write_text_file", { path: lastProjectIndexPath, content: path }).catch(() => { });
+        invoke("write_text_file", { path: lastProjectIndexPath, content: path })
+            .catch(e => log("debug", `Failed to record last project path: ${e}`));
 }
 
 // ── Channel dialog ────────────────────────────────────────────────────────────
@@ -1193,7 +1196,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         const available = ifaces.filter(i => !configured.has(`${i.backend}:${i.name}`));
 
         if (available.length === 0) {
-            setStatus(ifaces.length > 0 ? "All detected interfaces are already added." : "No CAN interfaces found.");
+            log("warn", ifaces.length > 0 ? "All detected interfaces are already added." : "No CAN interfaces found.");
             dialog.close();
             return;
         }
@@ -1271,7 +1274,7 @@ async function loadChannelDbc(handle: number): Promise<void> {
         ch.dbc = await invoke<ParsedDbc>("parse_dbc", { path: ch.config.dbc_path });
     } catch (e) {
         ch.dbc = null;
-        setError(`Failed to parse DBC: ${e}`);
+        log("error", `Failed to parse DBC: ${e}`);
     }
 }
 
@@ -1329,9 +1332,9 @@ async function openChannelByHandle(handle: number): Promise<boolean> {
     } catch (e) {
         const msg = String(e);
         if (msg === "Sudo authentication cancelled") {
-            setError("Cancelled — sudo password required.");
+            log("warn", "Cancelled — sudo password required.");
         } else {
-            setError(`Channel error: ${msg}`);
+            log("error", `Channel error: ${msg}`);
         }
         return false;
     }
@@ -1345,11 +1348,11 @@ async function applyChannelDialog() {
     if (dialogMode === "add") {
         const name = (document.getElementById("select-iface") as HTMLSelectElement).value;
         if (!name) {
-            setError("Channel name not set");
+            log("error", "Channel name not set");
             return;
         };
         if (ghostChannels.some(g => g.config.name === name)) {
-            setError(`Channel '${name}' is already added (hardware not available)`);
+            log("error", `Channel '${name}' is already added (hardware not available)`);
             return;
         }
         const backend = availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
@@ -1362,13 +1365,13 @@ async function applyChannelDialog() {
         const res = await registerChannel(config);
         if (res.handle === undefined) {
             if (!res.notFound) {
-                setError(`Failed to add channel: ${res.error}`);
+                log("error", `Failed to add channel: ${res.error}`);
                 return;
             }
             ghostChannels.push({ config, error: res.error! });
             refreshChannelList();
             rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
-            setStatus(`Added channel: ${name} (hardware not available)`);
+            log("warn", `Added channel: ${name} (hardware not available)`);
             scheduleAutoSave();
             dialog.close();
             return;
@@ -1378,7 +1381,7 @@ async function applyChannelDialog() {
         refreshChannelList();
         rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === handle) renderDbcTree();
-        setStatus(`Added channel: ${name}`);
+        log("info", `Added channel: ${name}`);
         scheduleAutoSave();
     } else {
         const h = dialogEditTarget!;
@@ -1397,7 +1400,7 @@ async function applyChannelDialog() {
         refreshChannelList();
         rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === h) renderDbcTree();
-        setStatus(`Updated channel: ${name}`);
+        log("info", `Updated channel: ${name}`);
         scheduleAutoSave();
     }
 
@@ -1672,7 +1675,7 @@ async function renderChannelList() {
 
             try { await invoke("remove_channel", { channelHandle: h }); }
             catch (e) {
-                setError(`Remove channel error: ${e}`);
+                log("error", `Remove channel error: ${e}`);
                 return;
             }
             channels.delete(h);
@@ -1904,7 +1907,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         });
         el.querySelector(".sim-send-once")!.addEventListener("click", async () => {
             try { await invoke("send_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry) } }); }
-            catch (e) { setError(`Send error: ${e}`); }
+            catch (e) { log("error", `Send error: ${e}`); }
         });
 
     } else {
@@ -1981,7 +1984,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         });
         el.querySelector(".sim-send-once")!.addEventListener("click", async () => {
             try { await invoke("send_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc) } }); }
-            catch (e) { setError(`Send error: ${e}`); }
+            catch (e) { log("error", `Send error: ${e}`); }
         });
     }
 
@@ -2004,7 +2007,7 @@ function renderSimEntries() {
 
 function addSimSignal(handle: number, sig: DbcSignal) {
     const dbc = channels.get(handle)?.dbc;
-    if (!dbc) { setStatus("No DBC loaded for this channel"); return; }
+    if (!dbc) { log("warn", "No DBC loaded for this channel"); return; }
     const msg = dbc.messages[sig.message_id];
     if (!msg) return;
 
@@ -2049,7 +2052,7 @@ async function startSim(key: string) {
     const entry = simEntries.get(key);
     // Guard: already sending (backend periodic registered).
     if (!entry || entry.periodicHandle !== null) return;
-    if (!entry.channel) { setStatus("Select a channel first"); return; }
+    if (!entry.channel) { log("warn", "Select a channel first"); return; }
 
     // Mark user intent immediately — button shows "Stop" even while app is stopped.
     entry.running = true;
@@ -2069,7 +2072,7 @@ async function startSim(key: string) {
         }
         entry.periodicHandle = handle;
     } catch (e) {
-        setError(`Sim start error: ${e}`);
+        log("error", `Sim start error: ${e}`);
         entry.running = false;
         if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
         scheduleAutoSave();
@@ -2205,7 +2208,7 @@ async function newProject() {
     refreshChannelList();
     rebuildTraceColumns();
     renderDbcTree();
-    setStatus("New project");
+    log("info", "New project");
 }
 
 async function saveProject() {
@@ -2214,7 +2217,8 @@ async function saveProject() {
             await invoke("save_project", { path: projectPath, project: buildProject() });
             projectDirty = false;
             updateWindowTitle();
-        } catch (e) { setError(`Save error: ${e}`); }
+            log("info", `Saved: ${projectPath}`);
+        } catch (e) { log("error", `Save error: ${e}`); }
     } else { await saveProjectAs(); }
 }
 
@@ -2232,7 +2236,8 @@ async function saveProjectAs() {
         updateWindowTitle();
         persistLastProjectPath(path);
         await invoke("save_project", { path, project: buildProject() });
-    } catch (e) { setError(`Save error: ${e}`); }
+        log("info", `Saved: ${path}`);
+    } catch (e) { log("error", `Save error: ${e}`); }
 }
 
 async function openProject() {
@@ -2245,8 +2250,8 @@ async function openProject() {
         updateWindowTitle();
         persistLastProjectPath(path);
         await applyProject(project);
-        setStatus(`Loaded: ${path}`);
-    } catch (e) { setError(`Load error: ${e}`); }
+        log("info", `Loaded: ${path}`);
+    } catch (e) { log("error", `Load error: ${e}`); }
 }
 
 async function applyProject(project: Project) {
@@ -2416,7 +2421,7 @@ async function startApp() {
             ghostChannels.splice(ghostChannels.indexOf(ghost), 1);
         } else {
             ghost.error = res.error!;
-            setError(`Channel ${ghost.config.name} (${ghost.config.backend}) not available: ${res.error}`);
+            log("error", `Channel ${ghost.config.name} (${ghost.config.backend}) not available: ${res.error}`);
         }
     }
 
@@ -2544,7 +2549,7 @@ async function startApp() {
     btn.textContent = "■ Stop";
     btn.classList.add("running");
     btn.title = "Pause live capture";
-    setStatus("Live capture started");
+    log("info", "Live capture started");
 }
 
 async function stopApp() {
@@ -2559,7 +2564,8 @@ async function stopApp() {
     // Close hardware connections; they will reopen on the next Start.
     for (const [handle, ch] of channels) {
         if (!ch.open) continue;
-        try { await invoke("close_channel", { channelHandle: handle }); } catch { }
+        try { await invoke("close_channel", { channelHandle: handle }); }
+        catch (e) { log("debug", `Failed to close channel ${ch.info.name}: ${e}`); }
         ch.open = false;
     }
     // Channels are closed so backend periodics are gone; preserve running intent so
@@ -2572,7 +2578,7 @@ async function stopApp() {
     btn.textContent = "▶ Start";
     btn.classList.remove("running");
     btn.title = "Start live capture";
-    setStatus("Stopped");
+    log("info", "Stopped");
 }
 
 function showConfirm(message: string): Promise<boolean> {
@@ -2617,8 +2623,8 @@ async function exportCsv() {
     if (!path) return;
     try {
         const count = await invoke<number>("export_signals_csv", { path, startMs: appStartTime });
-        setStatus(count > 0 ? `Exported ${count} signal samples to CSV` : "No signal data to export");
-    } catch (e) { setError(`Export error: ${e}`); }
+        log("info", count > 0 ? `Exported ${count} signal samples to CSV` : "No signal data to export");
+    } catch (e) { log("error", `Export error: ${e}`); }
 }
 
 async function exportTraceCsv() {
@@ -2629,8 +2635,8 @@ async function exportTraceCsv() {
     if (!path) return;
     try {
         const count = await invoke<number>("export_frames_csv", { path, startMs: appStartTime });
-        setStatus(count > 0 ? `Exported ${count} frames to CSV` : "No trace data to export");
-    } catch (e) { setError(`Export error: ${e}`); }
+        log("info", count > 0 ? `Exported ${count} frames to CSV` : "No trace data to export");
+    } catch (e) { log("error", `Export error: ${e}`); }
 }
 
 // ── Preferences ─────────────────────────────────────────────────────────────
@@ -2644,6 +2650,8 @@ interface Preferences {
     // Latest release version the user chose to skip. While this matches the
     // newest release we won't prompt at startup; a newer release clears it.
     skippedVersion?: string;
+    // Message log docked into the layout (and kept open) instead of floating.
+    logPinned?: boolean;
 }
 
 let preferencesPath: string | null = null;
@@ -2665,7 +2673,7 @@ function savePreferences() {
     invoke("write_text_file", {
         path: preferencesPath,
         content: JSON.stringify(preferences, null, 2),
-    }).catch(() => { });
+    }).catch(e => log("debug", `Failed to save preferences: ${e}`));
 }
 
 // ── Update checker ────────────────────────────────────────────────────────────
@@ -2791,7 +2799,7 @@ function openSysResDialog() {
 // always reports a result and ignores the skip preference) from the silent
 // startup check (which only surfaces a brand-new, non-skipped release).
 async function checkForUpdates(manual: boolean) {
-    if (manual) setStatus("Checking for updates…");
+    if (manual) log("info", "Checking for updates…");
 
     let latest: LatestRelease;
     try {
@@ -4188,7 +4196,7 @@ async function toggleTracePlot(sigRow: HTMLTableRowElement, handle: number, msgI
     // stable slot that keeps receiving updates. In append mode each row is a
     // historical snapshot that scrolls away, so there is nothing to plot onto.
     if (traceMode !== "overwrite") {
-        setStatus("Inline plots require Overwrite mode.");
+        log("warn", "Inline plots require Overwrite mode.");
         return;
     }
 
@@ -4582,35 +4590,84 @@ function escapeHtml(s: string): string {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-// Record an entry in the message-log panel (without touching the status bar).
-function appendToMessageLog(ts: string, text: string, level: LogLevel) {
-    const entry: LogEntry = { ts, text, level };
+// Record an entry in the message log (array + panel DOM + console) and, unless
+// suppressed, rotate it through the status bar. `ts` defaults to now; the
+// rust-log relay passes the backend timestamp and writes its own (richer)
+// console line, and suppresses the status bar when replaying the backlog.
+function log(level: LogLevel, message: string, opts?: { ts?: string; toConsole?: boolean; toStatus?: boolean }) {
+    const entry: LogEntry = { ts: opts?.ts ?? new Date().toLocaleTimeString(), text: message, level };
     messageLog.push(entry);
     if (messageLog.length > MAX_LOG_ENTRIES) messageLog.shift();
     appendLogEntry(entry);
     if (level === "error") {
         document.getElementById("btn-show-log")?.classList.add("log-has-error");
     }
-    console.log(level, text);
-
-    if (level === "debug") return; // don't show debug messages in the status bar
-
-    const el = document.getElementById("status-bar")!;
-    el.textContent = text;
-    el.classList.toggle("status-error", level === "error");
-    setTimeout(() => {
-        if (el.textContent === text) {
-            el.textContent = "";
-            el.classList.remove("status-error");
-        }
-    }, 4000);
+    if (opts?.toConsole !== false) {
+        const fn = level === "error" ? console.error
+            : level === "warn" ? console.warn
+                : level === "info" ? console.info : console.debug;
+        fn(message);
+    }
+    if (level !== "debug" && opts?.toStatus !== false) queueStatus(message, level);
 }
 
-function setStatus(msg: string, isError = false) {
-    appendToMessageLog(new Date().toLocaleTimeString(), msg, isError ? "error" : "info");
+// ── Status bar ────────────────────────────────────────────────────────────────
+// Messages rotate through the status bar: each is shown for at least
+// STATUS_MIN_MS (so a burst can't overwrite one instantly) and at most
+// STATUS_MAX_MS, then slides out to the right — towards the full log, where
+// every message already landed the moment it was logged.
+
+const STATUS_MIN_MS = 1500;
+const STATUS_MAX_MS = 4000;
+const STATUS_EXIT_MS = 250; // keep in sync with the status-slide-out animation
+const STATUS_MAX_QUEUE = 5;
+
+const statusQueue: { text: string; level: LogLevel }[] = [];
+let statusTimer: ReturnType<typeof setTimeout> | null = null;
+let statusShownAt = 0;
+let statusShowing = false;
+let statusExiting = false;
+
+function queueStatus(text: string, level: LogLevel) {
+    statusQueue.push({ text, level });
+    // A burst shouldn't back the bar up forever — dropped entries are in the log.
+    while (statusQueue.length > STATUS_MAX_QUEUE) statusQueue.shift();
+    if (!statusShowing) showNextStatus();
+    // Current message already had its minimum time on screen — advance now.
+    else if (!statusExiting && Date.now() - statusShownAt >= STATUS_MIN_MS) exitStatus();
 }
 
-function setError(msg: string) { setStatus(msg, true); }
+function showNextStatus() {
+    const bar = document.getElementById("status-bar")!;
+    const text = document.getElementById("status-text")!;
+    text.classList.remove("status-exit");
+    const next = statusQueue.shift();
+    if (!next) {
+        statusShowing = false;
+        text.textContent = "";
+        bar.classList.remove("status-error", "status-warn");
+        return;
+    }
+    statusShowing = true;
+    statusShownAt = Date.now();
+    text.textContent = next.text;
+    bar.classList.toggle("status-error", next.level === "error");
+    bar.classList.toggle("status-warn", next.level === "warn");
+    if (statusTimer) clearTimeout(statusTimer);
+    statusTimer = setTimeout(() => {
+        if (statusQueue.length > 0) exitStatus();
+        else statusTimer = setTimeout(exitStatus, STATUS_MAX_MS - STATUS_MIN_MS);
+    }, STATUS_MIN_MS);
+}
+
+// Slide the current message out to the right, then show the next queued one.
+function exitStatus() {
+    if (statusExiting) return;
+    statusExiting = true;
+    if (statusTimer) { clearTimeout(statusTimer); statusTimer = null; }
+    document.getElementById("status-text")!.classList.add("status-exit");
+    setTimeout(() => { statusExiting = false; showNextStatus(); }, STATUS_EXIT_MS);
+}
 
 function appendLogEntry(entry: LogEntry) {
     const container = document.getElementById("log-entries");
@@ -4633,11 +4690,11 @@ function appendLogEntry(entry: LogEntry) {
 // isn't visible in a packaged build.
 window.addEventListener("error", (e) => {
     const loc = e.filename ? ` (${e.filename.split("/").pop()}:${e.lineno}:${e.colno})` : "";
-    setError(`Frontend error: ${e.message}${loc}`);
+    log("error", `Frontend error: ${e.message}${loc}`);
 });
 window.addEventListener("unhandledrejection", (e) => {
     const reason = e.reason instanceof Error ? (e.reason.stack ?? e.reason.message) : String(e.reason);
-    setError(`Unhandled promise rejection: ${reason}`);
+    log("error", `Unhandled promise rejection: ${reason}`);
 });
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
@@ -4659,7 +4716,9 @@ window.addEventListener("DOMContentLoaded", async () => {
         d.setUTCHours(+m[1], +m[2], +m[3], +m[4]);
         return d.toLocaleTimeString();
     };
-    const logRust = (e: RustLog) => {
+    // `live` distinguishes events from backlog replay: historical messages go
+    // to the panel/console only, not through the status bar.
+    const logRust = (e: RustLog, live: boolean) => {
         const line = `[rust ${e.ts} ${e.module}] ${e.message}`;
         if (e.level === "ERROR") console.error(line);
         else if (e.level === "WARN") console.warn(line);
@@ -4669,13 +4728,13 @@ window.addEventListener("DOMContentLoaded", async () => {
             e.level === "ERROR" ? "error" :
                 e.level === "WARN" ? "warn" :
                     e.level === "INFO" ? "info" : "debug";
-        appendToMessageLog(rustTsToLocal(e.ts), e.message, level);
+        log(level, e.message, { ts: rustTsToLocal(e.ts), toConsole: false, toStatus: live });
     };
     let lastRustSeq = -1;
     let rustLogPending: RustLog[] | null = [];
     await listen<RustLog>("rust-log", (ev) => {
         if (rustLogPending) rustLogPending.push(ev.payload);
-        else if (ev.payload.seq > lastRustSeq) { lastRustSeq = ev.payload.seq; logRust(ev.payload); }
+        else if (ev.payload.seq > lastRustSeq) { lastRustSeq = ev.payload.seq; logRust(ev.payload, true); }
     });
     const backlog = [
         ...await invoke<RustLog[]>("get_logs").catch(() => [] as RustLog[]),
@@ -4683,12 +4742,12 @@ window.addEventListener("DOMContentLoaded", async () => {
     ];
     rustLogPending = null;
     for (const e of backlog) {
-        if (e.seq > lastRustSeq) { lastRustSeq = e.seq; logRust(e); }
+        if (e.seq > lastRustSeq) { lastRustSeq = e.seq; logRust(e, false); }
     }
 
     // The Rust backend outlives a page reload, so any channels opened by the
     // previous load are still registered/open. Reset it before we rebuild state.
-    await invoke("reset_backend").catch(() => { });
+    await invoke("reset_backend").catch(e => log("debug", `Backend reset failed: ${e}`));
 
     // Tab switching
     document.querySelectorAll<HTMLButtonElement>(".tab-btn").forEach(btn => {
@@ -4737,7 +4796,7 @@ window.addEventListener("DOMContentLoaded", async () => {
         try {
             remapped = await invoke<{ old_handle: number; new_handle: number; backend: string }[]>("reload_backends");
         } catch (e) {
-            setError(`Backend reload failed: ${e}`);
+            log("error", `Backend reload failed: ${e}`);
             return;
         }
 
@@ -4808,31 +4867,47 @@ window.addEventListener("DOMContentLoaded", async () => {
     });
 
     // Log panel
+    const logPanel = document.getElementById("log-panel")!;
+    const pinLogBtn = document.getElementById("btn-pin-log")!;
+    let logPinned = false;
+    // Pinned, the panel docks into the layout as a right-hand pane and stays
+    // put; unpinned it is the transient overlay that closes on outside click.
+    // The element always lives in #layout — position:fixed lifts it out of the
+    // flex flow while unpinned, so only the class needs toggling.
+    const setLogPinned = (pinned: boolean) => {
+        logPinned = pinned;
+        logPanel.classList.toggle("pinned", pinned);
+        pinLogBtn.classList.toggle("active", pinned);
+        pinLogBtn.title = pinned ? "Unpin log panel" : "Pin log panel to the layout";
+    };
+    pinLogBtn.addEventListener("click", () => {
+        setLogPinned(!logPinned);
+        preferences.logPinned = logPinned;
+        savePreferences();
+    });
     document.getElementById("btn-show-log")!.addEventListener("click", () => {
-        const panel = document.getElementById("log-panel")!;
-        panel.hidden = !panel.hidden;
-        if (!panel.hidden) {
+        logPanel.hidden = !logPanel.hidden;
+        if (!logPanel.hidden) {
             document.getElementById("btn-show-log")!.classList.remove("log-has-error");
             const entries = document.getElementById("log-entries")!;
             entries.scrollTop = entries.scrollHeight;
         }
     });
     document.getElementById("btn-close-log")!.addEventListener("click", () => {
-        document.getElementById("log-panel")!.hidden = true;
+        logPanel.hidden = true;
     });
     document.getElementById("btn-clear-log")!.addEventListener("click", () => {
         messageLog.length = 0;
         document.getElementById("log-entries")!.innerHTML = "";
     });
     document.addEventListener("pointerdown", (e) => {
-        const panel = document.getElementById("log-panel")!;
-        if (panel.hidden) return;
-        if (!panel.contains(e.target as Node) && e.target !== document.getElementById("btn-show-log")) {
-            panel.hidden = true;
+        if (logPanel.hidden || logPinned) return;
+        if (!logPanel.contains(e.target as Node) && e.target !== document.getElementById("btn-show-log")) {
+            logPanel.hidden = true;
         }
     });
     document.addEventListener("keydown", (e) => {
-        if (e.key === "Escape") document.getElementById("log-panel")!.hidden = true;
+        if (e.key === "Escape" && !logPinned) logPanel.hidden = true;
     });
 
     // Menu bar
@@ -4840,6 +4915,10 @@ window.addEventListener("DOMContentLoaded", async () => {
 
     // Preferences (per-user, persisted across restarts)
     await loadPreferences();
+    if (preferences.logPinned) {
+        setLogPinned(true);
+        logPanel.hidden = false;
+    }
 
     // Check for a newer release. Only nag on real release builds; dev builds can
     // still check manually via About → Check for Updates. Fire-and-forget so a
@@ -4895,7 +4974,7 @@ window.addEventListener("DOMContentLoaded", async () => {
             projectDirty = false;
         }
         updateWindowTitle();
-        setStatus("Session restored");
+        log("info", "Session restored");
     } else {
         sessionFilePath = sess;
         // No previous session — start fresh with one empty pane

@@ -63,19 +63,9 @@
         </select>
         <input id="input-window-custom" type="number" min="1" placeholder="sec" />
       </div>
-      <span id="status-bar"></span>
+      <span id="status-bar"><span id="status-text"></span></span>
       <button id="btn-show-log" title="View message log">Log</button>
     </header>
-
-    <!-- Message log panel -->
-    <div id="log-panel" hidden>
-      <div id="log-panel-header">
-        <span>Message Log</span>
-        <button id="btn-clear-log" class="btn btn-sm">Clear</button>
-        <button id="btn-close-log" class="btn-icon" title="Close">✕</button>
-      </div>
-      <div id="log-entries"></div>
-    </div>
 
     <!-- Main layout -->
     <div id="layout">
@@ -157,6 +147,18 @@
           </div>
         </div>
       </main>
+
+      <!-- Message log panel: floating overlay by default, docked right pane
+           when pinned (position:fixed escapes the flex flow while unpinned) -->
+      <div id="log-panel" hidden>
+        <div id="log-panel-header">
+          <span>Message Log</span>
+          <button id="btn-clear-log" class="btn btn-sm">Clear</button>
+          <button id="btn-pin-log" class="btn-icon" title="Pin log panel to the layout">📌</button>
+          <button id="btn-close-log" class="btn-icon" title="Close">✕</button>
+        </div>
+        <div id="log-entries"></div>
+      </div>
     </div>
 
     <!-- Channel dialog (add + edit) -->
