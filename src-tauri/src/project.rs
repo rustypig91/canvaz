@@ -1,4 +1,4 @@
-use log::{info, debug};
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

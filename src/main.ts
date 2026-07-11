@@ -454,7 +454,6 @@ function removeSigFromPane(pane: PlotPane, key: string) {
     syncDatasets(pane);
     updatePaneTitle(pane);
     updateSignalHighlights();
-    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -491,13 +490,11 @@ function createPlotPane(): PlotPane {
         btn.classList.toggle("active", pane.showPoints);
         btn.title = `Show data points: ${pane.showPoints ? "on" : "off"}`;
         syncDatasets(pane);
-        console.log("Scheduling autosave");
         scheduleAutoSave();
     });
     el.querySelector<HTMLSelectElement>(".sel-interp")!.addEventListener("change", (e) => {
         pane.interpolation = (e.currentTarget as HTMLSelectElement).value as PlotPane["interpolation"];
         syncDatasets(pane);
-        console.log("Scheduling autosave");
         scheduleAutoSave();
     });
     const resetZoomBtn = el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!;
@@ -664,7 +661,6 @@ function closePlotPane(id: string) {
     pane.chart.destroy();
     pane.el.remove();
     updateSignalHighlights();
-    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -718,7 +714,6 @@ async function addSignalToPane(pane: PlotPane, handle: number, sig: DbcSignal) {
     syncDatasets(pane);
     updatePaneTitle(pane);
     updateSignalHighlights();
-    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -1102,9 +1097,8 @@ let sessionFilePath: string | null = null;
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 let projectDirty = false;
-
-console.log("Scheduling autosave");function
-scheduleAutoSave() {
+function
+    scheduleAutoSave() {
     if (!sessionFilePath) return;
     projectDirty = true;
     updateWindowTitle();
@@ -1375,7 +1369,6 @@ async function applyChannelDialog() {
             refreshChannelList();
             rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
             setStatus(`Added channel: ${name} (hardware not available)`);
-            console.log("Scheduling autosave");
             scheduleAutoSave();
             dialog.close();
             return;
@@ -1386,7 +1379,6 @@ async function applyChannelDialog() {
         rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === handle) renderDbcTree();
         setStatus(`Added channel: ${name}`);
-        console.log("Scheduling autosave");
         scheduleAutoSave();
     } else {
         const h = dialogEditTarget!;
@@ -1406,7 +1398,6 @@ async function applyChannelDialog() {
         rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === h) renderDbcTree();
         setStatus(`Updated channel: ${name}`);
-        console.log("Scheduling autosave");
         scheduleAutoSave();
     }
 
@@ -1670,7 +1661,6 @@ async function renderChannelList() {
                         if (selectedChannel === h) selectChannel(null);
                         renderChannelList();
                         rebuildTraceColumns();
-                        console.log("Scheduling autosave");
                         scheduleAutoSave();
                     }
                 },
@@ -1691,7 +1681,6 @@ async function renderChannelList() {
 
             renderChannelList();
             rebuildTraceColumns();
-            console.log("Scheduling autosave");
             scheduleAutoSave();
         });
         list.appendChild(item);
@@ -1717,7 +1706,6 @@ async function renderChannelList() {
             ghostChannels.splice(ghostChannels.indexOf(ghost), 1);
             renderChannelList();
             rebuildTraceColumns();
-            console.log("Scheduling autosave");
             scheduleAutoSave();
         });
         list.appendChild(item);
@@ -1892,7 +1880,6 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             rawInp.value = String(raw);
             if (enumSel) enumSel.value = (s.def.enum_values ?? []).some(e => e.value === raw) ? String(raw) : "";
             if (entry.running) { await stopSim(key); await startSim(key); }
-            console.log("Scheduling autosave");
             scheduleAutoSave();
         };
 
@@ -2032,7 +2019,6 @@ function addSimSignal(handle: number, sig: DbcSignal) {
     simEntries.set(key, entry);
     document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
     updateSignalHighlights();
-    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -2047,7 +2033,6 @@ function addRawFrame() {
     };
     simEntries.set(key, entry);
     document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
-    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -2057,7 +2042,6 @@ async function removeSimEntry(key: string) {
     simEntries.delete(key);
     document.querySelector(`[data-sim-key="${key}"]`)?.remove();
     updateSignalHighlights();
-    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -2071,7 +2055,6 @@ async function startSim(key: string) {
     entry.running = true;
     const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
     if (btn) { btn.textContent = "Stop"; btn.classList.add("running"); }
-    console.log("Scheduling autosave");
     scheduleAutoSave();
 
     // Register with backend only when the app (and its channels) is live.
@@ -2089,7 +2072,6 @@ async function startSim(key: string) {
         setError(`Sim start error: ${e}`);
         entry.running = false;
         if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
-        console.log("Scheduling autosave");
         scheduleAutoSave();
     }
 }
@@ -2104,7 +2086,6 @@ async function stopSim(key: string) {
     entry.running = false;
     const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
     if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
-    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -2901,7 +2882,6 @@ function setWindowSize(sec: number) {
 // User changed the control: apply and mark the project dirty.
 function applyWindowSize(sec: number) {
     setWindowSize(sec);
-    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -3257,7 +3237,6 @@ function applyTraceFilter() {
         }
     }
     updateClearFiltersBtn();
-    console.log("Scheduling autosave");
     scheduleAutoSave();
 }
 
@@ -3894,7 +3873,6 @@ function setupTraceHeaders() {
                         const idx = before === null ? traceColOrder.length : traceColOrder.indexOf(before as string);
                         traceColOrder.splice(idx >= 0 ? idx : traceColOrder.length, 0, key);
                         rebuildTraceColumns();
-                        console.log("Scheduling autosave");
                         scheduleAutoSave();
                     }
                 } else { colDragKey = null; colDropBefore = undefined; }
@@ -4012,8 +3990,7 @@ function setupTraceHeaders() {
                     btn.addEventListener("click", () => {
                         traceDataFormat = value;
                         fmtRow.querySelectorAll<HTMLButtonElement>(".data-fmt-btn").forEach(b => b.classList.remove("active"));
-                        btn.classList.add("active");
-                        console.log("Scheduling autosave");refreshTraceFormat();
+                        btn.classList.add("active"); refreshTraceFormat();
                         scheduleAutoSave();
                     });
                     fmtRow.appendChild(btn);
@@ -4063,7 +4040,8 @@ function setupTraceHeaders() {
                     // lose their filter.
                     traceFilterData = Array.from({ length: n }, (_, i) => traceFilterData[i] ?? null);
                     buildGrid();
-                    console.log("Scheduling autosave");syncFilteredHeaders(); applyTraceFilter();
+                    syncFilteredHeaders();
+                    applyTraceFilter();
                     scheduleAutoSave();
                 });
                 menu.appendChild(grid);
@@ -4386,7 +4364,6 @@ function setupTrace() {
     });
     document.getElementById("btn-clear-filters")!.addEventListener("click", () => {
         clearAllFilters();
-        console.log("Scheduling autosave");
         scheduleAutoSave();
     });
 
@@ -4413,7 +4390,6 @@ function setupTrace() {
                 if (cb.checked) traceColHidden.delete(def.key);
                 else traceColHidden.add(def.key);
                 rebuildTraceColumns();
-                console.log("Scheduling autosave");
                 scheduleAutoSave();
             });
             item.append(cb, " ", def.label);
@@ -4431,7 +4407,6 @@ function setupTrace() {
             traceColHidden = new Set();
             traceColWidths = {};
             rebuildTraceColumns();
-            console.log("Scheduling autosave");
             scheduleAutoSave();
             ctxMenu?.remove(); ctxMenu = null;
         });
@@ -4473,14 +4448,12 @@ function setupTrace() {
         const active = this.classList.toggle("active");
         traceMode = active ? "overwrite" : "append";
         clearTrace();
-        console.log("Scheduling autosave");
         scheduleAutoSave();
     });
 
     document.getElementById("input-trace-max")!.addEventListener("change", (e) => {
         traceMaxRows = parseInt((e.target as HTMLInputElement).value) || 100;
         while (traceLocalBuffer.length > traceMaxRows) traceLocalBuffer.pop();
-        console.log("Scheduling autosave");
         scheduleAutoSave();
     });
 

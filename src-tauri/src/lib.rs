@@ -127,7 +127,11 @@ fn reload_backends(state: State<'_, TauriState>) -> Result<Vec<RemappedChannel>,
     let remapped = state.can_manager.lock().map_err(|e| e.to_string())?.reload_backends();
     Ok(remapped
         .into_iter()
-        .map(|(old_handle, created)| RemappedChannel { old_handle, new_handle: created.handle, backend: created.backend })
+        .map(|(old_handle, created)| RemappedChannel {
+            old_handle,
+            new_handle: created.handle,
+            backend: created.backend,
+        })
         .collect())
 }
 

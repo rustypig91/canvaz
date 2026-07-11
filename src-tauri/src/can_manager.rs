@@ -254,7 +254,11 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
             let sh_tx = Arc::clone(shared);
             cans.insert(
                 "kvaser".to_string(),
-                Can::new(backend, make_frame_callback("kvaser".into(), sh_rx, "rx"), make_frame_callback("kvaser".into(), sh_tx, "tx")),
+                Can::new(
+                    backend,
+                    make_frame_callback("kvaser".into(), sh_rx, "rx"),
+                    make_frame_callback("kvaser".into(), sh_tx, "tx"),
+                ),
             );
             info!("Kvaser backend initialized successfully");
         }
@@ -268,7 +272,11 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
             let sh_tx = Arc::clone(shared);
             cans.insert(
                 "pcan".to_string(),
-                Can::new(backend, make_frame_callback("pcan".into(), sh_rx, "rx"), make_frame_callback("pcan".into(), sh_tx, "tx")),
+                Can::new(
+                    backend,
+                    make_frame_callback("pcan".into(), sh_rx, "rx"),
+                    make_frame_callback("pcan".into(), sh_tx, "tx"),
+                ),
             );
             info!("PCAN backend initialized successfully");
         }
@@ -358,9 +366,7 @@ impl CanManager {
     /// Calling `create_channel` again for the same channel returns the
     /// existing handle.
     pub fn create_channel(&mut self, backend_name: &str, channel_name: &str) -> Result<CreatedChannel, String> {
-        let find = |can: &Can| {
-            can.list_channels().iter().position(|n| n == channel_name).map(|i| i as u8)
-        };
+        let find = |can: &Can| can.list_channels().iter().position(|n| n == channel_name).map(|i| i as u8);
         let (backend_name, hw_index) = self
             .cans
             .get(backend_name)
@@ -377,7 +383,10 @@ impl CanManager {
 
         // Already registered — return existing handle.
         if let Some(&handle) = lock.index_to_handle.get(&(backend_name.clone(), hw_index)) {
-            return Ok(CreatedChannel { handle, backend: backend_name });
+            return Ok(CreatedChannel {
+                handle,
+                backend: backend_name,
+            });
         }
 
         let handle = NEXT_CHANNEL_HANDLE.fetch_add(1, Ordering::Relaxed);
@@ -389,7 +398,10 @@ impl CanManager {
         lock.handle_to_index.insert(handle, (backend_name.clone(), hw_index));
         lock.channels.insert(handle, ChannelData::new(info));
         info!("Created {backend_name} channel {channel_name} (handle: {handle})");
-        Ok(CreatedChannel { handle, backend: backend_name })
+        Ok(CreatedChannel {
+            handle,
+            backend: backend_name,
+        })
     }
 
     pub fn remove_channel(&mut self, handle: u32) -> Result<(), String> {
@@ -499,9 +511,12 @@ impl CanManager {
     /// On Kvaser this calls canUnloadLibrary()+canInitializeLibrary() which is the
     /// documented way to detect hardware connected after the initial library init.
     pub fn reload_backends(&mut self) -> Vec<(u32, CreatedChannel)> {
-        let previous: Vec<(u32, ChannelInfo)> = self.shared.lock().ok().map(|lock| {
-            lock.channels.iter().map(|(&h, d)| (h, d.info.clone())).collect()
-        }).unwrap_or_default();
+        let previous: Vec<(u32, ChannelInfo)> = self
+            .shared
+            .lock()
+            .ok()
+            .map(|lock| lock.channels.iter().map(|(&h, d)| (h, d.info.clone())).collect())
+            .unwrap_or_default();
 
         self.reset();
 
@@ -666,8 +681,11 @@ impl CanManager {
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         let mut writer = BufWriter::new(file);
 
-        writeln!(writer, "timestamp_ms,elapsed_s,channel,can_id,direction,dlc,data,message,pgn,src,dst,prio")
-            .map_err(|e| e.to_string())?;
+        writeln!(
+            writer,
+            "timestamp_ms,elapsed_s,channel,can_id,direction,dlc,data,message,pgn,src,dst,prio"
+        )
+        .map_err(|e| e.to_string())?;
 
         for (ts, ch_name, f) in &frames {
             let elapsed = (*ts as f64 - start_ms as f64) / 1000.0;
@@ -734,7 +752,12 @@ impl CanManager {
 
         for (ts, ch_name, msg_name, sig_name, value, unit) in &rows {
             let elapsed = (*ts as f64 - start_ms as f64) / 1000.0;
-            writeln!(writer, "{},{:.3},{},{},{},{},{}", ts, elapsed, ch_name, msg_name, sig_name, value, unit).map_err(|e| e.to_string())?;
+            writeln!(
+                writer,
+                "{},{:.3},{},{},{},{},{}",
+                ts, elapsed, ch_name, msg_name, sig_name, value, unit
+            )
+            .map_err(|e| e.to_string())?;
         }
 
         writer.flush().map_err(|e| e.to_string())?;
@@ -903,4 +926,3 @@ fn now_ms() -> u64 {
         .unwrap_or_default()
         .as_millis() as u64
 }
-
