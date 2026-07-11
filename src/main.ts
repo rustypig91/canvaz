@@ -75,6 +75,9 @@ interface FrameInfo {
     direction: "rx" | "tx";
     message_name: string | null;
     j1939?: J1939Info | null;
+    // True if this row is a synthetic frame reassembled from a J1939 TP.CM /
+    // TP.DT transfer rather than a frame that actually appeared on the bus.
+    reassembled?: boolean;
     signals: FrameSignal[];
 }
 
@@ -88,6 +91,9 @@ interface CanFrameEvent {
     direction: "rx" | "tx";
     // J1939 breakdown of the identifier; only present on J1939 channels.
     j1939?: J1939Info | null;
+    // True if this row is a synthetic frame reassembled from a J1939 TP.CM /
+    // TP.DT transfer rather than a frame that actually appeared on the bus.
+    reassembled?: boolean;
     // Decoded signals as interleaved [value, raw, value, raw, …] pairs in DBC
     // message signal order. Names/units/message name are derived from the DBC by
     // position — no strings on the per-frame wire (they dominated GC churn).
@@ -3170,6 +3176,9 @@ interface TraceEntry {
     cycleTimeMs: number | null;
     direction: "rx" | "tx";
     j1939: J1939Info | null;
+    // True if this row is a synthetic frame reassembled from a J1939 TP.CM /
+    // TP.DT transfer rather than a frame that actually appeared on the bus.
+    reassembled: boolean;
     // Interleaved [value, raw] pairs in DBC message signal order (see CanFrameEvent).
     signals: number[];
 }
@@ -3449,7 +3458,7 @@ function buildTraceCellHtml(key: string, entry: TraceEntry): string {
         case "ts": return `<td data-col="ts" class="td-ts">${fmtElapsed(entry.timestampMs)}</td>`;
         case "dir": return `<td data-col="dir"><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>`;
         case "channel": return `<td data-col="channel">${channelName(entry.channelHandle)}</td>`;
-        case "canId": return `<td data-col="canId" class="td-canid">${fmtId(entry.canId, entry.isExtended)}</td>`;
+        case "canId": return `<td data-col="canId" class="td-canid">${fmtId(entry.canId, entry.isExtended)}${entry.reassembled ? ` <span class="tp-badge" data-tip="Reassembled from J1939 TP.CM/TP.DT — this frame did not appear on the bus in this form">TP</span>` : ""}</td>`;
         case "msg": return `<td data-col="msg">${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>`;
         case "dlc": return `<td data-col="dlc">${entry.dlc}</td>`;
         case "data": return `<td data-col="data" class="td-data">${fmtData(entry.data)}</td>`;
@@ -3469,6 +3478,7 @@ function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
         messageName: tr.dataset.msg || null,
         dlc: parseInt(tr.dataset.dlc ?? "0"),
         cycleTimeMs: tr.dataset.cycle ? parseFloat(tr.dataset.cycle) : null,
+        reassembled: tr.dataset.reassembled === "1",
         j1939: tr.dataset.pgn
             ? {
                 pgn: parseInt(tr.dataset.pgn),
@@ -3493,6 +3503,7 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
     tr.dataset.msg = entry.messageName ?? "";
     tr.dataset.dlc = String(entry.dlc);
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
+    if (entry.reassembled) tr.dataset.reassembled = "1";
     if (entry.j1939) {
         tr.dataset.pgn = String(entry.j1939.pgn);
         tr.dataset.prio = String(entry.j1939.priority);
@@ -3511,12 +3522,14 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     tr.dataset.ts = String(entry.timestampMs);
     tr.dataset.dlc = String(entry.dlc);
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
+    if (entry.reassembled) tr.dataset.reassembled = "1"; else delete tr.dataset.reassembled;
     tr.style.display = traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName, entry.j1939) ? "" : "none";
     const gc = (k: string) => tr.querySelector<HTMLTableCellElement>(`[data-col="${k}"]`);
     const tsCell = gc("ts"); if (tsCell) tsCell.textContent = fmtElapsed(entry.timestampMs);
     const dlcCell = gc("dlc"); if (dlcCell) dlcCell.textContent = String(entry.dlc);
     const dataCell = gc("data"); if (dataCell) dataCell.textContent = fmtData(entry.data);
     const cycleCell = gc("cycle"); if (cycleCell) cycleCell.textContent = entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—";
+    const canIdCell = gc("canId"); if (canIdCell) canIdCell.outerHTML = buildTraceCellHtml("canId", entry);
 
     // Refresh open expansion row with updated signal values + current min/max
     const next = tr.nextElementSibling as HTMLTableRowElement | null;
@@ -3634,6 +3647,7 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
             cycleTimeMs: cycleTime,
             direction,
             j1939: ev.j1939 ?? null,
+            reassembled: ev.reassembled ?? false,
             signals: ev.signals,
         };
 
@@ -3745,6 +3759,7 @@ async function loadTraceFrames() {
             cycleTimeMs,
             direction: f.direction,
             j1939: f.j1939 ?? null,
+            reassembled: f.reassembled ?? false,
             // get_frames returns named signals; flatten to the interleaved
             // [value, raw] layout used everywhere else (same DBC order).
             signals: f.signals.flatMap(s => [s.value, s.raw]),

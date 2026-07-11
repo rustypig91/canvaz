@@ -60,6 +60,10 @@ struct CanFrameEvent {
     /// J1939 breakdown of the identifier; only set on J1939 channels.
     #[serde(skip_serializing_if = "Option::is_none")]
     j1939: Option<J1939Info>,
+    /// True if this row is a synthetic frame reassembled from a J1939 TP.CM /
+    /// TP.DT transfer rather than a frame that actually appeared on the bus.
+    #[serde(skip_serializing_if = "is_false")]
+    reassembled: bool,
     /// Decoded signals as interleaved [value, raw, value, raw, …] pairs in DBC
     /// message signal order. Names/units/message name are NOT sent: the frontend
     /// holds the same parsed DBC and derives them by position, which keeps the
@@ -67,6 +71,10 @@ struct CanFrameEvent {
     /// frame rates). Raw values survive the f64 round-trip up to 2^53 — the same
     /// limit JSON numbers already imposed.
     signals: Vec<f64>,
+}
+
+fn is_false(b: &bool) -> bool {
+    !b
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -81,6 +89,10 @@ pub struct FrameInfo {
     pub message_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub j1939: Option<J1939Info>,
+    /// True if this row is a synthetic frame reassembled from a J1939 TP.CM /
+    /// TP.DT transfer rather than a frame that actually appeared on the bus.
+    #[serde(skip_serializing_if = "is_false")]
+    pub reassembled: bool,
     pub signals: Vec<FrameSignal>,
 }
 
@@ -131,6 +143,9 @@ struct StoredFrame {
     direction: &'static str,
     message_name: Option<String>,
     j1939: Option<J1939Info>,
+    /// True if this row is a synthetic frame reassembled from a J1939 TP.CM /
+    /// TP.DT transfer rather than a frame that actually appeared on the bus.
+    reassembled: bool,
     /// DBC message id this frame decoded against. On J1939 channels it can
     /// differ from `can_id` (PGN match ignores priority/source-address bits);
     /// signal-history queries key on it.
@@ -185,6 +200,7 @@ impl ChannelData {
                 is_extended: f.is_extended,
                 dlc: f.data.len() as u16,
                 j1939: f.j1939,
+                reassembled: f.reassembled,
                 data: f.data.clone(),
                 timestamp_ms: f.timestamp_ms,
                 direction: f.direction,
@@ -683,7 +699,7 @@ impl CanManager {
 
         writeln!(
             writer,
-            "timestamp_ms,elapsed_s,channel,can_id,direction,dlc,data,message,pgn,src,dst,prio"
+            "timestamp_ms,elapsed_s,channel,can_id,direction,dlc,data,message,pgn,src,dst,prio,reassembled"
         )
         .map_err(|e| e.to_string())?;
 
@@ -702,7 +718,7 @@ impl CanManager {
                 .unwrap_or_else(|| ",,,".to_string());
             writeln!(
                 writer,
-                "{},{:.3},{},{},{},{},\"{}\",\"{}\",{}",
+                "{},{:.3},{},{},{},{},\"{}\",\"{}\",{},{}",
                 ts,
                 elapsed,
                 ch_name,
@@ -711,7 +727,8 @@ impl CanManager {
                 f.data.len(),
                 data_str,
                 msg_str,
-                j1939_str
+                j1939_str,
+                f.reassembled as u8
             )
             .map_err(|e| e.to_string())?;
         }
@@ -835,16 +852,16 @@ fn make_frame_callback(
             }
         }
 
-        ingest_frame(&mut lock, handle, protocol, dbc.as_deref(), raw, ts, direction);
+        ingest_frame(&mut lock, handle, protocol, dbc.as_deref(), raw, ts, direction, false);
         if let Some(frame) = completed {
-            ingest_frame(&mut lock, handle, protocol, dbc.as_deref(), frame, ts, direction);
+            ingest_frame(&mut lock, handle, protocol, dbc.as_deref(), frame, ts, direction, true);
         }
     }
 }
 
 /// Decode a frame, store it in the channel's ring buffer and queue its webview
 /// event. Called once per raw frame and once more for each reassembled J1939
-/// transport message.
+/// transport message (`reassembled = true` in that second call).
 fn ingest_frame(
     lock: &mut ManagerShared,
     handle: u32,
@@ -853,6 +870,7 @@ fn ingest_frame(
     raw: CanFrame,
     ts: u64,
     direction: &'static str,
+    reassembled: bool,
 ) {
     let window_ms = lock.window_ms;
 
@@ -876,6 +894,7 @@ fn ingest_frame(
         direction,
         message_name,
         j1939: j1939_info,
+        reassembled,
         dbc_msg_id,
         signals: decoded_msg
             .map(|m| {
@@ -909,6 +928,7 @@ fn ingest_frame(
         timestamp_ms: ts,
         direction,
         j1939: j1939_info,
+        reassembled,
         signals: sig_data,
     };
 
