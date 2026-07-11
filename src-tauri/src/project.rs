@@ -156,6 +156,15 @@ impl Project {
         }
     }
 
+    pub fn has_changes(&self, path: &str) -> bool {
+        let json = match serde_json::to_string_pretty(self) {
+            Ok(j) => j,
+            Err(_) => return true,  // If we can't serialize, assume there are changes to save.
+        };
+        let current_json = std::fs::read_to_string(path).unwrap_or_default();
+        json != current_json
+    }
+
     pub fn save(&self, path: &str) -> Result<(), String> {
         let p = std::path::Path::new(path);
         if let Some(parent) = p.parent() {

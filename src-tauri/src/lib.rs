@@ -325,6 +325,11 @@ fn save_project(path: String, project: Project) -> Result<(), String> {
 }
 
 #[tauri::command]
+fn project_has_changes(path: String, project: Project) -> bool {
+    project.has_changes(&path)
+}
+
+#[tauri::command]
 fn load_project(path: String) -> Result<Project, String> {
     Project::load(&path)
 }
