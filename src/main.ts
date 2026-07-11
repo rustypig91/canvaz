@@ -108,7 +108,9 @@ interface ChannelInfo { backend: string; name: string; }
 // create_channel result: the backend is where the name was actually found —
 // the backend searches all of them, so it can differ from the hint we sent.
 interface CreatedChannel { handle: number; backend: string; }
-interface ChannelConfig { name: string; backend: string; dbc_path: string | null; bitrate: number | null; protocol: string | null; }
+// `display_name` is the user-chosen operating name (shown in the UI, trace and
+// CSV exports); `name` stays the hardware identity used for lookup.
+interface ChannelConfig { name: string; display_name?: string | null; backend: string; dbc_path: string | null; bitrate: number | null; protocol: string | null; }
 // Everything the app tracks about one channel, keyed by its u32 handle in `channels`.
 interface Channel {
     info: ChannelInfo;       // backend + hardware name (immutable identity)
@@ -1160,8 +1162,11 @@ const channels = new Map<number, Channel>();
 // Available hardware interfaces populated when the "Add Channel" dialog opens.
 let availableIfaces: ChannelInfo[] = [];
 
+// Operating name for a channel: the custom display name when set, else the
+// hardware interface name.
 function channelName(handle: number): string {
-    return channels.get(handle)?.info.name ?? String(handle);
+    const ch = channels.get(handle);
+    return ch ? (ch.config.display_name || ch.info.name) : String(handle);
 }
 const signalLastValues = new Map<string, number>();
 const signalLastRaw = new Map<string, number>();
@@ -1302,6 +1307,8 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
     const ifaceRow = document.getElementById("row-iface")!;
     const sel = document.getElementById("select-iface") as HTMLSelectElement;
 
+    const nameInput = document.getElementById("input-channel-name") as HTMLInputElement;
+
     if (mode === "add") {
         title.textContent = "Add CAN Channel";
         applyBtn.textContent = "Add";
@@ -1311,6 +1318,8 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         setDbcLabel(null);
         setBitrateInDialog(500000, false);
         setProtocolInDialog(null);
+        nameInput.value = "";
+        nameInput.placeholder = "Optional — defaults to interface name";
         const ifaces = await invoke<ChannelInfo[]>("list_can_interfaces").catch(() => [] as ChannelInfo[]);
         availableIfaces = ifaces;
 
@@ -1340,14 +1349,16 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         if (available[0]?.name.startsWith("vcan")) setBitrateInDialog(null, true);
     } else {
         const ch = channels.get(handle!);
-        const displayName = ch?.info.name ?? String(handle!);
-        title.textContent = `Channel: ${displayName}`;
+        const hwName = ch?.info.name ?? String(handle!);
+        title.textContent = `Channel: ${channelName(handle!)}`;
         applyBtn.textContent = "Apply";
         ifaceRow.style.display = "none";
         dialogPendingDbc = ch?.config.dbc_path ?? null;
         setDbcLabel(dialogPendingDbc);
-        setBitrateInDialog(ch?.config.bitrate ?? null, displayName.startsWith("vcan"));
+        setBitrateInDialog(ch?.config.bitrate ?? null, hwName.startsWith("vcan"));
         setProtocolInDialog(ch?.config.protocol ?? null);
+        nameInput.value = ch?.config.display_name ?? "";
+        nameInput.placeholder = hwName;
         selectChannel(handle!);
     }
 
@@ -1428,6 +1439,11 @@ async function registerChannel(config: ChannelConfig): Promise<RegisterResult> {
     }
     config.backend = created.backend;
     channels.set(created.handle, { info: { backend: created.backend, name: config.name }, config, dbc: null, open: false });
+    // Push the custom name to the backend so CSV exports use it too.
+    if (config.display_name) {
+        await invoke("set_channel_display_name", { channelHandle: created.handle, displayName: config.display_name })
+            .catch(e => log("error", `Failed to set channel name: ${e}`));
+    }
     await loadChannelDbc(created.handle);
     return { handle: created.handle };
 }
@@ -1467,6 +1483,7 @@ async function applyChannelDialog() {
     const dialog = document.getElementById("dialog-channel") as HTMLDialogElement;
     const bitrate = getBitrateFromDialog();
     const protocol = getProtocolFromDialog();
+    const customName = (document.getElementById("input-channel-name") as HTMLInputElement).value.trim() || null;
 
     if (dialogMode === "add") {
         const name = (document.getElementById("select-iface") as HTMLSelectElement).value;
@@ -1479,7 +1496,7 @@ async function applyChannelDialog() {
             return;
         }
         const backend = availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
-        const config: ChannelConfig = { name, backend, dbc_path: dialogPendingDbc, bitrate, protocol };
+        const config: ChannelConfig = { name, display_name: customName, backend, dbc_path: dialogPendingDbc, bitrate, protocol };
         // Register channel with backend (allocates handle); hardware opens (and
         // the DBC is loaded) on Start. If the name exists in no backend the
         // channel is still added, as a ghost — same as a project channel whose
@@ -1494,7 +1511,7 @@ async function applyChannelDialog() {
             ghostChannels.push({ config, error: res.error! });
             refreshChannelList();
             rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
-            log("warn", `Added channel: ${name} (hardware not available)`);
+            log("warn", `Added channel: ${customName ?? name} (hardware not available)`);
             scheduleAutoSave("channel added (hardware unavailable)");
             dialog.close();
             return;
@@ -1504,21 +1521,25 @@ async function applyChannelDialog() {
         refreshChannelList();
         rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === handle) renderDbcTree();
-        log("info", `Added channel: ${name}`);
+        log("info", `Added channel: ${customName ?? name}`);
         scheduleAutoSave("channel added");
     } else {
         const h = dialogEditTarget!;
         const ch = channels.get(h);
-        const name = ch?.info.name ?? String(h);
 
         // Update config in place and reparse the DBC so the signal tree reflects
         // the change immediately (a fresh copy is also loaded on the next open).
         if (ch) {
+            ch.config.display_name = customName;
             ch.config.dbc_path = dialogPendingDbc;
             ch.config.bitrate = bitrate;
             ch.config.protocol = protocol;
+            // Sync (or clear) the custom name backend-side so CSV exports match.
+            await invoke("set_channel_display_name", { channelHandle: h, displayName: customName })
+                .catch(e => log("error", `Failed to set channel name: ${e}`));
             await loadChannelDbc(h);
         }
+        const name = ch ? channelName(h) : String(h);
 
         refreshChannelList();
         rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
@@ -1752,17 +1773,18 @@ async function renderChannelList() {
     for (const [h, ch] of channels) {
         const dbcPath = ch.config.dbc_path;
         const bitrate = ch.config.bitrate ?? undefined;
-        const name = ch.info.name;
+        const name = ch.config.display_name || ch.info.name;
+        const hwName = ch.info.name;
         const backend = ch.info.backend;
         const isSelected = h === selectedChannel;
-        const bitrateLabel = name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
+        const bitrateLabel = hwName.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
         const protoLabel = ch.config.protocol === "j1939" ? " · J1939" : "";
         const item = document.createElement("div");
         item.className = `channel-item${isSelected ? " selected" : ""}`;
         item.dataset.channelHandle = String(h);
         item.innerHTML = `
       <span class="dot${ch.open ? "" : " closed"}"></span>
-      <span class="ch-name" title="${name}">${name}<span class="ch-backend label-muted"> ${backend}</span></span>
+      <span class="ch-name" title="${escapeHtml(name === hwName ? name : `${name} (${hwName})`)}">${escapeHtml(name)}<span class="ch-backend label-muted"> ${backend}</span></span>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
       <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}</span>
       <button class="btn-close-ch" title="Remove channel">×</button>
@@ -1816,13 +1838,14 @@ async function renderChannelList() {
         const { config, error } = ghost;
         const dbcPath = config.dbc_path;
         const bitrate = config.bitrate;
+        const ghostName = config.display_name || config.name;
         const bitrateLabel = config.name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
         const protoLabel = config.protocol === "j1939" ? " · J1939" : "";
         const item = document.createElement("div");
         item.className = "channel-item";
         item.innerHTML = `
       <span class="dot error" title="${error}"></span>
-      <span class="ch-name" title="${config.name}">${config.name}<span class="ch-backend label-muted"> ${config.backend}</span></span>
+      <span class="ch-name" title="${escapeHtml(ghostName === config.name ? ghostName : `${ghostName} (${config.name})`)}">${escapeHtml(ghostName)}<span class="ch-backend label-muted"> ${config.backend}</span></span>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
       <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}</span>
       <button class="btn-close-ch" title="Remove channel">×</button>
@@ -1951,7 +1974,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         <span class="sim-kind-badge kind-msg">MSG</span>
         <span class="sim-msg-name">${entry.messageName}</span>
         <span class="label-muted sim-msg-id">${idHex}</span>
-        <span class="ch-badge">${channelName(entry.channel)}</span>
+        <span class="ch-badge">${escapeHtml(channelName(entry.channel))}</span>
         <span class="label-muted">Period</span>
         <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
         <span class="label-muted">ms</span>
@@ -2039,7 +2062,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
       <div class="sim-group-header">
         <span class="sim-kind-badge kind-raw">RAW</span>
         <select class="sim-channel-sel">
-          ${[...channels].map(([h, ch]) => `<option value="${h}"${h === entry.channel ? " selected" : ""}>${ch.info.name}</option>`).join("")}
+          ${[...channels].map(([h, ch]) => `<option value="${h}"${h === entry.channel ? " selected" : ""}>${escapeHtml(ch.config.display_name || ch.info.name)}</option>`).join("")}
         </select>
         <span class="label-muted">Period</span>
         <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
@@ -2243,6 +2266,7 @@ function buildProject(): Project {
         channels: [
             ...[...channels.values()].map(ch => ({
                 name: ch.info.name,
+                display_name: ch.config.display_name ?? null,
                 backend: ch.info.backend,
                 dbc_path: ch.config.dbc_path,
                 bitrate: ch.config.bitrate,
@@ -2250,6 +2274,7 @@ function buildProject(): Project {
             })),
             ...ghostChannels.map(g => ({
                 name: g.config.name,
+                display_name: g.config.display_name ?? null,
                 backend: g.config.backend,
                 dbc_path: g.config.dbc_path,
                 bitrate: g.config.bitrate,
@@ -2392,7 +2417,7 @@ async function applyProject(project: Project) {
     for (const ch of project.channels) {
         const backend = ch.backend ?? "socketcan";
         const bitrate = ch.bitrate ?? null;
-        const config: ChannelConfig = { name: ch.name, backend, dbc_path: ch.dbc_path ?? null, bitrate, protocol: ch.protocol ?? null };
+        const config: ChannelConfig = { name: ch.name, display_name: ch.display_name ?? null, backend, dbc_path: ch.dbc_path ?? null, bitrate, protocol: ch.protocol ?? null };
         // Any failure keeps the saved config as a ghost — including a name that
         // currently resolves to an already-added channel (a duplicate ghost
         // recovers under its own backend once that hardware appears, since
@@ -3456,7 +3481,7 @@ function buildTraceCellHtml(key: string, entry: TraceEntry): string {
         case "da": return `<td data-col="da" class="td-canid">${j ? (j.da === 0xFF ? "All" : fmtJ1939Addr(j.da)) : "—"}</td>`;
         case "ts": return `<td data-col="ts" class="td-ts">${fmtElapsed(entry.timestampMs)}</td>`;
         case "dir": return `<td data-col="dir"><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>`;
-        case "channel": return `<td data-col="channel">${channelName(entry.channelHandle)}</td>`;
+        case "channel": return `<td data-col="channel">${escapeHtml(channelName(entry.channelHandle))}</td>`;
         case "canId": return `<td data-col="canId" class="td-canid">${entry.reassembled ? `<span class="tp-badge" data-tip="Reassembled from J1939 TP.CM/TP.DT — this frame did not appear on the bus in this form">${fmtId(entry.canId, entry.isExtended)}</span>` : fmtId(entry.canId, entry.isExtended)}</td>`;
         case "msg": return `<td data-col="msg">${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>`;
         case "dlc": return `<td data-col="dlc">${entry.dlc}</td>`;
