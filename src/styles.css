@@ -1112,6 +1112,7 @@ body.col-resizing { cursor: col-resize !important; user-select: none; }
   display: inline-block;
   font-weight: 700;
   padding: 0 4px;
+  margin: 0 -4px;
   border-radius: 3px;
   background: rgba(168,85,247,0.15);
   color: #c084fc;
