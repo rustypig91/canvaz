@@ -139,6 +139,10 @@ pub struct Can {
     channels: HashMap<u8, OpenChannel>,
     on_rx: Arc<dyn Fn(u8, CanFrame) + Send + Sync + 'static>,
     on_tx: Arc<dyn Fn(u8, CanFrame) + Send + Sync + 'static>,
+    /// Called with (channel, error, fatal). `fatal = true` means the RX loop
+    /// died and the channel no longer receives; `fatal = false` is a TX send
+    /// failure on an otherwise live channel.
+    on_error: Arc<dyn Fn(u8, String, bool) + Send + Sync + 'static>,
     admin_password: Option<String>,
 }
 
@@ -147,12 +151,14 @@ impl Can {
         backend: impl CanBackend,
         on_rx: impl Fn(u8, CanFrame) + Send + Sync + 'static,
         on_tx: impl Fn(u8, CanFrame) + Send + Sync + 'static,
+        on_error: impl Fn(u8, String, bool) + Send + Sync + 'static,
     ) -> Self {
         Self {
             backend: Box::new(backend),
             channels: HashMap::new(),
             on_rx: Arc::new(on_rx),
             on_tx: Arc::new(on_tx),
+            on_error: Arc::new(on_error),
             admin_password: None,
         }
     }
@@ -183,14 +189,16 @@ impl Can {
         let rx_thread = {
             let stop = Arc::clone(&stop);
             let on_rx = Arc::clone(&self.on_rx);
-            std::thread::spawn(move || rx_loop(rx_handle, stop, channel, on_rx))
+            let on_error = Arc::clone(&self.on_error);
+            std::thread::spawn(move || rx_loop(rx_handle, stop, channel, on_rx, on_error))
         };
 
         let tx_thread = {
             let queue = Arc::clone(&queue);
             let stop = Arc::clone(&stop);
             let on_tx = Arc::clone(&self.on_tx);
-            std::thread::spawn(move || tx_loop(tx_handle, queue, stop, channel, on_tx))
+            let on_error = Arc::clone(&self.on_error);
+            std::thread::spawn(move || tx_loop(tx_handle, queue, stop, channel, on_tx, on_error))
         };
 
         self.channels.insert(
@@ -286,13 +294,22 @@ impl Drop for Can {
 
 // ── Thread loops ──────────────────────────────────────────────────────────────
 
-fn rx_loop(mut rx: Box<dyn RxHandle>, stop: Arc<AtomicBool>, channel: u8, on_rx: Arc<dyn Fn(u8, CanFrame) + Send + Sync>) {
+fn rx_loop(
+    mut rx: Box<dyn RxHandle>,
+    stop: Arc<AtomicBool>,
+    channel: u8,
+    on_rx: Arc<dyn Fn(u8, CanFrame) + Send + Sync>,
+    on_error: Arc<dyn Fn(u8, String, bool) + Send + Sync>,
+) {
     while !stop.load(Ordering::Relaxed) {
         match rx.receive(50) {
             Ok(Some(frame)) => on_rx(channel, frame),
             Ok(None) => {}
             Err(e) => {
                 error!("RX error on channel {channel}: {e}");
+                // Fatal: this loop is the channel's only receive path, so the
+                // channel is dead from here on — let the app surface it.
+                on_error(channel, e, true);
                 break;
             }
         }
@@ -306,8 +323,26 @@ fn tx_loop(
     stop: Arc<AtomicBool>,
     channel: u8,
     on_tx: Arc<dyn Fn(u8, CanFrame) + Send + Sync>,
+    on_error: Arc<dyn Fn(u8, String, bool) + Send + Sync>,
 ) {
     let (lock, cvar) = &*queue;
+    // Report a TX failure once per distinct error, re-arming after a successful
+    // send — a bus-off makes every periodic send fail, and one event per queued
+    // frame per tick would flood the app.
+    let mut last_tx_err: Option<String> = None;
+    let mut report_tx = |result: Result<(), String>, f: CanFrame| match result {
+        Ok(()) => {
+            last_tx_err = None;
+            on_tx(channel, f);
+        }
+        Err(e) => {
+            error!("TX error on channel {channel}: {e}");
+            if last_tx_err.as_deref() != Some(e.as_str()) {
+                on_error(channel, e.clone(), false);
+                last_tx_err = Some(e);
+            }
+        }
+    };
     loop {
         if stop.load(Ordering::Relaxed) {
             break;
@@ -325,20 +360,16 @@ fn tx_loop(
             match &mut q[i] {
                 SendEntry::OneShot(_) => {
                     if let SendEntry::OneShot(mut f) = q.remove(i) {
-                        match tx.send(&mut f) {
-                            Ok(()) => on_tx(channel, f),
-                            Err(e) => error!("TX error on channel {channel}: {e}"),
-                        }
+                        let r = tx.send(&mut f);
+                        report_tx(r, f);
                     }
                 }
                 SendEntry::Periodic { frame, period_ms, next, .. } => {
                     if now >= *next {
                         let mut f = frame.clone();
                         *next = now + Duration::from_millis(*period_ms);
-                        match tx.send(&mut f) {
-                            Ok(()) => on_tx(channel, f),
-                            Err(e) => error!("TX error on channel {channel}: {e}"),
-                        }
+                        let r = tx.send(&mut f);
+                        report_tx(r, f);
                     }
                     next_deadline = Some(match next_deadline {
                         Some(t) => t.min(*next),

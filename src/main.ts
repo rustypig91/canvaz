@@ -124,7 +124,12 @@ interface Channel {
     config: ChannelConfig;   // user settings: DBC path + bitrate
     dbc: ParsedDbc | null;   // DBC tree, parsed by open_channel; null until opened
     open: boolean;           // hardware currently open?
+    error?: string | null;   // last fatal channel error; cleared on successful open
 }
+
+// Backend "channel-error" event: fatal means the RX loop died and the channel
+// no longer receives; non-fatal is a TX send failure on a live channel.
+interface ChannelErrorEvent { channel_handle: number; error: string; fatal: boolean; }
 // One simulated message instance; the same message can appear multiple times.
 interface SimMessageConfig {
     channel: string; message_id: number; period_ms: number; running?: boolean;
@@ -1457,8 +1462,9 @@ async function registerChannel(config: ChannelConfig): Promise<RegisterResult> {
 
 // Open a channel by its u32 handle. If root is required the Rust side emits
 // "request-admin-password", the global listener shows the dialog, and open_channel
-// unblocks automatically.
-async function openChannelByHandle(handle: number): Promise<boolean> {
+// unblocks automatically. `quiet` demotes failure logs to debug — used by the
+// automatic recovery retries so a persistently absent device doesn't spam the log.
+async function openChannelByHandle(handle: number, quiet = false): Promise<boolean> {
     const ch = channels.get(handle);
     if (!ch) return false;
     try {
@@ -1474,16 +1480,69 @@ async function openChannelByHandle(handle: number): Promise<boolean> {
         sigKeyCache.delete(handle); // key tables are derived from the DBC just replaced
         pgnMapCache.delete(handle);
         ch.open = true;
+        ch.error = null;
         return true;
     } catch (e) {
         const msg = String(e);
         if (msg === "Sudo authentication cancelled") {
             log("warn", "Cancelled — sudo password required.");
         } else {
-            log("error", `Channel error: ${msg}`);
+            log(quiet ? "debug" : "error", `Channel error: ${msg}`);
+            if (!quiet) { ch.error = msg; renderChannelList(); }
         }
         return false;
     }
+}
+
+// ── Channel error handling / recovery ─────────────────────────────────────────
+// A fatal "channel-error" means the channel's RX loop died (device unplugged,
+// driver failure, bus-off). Close the dead half-open channel, badge it in the
+// channel list, and — while capture is running — retry reopening in the
+// background so replugging the device recovers without a manual restart.
+
+const channelRecoveryTimers = new Map<number, ReturnType<typeof setTimeout>>();
+const CHANNEL_RECOVERY_INTERVAL_MS = 5000;
+
+async function onChannelError(ev: ChannelErrorEvent) {
+    const ch = channels.get(ev.channel_handle);
+    if (!ch) return;
+    const name = channelName(ev.channel_handle);
+    if (!ev.fatal) {
+        // TX failures are already deduped per distinct error in the backend.
+        log("warn", `TX error on ${name}: ${ev.error}`);
+        return;
+    }
+    log("error", `Channel ${name} stopped receiving: ${ev.error}`);
+    ch.error = ev.error;
+    // The RX thread is gone but the hardware handle is still registered as
+    // open; close it so the next open starts from a clean state.
+    try { await invoke("close_channel", { channelHandle: ev.channel_handle }); }
+    catch (e) { log("debug", `Close after channel error failed: ${e}`); }
+    ch.open = false;
+    renderChannelList();
+    if (appRunning) scheduleChannelRecovery(ev.channel_handle);
+}
+
+function scheduleChannelRecovery(handle: number) {
+    if (channelRecoveryTimers.has(handle)) return;
+    channelRecoveryTimers.set(handle, setTimeout(async () => {
+        channelRecoveryTimers.delete(handle);
+        const ch = channels.get(handle);
+        // Stop retrying once capture stops, the channel was removed, or
+        // something else (Start, Reload backends) already reopened it.
+        if (!ch || !appRunning || ch.open) return;
+        if (await openChannelByHandle(handle, true)) {
+            log("info", `Channel ${channelName(handle)} recovered`);
+            renderChannelList();
+            // Backend periodics died with the hardware handle; re-register the
+            // sim entries the user still has marked as running on this channel.
+            for (const [key, entry] of simEntries) {
+                if (entry.channel === handle && entry.running) await startSim(key);
+            }
+        } else {
+            scheduleChannelRecovery(handle);
+        }
+    }, CHANNEL_RECOVERY_INTERVAL_MS));
 }
 
 async function applyChannelDialog() {
@@ -1790,7 +1849,7 @@ async function renderChannelList() {
         item.className = `channel-item${isSelected ? " selected" : ""}`;
         item.dataset.channelHandle = String(h);
         item.innerHTML = `
-      <span class="dot${ch.open ? "" : " closed"}"></span>
+      <span class="dot${ch.open ? "" : ch.error ? " error" : " closed"}"${ch.error ? ` title="${escapeHtml(ch.error)}"` : ""}></span>
       <span class="ch-name" title="${escapeHtml(name === hwName ? name : `${name} (${hwName})`)}">${escapeHtml(name)}<span class="ch-backend label-muted"> ${backend}</span></span>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
       <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}</span>
@@ -2743,6 +2802,9 @@ async function stopApp() {
     updatePauseViewBtn();
     // Close hardware connections; they will reopen on the next Start.
     for (const [handle, ch] of channels) {
+        // A deliberate stop clears error badges — everything is closed now and
+        // the next Start reports fresh errors if the problem persists.
+        ch.error = null;
         if (!ch.open) continue;
         try { await invoke("close_channel", { channelHandle: handle }); }
         catch (e) { log("debug", `Failed to close channel ${ch.info.name}: ${e}`); }
@@ -5149,6 +5211,10 @@ window.addEventListener("DOMContentLoaded", async () => {
 
     // Events — the backend batches frames and emits one event per ~33 ms tick.
     await listen<CanFrameEvent[]>("can-frame-batch", (event) => onCanFrameBatch(event.payload));
+
+    // Channel RX/TX failures surfaced by the backend (device unplugged, bus
+    // errors); fatal ones badge the channel and trigger background recovery.
+    await listen<ChannelErrorEvent>("channel-error", (event) => { onChannelError(event.payload); });
 
     // Sudo password request from the Rust backend — show dialog once, cache in Rust.
     await listen("request-admin-password", async () => {
