@@ -327,6 +327,12 @@ fn read_text_file(path: String) -> Result<String, String> {
     std::fs::read_to_string(&path).map_err(|e| e.to_string())
 }
 
+/// Binary counterpart of `write_text_file`; used e.g. for PNG plot exports.
+#[tauri::command]
+fn write_binary_file(path: String, data: Vec<u8>) -> Result<(), String> {
+    std::fs::write(&path, data).map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 fn file_exists(path: String) -> bool {
     std::path::Path::new(&path).exists()
@@ -453,6 +459,7 @@ pub fn run() {
             get_app_data_dir,
             write_text_file,
             read_text_file,
+            write_binary_file,
             file_exists,
             provide_admin_password,
             get_logs,

@@ -113,7 +113,11 @@ interface CanFrameEvent {
 interface J1939Info { pgn: number; priority: number; sa: number; da: number; }
 
 interface PlotSignalEntry { signal_name: string; channel: string; message_id?: number; }
-interface PlotPaneConfig { signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean; }
+interface PlotPaneConfig {
+    signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean;
+    // Manual Y-axis lock; both set = locked, absent = auto-scale.
+    y_min?: number | null; y_max?: number | null;
+}
 interface ChannelInfo { backend: string; name: string; }
 // create_channel result: the backend is where the name was actually found —
 // the backend searches all of them, so it can differ from the hint we sent.
@@ -214,6 +218,13 @@ interface PlotPane {
     showPoints: boolean;
     hoveredDatasetIndex: number | null;
     zoomed: boolean;
+    // Manual Y-axis lock; null = auto-scale. Persisted in the project.
+    yLock: { min: number; max: number } | null;
+    // Measurement cursor positions in data-x (elapsed seconds), snapped to
+    // samples. Both null = cursors off. Not persisted (positions are only
+    // meaningful within the capture they were placed in).
+    cursorA: number | null;
+    cursorB: number | null;
 }
 
 const plotPanes: PlotPane[] = [];
@@ -230,6 +241,7 @@ let scrollRafId: number | null = null;
 // time, so Chart.js auto-scaling excludes it from Y range. We extend the Y axis
 // via suggestedMin/suggestedMax so the anchor's Y value is always visible.
 function applyYRange(pane: PlotPane) {
+    if (pane.yLock) return; // manual range pinned via options.scales.y.min/max
     let yMin = Infinity, yMax = -Infinity;
     for (const s of pane.series.values()) {
         const arr = s.frozenData ?? s.data;
@@ -318,6 +330,195 @@ let midPan: { startX: number; startMin: number; startMax: number; chartWidth: nu
 // writes, which resetZoom() knows nothing about.
 let preZoomX: { min: number; max: number } | null = null;
 
+
+// ── Measurement cursors ───────────────────────────────────────────────────────
+// Two vertical cursors (A amber, B blue) per pane, placed on the data's time
+// axis so they stay glued to their samples while the view scrolls or zooms.
+// Values and Δs are shown in a readout overlay; lines are drawn by a chart
+// plugin so they survive every Chart.js redraw.
+
+const CURSOR_COLOR_A = "#facc15";
+const CURSOR_COLOR_B = "#38bdf8";
+const CURSOR_GRAB_PX = 6;
+
+// The array a series currently renders from (frozen copy while paused).
+function seriesViewData(s: PlotSeries): { x: number; y: number }[] {
+    return viewPaused && s.frozenData ? s.frozenData : s.data;
+}
+
+// Index of the sample nearest to x (arrays are sorted by x).
+function nearestSampleIdx(arr: { x: number; y: number }[], x: number): number {
+    let lo = 0, hi = arr.length - 1;
+    while (lo < hi) {
+        const mid = (lo + hi) >> 1;
+        if (arr[mid].x < x) lo = mid + 1; else hi = mid;
+    }
+    if (lo > 0 && Math.abs(arr[lo - 1].x - x) < Math.abs(arr[lo].x - x)) return lo - 1;
+    return lo;
+}
+
+// Nearest sample x across all series of the pane; null when the pane is empty.
+function snapToNearestSample(pane: PlotPane, x: number): number | null {
+    let best: number | null = null;
+    let bestDist = Infinity;
+    for (const s of pane.series.values()) {
+        const arr = seriesViewData(s);
+        if (!arr.length) continue;
+        const sx = arr[nearestSampleIdx(arr, x)].x;
+        const d = Math.abs(sx - x);
+        if (d < bestDist) { bestDist = d; best = sx; }
+    }
+    return best;
+}
+
+// Series value at data-x: the sample nearest to x, or null when empty.
+function seriesValueAt(s: PlotSeries, x: number): number | null {
+    const arr = seriesViewData(s);
+    if (!arr.length) return null;
+    return arr[nearestSampleIdx(arr, x)].y;
+}
+
+// Draws the cursor lines. Registered globally; charts that aren't plot panes
+// (inline trace plots) fail the pane lookup and are left untouched.
+const cursorPlugin = {
+    id: "canvazCursors",
+    afterDatasetsDraw(chart: Chart) {
+        const pane = plotPanes.find(p => p.chart === chart);
+        if (!pane || (pane.cursorA === null && pane.cursorB === null)) return;
+        const area = chart.chartArea;
+        const xs = (chart.scales as any)["x"];
+        if (!area || !xs) return;
+        const ctx = chart.ctx;
+        ctx.save();
+        for (const [label, x, color] of [["A", pane.cursorA, CURSOR_COLOR_A], ["B", pane.cursorB, CURSOR_COLOR_B]] as const) {
+            if (x === null) continue;
+            const px = xs.getPixelForValue(x);
+            if (px < area.left || px > area.right) continue;
+            ctx.strokeStyle = color;
+            ctx.lineWidth = 1;
+            ctx.setLineDash([4, 3]);
+            ctx.beginPath();
+            ctx.moveTo(px, area.top);
+            ctx.lineTo(px, area.bottom);
+            ctx.stroke();
+            ctx.setLineDash([]);
+            ctx.fillStyle = color;
+            ctx.fillRect(px - 7, area.top, 14, 13);
+            ctx.fillStyle = "#18181b";
+            ctx.font = "bold 9px sans-serif";
+            ctx.textAlign = "center";
+            ctx.textBaseline = "middle";
+            ctx.fillText(label, px, area.top + 7);
+        }
+        ctx.restore();
+    },
+};
+Chart.register(cursorPlugin as any);
+
+function setPaneCursors(pane: PlotPane, enabled: boolean) {
+    const btn = pane.el.querySelector<HTMLButtonElement>(".btn-cursors")!;
+    const readout = pane.el.querySelector<HTMLElement>(".cursor-readout")!;
+    if (!enabled) {
+        pane.cursorA = pane.cursorB = null;
+        btn.classList.remove("active");
+        readout.style.display = "none";
+        markPaneDirty(pane, true);
+        return;
+    }
+    // Start at 30% / 70% of the visible window, snapped to real samples.
+    const xs = (pane.chart.scales as any)["x"];
+    const a = xs.min + (xs.max - xs.min) * 0.3;
+    const b = xs.min + (xs.max - xs.min) * 0.7;
+    pane.cursorA = snapToNearestSample(pane, a) ?? a;
+    pane.cursorB = snapToNearestSample(pane, b) ?? b;
+    btn.classList.add("active");
+    readout.style.display = "";
+    updateCursorReadout(pane);
+    markPaneDirty(pane, true);
+}
+
+function fmtCursorDt(dt: number): string {
+    return dt >= 1 ? `${dt.toFixed(3)} s` : `${(dt * 1000).toFixed(1)} ms`;
+}
+
+function updateCursorReadout(pane: PlotPane) {
+    const readout = pane.el.querySelector<HTMLElement>(".cursor-readout")!;
+    const { cursorA: a, cursorB: b } = pane;
+    if (a === null || b === null) return;
+    const dt = Math.abs(b - a);
+    const freq = dt > 0 ? ` · ${(1 / dt).toFixed(1 / dt >= 100 ? 0 : 2)} Hz` : "";
+    let html = `<div class="cr-head">Δt ${fmtCursorDt(dt)}${freq}</div>`;
+    html += `<table><tr><th></th><th style="color:${CURSOR_COLOR_A}">A</th><th style="color:${CURSOR_COLOR_B}">B</th><th>Δ</th></tr>`;
+    for (const s of pane.series.values()) {
+        const va = seriesValueAt(s, a);
+        const vb = seriesValueAt(s, b);
+        const f = (v: number | null) => v === null ? "—" : formatSigValue(v, "");
+        const dv = va !== null && vb !== null
+            ? `${vb - va >= 0 ? "+" : ""}${formatSigValue(vb - va, s.unit)}`
+            : "—";
+        html += `<tr><td><span class="cr-dot" style="background:${s.color}"></span>${s.signalName}</td><td>${f(va)}</td><td>${f(vb)}</td><td>${dv}</td></tr>`;
+    }
+    readout.innerHTML = html + "</table>";
+}
+
+// ── Y-axis lock ───────────────────────────────────────────────────────────────
+
+function setYLock(pane: PlotPane, lock: { min: number; max: number } | null, save = true) {
+    pane.yLock = lock;
+    const yScale = (pane.chart.options.scales as any)["y"];
+    const btn = pane.el.querySelector<HTMLButtonElement>(".btn-ylock")!;
+    const wrap = pane.el.querySelector<HTMLElement>(".ylock-inputs")!;
+    if (lock) {
+        yScale.min = lock.min;
+        yScale.max = lock.max;
+        delete yScale.suggestedMin;
+        delete yScale.suggestedMax;
+        btn.classList.add("active");
+        btn.title = "Unlock Y axis (auto-scale)";
+        wrap.style.display = "";
+        wrap.querySelector<HTMLInputElement>(".ylock-min")!.value = fmtNum(lock.min);
+        wrap.querySelector<HTMLInputElement>(".ylock-max")!.value = fmtNum(lock.max);
+    } else {
+        delete yScale.min;
+        delete yScale.max;
+        btn.classList.remove("active");
+        btn.title = "Lock Y axis to current range";
+        wrap.style.display = "none";
+    }
+    markPaneDirty(pane, true);
+    if (save) scheduleAutoSave("plot y-lock changed");
+}
+
+// ── PNG export ────────────────────────────────────────────────────────────────
+
+// Composite the chart canvas onto an opaque background (the chart itself is
+// transparent) and save it via the backend.
+async function exportPanePng(pane: PlotPane) {
+    const src = pane.chart.canvas;
+    const out = document.createElement("canvas");
+    out.width = src.width;
+    out.height = src.height;
+    const ctx = out.getContext("2d")!;
+    const bg = getComputedStyle(pane.el).backgroundColor;
+    ctx.fillStyle = bg && bg !== "rgba(0, 0, 0, 0)" ? bg : "#1b1c20";
+    ctx.fillRect(0, 0, out.width, out.height);
+    ctx.drawImage(src, 0, 0);
+    const names = [...pane.series.values()].map(s => s.signalName).join("_") || "plot";
+    const safeName = names.replace(/[\\/:*?"<>|]/g, "_").slice(0, 80);
+    const path = await dialogSave({
+        defaultPath: `${safeName}.png`,
+        filters: [{ name: "PNG image", extensions: ["png"] }],
+    });
+    if (!path) return;
+    const blob = await new Promise<Blob | null>(res => out.toBlob(res, "image/png"));
+    if (!blob) { log("error", "Failed to encode PNG"); return; }
+    try {
+        await invoke("write_binary_file", { path, data: Array.from(new Uint8Array(await blob.arrayBuffer())) });
+        log("info", `Saved plot image: ${path}`);
+    } catch (e) {
+        log("error", `Failed to save PNG: ${e}`);
+    }
+}
 
 function plotKey(channel: number, messageId: number, signalName: string) {
     return `${channel}::${messageId}::${signalName}`;
@@ -485,7 +686,7 @@ function createPlotPane(): PlotPane {
     const id = `pane-${++paneCounter}`;
 
     // Allocate pane object first so legend callbacks can close over it
-    const pane: PlotPane = { id, el: null!, chart: null!, series: new Map(), interpolation: 'none', showPoints: false, hoveredDatasetIndex: null, zoomed: false };
+    const pane: PlotPane = { id, el: null!, chart: null!, series: new Map(), interpolation: 'none', showPoints: false, hoveredDatasetIndex: null, zoomed: false, yLock: null, cursorA: null, cursorB: null };
 
     const el = document.createElement("div");
     el.className = "plot-pane";
@@ -501,10 +702,18 @@ function createPlotPane(): PlotPane {
         <option value="linear">Linear</option>
         <option value="smooth">Smooth</option>
       </select>
+      <button class="btn-cursors pane-btn" title="Measurement cursors">⌖</button>
+      <button class="btn-ylock pane-btn" title="Lock Y axis to current range">Y</button>
+      <span class="ylock-inputs" style="display:none">
+        <input type="number" step="any" class="ylock-min" title="Y axis minimum">
+        <input type="number" step="any" class="ylock-max" title="Y axis maximum">
+      </span>
+      <button class="btn-export-png pane-btn" title="Save pane as PNG">⤓</button>
       <button class="btn-close-pane" title="Close plot">×</button>
     </div>
     <div class="pane-canvas-wrap">
       <canvas></canvas>
+      <div class="cursor-readout" style="display:none"></div>
     </div>
   `;
     el.querySelector(".btn-close-pane")!.addEventListener("click", () => closePlotPane(id));
@@ -524,7 +733,70 @@ function createPlotPane(): PlotPane {
     const resetZoomBtn = el.querySelector<HTMLButtonElement>(".btn-reset-zoom")!;
     resetZoomBtn.addEventListener("click", () => resetAllZoom());
 
+    el.querySelector<HTMLButtonElement>(".btn-cursors")!.addEventListener("click", () => {
+        setPaneCursors(pane, pane.cursorA === null && pane.cursorB === null);
+    });
+
+    el.querySelector<HTMLButtonElement>(".btn-ylock")!.addEventListener("click", () => {
+        if (pane.yLock) { setYLock(pane, null); return; }
+        // Pin whatever range auto-scaling currently shows.
+        const ys = (pane.chart.scales as any)["y"];
+        setYLock(pane, { min: ys.min, max: ys.max });
+    });
+    const applyYLockInputs = () => {
+        const min = parseFloat(el.querySelector<HTMLInputElement>(".ylock-min")!.value);
+        const max = parseFloat(el.querySelector<HTMLInputElement>(".ylock-max")!.value);
+        if (Number.isFinite(min) && Number.isFinite(max) && min < max) setYLock(pane, { min, max });
+    };
+    el.querySelector<HTMLInputElement>(".ylock-min")!.addEventListener("change", applyYLockInputs);
+    el.querySelector<HTMLInputElement>(".ylock-max")!.addEventListener("change", applyYLockInputs);
+
+    el.querySelector<HTMLButtonElement>(".btn-export-png")!.addEventListener("click", () => { exportPanePng(pane); });
+
     const canvas = el.querySelector<HTMLCanvasElement>("canvas")!;
+
+    // Which cursor line (if any) is within grabbing distance of a canvas x.
+    const cursorHit = (offsetX: number): "a" | "b" | null => {
+        const xs = (pane.chart?.scales as any)?.["x"];
+        if (!xs) return null;
+        const hits: Array<["a" | "b", number]> = [];
+        if (pane.cursorA !== null) hits.push(["a", Math.abs(xs.getPixelForValue(pane.cursorA) - offsetX)]);
+        if (pane.cursorB !== null) hits.push(["b", Math.abs(xs.getPixelForValue(pane.cursorB) - offsetX)]);
+        hits.sort((p, q) => p[1] - q[1]);
+        return hits.length && hits[0][1] <= CURSOR_GRAB_PX ? hits[0][0] : null;
+    };
+
+    // Cursor dragging. Registered BEFORE the chart is created: at-target
+    // listeners fire in registration order, so stopImmediatePropagation()
+    // here keeps the zoom plugin's own mousedown from starting a drag-zoom
+    // when the user grabs a cursor line.
+    canvas.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        const which = cursorHit(e.offsetX);
+        if (!which) return;
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        const move = (ev: MouseEvent) => {
+            const rect = canvas.getBoundingClientRect();
+            const xs = (pane.chart.scales as any)["x"];
+            const raw = xs.getValueForPixel(ev.clientX - rect.left);
+            const clamped = Math.min(xs.max, Math.max(xs.min, raw));
+            const snapped = snapToNearestSample(pane, clamped) ?? clamped;
+            if (which === "a") pane.cursorA = snapped; else pane.cursorB = snapped;
+            updateCursorReadout(pane);
+            markPaneDirty(pane, true);
+        };
+        const up = () => {
+            window.removeEventListener("mousemove", move);
+            window.removeEventListener("mouseup", up);
+        };
+        window.addEventListener("mousemove", move);
+        window.addEventListener("mouseup", up);
+    });
+    canvas.addEventListener("mousemove", (e) => {
+        if (pane.cursorA === null && pane.cursorB === null) return;
+        canvas.style.cursor = cursorHit(e.offsetX) ? "ew-resize" : "";
+    });
 
     canvas.addEventListener("mousedown", (e) => {
         if (e.button !== 1) return;
@@ -2392,6 +2664,8 @@ function buildProject(): Project {
             signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: handleToId(s.channel), message_id: s.messageId })),
             interpolation: pane.interpolation,
             show_points: pane.showPoints,
+            y_min: pane.yLock?.min ?? null,
+            y_max: pane.yLock?.max ?? null,
         })),
         simulate_messages: [...simEntries.values()]
             .filter((e): e is SimMessageEntry => e.kind === "message")
@@ -2556,6 +2830,9 @@ async function applyProject(project: Project) {
             const btn = pane.el.querySelector<HTMLButtonElement>(".btn-show-points")!;
             btn.classList.add("active");
             btn.title = "Show data points: on";
+        }
+        if (paneConfig.y_min != null && paneConfig.y_max != null) {
+            setYLock(pane, { min: paneConfig.y_min, max: paneConfig.y_max }, false);
         }
         pendingPaneSignals.push(paneConfig.signals);
     }
@@ -2736,9 +3013,11 @@ async function startApp() {
     sidebarSnapshot = null;
     updatePauseViewBtn();
 
-    // Clear all plot pane data, reset zoom and X-axis bounds
+    // Clear all plot pane data, reset zoom and X-axis bounds. Cursors are
+    // dropped too: their positions belong to the previous capture's timeline.
     for (const pane of plotPanes) {
         for (const s of pane.series.values()) { s.timestamps.length = 0; s.data.length = 0; s.lastValue = null; s.frozenData = null; }
+        setPaneCursors(pane, false);
         clearPaneZoom(pane);
         const xScale = (pane.chart.options.scales as any)["x"];
         xScale.min = 0;

@@ -54,6 +54,11 @@ pub struct PlotPaneConfig {
     pub interpolation: Option<String>,
     #[serde(default, skip_serializing_if = "is_false")]
     pub show_points: bool,
+    /// Manual Y-axis lock; both present = locked, absent = auto-scale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y_min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub y_max: Option<f64>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -64,6 +69,10 @@ fn is_false(b: &bool) -> bool {
 pub struct PlotSignalEntry {
     pub signal_name: String,
     pub channel: String,
+    /// DBC message id the signal belongs to; disambiguates same-named signals
+    /// in different messages when a pane is restored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
