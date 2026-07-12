@@ -39,6 +39,9 @@ interface DbcSignal {
     // For multiplexed signals (m<v>): the switch value this signal is active
     // for. Absent for plain signals and the switch itself.
     mux_value?: number | null;
+    // IEEE float width from SIG_VALTYPE_ (32 or 64); absent = integer signal.
+    // Float signals have no integer raw value — no quantization applies.
+    float_bits?: number | null;
 }
 
 interface SignalEnumValue {
@@ -2217,6 +2220,9 @@ function physToRaw(sig: DbcSignal, phys: number): number {
     // A degenerate factor of 0 means every raw value encodes the same physical
     // (the offset) — use raw 0 rather than dividing to NaN.
     if (!sig.factor) return 0;
+    // Float signals (SIG_VALTYPE_): the "raw" is the unscaled IEEE value — no
+    // integer rounding.
+    if (sig.float_bits) return (phys - sig.offset) / sig.factor;
     return Math.round((phys - sig.offset) / sig.factor);
 }
 
@@ -2238,6 +2244,9 @@ function clampPhys(sig: DbcSignal, phys: number): number {
 // the single place value limits are enforced.
 function normalizeSignalValue(sig: DbcSignal, phys: number): { phys: number; raw: number } {
     const clampedPhys = clampPhys(sig, phys);
+    // Float signals carry any representable value — clamp to the DBC range but
+    // never snap to an integer raw grid.
+    if (sig.float_bits) return { phys: clampedPhys, raw: physToRaw(sig, clampedPhys) };
     const rr = signalRawRange(sig);
     const raw = Math.min(rr.max, Math.max(rr.min, physToRaw(sig, clampedPhys)));
     return { phys: rawToPhys(sig, raw), raw };
@@ -2338,8 +2347,10 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         ${entry.signals.map((s, i) => {
             const { phys, raw } = normalizeSignalValue(s.def, s.value);
             const rr = signalRawRange(s.def);
+            const isFloat = !!s.def.float_bits;
             // Arrow/spinner step = one raw unit's worth of physical value.
-            const physStep = Number.isFinite(s.def.factor) && s.def.factor !== 0 ? Math.abs(s.def.factor) : "any";
+            // Float signals accept any value — no raw grid to step along.
+            const physStep = !isFloat && Number.isFinite(s.def.factor) && s.def.factor !== 0 ? Math.abs(s.def.factor) : "any";
             const rangeTitle = s.def.max > s.def.min ? `Range: ${fmtNum(s.def.min)} … ${fmtNum(s.def.max)}` : "";
             const enums = s.def.enum_values ?? [];
             const enumSel = enums.length ? `
@@ -2356,9 +2367,9 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             return `
           <div class="sim-signal-row${inactive ? " sim-sig-inactive" : ""}">
             <span class="sim-sig-name" title="${rangeTitle}">${s.def.name}${muxBadge}</span>
-            <input type="number" class="sim-phys-input" data-idx="${i}" value="${fmtNum(phys)}" step="${physStep}"${rangeTitle ? ` min="${s.def.min}" max="${s.def.max}"` : ""} title="Physical value — step ${fmtNum(Math.abs(s.def.factor))}${s.def.unit ? " " + s.def.unit : ""}${rangeTitle ? " — " + rangeTitle : ""}">
+            <input type="number" class="sim-phys-input" data-idx="${i}" value="${fmtNum(phys)}" step="${physStep}"${rangeTitle ? ` min="${s.def.min}" max="${s.def.max}"` : ""} title="Physical value${isFloat ? "" : ` — step ${fmtNum(Math.abs(s.def.factor))}`}${s.def.unit ? " " + s.def.unit : ""}${rangeTitle ? " — " + rangeTitle : ""}">
             <span class="sim-sig-unit label-muted">${s.def.unit || ""}</span>
-            <input type="number" class="sim-raw-input" data-idx="${i}" value="${raw}" step="1" min="${rr.min}" max="${rr.max}" title="Raw value — range ${rr.min} … ${rr.max}">
+            <input type="number" class="sim-raw-input" data-idx="${i}" value="${isFloat ? fmtNum(raw) : raw}"${isFloat ? ` step="any" title="Unscaled IEEE float value"` : ` step="1" min="${rr.min}" max="${rr.max}" title="Raw value — range ${rr.min} … ${rr.max}"`}>
             <span class="sim-sig-raw-lbl label-muted">raw</span>
             ${enumSel}
           </div>`;
@@ -2382,7 +2393,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             const rawInp = row.querySelector<HTMLInputElement>(".sim-raw-input")!;
             const enumSel = row.querySelector<HTMLSelectElement>(".sim-enum-sel");
             physInp.value = fmtNum(phys);
-            rawInp.value = String(raw);
+            rawInp.value = s.def.float_bits ? fmtNum(raw) : String(raw);
             if (enumSel) enumSel.value = (s.def.enum_values ?? []).some(e => e.value === raw) ? String(raw) : "";
             // Changing the multiplexor switch selects a different mux group;
             // re-dim the rows the backend will now skip when encoding.
@@ -2405,7 +2416,9 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         el.querySelectorAll<HTMLInputElement>(".sim-raw-input").forEach(inp => {
             inp.addEventListener("change", () => {
                 const i = parseInt(inp.dataset.idx ?? "0");
-                const raw = parseInt(inp.value) || 0;
+                // parseFloat: float signals take fractional raw values; integer
+                // signals get re-rounded by normalizeSignalValue anyway.
+                const raw = parseFloat(inp.value) || 0;
                 setSignalValue(i, rawToPhys(entry.signals[i].def, raw));
             });
         });
