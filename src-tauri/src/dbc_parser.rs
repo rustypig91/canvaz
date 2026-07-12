@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use can_dbc::{ByteOrder, Dbc, MessageId, MultiplexIndicator, NumericValue, ValueType};
+use can_dbc::{ByteOrder, Dbc, MessageId, MultiplexIndicator, NumericValue, SignalExtendedValueType, ValueType};
 use serde::{Deserialize, Serialize};
 
 use crate::can_communication::CanFrame;
@@ -66,6 +66,11 @@ pub struct ParsedSignal {
     /// their `m<v>` value against the top-level switch like plain mux.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mux_value: Option<i64>,
+    /// IEEE float width from `SIG_VALTYPE_`: 32 or 64. `None` = plain integer
+    /// signal. Float signals reinterpret the extracted bits as f32/f64 before
+    /// factor/offset scaling instead of treating them as an integer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub float_bits: Option<u8>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -149,20 +154,24 @@ impl ParsedMessage {
                 });
                 continue;
             }
-            let raw = raw_signed(
-                extract_bits(data, sig.start_bit, sig.length, sig.little_endian),
-                sig.length,
-                sig.signed,
-            );
-            let physical = decode(
-                data,
-                sig.start_bit,
-                sig.length,
-                sig.little_endian,
-                sig.signed,
-                sig.factor,
-                sig.offset,
-            );
+            let bits = extract_bits(data, sig.start_bit, sig.length, sig.little_endian);
+            let (physical, raw) = if let Some(width) = sig.float_bits {
+                // SIG_VALTYPE_ float/double: the bit pattern IS an IEEE float,
+                // not an integer. Reinterpret, then scale. There is no integer
+                // raw value; report the unscaled float rounded so raw readouts
+                // show something meaningful (float→int casts saturate).
+                let base = if width == 32 {
+                    f32::from_bits(bits as u32) as f64
+                } else {
+                    f64::from_bits(bits)
+                };
+                (base * sig.factor + sig.offset, base.round() as i64)
+            } else {
+                (
+                    apply_scaling(bits, sig.length, sig.signed, sig.factor, sig.offset),
+                    raw_signed(bits, sig.length, sig.signed),
+                )
+            };
             decoded_signals.push(DecodedCanSignal {
                 name: sig.name.clone(),
                 physical,
@@ -200,7 +209,19 @@ impl ParsedMessage {
                 continue;
             }
             if let Some(&v) = signal_values.get(&sig.name) {
-                encode(&mut buf, v, sig.start_bit, sig.length, sig.little_endian, sig.factor, sig.offset);
+                if let Some(width) = sig.float_bits {
+                    // Float signal: unscale to the IEEE base value and pack its
+                    // bit pattern — no integer rounding anywhere.
+                    let base = if sig.factor == 0.0 { 0.0 } else { (v - sig.offset) / sig.factor };
+                    let bits = if width == 32 {
+                        f32::to_bits(base as f32) as u64
+                    } else {
+                        f64::to_bits(base)
+                    };
+                    pack_bits(&mut buf, bits, sig.start_bit, sig.length, sig.little_endian);
+                } else {
+                    encode(&mut buf, v, sig.start_bit, sig.length, sig.little_endian, sig.factor, sig.offset);
+                }
             }
         }
         buf
@@ -254,6 +275,11 @@ impl ParsedDbc {
                         MultiplexIndicator::MultiplexorAndMultiplexedSignal(v) => (true, Some(v as i64)),
                         MultiplexIndicator::Plain => (false, None),
                     };
+                    let float_bits = match dbc.extended_value_type_for_signal(msg.id, &sig.name) {
+                        Some(SignalExtendedValueType::IEEEfloat32Bit) => Some(32),
+                        Some(SignalExtendedValueType::IEEEdouble64bit) => Some(64),
+                        _ => None,
+                    };
                     ParsedSignal {
                         name: sig.name.clone(),
                         message_id: raw_id,
@@ -270,6 +296,7 @@ impl ParsedDbc {
                         enum_values,
                         multiplexor,
                         mux_value,
+                        float_bits,
                     }
                 })
                 .collect();
@@ -329,11 +356,6 @@ impl ParsedDbc {
         Some((msg.decode_data(&frame.data), msg.id))
     }
 
-}
-
-fn decode(data: &[u8], start_bit: u64, length: u64, little_endian: bool, signed: bool, factor: f64, offset: f64) -> f64 {
-    let raw = extract_bits(data, start_bit, length, little_endian);
-    apply_scaling(raw, length, signed, factor, offset)
 }
 
 fn encode(data: &mut [u8], value: f64, start_bit: u64, length: u64, little_endian: bool, factor: f64, offset: f64) {
@@ -506,6 +528,53 @@ mod tests {
         let ext = dbc.messages.get(&0x123).expect("extended message keyed by its 29-bit id");
         assert!(ext.is_extended, "29-bit message with id ≤ 0x7FF must keep the extended flag");
         assert!(!dbc.messages.get(&768).expect("standard message").is_extended);
+    }
+
+    /// One float32 signal (factor 2, offset 10) and one double64 signal in
+    /// separate messages, declared via SIG_VALTYPE_.
+    fn float_dbc() -> ParsedDbc {
+        let path = std::env::temp_dir().join("canvaz_test_float.dbc");
+        let content = "VERSION \"\"\n\nNS_ :\n\nBS_:\n\nBU_:\n\nBO_ 512 FMsg: 8 Vector__XXX\n \
+             SG_ F32 : 0|32@1- (2,10) [0|0] \"V\" Vector__XXX\n\nBO_ 513 DMsg: 8 Vector__XXX\n \
+             SG_ F64 : 0|64@1- (1,0) [0|0] \"\" Vector__XXX\n\n\
+             SIG_VALTYPE_ 512 F32 : 1;\nSIG_VALTYPE_ 513 F64 : 2;\n";
+        std::fs::write(&path, content).expect("write temp dbc");
+        ParsedDbc::new(path.to_str().unwrap()).expect("parse dbc")
+    }
+
+    #[test]
+    fn float_signals_decode_as_ieee_not_integer() {
+        let dbc = float_dbc();
+
+        // f32 1.5 = 0x3FC00000, little-endian bytes [00 00 C0 3F].
+        // physical = 1.5 × 2 + 10 = 13. Integer decode of the same bytes would
+        // give 0x3FC00000 × 2 + 10 — wildly wrong.
+        let msg = dbc.messages.get(&512).expect("F32 message");
+        assert_eq!(msg.signals[0].float_bits, Some(32));
+        let d = msg.decode_data(&[0x00, 0x00, 0xC0, 0x3F, 0, 0, 0, 0]);
+        assert_eq!(d.signals[0].physical, 13.0);
+
+        // f64 2.5 = 0x4004000000000000, little-endian bytes.
+        let msg = dbc.messages.get(&513).expect("F64 message");
+        assert_eq!(msg.signals[0].float_bits, Some(64));
+        let d = msg.decode_data(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x40]);
+        assert_eq!(d.signals[0].physical, 2.5);
+    }
+
+    #[test]
+    fn float_signals_encode_roundtrip() {
+        let dbc = float_dbc();
+        let msg = dbc.messages.get(&512).expect("F32 message");
+        let values: HashMap<String, f64> = [("F32".to_string(), 13.0)].into();
+        let buf = msg.encode_signals(&values);
+        assert_eq!(&buf[..4], &[0x00, 0x00, 0xC0, 0x3F], "13 unscales to f32 1.5");
+        assert_eq!(msg.decode_data(&buf).signals[0].physical, 13.0);
+
+        // Fractional physical values must survive without integer quantization.
+        let msg = dbc.messages.get(&513).expect("F64 message");
+        let values: HashMap<String, f64> = [("F64".to_string(), 0.123456789)].into();
+        let buf = msg.encode_signals(&values);
+        assert_eq!(msg.decode_data(&buf).signals[0].physical, 0.123456789);
     }
 
     #[test]
