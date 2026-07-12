@@ -698,6 +698,49 @@ body.resizing {
 }
 .pane-canvas-wrap canvas { width: 100% !important; height: 100% !important; }
 
+/* Y-axis lock: min/max inputs shown in the pane header while locked. */
+.ylock-inputs { display: inline-flex; gap: 4px; align-items: center; }
+.ylock-inputs input {
+  width: 64px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  color: var(--text);
+  font-size: 11px;
+  padding: 1px 4px;
+  height: 18px;
+  box-sizing: border-box;
+}
+
+/* Measurement-cursor readout: per-series values at cursors A/B and their Δ,
+   overlaid on the pane. pointer-events none so it never blocks chart input. */
+.cursor-readout {
+  position: absolute;
+  top: 10px;
+  right: 14px;
+  z-index: 5;
+  pointer-events: none;
+  background: rgba(23, 24, 28, 0.88);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 11px;
+  color: var(--text);
+}
+.cursor-readout .cr-head { font-weight: 600; margin-bottom: 3px; }
+.cursor-readout table { border-collapse: collapse; }
+.cursor-readout th { font-weight: 600; }
+.cursor-readout th, .cursor-readout td { padding: 1px 5px; text-align: right; white-space: nowrap; }
+.cursor-readout td:first-child { text-align: left; }
+.cr-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: middle;
+}
+
 .drop-zone {
   height: 38px;
   flex-shrink: 0;
