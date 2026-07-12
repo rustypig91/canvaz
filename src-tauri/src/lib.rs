@@ -174,6 +174,9 @@ struct SendFrameCmd {
     channel_handle: u32,
     can_id: u32,
     data: Vec<u8>,
+    /// Explicit frame format; omitted (None) falls back to inferring it from
+    /// the id value (> 0x7FF ⇒ extended).
+    is_extended: Option<bool>,
 }
 
 #[tauri::command]
@@ -182,7 +185,7 @@ fn send_frame(cmd: SendFrameCmd, state: State<'_, TauriState>) -> Result<(), Str
         .can_manager
         .lock()
         .map_err(|e| e.to_string())?
-        .send_frame(cmd.channel_handle, cmd.can_id, cmd.data)
+        .send_frame(cmd.channel_handle, cmd.can_id, cmd.data, cmd.is_extended)
 }
 
 #[derive(Deserialize)]
@@ -191,6 +194,9 @@ struct AddPeriodicFrameCmd {
     can_id: u32,
     data: Vec<u8>,
     period_ms: u64,
+    /// Explicit frame format; omitted (None) falls back to inferring it from
+    /// the id value (> 0x7FF ⇒ extended).
+    is_extended: Option<bool>,
 }
 
 #[tauri::command]
@@ -200,7 +206,7 @@ fn add_periodic_frame(cmd: AddPeriodicFrameCmd, state: State<'_, TauriState>) ->
         cmd.channel_handle,
         RawFrame {
             can_id: cmd.can_id,
-            is_extended: cmd.can_id > 0x7FF,
+            is_extended: cmd.is_extended.unwrap_or(cmd.can_id > 0x7FF),
             data: cmd.data,
             timestamp_ms: None,
         },

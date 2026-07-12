@@ -598,13 +598,16 @@ impl CanManager {
 
     // ── Send ──────────────────────────────────────────────────────────────────
 
-    pub fn send_frame(&self, handle: u32, can_id: u32, data: Vec<u8>) -> Result<(), String> {
+    /// `is_extended: None` falls back to inferring the frame format from the id
+    /// value (> 0x7FF ⇒ extended); pass an explicit value to send e.g. a 29-bit
+    /// frame whose id fits in 11 bits.
+    pub fn send_frame(&self, handle: u32, can_id: u32, data: Vec<u8>, is_extended: Option<bool>) -> Result<(), String> {
         let (backend_name, hw_index) = self.backend_index(handle)?;
         self.cans.get(&backend_name).ok_or("Backend not found")?.send_once(
             hw_index,
             CanFrame {
                 can_id,
-                is_extended: can_id > 0x7FF,
+                is_extended: is_extended.unwrap_or(can_id > 0x7FF),
                 data,
                 timestamp_ms: None,
             },
@@ -613,6 +616,28 @@ impl CanManager {
 
     pub fn send_message(&self, handle: u32, msg_id: u32, signal_values: &HashMap<String, f64>) -> Result<(), String> {
         let (backend_name, hw_index) = self.backend_index(handle)?;
+        let (data, is_extended) = self.encode_dbc_message(handle, msg_id, signal_values)?;
+        self.cans.get(&backend_name).ok_or("Backend not found")?.send_once(
+            hw_index,
+            CanFrame {
+                can_id: msg_id,
+                is_extended,
+                data,
+                timestamp_ms: None,
+            },
+        )
+    }
+
+    /// Encode `signal_values` against the channel's DBC message and return the
+    /// data plus the message's frame format. The format comes from the DBC's
+    /// extended-id flag, not from the id value — a 29-bit message with an id
+    /// ≤ 0x7FF must still go out as an extended frame.
+    fn encode_dbc_message(
+        &self,
+        handle: u32,
+        msg_id: u32,
+        signal_values: &HashMap<String, f64>,
+    ) -> Result<(Vec<u8>, bool), String> {
         let dbc = {
             let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
             lock.channels
@@ -620,16 +645,11 @@ impl CanManager {
                 .and_then(|c| c.dbc.clone())
                 .ok_or_else(|| "No DBC loaded for this channel".to_string())?
         };
-        let data = dbc.encode_message(msg_id, signal_values)?;
-        self.cans.get(&backend_name).ok_or("Backend not found")?.send_once(
-            hw_index,
-            CanFrame {
-                can_id: msg_id,
-                is_extended: msg_id > 0x7FF,
-                data,
-                timestamp_ms: None,
-            },
-        )
+        let msg = dbc
+            .messages
+            .get(&msg_id)
+            .ok_or_else(|| format!("Message 0x{msg_id:X} not in DBC"))?;
+        Ok((msg.encode_signals(signal_values), msg.is_extended))
     }
 
     pub fn add_periodic_frame(&self, handle: u32, frame: CanFrame, period_ms: u64) -> Result<u64, String> {
@@ -656,19 +676,12 @@ impl CanManager {
         period_ms: u64,
     ) -> Result<u64, String> {
         let (backend_name, hw_index) = self.backend_index(handle)?;
-        let dbc = {
-            let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
-            lock.channels
-                .get(&handle)
-                .and_then(|c| c.dbc.clone())
-                .ok_or_else(|| "No DBC loaded for this channel".to_string())?
-        };
-        let data = dbc.encode_message(msg_id, signal_values)?;
+        let (data, is_extended) = self.encode_dbc_message(handle, msg_id, signal_values)?;
         self.cans.get(&backend_name).ok_or("Backend not found")?.add_periodic(
             hw_index,
             CanFrame {
                 can_id: msg_id,
-                is_extended: msg_id > 0x7FF,
+                is_extended,
                 data,
                 timestamp_ms: None,
             },
