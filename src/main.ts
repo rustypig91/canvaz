@@ -50,6 +50,9 @@ interface DbcMessage {
     id: number;
     name: string;
     dlc: number;
+    // 29-bit (extended) frame format, from bit 31 of the DBC's raw id. The
+    // backend uses it when encoding sends; kept here for display parity.
+    is_extended?: boolean;
     signals: DbcSignal[];
     transmitter?: string | null;
 }
@@ -2191,10 +2194,24 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             const wasRunning = entry.running;
             if (wasRunning) await stopSim(key);
             entry.canId = parseInt((e.target as HTMLInputElement).value, 16) || 0;
+            // An id that doesn't fit in 11 bits can only be an extended frame;
+            // reflect that in the checkbox so the UI matches what will be sent.
+            if (entry.canId > 0x7FF && !entry.isExtended) {
+                entry.isExtended = true;
+                el.querySelector<HTMLInputElement>(".sim-ext-cb")!.checked = true;
+            }
             if (wasRunning) await startSim(key);
         });
-        el.querySelector<HTMLInputElement>(".sim-ext-cb")!.addEventListener("change", (e) => {
-            entry.isExtended = (e.target as HTMLInputElement).checked;
+        el.querySelector<HTMLInputElement>(".sim-ext-cb")!.addEventListener("change", async (e) => {
+            const cb = e.target as HTMLInputElement;
+            // Unchecking is only meaningful while the id fits in 11 bits.
+            if (!cb.checked && entry.canId > 0x7FF) {
+                cb.checked = true;
+                return;
+            }
+            entry.isExtended = cb.checked;
+            // Re-register a running periodic so the new frame format takes effect.
+            if (entry.running) { await stopSim(key); await startSim(key); }
         });
         el.querySelector<HTMLSelectElement>(".sim-dlc-sel")!.addEventListener("change", async (e) => {
             entry.dlc = parseInt((e.target as HTMLSelectElement).value);
@@ -2219,7 +2236,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             });
         });
         el.querySelector(".sim-send-once")!.addEventListener("click", async () => {
-            try { await invoke("send_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc) } }); }
+            try { await invoke("send_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), is_extended: entry.isExtended } }); }
             catch (e) { log("error", `Send error: ${e}`); }
         });
     }
@@ -2310,7 +2327,7 @@ async function startSim(key: string) {
         if (entry.kind === "message") {
             handle = await invoke<number>("add_periodic_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), period_ms: entry.periodMs } });
         } else {
-            handle = await invoke<number>("add_periodic_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs } });
+            handle = await invoke<number>("add_periodic_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs, is_extended: entry.isExtended } });
         }
         entry.periodicHandle = handle;
     } catch (e) {

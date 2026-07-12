@@ -30,6 +30,11 @@ pub struct ParsedMessage {
     pub id: u32,
     pub name: String,
     pub dlc: u64,
+    /// 29-bit (extended) frame format, from bit 31 of the DBC's raw id. Kept
+    /// separate from the id value: a 29-bit message whose id happens to be
+    /// ≤ 0x7FF is legal and must still be sent as an extended frame.
+    #[serde(default)]
+    pub is_extended: bool,
     pub signals: Vec<ParsedSignal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transmitter: Option<String>,
@@ -221,9 +226,9 @@ impl ParsedDbc {
 
         let mut messages = HashMap::new();
         for msg in &dbc.messages {
-            let raw_id = match msg.id {
-                MessageId::Standard(id) => u32::from(id),
-                MessageId::Extended(id) => id,
+            let (raw_id, is_extended) = match msg.id {
+                MessageId::Standard(id) => (u32::from(id), false),
+                MessageId::Extended(id) => (id, true),
             };
             let msg_name = msg.name.clone();
 
@@ -280,6 +285,7 @@ impl ParsedDbc {
                     id: raw_id,
                     name: msg_name,
                     dlc: msg.size,
+                    is_extended,
                     signals,
                     transmitter,
                 },
@@ -287,11 +293,11 @@ impl ParsedDbc {
         }
 
         self.pgn_index = messages
-            .keys()
-            .filter(|&&id| id > 0x7FF)
-            .map(|&id| {
-                let j = crate::j1939::decode_id(id);
-                ((j.pgn << 8) | j.sa as u32, id)
+            .values()
+            .filter(|m| m.is_extended)
+            .map(|m| {
+                let j = crate::j1939::decode_id(m.id);
+                ((j.pgn << 8) | j.sa as u32, m.id)
             })
             .collect();
         self.messages = messages;
@@ -323,13 +329,6 @@ impl ParsedDbc {
         Some((msg.decode_data(&frame.data), msg.id))
     }
 
-    /// Encode signal values for `msg_id` into a data buffer.
-    pub fn encode_message(&self, msg_id: u32, signal_values: &HashMap<String, f64>) -> Result<Vec<u8>, String> {
-        self.messages
-            .get(&msg_id)
-            .map(|msg| msg.encode_signals(signal_values))
-            .ok_or_else(|| format!("Message 0x{:X} not in DBC", msg_id))
-    }
 }
 
 fn decode(data: &[u8], start_bit: u64, length: u64, little_endian: bool, signed: bool, factor: f64, offset: f64) -> f64 {
@@ -489,6 +488,24 @@ mod tests {
              SG_ Always : 24|8@1+ (1,0) [0|255] \"\" Vector__XXX\n";
         std::fs::write(&path, content).expect("write temp dbc");
         ParsedDbc::new(path.to_str().unwrap()).expect("parse dbc")
+    }
+
+    #[test]
+    fn extended_flag_comes_from_dbc_bit31_not_id_value() {
+        let path = std::env::temp_dir().join("canvaz_test_extid.dbc");
+        // BO_ 0x80000123: extended-id flag (bit 31) set with a 29-bit id of
+        // 0x123 — an id that would pass for standard if inferred from its value.
+        let content = format!(
+            "VERSION \"\"\n\nNS_ :\n\nBS_:\n\nBU_:\n\nBO_ {} ExtLow: 8 Vector__XXX\n \
+             SG_ A : 0|8@1+ (1,0) [0|255] \"\" Vector__XXX\n\nBO_ 768 Std: 8 Vector__XXX\n \
+             SG_ B : 0|8@1+ (1,0) [0|255] \"\" Vector__XXX\n",
+            0x8000_0123u32
+        );
+        std::fs::write(&path, content).expect("write temp dbc");
+        let dbc = ParsedDbc::new(path.to_str().unwrap()).expect("parse dbc");
+        let ext = dbc.messages.get(&0x123).expect("extended message keyed by its 29-bit id");
+        assert!(ext.is_extended, "29-bit message with id ≤ 0x7FF must keep the extended flag");
+        assert!(!dbc.messages.get(&768).expect("standard message").is_extended);
     }
 
     #[test]
