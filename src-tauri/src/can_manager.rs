@@ -69,7 +69,9 @@ struct CanFrameEvent {
     /// holds the same parsed DBC and derives them by position, which keeps the
     /// per-frame payload free of strings (they dominated IPC/GC churn at high
     /// frame rates). Raw values survive the f64 round-trip up to 2^53 — the same
-    /// limit JSON numbers already imposed.
+    /// limit JSON numbers already imposed. Signals of inactive multiplexer
+    /// groups are NaN pairs, which serde_json serializes as null — the frontend
+    /// skips those, keeping positions aligned with the DBC signal list.
     signals: Vec<f64>,
 }
 
@@ -911,6 +913,32 @@ fn ingest_frame(
     };
     let message_name = decoded_msg.as_ref().map(|m| m.name.clone());
 
+    // Interleaved [value, raw] pairs covering *every* signal of the DBC message
+    // (decode preserves order), so the frontend's position-based name lookup
+    // stays aligned even for multiplexed messages. Signals of inactive mux
+    // groups become NaN pairs — serde_json emits them as null. Storage keeps
+    // only active signals: history/export must not contain garbage samples.
+    let mut sig_data: Vec<f64> = Vec::new();
+    let mut stored_signals: Vec<StoredSignal> = Vec::new();
+    if let Some(m) = decoded_msg {
+        sig_data.reserve(m.signals.len() * 2);
+        for s in m.signals {
+            if s.active {
+                sig_data.push(s.physical);
+                sig_data.push(s.raw as f64);
+                stored_signals.push(StoredSignal {
+                    name: s.name,
+                    value: s.physical,
+                    raw: s.raw,
+                    unit: s.unit,
+                });
+            } else {
+                sig_data.push(f64::NAN);
+                sig_data.push(f64::NAN);
+            }
+        }
+    }
+
     let stored = StoredFrame {
         can_id: raw.can_id,
         is_extended: raw.is_extended,
@@ -921,28 +949,8 @@ fn ingest_frame(
         j1939: j1939_info,
         reassembled,
         dbc_msg_id,
-        signals: decoded_msg
-            .map(|m| {
-                m.signals
-                    .into_iter()
-                    .map(|s| StoredSignal {
-                        name: s.name,
-                        value: s.physical,
-                        raw: s.raw,
-                        unit: s.unit,
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        signals: stored_signals,
     };
-
-    // Interleaved [value, raw] pairs, in the same order the DBC lists the
-    // message's signals (decode preserves it).
-    let mut sig_data: Vec<f64> = Vec::with_capacity(stored.signals.len() * 2);
-    for s in &stored.signals {
-        sig_data.push(s.value);
-        sig_data.push(s.raw as f64);
-    }
 
     let event = CanFrameEvent {
         channel_handle: handle,
