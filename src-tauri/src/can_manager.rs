@@ -79,6 +79,16 @@ fn is_false(b: &bool) -> bool {
     !b
 }
 
+/// Emitted as a "channel-error" webview event when a channel's RX loop dies
+/// (`fatal: true` — the channel no longer receives) or a send fails
+/// (`fatal: false`). Rare, so emitted directly rather than batched.
+#[derive(Debug, Clone, Serialize)]
+struct ChannelErrorEvent {
+    channel_handle: u32,
+    error: String,
+    fatal: bool,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FrameInfo {
     pub channel_handle: u32,
@@ -278,14 +288,13 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
     #[cfg(feature = "kvaser")]
     match KvaserBackend::new() {
         Ok(backend) => {
-            let sh_rx = Arc::clone(shared);
-            let sh_tx = Arc::clone(shared);
             cans.insert(
                 "kvaser".to_string(),
                 Can::new(
                     backend,
-                    make_frame_callback("kvaser".into(), sh_rx, "rx"),
-                    make_frame_callback("kvaser".into(), sh_tx, "tx"),
+                    make_frame_callback("kvaser".into(), Arc::clone(shared), "rx"),
+                    make_frame_callback("kvaser".into(), Arc::clone(shared), "tx"),
+                    make_error_callback("kvaser".into(), Arc::clone(shared)),
                 ),
             );
             info!("Kvaser backend initialized successfully");
@@ -296,14 +305,13 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
     #[cfg(feature = "pcan")]
     match PcanBackend::new() {
         Ok(backend) => {
-            let sh_rx = Arc::clone(shared);
-            let sh_tx = Arc::clone(shared);
             cans.insert(
                 "pcan".to_string(),
                 Can::new(
                     backend,
-                    make_frame_callback("pcan".into(), sh_rx, "rx"),
-                    make_frame_callback("pcan".into(), sh_tx, "tx"),
+                    make_frame_callback("pcan".into(), Arc::clone(shared), "rx"),
+                    make_frame_callback("pcan".into(), Arc::clone(shared), "tx"),
+                    make_error_callback("pcan".into(), Arc::clone(shared)),
                 ),
             );
             info!("PCAN backend initialized successfully");
@@ -315,14 +323,13 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
 
     #[cfg(any(feature = "linux-can", target_os = "linux"))]
     {
-        let sh_rx = Arc::clone(shared);
-        let sh_tx = Arc::clone(shared);
         cans.insert(
             "socketcan".to_string(),
             Can::new(
                 SocketCanBackend,
-                make_frame_callback("socketcan".into(), sh_rx, "rx"),
-                make_frame_callback("socketcan".into(), sh_tx, "tx"),
+                make_frame_callback("socketcan".into(), Arc::clone(shared), "rx"),
+                make_frame_callback("socketcan".into(), Arc::clone(shared), "tx"),
+                make_error_callback("socketcan".into(), Arc::clone(shared)),
             ),
         );
         info!("SocketCAN backend initialized successfully");
@@ -883,6 +890,30 @@ fn make_frame_callback(
         if let Some(frame) = completed {
             ingest_frame(&mut lock, handle, protocol, dbc.as_deref(), frame, ts, direction, true);
         }
+    }
+}
+
+/// Error callback for a backend: resolves the hardware index to the channel
+/// handle and emits a "channel-error" event. The lock is held only for the
+/// lookup — emitting happens outside it (the callback runs on the RX/TX
+/// thread that is about to exit or keep sending).
+fn make_error_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl Fn(u8, String, bool) + Send + Sync + 'static {
+    move |hw_index, error, fatal| {
+        let resolved = {
+            let Ok(lock) = shared.lock() else { return };
+            lock.index_to_handle
+                .get(&(backend.clone(), hw_index))
+                .map(|&handle| (handle, lock.app.clone()))
+        };
+        let Some((handle, app)) = resolved else { return };
+        let _ = app.emit(
+            "channel-error",
+            &ChannelErrorEvent {
+                channel_handle: handle,
+                error,
+                fatal,
+            },
+        );
     }
 }
 
