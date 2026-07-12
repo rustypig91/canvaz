@@ -34,6 +34,11 @@ interface DbcSignal {
     max: number;
     unit: string;
     enum_values?: SignalEnumValue[];
+    // True for a multiplexor switch signal (M in the DBC).
+    multiplexor?: boolean;
+    // For multiplexed signals (m<v>): the switch value this signal is active
+    // for. Absent for plain signals and the switch itself.
+    mux_value?: number | null;
 }
 
 interface SignalEnumValue {
@@ -97,7 +102,9 @@ interface CanFrameEvent {
     // Decoded signals as interleaved [value, raw, value, raw, …] pairs in DBC
     // message signal order. Names/units/message name are derived from the DBC by
     // position — no strings on the per-frame wire (they dominated GC churn).
-    signals: number[];
+    // Signals of inactive multiplexer groups arrive as null pairs (NaN in Rust,
+    // serialized to null) so positions stay aligned with the DBC signal list.
+    signals: (number | null)[];
 }
 
 interface J1939Info { pgn: number; priority: number; sa: number; da: number; }
@@ -1969,6 +1976,15 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         // Reserve the enum column for the whole message (not per-row) so the raw
         // inputs stay aligned whether or not a given signal has named values.
         const hasEnums = entry.signals.some(s => (s.def.enum_values ?? []).length > 0);
+        // Multiplexed message support: rows of a mux group not selected by the
+        // switch's current value are dimmed — the backend won't encode them.
+        const muxDef = entry.signals.find(s => s.def.multiplexor && s.def.mux_value == null)?.def
+            ?? entry.signals.find(s => s.def.multiplexor)?.def;
+        const currentMuxRaw = () => {
+            const ms = muxDef && entry.signals.find(s => s.def === muxDef);
+            return ms ? normalizeSignalValue(muxDef!, ms.value).raw : null;
+        };
+        const muxRaw0 = currentMuxRaw();
         el.innerHTML = `
       <div class="sim-group-header">
         <span class="sim-kind-badge kind-msg">MSG</span>
@@ -1997,9 +2013,15 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
               <option value="" hidden disabled${enums.some(e => e.value === raw) ? "" : " selected"}>—</option>
               ${enums.map(e => `<option value="${e.value}"${e.value === raw ? " selected" : ""}>${e.description} (${e.value})</option>`).join("")}
             </select>` : "";
+            const muxBadge = s.def.multiplexor
+                ? `<span class="sim-mux-badge" title="Multiplexor switch">M</span>`
+                : s.def.mux_value != null
+                    ? `<span class="sim-mux-badge" title="Active when ${muxDef?.name ?? "switch"} = ${s.def.mux_value}">m${s.def.mux_value}</span>`
+                    : "";
+            const inactive = s.def.mux_value != null && s.def.mux_value !== muxRaw0;
             return `
-          <div class="sim-signal-row">
-            <span class="sim-sig-name" title="${rangeTitle}">${s.def.name}</span>
+          <div class="sim-signal-row${inactive ? " sim-sig-inactive" : ""}">
+            <span class="sim-sig-name" title="${rangeTitle}">${s.def.name}${muxBadge}</span>
             <input type="number" class="sim-phys-input" data-idx="${i}" value="${fmtNum(phys)}" step="${physStep}"${rangeTitle ? ` min="${s.def.min}" max="${s.def.max}"` : ""} title="Physical value — step ${fmtNum(Math.abs(s.def.factor))}${s.def.unit ? " " + s.def.unit : ""}${rangeTitle ? " — " + rangeTitle : ""}">
             <span class="sim-sig-unit label-muted">${s.def.unit || ""}</span>
             <input type="number" class="sim-raw-input" data-idx="${i}" value="${raw}" step="1" min="${rr.min}" max="${rr.max}" title="Raw value — range ${rr.min} … ${rr.max}">
@@ -2028,6 +2050,15 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             physInp.value = fmtNum(phys);
             rawInp.value = String(raw);
             if (enumSel) enumSel.value = (s.def.enum_values ?? []).some(e => e.value === raw) ? String(raw) : "";
+            // Changing the multiplexor switch selects a different mux group;
+            // re-dim the rows the backend will now skip when encoding.
+            if (muxDef && s.def === muxDef) {
+                const mr = currentMuxRaw();
+                el.querySelectorAll(".sim-signal-row").forEach((r, j) => {
+                    const mv = entry.signals[j]?.def.mux_value;
+                    r.classList.toggle("sim-sig-inactive", mv != null && mv !== mr);
+                });
+            }
             if (entry.running) { await stopSim(key); await startSim(key); }
             scheduleAutoSave("sim signal value changed");
         };
@@ -3204,13 +3235,13 @@ interface TraceEntry {
     // TP.DT transfer rather than a frame that actually appeared on the bus.
     reassembled: boolean;
     // Interleaved [value, raw] pairs in DBC message signal order (see CanFrameEvent).
-    signals: number[];
+    signals: (number | null)[];
 }
 
 // Decoded signal values (interleaved [value, raw] pairs) for each rendered trace
 // row, keyed by the row element so the expansion table can show them without
 // re-decoding in TS. Auto-cleared when a row is evicted (element GC'd).
-const traceRowSignals = new WeakMap<HTMLTableRowElement, number[]>();
+const traceRowSignals = new WeakMap<HTMLTableRowElement, (number | null)[]>();
 
 type TraceMode = "overwrite" | "append";
 type TraceDataFormat = "hex" | "dec" | "ascii";
@@ -3566,9 +3597,10 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
             const maxCells = next.querySelectorAll<HTMLElement>(".te-max");
             const enumCells = next.querySelectorAll<HTMLElement>(".te-enum");
             msg.signals.forEach((sig: DbcSignal, i: number) => {
-                const hasVal = 2 * i + 1 < vals.length;
+                // Null pairs mark signals of a multiplexer group not active in this frame.
+                const hasVal = 2 * i + 1 < vals.length && vals[2 * i] != null;
                 if (valCells[i]) {
-                    valCells[i].textContent = hasVal ? formatSigValue(vals[2 * i], "") : "—";
+                    valCells[i].textContent = hasVal ? formatSigValue(vals[2 * i]!, "") : "—";
                     if (hasVal) valCells[i].dataset.tip = `Raw: ${vals[2 * i + 1]}`;
                 }
                 // Keyed by the DBC message id (not the wire id): J1939 frames from
@@ -3584,7 +3616,7 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
                     maxCells[i].textContent = mx !== undefined ? formatSigValue(mx, "") : "—";
                     if (mx !== undefined) maxCells[i].dataset.tip = `Raw: ${physToRaw(sig, mx)}`;
                 }
-                if (enumCells[i]) enumCells[i].textContent = hasVal ? (enumLabelForRaw(sig, vals[2 * i + 1]) || "—") : "—";
+                if (enumCells[i]) enumCells[i].textContent = hasVal ? (enumLabelForRaw(sig, vals[2 * i + 1]!) || "—") : "—";
             });
         }
     }
@@ -3637,7 +3669,8 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
             const n = Math.min(keys.length, ev.signals.length >>> 1);
             for (let i = 0; i < n; i++) {
                 const value = ev.signals[2 * i];
-                const raw = ev.signals[2 * i + 1];
+                if (value == null) continue; // inactive multiplexer group in this frame
+                const raw = ev.signals[2 * i + 1]!;
                 const sigKey = keys[i];
                 signalLastValues.set(sigKey, value);
                 signalLastRaw.set(sigKey, raw);
@@ -3752,6 +3785,23 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
     if (latestOverwrite.size > 0 || appendEntries.length > 0) applyTraceSort();
 }
 
+// Rebuild the interleaved [value, raw] layout from get_frames' named signals.
+// The backend stores only the signals active in each frame, so for multiplexed
+// messages the list can be a subset of the DBC's — align by name against the
+// message's signal order and fill the gaps with null pairs, mirroring the
+// live-event layout.
+function interleaveFrameSignals(f: FrameInfo): (number | null)[] {
+    const msg = dbcMessageFor(f.channel_handle, f.can_id, f.is_extended);
+    if (!msg || msg.signals.length === f.signals.length) {
+        return f.signals.flatMap(s => [s.value, s.raw]);
+    }
+    const byName = new Map(f.signals.map(s => [s.name, s]));
+    return msg.signals.flatMap(sig => {
+        const d = byName.get(sig.name);
+        return d ? [d.value, d.raw] : [null, null];
+    });
+}
+
 async function loadTraceFrames() {
     const frames = await invoke<FrameInfo[]>("get_frames", { handle: null, limit: traceMaxRows });
     const cycleTimes = new Map<string, number>();
@@ -3786,7 +3836,7 @@ async function loadTraceFrames() {
             reassembled: f.reassembled ?? false,
             // get_frames returns named signals; flatten to the interleaved
             // [value, raw] layout used everywhere else (same DBC order).
-            signals: f.signals.flatMap(s => [s.value, s.raw]),
+            signals: interleaveFrameSignals(f),
         };
     }).reverse();
 }
@@ -4473,7 +4523,8 @@ function expandTraceRow(tr: HTMLTableRowElement) {
         + '</tr></thead><tbody>';
     for (let i = 0; i < msg.signals.length; i++) {
         const sig = msg.signals[i];
-        const hasVal = 2 * i + 1 < vals.length;
+        // Null pairs mark signals of a multiplexer group not active in this frame.
+        const hasVal = 2 * i + 1 < vals.length && vals[2 * i] != null;
         // DBC message id, not the wire id — matches the keys written by
         // onCanFrameBatch (J1939 wire ids embed the sender's address).
         const key = plotKey(trHandle, msg.id, sig.name);
@@ -4483,11 +4534,11 @@ function expandTraceRow(tr: HTMLTableRowElement) {
         const rawTip = (v: number | undefined) => v !== undefined ? ` data-tip="Raw: ${physToRaw(sig, v)}"` : "";
         html += `<tr data-sig="${sig.name}">
         <td class="te-name" title="Click to plot">${sig.name}</td>
-        <td class="te-val"${hasVal ? ` data-tip="Raw: ${vals[2 * i + 1]}"` : ""}>${hasVal ? formatSigValue(vals[2 * i], "") : "—"}</td>
+        <td class="te-val"${hasVal ? ` data-tip="Raw: ${vals[2 * i + 1]}"` : ""}>${hasVal ? formatSigValue(vals[2 * i]!, "") : "—"}</td>
         <td class="te-min"${rawTip(mn)}>${fmt(mn)}</td>
         <td class="te-max"${rawTip(mx)}>${fmt(mx)}</td>
         <td class="te-unit">${sig.unit || "—"}</td>`
-            + (hasEnums ? `<td class="te-enum">${hasVal ? (enumLabelForRaw(sig, vals[2 * i + 1]) || "—") : "—"}</td>` : "")
+            + (hasEnums ? `<td class="te-enum">${hasVal ? (enumLabelForRaw(sig, vals[2 * i + 1]!) || "—") : "—"}</td>` : "")
             + '<td class="te-fill"></td>'
             + `</tr>`;
     }

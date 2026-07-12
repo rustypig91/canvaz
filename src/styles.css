@@ -811,6 +811,21 @@ body.resizing {
 .sim-sig-unit { font-size: 11px; }
 .sim-sig-raw-lbl { font-size: 11px; }
 
+/* Multiplexed messages: badge marks the switch (M) and each muxed signal (m<v>);
+   rows of the group not selected by the switch's current value are dimmed —
+   their values are not encoded into the frame. */
+.sim-mux-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 4px;
+  border-radius: 3px;
+  font-size: 10px;
+  line-height: 14px;
+  background: rgba(255,255,255,0.08);
+  color: var(--text-muted);
+}
+.sim-sig-inactive { opacity: 0.45; }
+
 .sim-value-input,
 .sim-phys-input,
 .sim-raw-input {
