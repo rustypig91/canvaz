@@ -156,11 +156,13 @@ kbd {
 }
 
 /* "N periodic TX" — visible only while the simulator is actively sending.
-   Styled as a .bus-chip pill like the channel stats; right-aligned. */
+   Styled as a .bus-chip pill like the channel stats; right-aligned. The dot
+   reuses the chips' .bus-state look in the TX-badge orange. */
 #sim-tx-status {
   display: none;
   margin-left: auto;
 }
+#sim-tx-status .bus-state { background: #fb923c; }
 .bus-chip {
   display: inline-flex;
   align-items: center;
