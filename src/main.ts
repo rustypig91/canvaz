@@ -1846,8 +1846,10 @@ async function onChannelError(ev: ChannelErrorEvent) {
     if (!ch) return;
     const name = channelName(ev.channel_handle);
     if (!ev.fatal) {
-        // TX failures are already deduped per distinct error in the backend.
-        log("warn", `TX error on ${name}: ${ev.error}`);
+        // Debug only: bus trouble is continuously visible in the footer's
+        // bus-stats chips (state dot, error counters, error frames), so a
+        // failing bus shouldn't also flood the message log per send attempt.
+        log("debug", `TX error on ${name}: ${ev.error}`);
         return;
     }
     log("error", `Channel ${name} stopped receiving: ${ev.error}`);

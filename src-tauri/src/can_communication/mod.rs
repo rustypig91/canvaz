@@ -450,7 +450,10 @@ fn tx_loop(
             on_tx(channel, f);
         }
         Err(e) => {
-            error!("TX error on channel {channel}: {e}");
+            // Debug, not error: TX failures are continuously visible in the
+            // bus-stats footer (bus state, error counters), and a failing bus
+            // would otherwise flood the user-facing log via periodic sends.
+            debug!("TX error on channel {channel}: {e}");
             if last_tx_err.as_deref() != Some(e.as_str()) {
                 on_error(channel, e.clone(), false);
                 last_tx_err = Some(e);
