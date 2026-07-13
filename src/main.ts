@@ -2294,12 +2294,23 @@ function simGenerators(entry: SimMessageEntry): Record<string, SimGen> {
     return out;
 }
 
-// Options of the per-signal generator dropdown. Checksum algorithms are
-// flattened into the list — one dropdown instead of a nested algorithm picker.
-const SIM_GEN_OPTIONS: [string, string][] = [
-    ["", "const"], ["ramp", "ramp"], ["sine", "sine"], ["toggle", "toggle"],
-    ["counter", "count"], ["xor8", "xor8"], ["sum8", "sum8"], ["crc8_sae", "crc8"],
+// Options of the per-signal generator dropdown as [value, label, tooltip].
+// Checksum algorithms are flattened into the list — one dropdown instead of a
+// nested algorithm picker.
+const SIM_GEN_OPTIONS: [string, string, string][] = [
+    ["", "const", "Constant — sends the entered value"],
+    ["ramp", "ramp", "Ramp — sawtooth climbing from min to max over the period, then wrapping back to min"],
+    ["sine", "sine", "Sine — oscillates between min and max over the period, starting at the midpoint going up"],
+    ["toggle", "toggle", "Toggle — square wave: min for the first half of the period, max for the second"],
+    ["counter", "count", "Counter — raw value increments by 1 per sent frame, wrapping at the signal width (2^length)"],
+    ["xor8", "xor8", "XOR checksum — XOR of all frame bytes, computed after the other signals (incl. counters) are encoded, with this signal's bits zeroed"],
+    ["sum8", "sum8", "SUM checksum — sum of all frame bytes modulo 256, computed after the other signals (incl. counters) are encoded, with this signal's bits zeroed"],
+    ["crc8_sae", "crc8", "CRC-8 SAE J1850 (poly 0x1D, init/XOR-out 0xFF, AUTOSAR E2E profile 1) — computed after the other signals (incl. counters) are encoded, with this signal's bits zeroed"],
 ];
+
+function simGenTooltip(value: string): string {
+    return SIM_GEN_OPTIONS.find(([v]) => v === value)?.[2] ?? "Value generator";
+}
 
 function simGenSelValue(g: SimGen | null | undefined): string {
     if (!g) return "";
@@ -2415,8 +2426,8 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             const inactive = s.def.mux_value != null && s.def.mux_value !== muxRaw0;
             const genVal = simGenSelValue(s.gen);
             const genSel = `
-            <select class="sim-gen-sel" data-idx="${i}" title="Value generator — const sends the entered value; waveforms, counter and checksums are computed per frame">
-              ${SIM_GEN_OPTIONS.map(([v, label]) => `<option value="${v}"${v === genVal ? " selected" : ""}>${label}</option>`).join("")}
+            <select class="sim-gen-sel" data-idx="${i}" title="${simGenTooltip(genVal)}">
+              ${SIM_GEN_OPTIONS.map(([v, label, tip]) => `<option value="${v}" title="${tip}"${v === genVal ? " selected" : ""}>${label}</option>`).join("")}
             </select>`;
             const wave = isWaveformGen(s.gen);
             return `
@@ -2499,6 +2510,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
                 const i = parseInt(sel.dataset.idx ?? "0");
                 const s = entry.signals[i];
                 const v = sel.value;
+                sel.title = simGenTooltip(v);
                 if (v === "") s.gen = null;
                 else if (v === "counter") s.gen = { mode: "counter" };
                 else if (v === "xor8" || v === "sum8" || v === "crc8_sae") s.gen = { mode: "checksum", algorithm: v };
