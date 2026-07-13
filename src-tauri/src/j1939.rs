@@ -166,6 +166,7 @@ impl TpReassembler {
             is_extended: true,
             data: session.data,
             timestamp_ms: Some(ts),
+            error: None,
         })
     }
 
@@ -184,6 +185,7 @@ mod tests {
             is_extended: true,
             data,
             timestamp_ms: None,
+            error: None,
         }
     }
 

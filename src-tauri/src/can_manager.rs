@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 use crate::app_state::AppState;
-use crate::can_communication::{Can, CanFrame, FrameDataSource};
+use crate::can_communication::{BusStatus, Can, CanFrame, FrameDataSource};
 use crate::dbc_parser::ParsedDbc;
 use crate::j1939::{self, J1939Info, TpReassembler};
 use crate::sim_generator::{build_frame_source, SignalGen};
@@ -65,6 +65,9 @@ struct CanFrameEvent {
     /// TP.DT transfer rather than a frame that actually appeared on the bus.
     #[serde(skip_serializing_if = "is_false")]
     reassembled: bool,
+    /// Bus error frame description; set only on error rows (direction "err").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
     /// Decoded signals as interleaved [value, raw, value, raw, …] pairs in DBC
     /// message signal order. Names/units/message name are NOT sent: the frontend
     /// holds the same parsed DBC and derives them by position, which keeps the
@@ -106,6 +109,9 @@ pub struct FrameInfo {
     /// TP.DT transfer rather than a frame that actually appeared on the bus.
     #[serde(skip_serializing_if = "is_false")]
     pub reassembled: bool,
+    /// Bus error frame description; set only on error rows (direction "err").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     pub signals: Vec<FrameSignal>,
 }
 
@@ -137,6 +143,25 @@ pub struct CreatedChannel {
     pub backend: String,
 }
 
+/// One channel's live health/load numbers, returned by `get_bus_stats`.
+/// Rates cover the interval since the previous `get_bus_stats` call.
+#[derive(Debug, Clone, Serialize)]
+pub struct BusStats {
+    pub channel_handle: u32,
+    /// Received data frames per second.
+    pub rx_fps: f64,
+    /// Transmitted frames per second.
+    pub tx_fps: f64,
+    /// Estimated bus load in percent (0–100), from frame sizes with an
+    /// average stuff-bit allowance against the configured bitrate.
+    pub bus_load: f64,
+    /// Total bus error frames seen since the channel was opened.
+    pub error_frames: u64,
+    /// Latest controller status from the backend; `None` until first report.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<BusStatus>,
+}
+
 // ── Internal frame storage ────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -159,6 +184,8 @@ struct StoredFrame {
     /// True if this row is a synthetic frame reassembled from a J1939 TP.CM /
     /// TP.DT transfer rather than a frame that actually appeared on the bus.
     reassembled: bool,
+    /// Bus error frame description; set only on error rows (direction "err").
+    error: Option<String>,
     /// DBC message id this frame decoded against. On J1939 channels it can
     /// differ from `can_id` (PGN match ignores priority/source-address bits);
     /// signal-history queries key on it.
@@ -167,6 +194,32 @@ struct StoredFrame {
 }
 
 // ── Per-channel data ──────────────────────────────────────────────────────────
+
+/// Cumulative traffic counters plus the latest backend status report. Reset
+/// each time the channel is (re)opened.
+#[derive(Default)]
+struct ChannelStats {
+    rx_frames: u64,
+    tx_frames: u64,
+    /// Estimated wire bits (RX + TX), for the bus-load estimate.
+    wire_bits: u64,
+    error_frames: u64,
+    bus_status: Option<BusStatus>,
+    /// Counter snapshot at the previous `get_bus_stats` call:
+    /// (when, rx_frames, tx_frames, wire_bits). Rates are deltas against it.
+    last_query: Option<(std::time::Instant, u64, u64, u64)>,
+}
+
+/// Estimated number of bits one frame occupies on the wire, including an
+/// average stuff-bit allowance (~1 stuff bit per 5 stuffable bits; worst case
+/// is 1 per 4). Standard frames carry 47 fixed bits (SOF through EOF + IFS) of
+/// which 34 are stuffable; extended frames 67 fixed / 54 stuffable. All data
+/// bits are stuffable.
+fn estimate_frame_bits(dlc: usize, extended: bool) -> u64 {
+    let data_bits = 8 * dlc.min(8) as u64;
+    let (fixed, stuffable) = if extended { (67, 54 + data_bits) } else { (47, 34 + data_bits) };
+    fixed + data_bits + stuffable / 5
+}
 
 struct ChannelData {
     frames: VecDeque<StoredFrame>,
@@ -181,6 +234,10 @@ struct ChannelData {
     /// to send so the bus stays undisturbed rather than the frame silently
     /// getting dropped by the hardware's silent/listen-only mode.
     listen_only: bool,
+    /// Bitrate from the last `open_channel` call; denominator of the bus-load
+    /// estimate. 0 until first opened.
+    bitrate: u32,
+    stats: ChannelStats,
 }
 
 impl ChannelData {
@@ -193,6 +250,8 @@ impl ChannelData {
             protocol: Protocol::None,
             tp: TpReassembler::default(),
             listen_only: false,
+            bitrate: 0,
+            stats: ChannelStats::default(),
         }
     }
 
@@ -229,6 +288,7 @@ impl ChannelData {
                 dlc: f.data.len() as u16,
                 j1939: f.j1939,
                 reassembled: f.reassembled,
+                error: f.error.clone(),
                 data: f.data.clone(),
                 timestamp_ms: f.timestamp_ms,
                 direction: f.direction,
@@ -301,6 +361,7 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
                     make_frame_callback("kvaser".into(), Arc::clone(shared), "rx"),
                     make_frame_callback("kvaser".into(), Arc::clone(shared), "tx"),
                     make_error_callback("kvaser".into(), Arc::clone(shared)),
+                    make_status_callback("kvaser".into(), Arc::clone(shared)),
                 ),
             );
             info!("Kvaser backend initialized successfully");
@@ -318,6 +379,7 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
                     make_frame_callback("pcan".into(), Arc::clone(shared), "rx"),
                     make_frame_callback("pcan".into(), Arc::clone(shared), "tx"),
                     make_error_callback("pcan".into(), Arc::clone(shared)),
+                    make_status_callback("pcan".into(), Arc::clone(shared)),
                 ),
             );
             info!("PCAN backend initialized successfully");
@@ -336,6 +398,7 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
                 make_frame_callback("socketcan".into(), Arc::clone(shared), "rx"),
                 make_frame_callback("socketcan".into(), Arc::clone(shared), "tx"),
                 make_error_callback("socketcan".into(), Arc::clone(shared)),
+                make_status_callback("socketcan".into(), Arc::clone(shared)),
             ),
         );
         info!("SocketCAN backend initialized successfully");
@@ -517,6 +580,8 @@ impl CanManager {
                 ch.protocol = protocol;
                 ch.tp = TpReassembler::default();
                 ch.listen_only = listen_only;
+                ch.bitrate = bitrate;
+                ch.stats = ChannelStats::default();
             }
         }
 
@@ -629,6 +694,7 @@ impl CanManager {
                 is_extended: is_extended.unwrap_or(can_id > 0x7FF),
                 data,
                 timestamp_ms: None,
+                error: None,
             },
         )
     }
@@ -656,6 +722,7 @@ impl CanManager {
                 is_extended,
                 data,
                 timestamp_ms: None,
+                error: None,
             },
         )
     }
@@ -761,6 +828,7 @@ impl CanManager {
                 is_extended,
                 data,
                 timestamp_ms: None,
+                error: None,
             },
             period_ms,
             source,
@@ -816,6 +884,58 @@ impl CanManager {
         }
     }
 
+    /// Per-channel bus statistics for every currently open channel. Rates are
+    /// computed against the counter snapshot taken by the previous call, so a
+    /// single poller (the frontend, at ~1 Hz) gets rates over its own poll
+    /// interval.
+    pub fn get_bus_stats(&self) -> Vec<BusStats> {
+        let open_handles: Vec<u32> = {
+            let Ok(lock) = self.shared.lock() else { return Vec::new() };
+            lock.handle_to_index
+                .iter()
+                .filter(|(_, (backend, hw_index))| {
+                    self.cans.get(backend).is_some_and(|can| can.is_open(*hw_index))
+                })
+                .map(|(&h, _)| h)
+                .collect()
+        };
+
+        let Ok(mut lock) = self.shared.lock() else { return Vec::new() };
+        let now = std::time::Instant::now();
+        let mut out = Vec::new();
+        for handle in open_handles {
+            let Some(ch) = lock.channels.get_mut(&handle) else { continue };
+            let s = &mut ch.stats;
+            let (rx_fps, tx_fps, bus_load) = match s.last_query {
+                Some((t, rx, tx, bits)) => {
+                    let dt = now.duration_since(t).as_secs_f64();
+                    if dt > 0.0 {
+                        let load = if ch.bitrate > 0 {
+                            ((s.wire_bits - bits) as f64 / dt / ch.bitrate as f64 * 100.0).min(100.0)
+                        } else {
+                            0.0
+                        };
+                        ((s.rx_frames - rx) as f64 / dt, (s.tx_frames - tx) as f64 / dt, load)
+                    } else {
+                        (0.0, 0.0, 0.0)
+                    }
+                }
+                None => (0.0, 0.0, 0.0),
+            };
+            s.last_query = Some((now, s.rx_frames, s.tx_frames, s.wire_bits));
+            out.push(BusStats {
+                channel_handle: handle,
+                rx_fps,
+                tx_fps,
+                bus_load,
+                error_frames: s.error_frames,
+                status: s.bus_status,
+            });
+        }
+        out.sort_unstable_by_key(|s| s.channel_handle);
+        out
+    }
+
     pub fn set_window_ms(&self, ms: u64) -> Result<(), String> {
         let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
         lock.window_ms = ms;
@@ -857,7 +977,9 @@ impl CanManager {
                 format!("{:03X}", f.can_id)
             };
             let data_str = f.data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
-            let msg_str = f.message_name.as_deref().unwrap_or("").replace('"', "\"\"");
+            // Error rows have no DBC message; export the error description in
+            // the message column instead.
+            let msg_str = f.message_name.as_deref().or(f.error.as_deref()).unwrap_or("").replace('"', "\"\"");
             let j1939_str = f
                 .j1939
                 .map(|j| format!("{:X},{:02X},{:02X},{}", j.pgn, j.sa, j.da, j.priority))
@@ -988,8 +1110,9 @@ fn make_frame_callback(
         // J1939: feed transport-protocol frames to the reassembler. A completed
         // transfer yields a synthetic frame (announced PGN as id, data longer
         // than 8 bytes) ingested right after the raw frame that completed it.
+        // Error frames have no identifier and are never J1939 traffic.
         let mut completed: Option<CanFrame> = None;
-        if protocol == Protocol::J1939 && raw.is_extended {
+        if protocol == Protocol::J1939 && raw.is_extended && raw.error.is_none() {
             let pgn = j1939::decode_id(raw.can_id).pgn;
             if pgn == j1939::PGN_TP_CM || pgn == j1939::PGN_TP_DT {
                 if let Some(ch) = lock.channels.get_mut(&handle) {
@@ -1001,6 +1124,19 @@ fn make_frame_callback(
         ingest_frame(&mut lock, handle, protocol, dbc.as_deref(), raw, ts, direction, false);
         if let Some(frame) = completed {
             ingest_frame(&mut lock, handle, protocol, dbc.as_deref(), frame, ts, direction, true);
+        }
+    }
+}
+
+/// Status callback for a backend: stores the ~1/s controller status report in
+/// the channel's stats. The frontend picks it up on its next `get_bus_stats`
+/// poll — no webview event needed at this cadence.
+fn make_status_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> impl Fn(u8, BusStatus) + Send + Sync + 'static {
+    move |hw_index, status| {
+        let Ok(mut lock) = shared.lock() else { return };
+        let Some(&handle) = lock.index_to_handle.get(&(backend.clone(), hw_index)) else { return };
+        if let Some(ch) = lock.channels.get_mut(&handle) {
+            ch.stats.bus_status = Some(status);
         }
     }
 }
@@ -1043,10 +1179,28 @@ fn ingest_frame(
     reassembled: bool,
 ) {
     let window_ms = lock.window_ms;
+    let is_error = raw.error.is_some();
+    let direction = if is_error { "err" } else { direction };
 
-    let j1939_info = (protocol == Protocol::J1939 && raw.is_extended).then(|| j1939::decode_id(raw.can_id));
+    // Traffic stats. Synthetic reassembled frames never appeared on the wire
+    // in this form (their TP.DT frames were already counted individually).
+    if let Some(ch) = lock.channels.get_mut(&handle) {
+        if is_error {
+            ch.stats.error_frames += 1;
+        } else if !reassembled {
+            match direction {
+                "tx" => ch.stats.tx_frames += 1,
+                _ => ch.stats.rx_frames += 1,
+            }
+            ch.stats.wire_bits += estimate_frame_bits(raw.data.len(), raw.is_extended);
+        }
+    }
 
+    let j1939_info = (protocol == Protocol::J1939 && raw.is_extended && !is_error).then(|| j1939::decode_id(raw.can_id));
+
+    // Error frames carry no decodable payload.
     let decoded = match protocol {
+        _ if is_error => None,
         Protocol::J1939 => dbc.and_then(|d| d.decode_frame_j1939(&raw)),
         Protocol::None => dbc.and_then(|d| d.decode_frame(&raw)).map(|m| (m, raw.can_id)),
     };
@@ -1091,6 +1245,7 @@ fn ingest_frame(
         message_name,
         j1939: j1939_info,
         reassembled,
+        error: raw.error.clone(),
         dbc_msg_id,
         signals: stored_signals,
     };
@@ -1105,6 +1260,7 @@ fn ingest_frame(
         direction,
         j1939: j1939_info,
         reassembled,
+        error: raw.error,
         signals: sig_data,
     };
 
@@ -1121,4 +1277,25 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::estimate_frame_bits;
+
+    #[test]
+    fn frame_bits_estimate_brackets_reality() {
+        // A standard 8-byte frame is 111 bits before stuffing; with stuffing
+        // it lands between that and the 135-bit worst case.
+        let std8 = estimate_frame_bits(8, false);
+        assert!((111..=135).contains(&std8), "std 8-byte estimate {std8}");
+        // Extended 8-byte: 131 pre-stuffing, ~160 worst case.
+        let ext8 = estimate_frame_bits(8, true);
+        assert!((131..=160).contains(&ext8), "ext 8-byte estimate {ext8}");
+        // More data ⇒ more bits; extended > standard at equal DLC.
+        assert!(estimate_frame_bits(0, false) < std8);
+        assert!(ext8 > std8);
+        // Reassembled J1939 payloads (> 8 bytes) clamp at the 8-byte cost.
+        assert_eq!(estimate_frame_bits(64, false), std8);
+    }
 }

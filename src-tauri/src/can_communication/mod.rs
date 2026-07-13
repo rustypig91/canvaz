@@ -9,6 +9,7 @@ mod pcan;
 mod socketcan;
 
 use log::{debug, error, info};
+use serde::Serialize;
 
 #[cfg(feature = "kvaser")]
 pub use kvaser::KvaserBackend;
@@ -37,6 +38,35 @@ pub struct CanFrame {
     /// both received frames (from hardware clock) and sent frames (post-send).
     /// `None` on frames that have not yet been sent or received.
     pub timestamp_ms: Option<u64>,
+    /// `Some(description)` marks a bus error frame rather than a data frame.
+    /// `data` then carries the backend's raw error payload (if any) and
+    /// `can_id` is 0 — error frames have no meaningful identifier.
+    pub error: Option<String>,
+}
+
+// ── Bus status ────────────────────────────────────────────────────────────────
+
+/// CAN controller fault-confinement state, as reported by the backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BusState {
+    Active,
+    Warning,
+    Passive,
+    BusOff,
+}
+
+/// Controller health snapshot polled from the backend about once a second.
+/// Fields are `None` where the underlying API does not expose the value.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct BusStatus {
+    pub bus_state: Option<BusState>,
+    /// Transmit error counter (TEC).
+    pub tx_err: Option<u32>,
+    /// Receive error counter (REC).
+    pub rx_err: Option<u32>,
+    /// Number of RX overruns.
+    pub overrun: Option<u32>,
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -84,6 +114,11 @@ pub trait TxHandle: Send + 'static {
 pub trait RxHandle: Send + 'static {
     /// Block for at most `timeout_ms` milliseconds. Return `None` on timeout.
     fn receive(&mut self, timeout_ms: u64) -> Result<Option<CanFrame>, String>;
+    /// Controller status (error counters, bus state), polled ~1/s by the RX
+    /// loop. Default: not supported by this backend.
+    fn poll_status(&mut self) -> Option<BusStatus> {
+        None
+    }
     fn close(&mut self);
 }
 
@@ -155,6 +190,8 @@ pub struct Can {
     /// died and the channel no longer receives; `fatal = false` is a TX send
     /// failure on an otherwise live channel.
     on_error: Arc<dyn Fn(u8, String, bool) + Send + Sync + 'static>,
+    /// Called ~1/s with the controller status on backends that support it.
+    on_status: Arc<dyn Fn(u8, BusStatus) + Send + Sync + 'static>,
     admin_password: Option<String>,
 }
 
@@ -164,6 +201,7 @@ impl Can {
         on_rx: impl Fn(u8, CanFrame) + Send + Sync + 'static,
         on_tx: impl Fn(u8, CanFrame) + Send + Sync + 'static,
         on_error: impl Fn(u8, String, bool) + Send + Sync + 'static,
+        on_status: impl Fn(u8, BusStatus) + Send + Sync + 'static,
     ) -> Self {
         Self {
             backend: Box::new(backend),
@@ -171,6 +209,7 @@ impl Can {
             on_rx: Arc::new(on_rx),
             on_tx: Arc::new(on_tx),
             on_error: Arc::new(on_error),
+            on_status: Arc::new(on_status),
             admin_password: None,
         }
     }
@@ -202,7 +241,8 @@ impl Can {
             let stop = Arc::clone(&stop);
             let on_rx = Arc::clone(&self.on_rx);
             let on_error = Arc::clone(&self.on_error);
-            std::thread::spawn(move || rx_loop(rx_handle, stop, channel, on_rx, on_error))
+            let on_status = Arc::clone(&self.on_status);
+            std::thread::spawn(move || rx_loop(rx_handle, stop, channel, on_rx, on_error, on_status))
         };
 
         let tx_thread = {
@@ -355,13 +395,18 @@ impl Drop for Can {
 
 // ── Thread loops ──────────────────────────────────────────────────────────────
 
+/// How often the RX loop polls the backend for controller status.
+const STATUS_POLL_INTERVAL: Duration = Duration::from_secs(1);
+
 fn rx_loop(
     mut rx: Box<dyn RxHandle>,
     stop: Arc<AtomicBool>,
     channel: u8,
     on_rx: Arc<dyn Fn(u8, CanFrame) + Send + Sync>,
     on_error: Arc<dyn Fn(u8, String, bool) + Send + Sync>,
+    on_status: Arc<dyn Fn(u8, BusStatus) + Send + Sync>,
 ) {
+    let mut last_status_poll = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         match rx.receive(50) {
             Ok(Some(frame)) => on_rx(channel, frame),
@@ -372,6 +417,14 @@ fn rx_loop(
                 // channel is dead from here on — let the app surface it.
                 on_error(channel, e, true);
                 break;
+            }
+        }
+        // receive() returns at least every 50 ms, so this fires close to the
+        // intended cadence even on a quiet bus.
+        if last_status_poll.elapsed() >= STATUS_POLL_INTERVAL {
+            last_status_poll = Instant::now();
+            if let Some(status) = rx.poll_status() {
+                on_status(channel, status);
             }
         }
     }
@@ -397,7 +450,10 @@ fn tx_loop(
             on_tx(channel, f);
         }
         Err(e) => {
-            error!("TX error on channel {channel}: {e}");
+            // Debug, not error: TX failures are continuously visible in the
+            // bus-stats footer (bus state, error counters), and a failing bus
+            // would otherwise flood the user-facing log via periodic sends.
+            debug!("TX error on channel {channel}: {e}");
             if last_tx_err.as_deref() != Some(e.as_str()) {
                 on_error(channel, e.clone(), false);
                 last_tx_err = Some(e);

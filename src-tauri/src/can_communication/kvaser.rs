@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use libloading::Library;
 
-use super::{CanBackend, CanFrame, CanOpenError, RxHandle, TxHandle};
+use super::{BusState, BusStatus, CanBackend, CanFrame, CanOpenError, RxHandle, TxHandle};
 
 #[cfg(unix)]
 const CANLIB: &str = "libcanlib.so.1";
@@ -44,6 +44,13 @@ const CANIOCTL_SET_LOCAL_TXECHO: u32 = 32;
 const CAN_DRIVER_NORMAL: u32 = 4;
 const CAN_DRIVER_SILENT: u32 = 1;
 
+// canSTAT_xxx flags returned by canReadStatus (defined in canstat.h).
+const CANSTAT_ERROR_PASSIVE: c_ulong = 0x0000_0001;
+const CANSTAT_BUS_OFF: c_ulong = 0x0000_0002;
+const CANSTAT_ERROR_WARNING: c_ulong = 0x0000_0004;
+// canSTAT_ERROR_ACTIVE (0x08) is the normal state — implied when no fault flag
+// is set, so it has no constant here.
+
 type FnInit = unsafe extern "system" fn();
 type FnUnload = unsafe extern "system" fn() -> i32;
 type FnGetCount = unsafe extern "system" fn(*mut i32) -> i32;
@@ -57,6 +64,8 @@ type FnSetBusOutputControl = unsafe extern "system" fn(i32, u32) -> i32;
 type FnReadWait = unsafe extern "system" fn(i32, *mut c_long, *mut u8, *mut u32, *mut u32, *mut c_ulong, c_ulong) -> i32;
 type FnWriteWait = unsafe extern "system" fn(i32, c_long, *const u8, u32, u32, c_ulong) -> i32;
 type FnGetChannelData = unsafe extern "system" fn(i32, i32, *mut u8, usize) -> i32;
+type FnReadStatus = unsafe extern "system" fn(i32, *mut c_ulong) -> i32;
+type FnReadErrorCounters = unsafe extern "system" fn(i32, *mut u32, *mut u32, *mut u32) -> i32;
 
 struct CanLib {
     _lib: Library,
@@ -73,6 +82,8 @@ struct CanLib {
     set_bus_output_control: FnSetBusOutputControl,
     read_wait: FnReadWait,
     write_wait: FnWriteWait,
+    read_status: FnReadStatus,
+    read_error_counters: FnReadErrorCounters,
 }
 
 // SAFETY: all fields are function pointers or a library handle kept for lifetime.
@@ -106,6 +117,8 @@ impl CanLib {
                 set_bus_output_control: sym!(b"canSetBusOutputControl\0", FnSetBusOutputControl),
                 read_wait: sym!(b"canReadWait\0", FnReadWait),
                 write_wait: sym!(b"canWriteWait\0", FnWriteWait),
+                read_status: sym!(b"canReadStatus\0", FnReadStatus),
+                read_error_counters: sym!(b"canReadErrorCounters\0", FnReadErrorCounters),
                 _lib: lib,
             }))
         }
@@ -267,7 +280,7 @@ impl RxHandle for KvaserRxHandle {
         if s < CAN_OK {
             return Err(format!("canReadWait failed: {}", canlib_err(s)));
         }
-        if flags & (CAN_MSG_ERROR_FRAME | CAN_MSG_RTR | CAN_MSG_TXACK | CAN_MSG_LOCAL_TXACK) != 0 {
+        if flags & (CAN_MSG_RTR | CAN_MSG_TXACK | CAN_MSG_LOCAL_TXACK) != 0 {
             return Ok(None);
         }
         let hw_ms = timestamp as u64;
@@ -279,12 +292,55 @@ impl RxHandle for KvaserRxHandle {
         let (hw_base, wall_base) = h.ts_anchor.unwrap();
         let abs_ms = wall_base.saturating_add(hw_ms.saturating_sub(hw_base));
         let dlc = (dlc as usize).min(8);
+        if flags & CAN_MSG_ERROR_FRAME != 0 {
+            // CANlib gives no per-frame error detail beyond the flag; counters
+            // and bus state come from poll_status.
+            return Ok(Some(CanFrame {
+                can_id: 0,
+                is_extended: false,
+                data: data[..dlc].to_vec(),
+                timestamp_ms: Some(abs_ms),
+                error: Some("Bus error frame".to_string()),
+            }));
+        }
         Ok(Some(CanFrame {
             can_id: id as u32,
             is_extended: (flags & CAN_MSG_EXT) != 0,
             data: data[..dlc].to_vec(),
             timestamp_ms: Some(abs_ms),
+            error: None,
         }))
+    }
+
+    fn poll_status(&mut self) -> Option<BusStatus> {
+        let h = &self.0;
+        let (mut tx_err, mut rx_err, mut ov_err) = (0u32, 0u32, 0u32);
+        let s = unsafe { (h.lib.read_error_counters)(h.handle, &mut tx_err, &mut rx_err, &mut ov_err) };
+        let counters_ok = s >= CAN_OK;
+
+        let mut flags: c_ulong = 0;
+        let s = unsafe { (h.lib.read_status)(h.handle, &mut flags) };
+        let bus_state = (s >= CAN_OK).then(|| {
+            if flags & CANSTAT_BUS_OFF != 0 {
+                BusState::BusOff
+            } else if flags & CANSTAT_ERROR_PASSIVE != 0 {
+                BusState::Passive
+            } else if flags & CANSTAT_ERROR_WARNING != 0 {
+                BusState::Warning
+            } else {
+                BusState::Active
+            }
+        });
+
+        if !counters_ok && bus_state.is_none() {
+            return None;
+        }
+        Some(BusStatus {
+            bus_state,
+            tx_err: counters_ok.then_some(tx_err),
+            rx_err: counters_ok.then_some(rx_err),
+            overrun: counters_ok.then_some(ov_err),
+        })
     }
 
     fn close(&mut self) {}

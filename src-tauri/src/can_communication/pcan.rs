@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use libloading::Library;
 
-use super::{CanBackend, CanFrame, CanOpenError, RxHandle, TxHandle};
+use super::{BusState, BusStatus, CanBackend, CanFrame, CanOpenError, RxHandle, TxHandle};
 
 #[cfg(unix)]
 const PCAN_LIB: &str = "libpcanbasic.so";
@@ -48,6 +48,9 @@ const PCAN_ATTACHED_CHANNELS_COUNT: u8 = 0x2A;
 const PCAN_ATTACHED_CHANNELS: u8      = 0x2B;
 // CAN_SetValue parameter: listen-only mode (no ACKs, no error frames transmitted).
 const PCAN_LISTEN_ONLY: u8 = 0x08;
+// CAN_SetValue parameter: deliver bus error frames through CAN_Read
+// (msg_type PCAN_MESSAGE_ERRFRAME) instead of suppressing them.
+const PCAN_ALLOW_ERROR_FRAMES: u8 = 0x20;
 const PCAN_PARAMETER_OFF: u32 = 0x00;
 const PCAN_PARAMETER_ON: u32  = 0x01;
 
@@ -108,6 +111,7 @@ type FnRead = unsafe extern "system" fn(TPCANHandle, *mut TPCANMsg, *mut TPCANTi
 type FnWrite = unsafe extern "system" fn(TPCANHandle, *mut TPCANMsg) -> TPCANStatus;
 type FnGetValue = unsafe extern "system" fn(TPCANHandle, u8, *mut u8, u32) -> TPCANStatus;
 type FnSetValue = unsafe extern "system" fn(TPCANHandle, u8, *mut u8, u32) -> TPCANStatus;
+type FnGetStatus = unsafe extern "system" fn(TPCANHandle) -> TPCANStatus;
 
 // ── Library wrapper ───────────────────────────────────────────────────────────
 
@@ -119,6 +123,7 @@ struct PcanLib {
     write: FnWrite,
     get_value: FnGetValue,
     set_value: FnSetValue,
+    get_status: FnGetStatus,
 }
 
 // SAFETY: PCAN-Basic is documented as thread-safe for concurrent CAN_Read +
@@ -144,6 +149,7 @@ impl PcanLib {
                 write: sym!(b"CAN_Write\0", FnWrite),
                 get_value: sym!(b"CAN_GetValue\0", FnGetValue),
                 set_value: sym!(b"CAN_SetValue\0", FnSetValue),
+                get_status: sym!(b"CAN_GetStatus\0", FnGetStatus),
                 _lib: lib,
             }))
         }
@@ -311,8 +317,9 @@ impl RxHandle for PcanRxHandle {
             let s_primary = s & !PCAN_ERROR_ANYBUSERR;
 
             if s_primary == PCAN_ERROR_OK {
-                // Skip RTR, status, and error frames — pass only data frames.
-                if msg.msg_type & (PCAN_MESSAGE_RTR | PCAN_MESSAGE_ECHO | PCAN_MESSAGE_STATUS | PCAN_MESSAGE_ERRFRAME) != 0 {
+                // Skip RTR, echo and status frames; error frames pass through
+                // as distinct error rows, everything else as data frames.
+                if msg.msg_type & (PCAN_MESSAGE_RTR | PCAN_MESSAGE_ECHO | PCAN_MESSAGE_STATUS) != 0 {
                     continue;
                 }
                 let dlc = (msg.len as usize).min(8);
@@ -332,11 +339,23 @@ impl RxHandle for PcanRxHandle {
                     let (hw_base, wall_base) = anchor.unwrap();
                     wall_base.saturating_add(hw_ms.saturating_sub(hw_base))
                 };
+                if msg.msg_type & PCAN_MESSAGE_ERRFRAME != 0 {
+                    // PCAN-Basic reports no structured error detail; the raw
+                    // payload is kept as the frame data.
+                    return Ok(Some(CanFrame {
+                        can_id: 0,
+                        is_extended: false,
+                        data: msg.data[..dlc].to_vec(),
+                        timestamp_ms: Some(abs_ms),
+                        error: Some("Bus error frame".to_string()),
+                    }));
+                }
                 return Ok(Some(CanFrame {
                     can_id: msg.id,
                     is_extended: (msg.msg_type & PCAN_MESSAGE_EXTENDED) != 0,
                     data: msg.data[..dlc].to_vec(),
                     timestamp_ms: Some(abs_ms),
+                    error: None,
                 }));
             } else if s_primary == PCAN_ERROR_QRCVEMPTY {
                 if std::time::Instant::now() >= deadline {
@@ -347,6 +366,27 @@ impl RxHandle for PcanRxHandle {
                 return Err(format!("CAN_Read failed: {}", pcan_err(s)));
             }
         }
+    }
+
+    fn poll_status(&mut self) -> Option<BusStatus> {
+        let ch = &*self.0;
+        // SAFETY: handle is a valid initialized channel.
+        let s = unsafe { (ch.lib.get_status)(ch.handle) };
+        // PCAN-Basic exposes no TEC/REC; only the coarse bus state. BUSHEAVY
+        // means an error counter passed 128, which is the error-passive limit.
+        let bus_state = if s & PCAN_ERROR_BUSOFF != 0 {
+            BusState::BusOff
+        } else if s & (PCAN_ERROR_BUSPASSIVE | PCAN_ERROR_BUSHEAVY) != 0 {
+            BusState::Passive
+        } else if s & PCAN_ERROR_BUSLIGHT != 0 {
+            BusState::Warning
+        } else {
+            BusState::Active
+        };
+        Some(BusStatus {
+            bus_state: Some(bus_state),
+            ..BusStatus::default()
+        })
     }
 
     fn close(&mut self) {}
@@ -411,6 +451,15 @@ impl CanBackend for PcanBackend {
         let s = unsafe { (lib.initialize)(pcan_handle, baud, 0, 0, 0) };
         if s & !PCAN_ERROR_ANYBUSERR != PCAN_ERROR_OK {
             return Err(format!("CAN_Initialize failed: {}", pcan_err(s)).into());
+        }
+
+        // Ask the driver to deliver bus error frames through CAN_Read (as
+        // PCAN_MESSAGE_ERRFRAME) — off by default. Requires an initialized
+        // channel, so this comes after CAN_Initialize.
+        let mut err_frames_val: u32 = PCAN_PARAMETER_ON;
+        let s = unsafe { (lib.set_value)(pcan_handle, PCAN_ALLOW_ERROR_FRAMES, &mut err_frames_val as *mut u32 as *mut u8, 4) };
+        if s & !PCAN_ERROR_ANYBUSERR != PCAN_ERROR_OK {
+            log::warn!("CAN_SetValue(PCAN_ALLOW_ERROR_FRAMES) failed: {} — error frames will not be shown", pcan_err(s));
         }
 
         let channel = Arc::new(PcanChannel { lib, handle: pcan_handle, ts_anchor: Mutex::new(None) });

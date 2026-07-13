@@ -217,6 +217,7 @@ fn add_periodic_frame(cmd: AddPeriodicFrameCmd, state: State<'_, TauriState>) ->
             is_extended: cmd.is_extended.unwrap_or(cmd.can_id > 0x7FF),
             data: cmd.data,
             timestamp_ms: None,
+            error: None,
         },
         cmd.period_ms,
     )
@@ -330,6 +331,13 @@ fn get_signal_history(
         .lock()
         .map_err(|e| e.to_string())?
         .get_signal_history(handle, message_id, &signal_name, since_ms))
+}
+
+/// Per-channel bus statistics (frames/sec, bus load, error counters); polled
+/// by the frontend at ~1 Hz while capture is running.
+#[tauri::command]
+fn get_bus_stats(state: State<'_, TauriState>) -> Result<Vec<can_manager::BusStats>, String> {
+    Ok(state.can_manager.lock().map_err(|e| e.to_string())?.get_bus_stats())
 }
 
 #[tauri::command]
@@ -540,6 +548,7 @@ pub fn run() {
             remove_periodic,
             get_frames,
             get_signal_history,
+            get_bus_stats,
             set_window_ms,
             export_frames_csv,
             export_signals_csv,
