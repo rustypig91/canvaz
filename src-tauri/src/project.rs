@@ -1,6 +1,8 @@
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 
+use crate::sim_generator::SignalGen;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Project {
     pub version: u32,
@@ -89,6 +91,9 @@ pub struct SimulateMessage {
 pub struct SimulateMessageSignal {
     pub name: String,
     pub value: f64,
+    /// Value generator (ramp/sine/toggle/counter/checksum); None = constant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator: Option<SignalGen>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

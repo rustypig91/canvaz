@@ -153,7 +153,7 @@ interface ChannelErrorEvent { channel_handle: number; error: string; fatal: bool
 // One simulated message instance; the same message can appear multiple times.
 interface SimMessageConfig {
     channel: string; message_id: number; period_ms: number; running?: boolean;
-    signals: { name: string; value: number }[];
+    signals: { name: string; value: number; generator?: SimGen | null }[];
 }
 
 interface SimRawFrameConfig {
@@ -2286,7 +2286,42 @@ function simSignalValues(entry: SimMessageEntry): Record<string, number> {
     return out;
 }
 
+// Generator map for the backend, keyed by signal name; only signals with a
+// generator appear (constant signals send their value from simSignalValues).
+function simGenerators(entry: SimMessageEntry): Record<string, SimGen> {
+    const out: Record<string, SimGen> = {};
+    for (const s of entry.signals) if (s.gen) out[s.def.name] = s.gen;
+    return out;
+}
+
+// Options of the per-signal generator dropdown. Checksum algorithms are
+// flattened into the list — one dropdown instead of a nested algorithm picker.
+const SIM_GEN_OPTIONS: [string, string][] = [
+    ["", "const"], ["ramp", "ramp"], ["sine", "sine"], ["toggle", "toggle"],
+    ["counter", "count"], ["xor8", "xor8"], ["sum8", "sum8"], ["crc8_sae", "crc8"],
+];
+
+function simGenSelValue(g: SimGen | null | undefined): string {
+    if (!g) return "";
+    return g.mode === "checksum" ? (g.algorithm ?? "xor8") : g.mode;
+}
+
+function isWaveformGen(g: SimGen | null | undefined): boolean {
+    return !!g && (g.mode === "ramp" || g.mode === "sine" || g.mode === "toggle");
+}
+
 // ── Simulate tab ──────────────────────────────────────────────────────────────
+
+// Per-signal value generator, mirroring the backend's serde wire format
+// (internally tagged on "mode"). Waveforms carry min/max/period_ms; checksum
+// carries the algorithm; counter has no parameters.
+interface SimGen {
+    mode: "ramp" | "sine" | "toggle" | "counter" | "checksum";
+    min?: number;
+    max?: number;
+    period_ms?: number;
+    algorithm?: "xor8" | "sum8" | "crc8_sae";
+}
 
 interface SimMessageEntry {
     kind: "message";
@@ -2294,7 +2329,7 @@ interface SimMessageEntry {
     messageId: number;
     messageName: string;
     dlc: number;
-    signals: { def: DbcSignal; value: number }[];
+    signals: { def: DbcSignal; value: number; gen: SimGen | null }[];
     periodMs: number;
     running: boolean;
     periodicHandle: number | null;
@@ -2366,8 +2401,9 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             const physStep = !isFloat && Number.isFinite(s.def.factor) && s.def.factor !== 0 ? Math.abs(s.def.factor) : "any";
             const rangeTitle = s.def.max > s.def.min ? `Range: ${fmtNum(s.def.min)} … ${fmtNum(s.def.max)}` : "";
             const enums = s.def.enum_values ?? [];
+            const generated = s.gen != null;
             const enumSel = enums.length ? `
-            <select class="sim-enum-sel" data-idx="${i}" title="Named values">
+            <select class="sim-enum-sel" data-idx="${i}" title="Named values"${generated ? " disabled" : ""}>
               <option value="" hidden disabled${enums.some(e => e.value === raw) ? "" : " selected"}>—</option>
               ${enums.map(e => `<option value="${e.value}"${e.value === raw ? " selected" : ""}>${e.description} (${e.value})</option>`).join("")}
             </select>` : "";
@@ -2377,26 +2413,42 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
                     ? `<span class="sim-mux-badge" title="Active when ${muxDef?.name ?? "switch"} = ${s.def.mux_value}">m${s.def.mux_value}</span>`
                     : "";
             const inactive = s.def.mux_value != null && s.def.mux_value !== muxRaw0;
+            const genVal = simGenSelValue(s.gen);
+            const genSel = `
+            <select class="sim-gen-sel" data-idx="${i}" title="Value generator — const sends the entered value; waveforms, counter and checksums are computed per frame">
+              ${SIM_GEN_OPTIONS.map(([v, label]) => `<option value="${v}"${v === genVal ? " selected" : ""}>${label}</option>`).join("")}
+            </select>`;
+            const wave = isWaveformGen(s.gen);
             return `
           <div class="sim-signal-row${inactive ? " sim-sig-inactive" : ""}">
             <span class="sim-sig-name" title="${rangeTitle}">${s.def.name}${muxBadge}</span>
-            <input type="number" class="sim-phys-input" data-idx="${i}" value="${fmtNum(phys)}" step="${physStep}"${rangeTitle ? ` min="${s.def.min}" max="${s.def.max}"` : ""} title="Physical value${isFloat ? "" : ` — step ${fmtNum(Math.abs(s.def.factor))}`}${s.def.unit ? " " + s.def.unit : ""}${rangeTitle ? " — " + rangeTitle : ""}">
+            ${genSel}
+            <input type="number" class="sim-phys-input" data-idx="${i}" value="${fmtNum(phys)}" step="${physStep}"${rangeTitle ? ` min="${s.def.min}" max="${s.def.max}"` : ""}${generated ? " disabled" : ""} title="Physical value${isFloat ? "" : ` — step ${fmtNum(Math.abs(s.def.factor))}`}${s.def.unit ? " " + s.def.unit : ""}${rangeTitle ? " — " + rangeTitle : ""}">
             <span class="sim-sig-unit label-muted">${s.def.unit || ""}</span>
-            <input type="number" class="sim-raw-input" data-idx="${i}" value="${isFloat ? fmtNum(raw) : raw}"${isFloat ? ` step="any" title="Unscaled IEEE float value"` : ` step="1" min="${rr.min}" max="${rr.max}" title="Raw value — range ${rr.min} … ${rr.max}"`}>
+            <input type="number" class="sim-raw-input" data-idx="${i}" value="${isFloat ? fmtNum(raw) : raw}"${generated ? " disabled" : ""}${isFloat ? ` step="any" title="Unscaled IEEE float value"` : ` step="1" min="${rr.min}" max="${rr.max}" title="Raw value — range ${rr.min} … ${rr.max}"`}>
             <span class="sim-sig-raw-lbl label-muted">raw</span>
             ${enumSel}
+          </div>
+          <div class="sim-gen-params" data-idx="${i}"${wave ? "" : ` style="display:none"`}>
+            <span class="label-muted">min</span>
+            <input type="number" class="gen-min small-input" step="any" value="${fmtNum(s.gen?.min ?? 0)}">
+            <span class="label-muted">max</span>
+            <input type="number" class="gen-max small-input" step="any" value="${fmtNum(s.gen?.max ?? 0)}">
+            <span class="label-muted">period</span>
+            <input type="number" class="gen-period small-input" min="1" value="${s.gen?.period_ms ?? 1000}">
+            <span class="label-muted">ms</span>
           </div>`;
         }).join("")}
       </div>`;
 
         el.querySelector<HTMLInputElement>(".sim-period")!.addEventListener("input", async (e) => {
-            const p = parseInt((e.target as HTMLInputElement).value) || 100;
-            if (entry.running) { await stopSim(key); entry.periodMs = p; await startSim(key); }
-            else entry.periodMs = p;
+            entry.periodMs = parseInt((e.target as HTMLInputElement).value) || 100;
+            await updateRunningSim(key);
         });
 
         // Commit a new physical value for signal `i`: clamp, store, and refresh the
-        // physical/raw/enum boxes so all three stay consistent. Restarts a running sim.
+        // physical/raw/enum boxes so all three stay consistent. A running sim is
+        // updated in place — no transmission gap.
         const setSignalValue = async (i: number, candidatePhys: number) => {
             const s = entry.signals[i];
             const { phys, raw } = normalizeSignalValue(s.def, candidatePhys);
@@ -2417,7 +2469,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
                     r.classList.toggle("sim-sig-inactive", mv != null && mv !== mr);
                 });
             }
-            if (entry.running) { await stopSim(key); await startSim(key); }
+            await updateRunningSim(key);
             scheduleAutoSave("sim signal value changed");
         };
 
@@ -2442,8 +2494,57 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
                 setSignalValue(i, rawToPhys(entry.signals[i].def, parseInt(sel.value)));
             });
         });
+        el.querySelectorAll<HTMLSelectElement>(".sim-gen-sel").forEach(sel => {
+            sel.addEventListener("change", async () => {
+                const i = parseInt(sel.dataset.idx ?? "0");
+                const s = entry.signals[i];
+                const v = sel.value;
+                if (v === "") s.gen = null;
+                else if (v === "counter") s.gen = { mode: "counter" };
+                else if (v === "xor8" || v === "sum8" || v === "crc8_sae") s.gen = { mode: "checksum", algorithm: v };
+                else {
+                    // Waveform: keep parameters when switching between shapes;
+                    // otherwise default to the signal's DBC range over 1 s.
+                    const prev = isWaveformGen(s.gen) ? s.gen : null;
+                    const hasRange = s.def.max > s.def.min;
+                    s.gen = {
+                        mode: v as "ramp" | "sine" | "toggle",
+                        min: prev?.min ?? (hasRange ? s.def.min : 0),
+                        max: prev?.max ?? (hasRange ? s.def.max : 100),
+                        period_ms: prev?.period_ms ?? 1000,
+                    };
+                }
+                const row = el.querySelectorAll(".sim-signal-row")[i];
+                const params = el.querySelector<HTMLElement>(`.sim-gen-params[data-idx="${i}"]`)!;
+                params.style.display = isWaveformGen(s.gen) ? "" : "none";
+                if (isWaveformGen(s.gen)) {
+                    params.querySelector<HTMLInputElement>(".gen-min")!.value = fmtNum(s.gen!.min!);
+                    params.querySelector<HTMLInputElement>(".gen-max")!.value = fmtNum(s.gen!.max!);
+                    params.querySelector<HTMLInputElement>(".gen-period")!.value = String(s.gen!.period_ms!);
+                }
+                // Generated signals ignore the entered value — disable its inputs.
+                row.querySelectorAll<HTMLInputElement | HTMLSelectElement>(".sim-phys-input, .sim-raw-input, .sim-enum-sel")
+                    .forEach(inp => { inp.disabled = s.gen != null; });
+                await updateRunningSim(key);
+                scheduleAutoSave("sim generator changed");
+            });
+        });
+        el.querySelectorAll<HTMLElement>(".sim-gen-params").forEach(params => {
+            const i = parseInt(params.dataset.idx ?? "0");
+            params.querySelectorAll<HTMLInputElement>("input").forEach(inp => {
+                inp.addEventListener("change", async () => {
+                    const g = entry.signals[i].gen;
+                    if (!isWaveformGen(g)) return;
+                    g!.min = parseFloat(params.querySelector<HTMLInputElement>(".gen-min")!.value) || 0;
+                    g!.max = parseFloat(params.querySelector<HTMLInputElement>(".gen-max")!.value) || 0;
+                    g!.period_ms = Math.max(1, parseInt(params.querySelector<HTMLInputElement>(".gen-period")!.value) || 1000);
+                    await updateRunningSim(key);
+                    scheduleAutoSave("sim generator params changed");
+                });
+            });
+        });
         el.querySelector(".sim-send-once")!.addEventListener("click", async () => {
-            try { await invoke("send_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry) } }); }
+            try { await invoke("send_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry) } }); }
             catch (e) { log("error", `Send error: ${e}`); }
         });
 
@@ -2516,17 +2617,16 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             el.querySelectorAll<HTMLInputElement>(".sim-byte").forEach((inp, i) => {
                 inp.disabled = i >= entry.dlc;
             });
-            if (entry.running) { await stopSim(key); await startSim(key); }
+            await updateRunningSim(key);
         });
         el.querySelector<HTMLInputElement>(".sim-period")!.addEventListener("input", async (e) => {
-            const p = parseInt((e.target as HTMLInputElement).value) || 100;
-            if (entry.running) { await stopSim(key); entry.periodMs = p; await startSim(key); }
-            else entry.periodMs = p;
+            entry.periodMs = parseInt((e.target as HTMLInputElement).value) || 100;
+            await updateRunningSim(key);
         });
         el.querySelectorAll<HTMLInputElement>(".sim-byte").forEach(inp => {
             inp.addEventListener("input", async () => {
                 entry.data[parseInt(inp.dataset.idx ?? "0")] = parseInt(inp.value, 16) || 0;
-                if (entry.running) { await stopSim(key); await startSim(key); }
+                await updateRunningSim(key);
             });
             inp.addEventListener("blur", () => {
                 const i = parseInt(inp.dataset.idx ?? "0");
@@ -2579,7 +2679,7 @@ function addSimMessage(handle: number, msg: DbcMessage) {
     const entry: SimMessageEntry = {
         kind: "message", channel: handle,
         messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
-        signals: msg.signals.map(s => ({ def: s, value: simDefaultValue(s) })),
+        signals: msg.signals.map(s => ({ def: s, value: simDefaultValue(s), gen: null })),
         periodMs: msg.cycle_time_ms ?? 100, running: false, periodicHandle: null,
     };
     simEntries.set(key, entry);
@@ -2629,7 +2729,7 @@ async function startSim(key: string) {
     try {
         let handle: number;
         if (entry.kind === "message") {
-            handle = await invoke<number>("add_periodic_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), period_ms: entry.periodMs } });
+            handle = await invoke<number>("add_periodic_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry), period_ms: entry.periodMs } });
         } else {
             handle = await invoke<number>("add_periodic_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs, is_extended: entry.isExtended } });
         }
@@ -2653,6 +2753,27 @@ async function stopSim(key: string) {
     const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
     if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
     scheduleAutoSave("sim stopped");
+}
+
+// Push an edited entry's current values/generators/period to its running
+// backend periodic in place — the send deadline is preserved, so there is no
+// transmission gap or phase reset (unlike stop + start). No-op when the entry
+// isn't registered (app stopped); falls back to a restart if the in-place
+// update fails (e.g. the handle went stale with a channel recovery).
+async function updateRunningSim(key: string) {
+    const entry = simEntries.get(key);
+    if (!entry || entry.periodicHandle === null) return;
+    try {
+        if (entry.kind === "message") {
+            await invoke("update_periodic_message", { cmd: { channel_handle: entry.channel, periodic_handle: entry.periodicHandle, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry), period_ms: entry.periodMs } });
+        } else {
+            await invoke("update_periodic_frame", { cmd: { channel_handle: entry.channel, periodic_handle: entry.periodicHandle, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs } });
+        }
+    } catch (e) {
+        log("warn", `In-place sim update failed (${e}); restarting entry`);
+        await stopSim(key);
+        await startSim(key);
+    }
 }
 
 // ── Project ───────────────────────────────────────────────────────────────────
@@ -2706,7 +2827,7 @@ function buildProject(): Project {
                 message_id: e.messageId,
                 period_ms: e.periodMs,
                 running: e.running,
-                signals: e.signals.map(s => ({ name: s.def.name, value: s.value })),
+                signals: e.signals.map(s => ({ name: s.def.name, value: s.value, generator: s.gen ?? null })),
             })),
         simulate_raw_frames: [...simEntries.values()]
             .filter((e): e is SimRawEntry => e.kind === "raw")
@@ -3013,9 +3134,10 @@ async function startApp() {
                 continue;
             }
             const prevValues = new Map(entry.signals.map(s => [s.def.name, s.value]));
+            const prevGens = new Map(entry.signals.map(s => [s.def.name, s.gen]));
             entry.messageName = msg.name;
             entry.dlc = msg.dlc;
-            entry.signals = msg.signals.map(s => ({ def: s, value: prevValues.get(s.name) ?? simDefaultValue(s) }));
+            entry.signals = msg.signals.map(s => ({ def: s, value: prevValues.get(s.name) ?? simDefaultValue(s), gen: prevGens.get(s.name) ?? null }));
             simContainer.querySelector(`[data-sim-key="${key}"]`)?.replaceWith(createSimEntryEl(key, entry));
         }
     }
@@ -3087,11 +3209,12 @@ async function startApp() {
             const msg = channels.get(handle)?.dbc?.messages[m.message_id];
             if (!msg) continue;
             const valueByName = new Map(m.signals.map(s => [s.name, s.value]));
+            const genByName = new Map(m.signals.map(s => [s.name, s.generator ?? null]));
             const key = `msg::${++msgEntryCounter}`;
             const simEntry: SimMessageEntry = {
                 kind: "message", channel: handle,
                 messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
-                signals: msg.signals.map(s => ({ def: s, value: valueByName.get(s.name) ?? simDefaultValue(s) })),
+                signals: msg.signals.map(s => ({ def: s, value: valueByName.get(s.name) ?? simDefaultValue(s), gen: genByName.get(s.name) ?? null })),
                 periodMs: m.period_ms, running: m.running ?? false, periodicHandle: null,
             };
             simEntries.set(key, simEntry);

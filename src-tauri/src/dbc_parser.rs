@@ -488,7 +488,10 @@ fn extract_bits(data: &[u8], start_bit: u64, length: u64, little_endian: bool) -
     raw
 }
 
-fn pack_bits(data: &mut [u8], raw: u64, start_bit: u64, length: u64, little_endian: bool) {
+/// Write the low `length` bits of `raw` into the buffer at the signal's bit
+/// position. Also used by the sim generator to stamp counters/checksums into an
+/// already-encoded frame.
+pub(crate) fn pack_bits(data: &mut [u8], raw: u64, start_bit: u64, length: u64, little_endian: bool) {
     if little_endian {
         for i in 0..length {
             let bit_pos = start_bit + i;

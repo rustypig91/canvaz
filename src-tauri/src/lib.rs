@@ -9,6 +9,7 @@ mod dbc_parser;
 mod j1939;
 mod logger;
 mod project;
+mod sim_generator;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -18,6 +19,7 @@ use can_manager::{CanManager, ChannelInfo, FrameInfo, ManagerState, SignalSample
 use dbc_parser::ParsedDbc;
 use project::Project;
 use serde::{Deserialize, Serialize};
+use sim_generator::SignalGen;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tauri::{Manager, State};
 
@@ -158,6 +160,10 @@ struct SendMessageCmd {
     channel_handle: u32,
     message_id: u32,
     signal_values: HashMap<String, f64>,
+    /// Per-signal value generators, evaluated once at t=0 — a one-shot send of
+    /// an E2E-protected message still gets its checksum/counter bytes.
+    #[serde(default)]
+    generators: HashMap<String, SignalGen>,
 }
 
 #[tauri::command]
@@ -166,7 +172,7 @@ fn send_message(cmd: SendMessageCmd, state: State<'_, TauriState>) -> Result<(),
         .can_manager
         .lock()
         .map_err(|e| e.to_string())?
-        .send_message(cmd.channel_handle, cmd.message_id, &cmd.signal_values)
+        .send_message(cmd.channel_handle, cmd.message_id, &cmd.signal_values, &cmd.generators)
 }
 
 #[derive(Deserialize)]
@@ -219,6 +225,10 @@ struct AddPeriodicMessageCmd {
     channel_handle: u32,
     message_id: u32,
     signal_values: HashMap<String, f64>,
+    /// Per-signal value generators (keyed by signal name); signals not listed
+    /// send their constant value from `signal_values`.
+    #[serde(default)]
+    generators: HashMap<String, SignalGen>,
     period_ms: u64,
 }
 
@@ -228,6 +238,52 @@ fn add_periodic_message(cmd: AddPeriodicMessageCmd, state: State<'_, TauriState>
         cmd.channel_handle,
         cmd.message_id,
         &cmd.signal_values,
+        &cmd.generators,
+        cmd.period_ms,
+    )
+}
+
+#[derive(Deserialize)]
+struct UpdatePeriodicMessageCmd {
+    channel_handle: u32,
+    periodic_handle: u64,
+    message_id: u32,
+    signal_values: HashMap<String, f64>,
+    #[serde(default)]
+    generators: HashMap<String, SignalGen>,
+    period_ms: u64,
+}
+
+/// Re-encode a running periodic DBC message and swap it in place — unlike
+/// remove + add there is no transmission gap or phase reset.
+#[tauri::command]
+fn update_periodic_message(cmd: UpdatePeriodicMessageCmd, state: State<'_, TauriState>) -> Result<(), String> {
+    state.can_manager.lock().map_err(|e| e.to_string())?.update_periodic_message(
+        cmd.channel_handle,
+        cmd.periodic_handle,
+        cmd.message_id,
+        &cmd.signal_values,
+        &cmd.generators,
+        cmd.period_ms,
+    )
+}
+
+#[derive(Deserialize)]
+struct UpdatePeriodicFrameCmd {
+    channel_handle: u32,
+    periodic_handle: u64,
+    data: Vec<u8>,
+    period_ms: u64,
+}
+
+/// Swap a running periodic raw frame's data/period in place (id and frame
+/// format changes still go through remove + add).
+#[tauri::command]
+fn update_periodic_frame(cmd: UpdatePeriodicFrameCmd, state: State<'_, TauriState>) -> Result<(), String> {
+    state.can_manager.lock().map_err(|e| e.to_string())?.update_periodic_frame(
+        cmd.channel_handle,
+        cmd.periodic_handle,
+        cmd.data,
         cmd.period_ms,
     )
 }
@@ -477,6 +533,8 @@ pub fn run() {
             send_frame,
             add_periodic_frame,
             add_periodic_message,
+            update_periodic_message,
+            update_periodic_frame,
             remove_periodic,
             get_frames,
             get_signal_history,
