@@ -64,7 +64,6 @@
         <input id="input-window-custom" type="number" min="1" placeholder="sec" />
       </div>
       <span id="status-bar"><span id="status-text"></span></span>
-      <span id="bus-stats"></span>
       <button id="btn-show-log" title="View message log">Log</button>
     </header>
 
@@ -165,6 +164,11 @@
         <div id="log-entries"></div>
       </div>
     </div>
+
+    <!-- Footer: per-channel bus statistics while capture runs -->
+    <footer id="footer">
+      <span id="bus-stats"></span>
+    </footer>
 
     <!-- Channel dialog (add + edit) -->
     <dialog id="dialog-channel">

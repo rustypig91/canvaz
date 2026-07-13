@@ -12,6 +12,7 @@
   --warning: #f59e0b;
   --sidebar-width: 280px;
   --menubar-height: 30px;
+  --footer-height: 26px;
   --toolbar-height: 36px;
   --tabbar-height: 38px;
 }
@@ -146,13 +147,12 @@ kbd {
   to { transform: translateX(calc(100% + 12px)); opacity: 0; }
 }
 
-/* ── Per-channel bus-stats strip (menubar, next to the Log button) ─────────── */
+/* ── Per-channel bus-stats strip (in the footer) ───────────────────────────── */
 #bus-stats {
   display: flex;
   align-items: center;
   gap: 6px;
   flex-shrink: 0;
-  padding-right: 8px;
 }
 .bus-chip {
   display: inline-flex;
@@ -209,7 +209,7 @@ kbd {
   top: var(--menubar-height);
   right: 0;
   width: 520px;
-  max-height: calc(100vh - var(--menubar-height));
+  max-height: calc(100vh - var(--menubar-height) - var(--footer-height));
   background: var(--bg2);
   border: 1px solid var(--border);
   border-top: none;
@@ -369,7 +369,19 @@ kbd {
 /* ── Layout ──────────────────────────────────────────────────────────────── */
 #layout {
   display: flex;
-  height: calc(100vh - var(--menubar-height));
+  height: calc(100vh - var(--menubar-height) - var(--footer-height));
+}
+
+/* ── Footer ──────────────────────────────────────────────────────────────── */
+#footer {
+  display: flex;
+  align-items: center;
+  height: var(--footer-height);
+  padding: 0 8px;
+  background: #111214;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  user-select: none;
 }
 
 /* ── Sidebar ─────────────────────────────────────────────────────────────── */

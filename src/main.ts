@@ -5459,7 +5459,7 @@ function log(level: LogLevel, message: string, opts?: { ts?: string; toConsole?:
 }
 
 // ── Bus statistics strip ──────────────────────────────────────────────────────
-// One compact chip per open channel in the menubar while capture runs: bus
+// One compact chip per open channel in the footer while capture runs: bus
 // state dot, load % and frames/sec, with the full numbers in the tooltip.
 // Polled from the backend at 1 Hz — rates are computed over the poll interval.
 
