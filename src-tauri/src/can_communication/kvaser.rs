@@ -38,6 +38,12 @@ const CAN_ERR_NOMSG: i32 = -2;
 // to other handles open on the same physical channel (including our own RX handle).
 const CANIOCTL_SET_LOCAL_TXECHO: u32 = 32;
 
+// Driver types for canSetBusOutputControl. canDRIVER_SILENT puts the CAN
+// controller's transceiver in listen-only mode: no ACK bit is driven and no
+// error frames are transmitted. Must be set before canBusOn().
+const CAN_DRIVER_NORMAL: u32 = 4;
+const CAN_DRIVER_SILENT: u32 = 1;
+
 type FnInit = unsafe extern "system" fn();
 type FnUnload = unsafe extern "system" fn() -> i32;
 type FnGetCount = unsafe extern "system" fn(*mut i32) -> i32;
@@ -47,6 +53,7 @@ type FnSetBus = unsafe extern "system" fn(i32, c_long, u32, u32, u32, u32, u32) 
 type FnBusOn = unsafe extern "system" fn(i32) -> i32;
 type FnBusOff = unsafe extern "system" fn(i32) -> i32;
 type FnIoCtl = unsafe extern "system" fn(i32, u32, *mut std::ffi::c_void, u32) -> i32;
+type FnSetBusOutputControl = unsafe extern "system" fn(i32, u32) -> i32;
 type FnReadWait = unsafe extern "system" fn(i32, *mut c_long, *mut u8, *mut u32, *mut u32, *mut c_ulong, c_ulong) -> i32;
 type FnWriteWait = unsafe extern "system" fn(i32, c_long, *const u8, u32, u32, c_ulong) -> i32;
 type FnGetChannelData = unsafe extern "system" fn(i32, i32, *mut u8, usize) -> i32;
@@ -63,6 +70,7 @@ struct CanLib {
     bus_on: FnBusOn,
     bus_off: FnBusOff,
     ioctl: FnIoCtl,
+    set_bus_output_control: FnSetBusOutputControl,
     read_wait: FnReadWait,
     write_wait: FnWriteWait,
 }
@@ -95,6 +103,7 @@ impl CanLib {
                 bus_on: sym!(b"canBusOn\0", FnBusOn),
                 bus_off: sym!(b"canBusOff\0", FnBusOff),
                 ioctl: sym!(b"canIoCtl\0", FnIoCtl),
+                set_bus_output_control: sym!(b"canSetBusOutputControl\0", FnSetBusOutputControl),
                 read_wait: sym!(b"canReadWait\0", FnReadWait),
                 write_wait: sym!(b"canWriteWait\0", FnWriteWait),
                 _lib: lib,
@@ -306,6 +315,7 @@ impl CanBackend for KvaserBackend {
         &mut self,
         index: u8,
         bitrate: u32,
+        listen_only: bool,
         _admin_password: Option<&str>,
     ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
         let (freq, tseg1, tseg2, sjw) = bitrate_params(bitrate).ok_or_else(|| {
@@ -332,6 +342,15 @@ impl CanBackend for KvaserBackend {
             }
         };
 
+        // Selects normal vs. silent transceiver mode. Must be called before canBusOn().
+        let set_driver_mode = |h: i32| {
+            let mode = if listen_only { CAN_DRIVER_SILENT } else { CAN_DRIVER_NORMAL };
+            let s = unsafe { (lib.set_bus_output_control)(h, mode) };
+            if s < CAN_OK {
+                log::warn!("canSetBusOutputControl failed: {} — listen-only may not be applied", canlib_err(s));
+            }
+        };
+
         // TX handle: has init access and sets the bitrate.
         let tx_raw = unsafe { (lib.open)(idx, CAN_OPEN_ACCEPT_VIRTUAL) };
         if tx_raw < 0 {
@@ -343,6 +362,7 @@ impl CanBackend for KvaserBackend {
             return Err(format!("canSetBusParams failed: {}", canlib_err(s)).into());
         }
         set_echo_off(tx_raw);
+        set_driver_mode(tx_raw);
         let s = unsafe { (lib.bus_on)(tx_raw) };
         if s < CAN_OK {
             unsafe { (lib.close)(tx_raw) };
@@ -358,6 +378,7 @@ impl CanBackend for KvaserBackend {
         }
         // The RX handle is the one that would receive the echo — see set_echo_off.
         set_echo_off(rx_raw);
+        set_driver_mode(rx_raw);
         let s = unsafe { (lib.bus_on)(rx_raw) };
         if s < CAN_OK {
             unsafe { (lib.bus_off)(tx_raw); (lib.close)(tx_raw); (lib.close)(rx_raw) };

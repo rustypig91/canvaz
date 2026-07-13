@@ -89,10 +89,14 @@ pub trait RxHandle: Send + 'static {
 
 pub trait CanBackend: Send + 'static {
     fn list_channels(&self) -> Vec<String>;
+    /// `listen_only`: open the channel silent (no ACKs, no error flags injected)
+    /// so the tool cannot disturb the bus. Backends that cannot honor it should
+    /// still open normally rather than fail.
     fn open_channel(
         &mut self,
         index: u8,
         bitrate: u32,
+        listen_only: bool,
         admin_password: Option<&str>,
     ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError>;
     /// Reset and re-enumerate hardware. Call only after all channels are closed.
@@ -179,7 +183,7 @@ impl Can {
         self.backend.reinitialize();
     }
 
-    pub fn open(&mut self, channel: u8, bitrate: u32, admin_password: Option<&str>) -> Result<(), CanOpenError> {
+    pub fn open(&mut self, channel: u8, bitrate: u32, listen_only: bool, admin_password: Option<&str>) -> Result<(), CanOpenError> {
         if self.is_open(channel) {
             error!("Attempted to open channel {channel} which is already open");
             return Err(CanOpenError::AlreadyOpen(format!("Channel {channel} is already open")));
@@ -189,7 +193,7 @@ impl Can {
             self.admin_password = Some(admin_password.unwrap().to_string());
         }
 
-        let (tx_handle, rx_handle) = self.backend.open_channel(channel, bitrate, self.admin_password.as_deref())?;
+        let (tx_handle, rx_handle) = self.backend.open_channel(channel, bitrate, listen_only, self.admin_password.as_deref())?;
 
         let queue: SendQueue = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));

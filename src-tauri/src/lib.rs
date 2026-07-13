@@ -81,17 +81,19 @@ fn created_channels(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>, St
 async fn open_channel(
     channel_handle: u32,
     bitrate: u32,
+    listen_only: Option<bool>,
     dbc_path: Option<String>,
     protocol: Option<String>,
     state: State<'_, TauriState>,
 ) -> Result<Option<ParsedDbc>, String> {
     let can_manager = Arc::clone(&state.can_manager);
     let proto = can_manager::Protocol::from_config(protocol.as_deref());
+    let listen_only = listen_only.unwrap_or(false);
     let result = tauri::async_runtime::spawn_blocking(move || {
         can_manager
             .lock()
             .map_err(|e| e.to_string())?
-            .open_channel(channel_handle, bitrate, dbc_path.as_deref(), proto)
+            .open_channel(channel_handle, bitrate, listen_only, dbc_path.as_deref(), proto)
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));

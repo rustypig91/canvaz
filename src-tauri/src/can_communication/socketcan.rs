@@ -93,6 +93,7 @@ impl CanBackend for SocketCanBackend {
         &mut self,
         index: u8,
         bitrate: u32,
+        listen_only: bool,
         admin_password: Option<&str>,
     ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
         let channels = self.list_channels();
@@ -103,14 +104,18 @@ impl CanBackend for SocketCanBackend {
             })?
             .clone();
 
-        if !already_up(&name, bitrate) {
+        if !already_up(&name, bitrate, listen_only) {
             if name.starts_with("vcan") {
                 let _ = run_ip_auto(&["link", "add", "dev", &name, "type", "vcan"], admin_password);
                 run_ip_auto(&["link", "set", &name, "up"], admin_password)?;
             } else {
                 let _ = run_ip_auto(&["link", "set", &name, "down"], admin_password);
                 let baud_s = bitrate.to_string();
-                run_ip_auto(&["link", "set", &name, "type", "can", "bitrate", &baud_s], admin_password)?;
+                let listen_only_s = if listen_only { "on" } else { "off" };
+                run_ip_auto(
+                    &["link", "set", &name, "type", "can", "bitrate", &baud_s, "listen-only", listen_only_s],
+                    admin_password,
+                )?;
                 run_ip_auto(&["link", "set", &name, "up"], admin_password)?;
             }
         }
@@ -201,7 +206,7 @@ fn run_ip(args: &[&str], sudo_password: Option<&str>) -> Result<(), String> {
     }
 }
 
-fn already_up(name: &str, bitrate: u32) -> bool {
+fn already_up(name: &str, bitrate: u32, listen_only: bool) -> bool {
     let out = match std::process::Command::new("ip").args(["-det", "link", "show", name]).output() {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
         _ => return false,
@@ -211,6 +216,12 @@ fn already_up(name: &str, bitrate: u32) -> bool {
     }
     if name.starts_with("vcan") {
         return true;
+    }
+    // The controller-mode flags (e.g. "can <LISTEN-ONLY> state ...") only
+    // appear once `ip -details` is asked for; a mismatch here forces the
+    // reconfigure branch below to reapply the mode via `ip link set`.
+    if out.contains("LISTEN-ONLY") != listen_only {
+        return false;
     }
     for line in out.lines() {
         if let Some(rest) = line.trim().strip_prefix("bitrate ") {

@@ -137,7 +137,7 @@ interface ChannelInfo { backend: string; name: string; }
 interface CreatedChannel { handle: number; backend: string; }
 // `display_name` is the user-chosen operating name (shown in the UI, trace and
 // CSV exports); `name` stays the hardware identity used for lookup.
-interface ChannelConfig { name: string; display_name?: string | null; backend: string; dbc_path: string | null; bitrate: number | null; protocol: string | null; }
+interface ChannelConfig { name: string; display_name?: string | null; backend: string; dbc_path: string | null; bitrate: number | null; protocol: string | null; listen_only: boolean; }
 // Everything the app tracks about one channel, keyed by its u32 handle in `channels`.
 interface Channel {
     info: ChannelInfo;       // backend + hardware name (immutable identity)
@@ -1613,6 +1613,14 @@ function setProtocolInDialog(protocol: string | null) {
     (document.getElementById("select-protocol") as HTMLSelectElement).value = protocol ?? "";
 }
 
+function getListenOnlyFromDialog(): boolean {
+    return (document.getElementById("input-listen-only") as HTMLInputElement).checked;
+}
+
+function setListenOnlyInDialog(listenOnly: boolean) {
+    (document.getElementById("input-listen-only") as HTMLInputElement).checked = listenOnly;
+}
+
 function setBitrateInDialog(bitrate: number | null, isVcan: boolean) {
     const sel = document.getElementById("select-bitrate") as HTMLSelectElement;
     const custom = document.getElementById("input-bitrate-custom") as HTMLInputElement;
@@ -1653,6 +1661,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         setDbcLabel(null);
         setBitrateInDialog(500000, false);
         setProtocolInDialog(null);
+        setListenOnlyInDialog(false);
         nameInput.value = "";
         nameInput.placeholder = "Optional — defaults to interface name";
         const ifaces = await invoke<ChannelInfo[]>("list_can_interfaces").catch(() => [] as ChannelInfo[]);
@@ -1692,6 +1701,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         setDbcLabel(dialogPendingDbc);
         setBitrateInDialog(ch?.config.bitrate ?? null, hwName.startsWith("vcan"));
         setProtocolInDialog(ch?.config.protocol ?? null);
+        setListenOnlyInDialog(ch?.config.listen_only ?? false);
         nameInput.value = ch?.config.display_name ?? "";
         nameInput.placeholder = hwName;
         selectChannel(handle!);
@@ -1796,6 +1806,7 @@ async function openChannelByHandle(handle: number, quiet = false): Promise<boole
         const dbc = await invoke<ParsedDbc | null>("open_channel", {
             channelHandle: handle,
             bitrate: ch.config.bitrate ?? 500000,
+            listenOnly: ch.config.listen_only ?? false,
             dbcPath: ch.config.dbc_path ?? null,
             protocol: ch.config.protocol ?? null,
         });
@@ -1872,6 +1883,7 @@ async function applyChannelDialog() {
     const dialog = document.getElementById("dialog-channel") as HTMLDialogElement;
     const bitrate = getBitrateFromDialog();
     const protocol = getProtocolFromDialog();
+    const listenOnly = getListenOnlyFromDialog();
     const customName = (document.getElementById("input-channel-name") as HTMLInputElement).value.trim() || null;
 
     if (dialogMode === "add") {
@@ -1885,7 +1897,7 @@ async function applyChannelDialog() {
             return;
         }
         const backend = availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
-        const config: ChannelConfig = { name, display_name: customName, backend, dbc_path: dialogPendingDbc, bitrate, protocol };
+        const config: ChannelConfig = { name, display_name: customName, backend, dbc_path: dialogPendingDbc, bitrate, protocol, listen_only: listenOnly };
         // Register channel with backend (allocates handle); hardware opens (and
         // the DBC is loaded) on Start. If the name exists in no backend the
         // channel is still added, as a ghost — same as a project channel whose
@@ -1923,6 +1935,7 @@ async function applyChannelDialog() {
             ch.config.dbc_path = dialogPendingDbc;
             ch.config.bitrate = bitrate;
             ch.config.protocol = protocol;
+            ch.config.listen_only = listenOnly;
             // Sync (or clear) the custom name backend-side so CSV exports match.
             await invoke("set_channel_display_name", { channelHandle: h, displayName: customName })
                 .catch(e => log("error", `Failed to set channel name: ${e}`));
@@ -1933,6 +1946,7 @@ async function applyChannelDialog() {
         refreshChannelList();
         rebuildTraceColumns(); // J1939 columns appear/disappear with the protocol
         if (selectedChannel === h) renderDbcTree();
+        renderSimEntries(); // send/simulate controls grey out when listen-only changes
         log("info", `Updated channel: ${name}`);
         scheduleAutoSave("channel updated");
     }
@@ -2190,6 +2204,7 @@ async function renderChannelList() {
         const isSelected = h === selectedChannel;
         const bitrateLabel = hwName.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
         const protoLabel = ch.config.protocol === "j1939" ? " · J1939" : "";
+        const listenOnlyLabel = ch.config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">silent</span>` : "";
         const item = document.createElement("div");
         item.className = `channel-item${isSelected ? " selected" : ""}`;
         item.dataset.channelHandle = String(h);
@@ -2197,7 +2212,7 @@ async function renderChannelList() {
       <span class="dot${ch.open ? "" : ch.error ? " error" : " closed"}"${ch.error ? ` title="${escapeHtml(ch.error)}"` : ""}></span>
       <span class="ch-name" title="${escapeHtml(name === hwName ? name : `${name} (${hwName})`)}">${escapeHtml(name)}<span class="ch-backend label-muted"> ${backend}</span></span>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
-      <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}</span>
+      <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}${listenOnlyLabel}</span>
       <button class="btn-close-ch" title="Remove channel">×</button>
     `;
         item.addEventListener("click", (e) => {
@@ -2252,13 +2267,14 @@ async function renderChannelList() {
         const ghostName = config.display_name || config.name;
         const bitrateLabel = config.name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
         const protoLabel = config.protocol === "j1939" ? " · J1939" : "";
+        const listenOnlyLabel = config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">silent</span>` : "";
         const item = document.createElement("div");
         item.className = "channel-item";
         item.innerHTML = `
       <span class="dot error" title="${error}"></span>
       <span class="ch-name" title="${escapeHtml(ghostName === config.name ? ghostName : `${ghostName} (${config.name})`)}">${escapeHtml(ghostName)}<span class="ch-backend label-muted"> ${config.backend}</span></span>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
-      <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}</span>
+      <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}${listenOnlyLabel}</span>
       <button class="btn-close-ch" title="Remove channel">×</button>
     `;
         item.querySelector(".btn-close-ch")!.addEventListener("click", (e) => {
@@ -2422,10 +2438,17 @@ let msgEntryCounter = 0;
 
 // ── Sim entry element builders ────────────────────────────────────────────────
 
+const LISTEN_ONLY_TITLE = "Channel is listen-only — sending is disabled";
+
+function isChannelListenOnly(handle: number): boolean {
+    return channels.get(handle)?.config.listen_only ?? false;
+}
+
 function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
     const el = document.createElement("div");
     el.className = "sim-group";
     el.dataset.simKey = key;
+    const txDisabledAttr = isChannelListenOnly(entry.channel) ? ` disabled title="${LISTEN_ONLY_TITLE}"` : "";
 
     if (entry.kind === "message") {
         const idHex = "0x" + entry.messageId.toString(16).toUpperCase().padStart(3, "0");
@@ -2451,8 +2474,8 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
         <span class="label-muted">ms</span>
         <div class="sim-actions">
-          <button class="btn btn-sm sim-send-once">Send</button>
-          <button class="btn btn-sm sim-toggle${entry.running ? " running" : ""}">${entry.running ? "Stop" : "Start"}</button>
+          <button class="btn btn-sm sim-send-once"${txDisabledAttr}>Send</button>
+          <button class="btn btn-sm sim-toggle${entry.running ? " running" : ""}"${txDisabledAttr}>${entry.running ? "Stop" : "Start"}</button>
           <button class="btn btn-sm btn-danger sim-remove">✕</button>
         </div>
       </div>
@@ -2626,8 +2649,8 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
         <span class="label-muted">ms</span>
         <div class="sim-actions">
-          <button class="btn btn-sm sim-send-once">Send</button>
-          <button class="btn btn-sm sim-toggle${entry.running ? " running" : ""}">${entry.running ? "Stop" : "Start"}</button>
+          <button class="btn btn-sm sim-send-once"${txDisabledAttr}>Send</button>
+          <button class="btn btn-sm sim-toggle${entry.running ? " running" : ""}"${txDisabledAttr}>${entry.running ? "Stop" : "Start"}</button>
           <button class="btn btn-sm btn-danger sim-remove">✕</button>
         </div>
       </div>
@@ -2653,7 +2676,14 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             const wasRunning = entry.running;
             if (wasRunning) await stopSim(key);
             entry.channel = parseInt((e.target as HTMLSelectElement).value);
-            if (wasRunning) await startSim(key);
+            const listenOnly = isChannelListenOnly(entry.channel);
+            const sendBtn = el.querySelector<HTMLButtonElement>(".sim-send-once")!;
+            const toggleBtn = el.querySelector<HTMLButtonElement>(".sim-toggle")!;
+            sendBtn.disabled = listenOnly;
+            sendBtn.title = listenOnly ? LISTEN_ONLY_TITLE : "";
+            toggleBtn.disabled = listenOnly;
+            toggleBtn.title = listenOnly ? LISTEN_ONLY_TITLE : "";
+            if (wasRunning && !listenOnly) await startSim(key);
         });
         el.querySelector<HTMLInputElement>(".sim-canid-input")!.addEventListener("input", async (e) => {
             const wasRunning = entry.running;
@@ -2869,6 +2899,7 @@ function buildProject(): Project {
                 dbc_path: ch.config.dbc_path,
                 bitrate: ch.config.bitrate,
                 protocol: ch.config.protocol,
+                listen_only: ch.config.listen_only,
             })),
             ...ghostChannels.map(g => ({
                 name: g.config.name,
@@ -2877,6 +2908,7 @@ function buildProject(): Project {
                 dbc_path: g.config.dbc_path,
                 bitrate: g.config.bitrate,
                 protocol: g.config.protocol,
+                listen_only: g.config.listen_only,
             })),
         ],
         plot_panes: plotPanes.map(pane => ({
@@ -3017,7 +3049,7 @@ async function applyProject(project: Project) {
     for (const ch of project.channels) {
         const backend = ch.backend ?? "socketcan";
         const bitrate = ch.bitrate ?? null;
-        const config: ChannelConfig = { name: ch.name, display_name: ch.display_name ?? null, backend, dbc_path: ch.dbc_path ?? null, bitrate, protocol: ch.protocol ?? null };
+        const config: ChannelConfig = { name: ch.name, display_name: ch.display_name ?? null, backend, dbc_path: ch.dbc_path ?? null, bitrate, protocol: ch.protocol ?? null, listen_only: ch.listen_only ?? false };
         // Any failure keeps the saved config as a ghost — including a name that
         // currently resolves to an already-added channel (a duplicate ghost
         // recovers under its own backend once that hardware appears, since
