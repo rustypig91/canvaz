@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use can_dbc::{ByteOrder, Dbc, MessageId, MultiplexIndicator, NumericValue, SignalExtendedValueType, ValueType};
+use can_dbc::{
+    AttributeValue, ByteOrder, Comment, Dbc, MessageId, MultiplexIndicator, NumericValue, SignalExtendedValueType,
+    ValueType,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::can_communication::CanFrame;
@@ -38,6 +41,13 @@ pub struct ParsedMessage {
     pub signals: Vec<ParsedSignal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transmitter: Option<String>,
+    /// `GenMsgCycleTime` attribute (`BA_`): the intended transmit period. A
+    /// value of 0 in the DBC means "not cyclic" and is stored as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cycle_time_ms: Option<u32>,
+    /// `CM_ BO_` comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,6 +81,14 @@ pub struct ParsedSignal {
     /// factor/offset scaling instead of treating them as an integer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub float_bits: Option<u8>,
+    /// `GenSigStartValue` attribute (`BA_`), converted from the raw value the
+    /// DBC stores to a physical value (× factor + offset) so consumers can use
+    /// it directly as an initial signal value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start_value: Option<f64>,
+    /// `CM_ SG_` comment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -245,6 +263,34 @@ impl ParsedDbc {
         let text = std::fs::read_to_string(self.path.as_str()).map_err(|e| format!("Failed to read DBC file: {e}"))?;
         let dbc = Dbc::try_from(text.as_str()).map_err(|e| format!("Failed to parse DBC: {e}"))?;
 
+        // Attribute/comment lookups prebuilt once: the crate only offers linear
+        // scans, which would make populating every signal O(n²) on large DBCs.
+        let msg_cycle_times: HashMap<MessageId, f64> = dbc
+            .attribute_values_message
+            .iter()
+            .filter(|a| a.name == "GenMsgCycleTime")
+            .filter_map(|a| attribute_to_f64(&a.value).map(|v| (a.message_id, v)))
+            .collect();
+        let sig_start_values: HashMap<(MessageId, &str), f64> = dbc
+            .attribute_values_signal
+            .iter()
+            .filter(|a| a.name == "GenSigStartValue")
+            .filter_map(|a| attribute_to_f64(&a.value).map(|v| ((a.message_id, a.signal_name.as_str()), v)))
+            .collect();
+        let mut msg_comments: HashMap<MessageId, &str> = HashMap::new();
+        let mut sig_comments: HashMap<(MessageId, &str), &str> = HashMap::new();
+        for c in &dbc.comments {
+            match c {
+                Comment::Message { id, comment } => {
+                    msg_comments.insert(*id, comment.as_str());
+                }
+                Comment::Signal { message_id, name, comment } => {
+                    sig_comments.insert((*message_id, name.as_str()), comment.as_str());
+                }
+                _ => {}
+            }
+        }
+
         let mut messages = HashMap::new();
         for msg in &dbc.messages {
             let (raw_id, is_extended) = match msg.id {
@@ -280,6 +326,11 @@ impl ParsedDbc {
                         Some(SignalExtendedValueType::IEEEdouble64bit) => Some(64),
                         _ => None,
                     };
+                    // GenSigStartValue is a raw value (also for float signals,
+                    // where "raw" is the IEEE base value) — scale it to physical.
+                    let start_value = sig_start_values
+                        .get(&(msg.id, sig.name.as_str()))
+                        .map(|raw| raw * sig.factor + sig.offset);
                     ParsedSignal {
                         name: sig.name.clone(),
                         message_id: raw_id,
@@ -297,6 +348,8 @@ impl ParsedDbc {
                         multiplexor,
                         mux_value,
                         float_bits,
+                        start_value,
+                        comment: sig_comments.get(&(msg.id, sig.name.as_str())).map(|c| c.to_string()),
                     }
                 })
                 .collect();
@@ -315,6 +368,12 @@ impl ParsedDbc {
                     is_extended,
                     signals,
                     transmitter,
+                    // Cycle time 0 means "not cyclic" per convention — treat as absent.
+                    cycle_time_ms: msg_cycle_times
+                        .get(&msg.id)
+                        .filter(|&&v| v > 0.0)
+                        .map(|&v| v.round() as u32),
+                    comment: msg_comments.get(&msg.id).map(|c| c.to_string()),
                 },
             );
         }
@@ -464,6 +523,17 @@ fn pack_bits(data: &mut [u8], raw: u64, start_bit: u64, length: u64, little_endi
     }
 }
 
+/// Numeric view of a `BA_` attribute value. DBC tools disagree on whether
+/// numeric attributes are written quoted or bare, so parse strings too.
+fn attribute_to_f64(v: &AttributeValue) -> Option<f64> {
+    match v {
+        AttributeValue::Uint(n) => Some(*n as f64),
+        AttributeValue::Int(n) => Some(*n as f64),
+        AttributeValue::Double(n) => Some(*n),
+        AttributeValue::String(s) => s.trim().parse().ok(),
+    }
+}
+
 fn numeric_to_f64(v: NumericValue) -> f64 {
     match v {
         NumericValue::Uint(n) => n as f64,
@@ -575,6 +645,43 @@ mod tests {
         let values: HashMap<String, f64> = [("F64".to_string(), 0.123456789)].into();
         let buf = msg.encode_signals(&values);
         assert_eq!(msg.decode_data(&buf).signals[0].physical, 0.123456789);
+    }
+
+    #[test]
+    fn attributes_and_comments_are_parsed() {
+        let path = std::env::temp_dir().join("canvaz_test_attrs.dbc");
+        // Temp signal: raw start 70 with (0.5, -40) → physical -5.
+        // NoCycle has GenMsgCycleTime 0, which means "not cyclic" → None.
+        let content = "VERSION \"\"\n\nNS_ :\n\nBS_:\n\nBU_:\n\nBO_ 512 Status: 8 Vector__XXX\n \
+             SG_ Temp : 0|8@1+ (0.5,-40) [-40|87.5] \"degC\" Vector__XXX\n \
+             SG_ Plain : 8|8@1+ (1,0) [0|255] \"\" Vector__XXX\n\n\
+             BO_ 513 NoCycle: 8 Vector__XXX\n \
+             SG_ X : 0|8@1+ (1,0) [0|255] \"\" Vector__XXX\n\n\
+             CM_ BO_ 512 \"Periodic status frame\";\n\
+             CM_ SG_ 512 Temp \"Coolant temperature\";\n\
+             BA_DEF_ BO_ \"GenMsgCycleTime\" INT 0 60000;\n\
+             BA_DEF_ SG_ \"GenSigStartValue\" INT 0 255;\n\
+             BA_DEF_DEF_ \"GenMsgCycleTime\" 0;\n\
+             BA_DEF_DEF_ \"GenSigStartValue\" 0;\n\
+             BA_ \"GenMsgCycleTime\" BO_ 512 250;\n\
+             BA_ \"GenMsgCycleTime\" BO_ 513 0;\n\
+             BA_ \"GenSigStartValue\" SG_ 512 Temp 70;\n";
+        std::fs::write(&path, content).expect("write temp dbc");
+        let dbc = ParsedDbc::new(path.to_str().unwrap()).expect("parse dbc");
+
+        let msg = dbc.messages.get(&512).expect("Status message");
+        assert_eq!(msg.cycle_time_ms, Some(250));
+        assert_eq!(msg.comment.as_deref(), Some("Periodic status frame"));
+        let temp = &msg.signals[0];
+        assert_eq!(temp.start_value, Some(-5.0), "raw 70 × 0.5 − 40");
+        assert_eq!(temp.comment.as_deref(), Some("Coolant temperature"));
+        let plain = &msg.signals[1];
+        assert_eq!(plain.start_value, None, "no GenSigStartValue set");
+        assert_eq!(plain.comment, None);
+
+        let no_cycle = dbc.messages.get(&513).expect("NoCycle message");
+        assert_eq!(no_cycle.cycle_time_ms, None, "cycle time 0 means not cyclic");
+        assert_eq!(no_cycle.comment, None);
     }
 
     #[test]
