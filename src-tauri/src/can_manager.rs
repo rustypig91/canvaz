@@ -177,6 +177,10 @@ struct ChannelData {
     display_name: Option<String>,
     protocol: Protocol,
     tp: TpReassembler,
+    /// Set by the last `open_channel` call. When true, TX entry points refuse
+    /// to send so the bus stays undisturbed rather than the frame silently
+    /// getting dropped by the hardware's silent/listen-only mode.
+    listen_only: bool,
 }
 
 impl ChannelData {
@@ -188,6 +192,7 @@ impl ChannelData {
             display_name: None,
             protocol: Protocol::None,
             tp: TpReassembler::default(),
+            listen_only: false,
         }
     }
 
@@ -495,6 +500,7 @@ impl CanManager {
         &mut self,
         handle: u32,
         bitrate: u32,
+        listen_only: bool,
         dbc_path: Option<&str>,
         protocol: Protocol,
     ) -> Result<Option<ParsedDbc>, String> {
@@ -510,16 +516,17 @@ impl CanManager {
                 ch.dbc = dbc.clone();
                 ch.protocol = protocol;
                 ch.tp = TpReassembler::default();
+                ch.listen_only = listen_only;
             }
         }
 
         let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
-        match can.open(hw_index, bitrate, None) {
+        match can.open(hw_index, bitrate, listen_only, None) {
             Ok(()) => {}
             Err(crate::can_communication::CanOpenError::PasswordRequired) => {
                 info!("Backend '{backend_name}' requires admin password to open channel {handle}");
                 let pw = self.app_state.get_admin_password()?;
-                can.open(hw_index, bitrate, Some(&pw)).map_err(|e| e.to_string())?;
+                can.open(hw_index, bitrate, listen_only, Some(&pw)).map_err(|e| e.to_string())?;
             }
             Err(e) => return Err(e.to_string()),
         }
@@ -599,10 +606,21 @@ impl CanManager {
 
     // ── Send ──────────────────────────────────────────────────────────────────
 
+    /// Fails loudly instead of letting a listen-only channel silently drop (or
+    /// disturb) a transmit attempt on the bus.
+    fn ensure_not_listen_only(&self, handle: u32) -> Result<(), String> {
+        let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
+        if lock.channels.get(&handle).is_some_and(|c| c.listen_only) {
+            return Err("Channel is listen-only — sending is disabled".to_string());
+        }
+        Ok(())
+    }
+
     /// `is_extended: None` falls back to inferring the frame format from the id
     /// value (> 0x7FF ⇒ extended); pass an explicit value to send e.g. a 29-bit
     /// frame whose id fits in 11 bits.
     pub fn send_frame(&self, handle: u32, can_id: u32, data: Vec<u8>, is_extended: Option<bool>) -> Result<(), String> {
+        self.ensure_not_listen_only(handle)?;
         let (backend_name, hw_index) = self.backend_index(handle)?;
         self.cans.get(&backend_name).ok_or("Backend not found")?.send_once(
             hw_index,
@@ -622,6 +640,7 @@ impl CanManager {
         signal_values: &HashMap<String, f64>,
         generators: &HashMap<String, SignalGen>,
     ) -> Result<(), String> {
+        self.ensure_not_listen_only(handle)?;
         let (backend_name, hw_index) = self.backend_index(handle)?;
         // Evaluate generators once at t=0 so a one-shot send of an E2E message
         // still carries a valid checksum (and counter 0).
@@ -666,6 +685,7 @@ impl CanManager {
     }
 
     pub fn add_periodic_frame(&self, handle: u32, frame: CanFrame, period_ms: u64) -> Result<u64, String> {
+        self.ensure_not_listen_only(handle)?;
         let (backend_name, hw_index) = self.backend_index(handle)?;
         self.cans
             .get(&backend_name)
@@ -731,6 +751,7 @@ impl CanManager {
         generators: &HashMap<String, SignalGen>,
         period_ms: u64,
     ) -> Result<u64, String> {
+        self.ensure_not_listen_only(handle)?;
         let (backend_name, hw_index) = self.backend_index(handle)?;
         let (data, is_extended, source) = self.message_payload(handle, msg_id, signal_values, generators)?;
         self.cans.get(&backend_name).ok_or("Backend not found")?.add_periodic(

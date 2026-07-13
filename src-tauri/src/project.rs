@@ -39,6 +39,10 @@ pub struct ChannelConfig {
     /// Protocol interpretation for received frames ("j1939"); None = raw CAN.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
+    /// Open the channel silent (no ACKs, no error flags injected) so the tool
+    /// cannot disturb the bus. Send/simulate controls are disabled in the UI.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub listen_only: bool,
 }
 
 fn default_bitrate() -> u32 {

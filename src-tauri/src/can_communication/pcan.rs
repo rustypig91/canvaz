@@ -46,6 +46,10 @@ const PCAN_CHANNEL_CONDITION: u8      = 0x0D;
 const PCAN_HARDWARE_NAME: u8          = 0x0E;
 const PCAN_ATTACHED_CHANNELS_COUNT: u8 = 0x2A;
 const PCAN_ATTACHED_CHANNELS: u8      = 0x2B;
+// CAN_SetValue parameter: listen-only mode (no ACKs, no error frames transmitted).
+const PCAN_LISTEN_ONLY: u8 = 0x08;
+const PCAN_PARAMETER_OFF: u32 = 0x00;
+const PCAN_PARAMETER_ON: u32  = 0x01;
 
 const PCAN_CHANNEL_AVAILABLE: u32 = 0x01;
 const PCAN_CHANNEL_OCCUPIED: u32  = 0x02;
@@ -103,6 +107,7 @@ type FnUninitialize = unsafe extern "system" fn(TPCANHandle) -> TPCANStatus;
 type FnRead = unsafe extern "system" fn(TPCANHandle, *mut TPCANMsg, *mut TPCANTimestamp) -> TPCANStatus;
 type FnWrite = unsafe extern "system" fn(TPCANHandle, *mut TPCANMsg) -> TPCANStatus;
 type FnGetValue = unsafe extern "system" fn(TPCANHandle, u8, *mut u8, u32) -> TPCANStatus;
+type FnSetValue = unsafe extern "system" fn(TPCANHandle, u8, *mut u8, u32) -> TPCANStatus;
 
 // ── Library wrapper ───────────────────────────────────────────────────────────
 
@@ -113,6 +118,7 @@ struct PcanLib {
     read: FnRead,
     write: FnWrite,
     get_value: FnGetValue,
+    set_value: FnSetValue,
 }
 
 // SAFETY: PCAN-Basic is documented as thread-safe for concurrent CAN_Read +
@@ -137,6 +143,7 @@ impl PcanLib {
                 read: sym!(b"CAN_Read\0", FnRead),
                 write: sym!(b"CAN_Write\0", FnWrite),
                 get_value: sym!(b"CAN_GetValue\0", FnGetValue),
+                set_value: sym!(b"CAN_SetValue\0", FnSetValue),
                 _lib: lib,
             }))
         }
@@ -366,6 +373,7 @@ impl CanBackend for PcanBackend {
         &mut self,
         index: u8,
         bitrate: u32,
+        listen_only: bool,
         _admin_password: Option<&str>,
     ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
         let baud = pcan_baud(bitrate).ok_or_else(|| {
@@ -390,6 +398,14 @@ impl CanBackend for PcanBackend {
         // Uninitialize first in case the channel was left open by a previous
         // crash. CAN_Uninitialize on an already-closed channel is a no-op.
         unsafe { (lib.uninitialize)(pcan_handle) };
+
+        // PCAN_LISTEN_ONLY must be set before CAN_Initialize — it configures
+        // the driver's transmit path at initialization time.
+        let mut listen_only_val: u32 = if listen_only { PCAN_PARAMETER_ON } else { PCAN_PARAMETER_OFF };
+        let s = unsafe { (lib.set_value)(pcan_handle, PCAN_LISTEN_ONLY, &mut listen_only_val as *mut u32 as *mut u8, 4) };
+        if s & !PCAN_ERROR_ANYBUSERR != PCAN_ERROR_OK {
+            log::warn!("CAN_SetValue(PCAN_LISTEN_ONLY) failed: {} — listen-only may not be applied", pcan_err(s));
+        }
 
         // SAFETY: valid handle, baud, and zeros for the legacy ISA/DNG args
         let s = unsafe { (lib.initialize)(pcan_handle, baud, 0, 0, 0) };
