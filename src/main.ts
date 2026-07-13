@@ -2773,11 +2773,13 @@ function updateSimTxStatus() {
     const el = document.getElementById("sim-tx-status")!;
     const active = [...simEntries.values()].filter(e => e.periodicHandle !== null);
     if (active.length === 0) {
-        el.style.display = "none";
+        el.style.display = "";  // back to the stylesheet default (none)
         delete el.dataset.tip;
         return;
     }
-    el.style.display = "";
+    // Must be an explicit inline value: "" would fall back to the
+    // stylesheet's display:none and the indicator would never appear.
+    el.style.display = "inline";
     el.textContent = `▶ ${active.length} periodic TX`;
     el.dataset.tip = active.map(e => e.kind === "message"
         ? `${e.messageName} @ ${e.periodMs} ms → ${channelName(e.channel)}`
