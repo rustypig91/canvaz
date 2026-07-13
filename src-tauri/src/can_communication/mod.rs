@@ -111,6 +111,11 @@ impl From<&str> for CanOpenError {
 
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
 
+/// Produces the data bytes for one transmission of a periodic entry. Runs on
+/// the TX thread right before each send, so time-varying payloads (signal
+/// generators, counters, checksums) stay jitter-free even when the UI is busy.
+pub type FrameDataSource = Box<dyn FnMut() -> Vec<u8> + Send>;
+
 enum SendEntry {
     OneShot(CanFrame),
     Periodic {
@@ -118,6 +123,9 @@ enum SendEntry {
         frame: CanFrame,
         period_ms: u64,
         next: Instant,
+        /// When set, called per tick to regenerate `frame.data`; `None` sends
+        /// the static `frame.data` unchanged.
+        source: Option<FrameDataSource>,
     },
 }
 
@@ -242,8 +250,16 @@ impl Can {
     }
 
     /// Enqueue a frame to be sent repeatedly every `period_ms` milliseconds.
-    /// Returns a unique handle that can be passed to `remove_periodic`.
-    pub fn add_periodic(&self, channel: u8, frame: CanFrame, period_ms: u64) -> Result<u64, String> {
+    /// `source`, when given, regenerates the frame data before every send.
+    /// Returns a unique handle that can be passed to `update_periodic` /
+    /// `remove_periodic`.
+    pub fn add_periodic(
+        &self,
+        channel: u8,
+        frame: CanFrame,
+        period_ms: u64,
+        source: Option<FrameDataSource>,
+    ) -> Result<u64, String> {
         let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
         debug!(
             "Adding periodic frame on channel {channel}: id=0x{:X}, period={}ms, handle={handle}",
@@ -256,9 +272,50 @@ impl Can {
             frame,
             period_ms,
             next: Instant::now(),
+            source,
         });
         cvar.notify_one();
         Ok(handle)
+    }
+
+    /// Swap the payload (and period) of an existing periodic entry in place.
+    /// Unlike remove + add, the entry's `next` deadline is preserved, so there
+    /// is no transmission gap or phase reset; a shortened period only pulls the
+    /// deadline earlier.
+    pub fn update_periodic(
+        &self,
+        channel: u8,
+        handle: u64,
+        data: Vec<u8>,
+        source: Option<FrameDataSource>,
+        period_ms: u64,
+    ) -> Result<(), String> {
+        debug!("Updating periodic frame on channel {channel}: handle={handle}, period={period_ms}ms");
+        let q = self.queue(channel)?;
+        let (lock, cvar) = q.as_ref();
+        let mut entries = lock.lock().map_err(|_| "Queue lock poisoned".to_string())?;
+        let found = entries.iter_mut().find_map(|e| match e {
+            SendEntry::Periodic {
+                handle: h,
+                frame,
+                period_ms: p,
+                next,
+                source: s,
+            } if *h == handle => Some((frame, p, next, s)),
+            _ => None,
+        });
+        let Some((frame, p, next, s)) = found else {
+            return Err(format!("Periodic handle {handle} not found on channel {channel}"));
+        };
+        frame.data = data;
+        *s = source;
+        *next = (*next).min(Instant::now() + Duration::from_millis(period_ms));
+        *p = period_ms;
+        drop(entries);
+        // Wake the TX loop so a shortened period takes effect immediately
+        // instead of after the previously computed sleep.
+        cvar.notify_one();
+        Ok(())
     }
 
     /// Remove the periodic entry identified by `handle`.
@@ -364,8 +421,17 @@ fn tx_loop(
                         report_tx(r, f);
                     }
                 }
-                SendEntry::Periodic { frame, period_ms, next, .. } => {
+                SendEntry::Periodic {
+                    frame,
+                    period_ms,
+                    next,
+                    source,
+                    ..
+                } => {
                     if now >= *next {
+                        if let Some(src) = source {
+                            frame.data = src();
+                        }
                         let mut f = frame.clone();
                         *next = now + Duration::from_millis(*period_ms);
                         let r = tx.send(&mut f);

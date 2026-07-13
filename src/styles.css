@@ -841,16 +841,41 @@ body.resizing {
    so rows without named values still line up under those that have them. */
 .sim-signal-row {
   display: grid;
-  grid-template-columns: minmax(80px, 1fr) 96px 44px 72px 34px;
+  grid-template-columns: minmax(80px, 1fr) 64px 96px 44px 72px 34px;
   align-items: center;
   gap: 8px;
   padding: 4px 14px;
   border-bottom: 1px solid rgba(255,255,255,0.03);
 }
 .sim-group-body.has-enums .sim-signal-row {
-  grid-template-columns: minmax(80px, 1fr) 96px 44px 72px 34px 150px;
+  grid-template-columns: minmax(80px, 1fr) 64px 96px 44px 72px 34px 150px;
 }
-.sim-signal-row:last-child { border-bottom: none; }
+/* The last element in a group is either a signal row or its (possibly hidden)
+   generator-params row — drop the border on whichever it is. */
+.sim-group-body > :last-child { border-bottom: none; }
+
+.sim-gen-sel {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text-muted);
+  padding: 2px 4px;
+  font-size: 11px;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+/* Waveform parameter sub-row shown under a signal when ramp/sine/toggle is
+   selected; indented so it reads as belonging to the signal above. */
+.sim-gen-params {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 14px 6px 28px;
+  border-bottom: 1px solid rgba(255,255,255,0.03);
+  font-size: 11px;
+}
+.sim-gen-params input { width: 72px; }
 
 .sim-sig-name {
   font-size: 12px;

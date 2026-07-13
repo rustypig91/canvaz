@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 use crate::app_state::AppState;
-use crate::can_communication::{Can, CanFrame};
+use crate::can_communication::{Can, CanFrame, FrameDataSource};
 use crate::dbc_parser::ParsedDbc;
 use crate::j1939::{self, J1939Info, TpReassembler};
+use crate::sim_generator::{build_frame_source, SignalGen};
 
 #[cfg(feature = "kvaser")]
 use crate::can_communication::KvaserBackend;
@@ -614,9 +615,21 @@ impl CanManager {
         )
     }
 
-    pub fn send_message(&self, handle: u32, msg_id: u32, signal_values: &HashMap<String, f64>) -> Result<(), String> {
+    pub fn send_message(
+        &self,
+        handle: u32,
+        msg_id: u32,
+        signal_values: &HashMap<String, f64>,
+        generators: &HashMap<String, SignalGen>,
+    ) -> Result<(), String> {
         let (backend_name, hw_index) = self.backend_index(handle)?;
-        let (data, is_extended) = self.encode_dbc_message(handle, msg_id, signal_values)?;
+        // Evaluate generators once at t=0 so a one-shot send of an E2E message
+        // still carries a valid checksum (and counter 0).
+        let (data, is_extended, source) = self.message_payload(handle, msg_id, signal_values, generators)?;
+        let data = match source {
+            Some(mut src) => src(),
+            None => data,
+        };
         self.cans.get(&backend_name).ok_or("Backend not found")?.send_once(
             hw_index,
             CanFrame {
@@ -657,7 +670,23 @@ impl CanManager {
         self.cans
             .get(&backend_name)
             .ok_or("Backend not found")?
-            .add_periodic(hw_index, frame, period_ms)
+            .add_periodic(hw_index, frame, period_ms, None)
+    }
+
+    /// Swap a periodic raw frame's data and period in place — no transmission
+    /// gap or phase reset (frame id/format changes still need remove + add).
+    pub fn update_periodic_frame(
+        &self,
+        handle: u32,
+        periodic_handle: u64,
+        data: Vec<u8>,
+        period_ms: u64,
+    ) -> Result<(), String> {
+        let (backend_name, hw_index) = self.backend_index(handle)?;
+        self.cans
+            .get(&backend_name)
+            .ok_or("Backend not found")?
+            .update_periodic(hw_index, periodic_handle, data, None, period_ms)
     }
 
     pub fn remove_periodic(&self, handle: u32, periodic_handle: u64) -> Result<(), String> {
@@ -668,15 +697,42 @@ impl CanManager {
             .remove_periodic(hw_index, periodic_handle)
     }
 
+    /// Encoded payload plus, when any generators are declared, the per-tick
+    /// data source evaluated by the TX loop.
+    fn message_payload(
+        &self,
+        handle: u32,
+        msg_id: u32,
+        signal_values: &HashMap<String, f64>,
+        generators: &HashMap<String, SignalGen>,
+    ) -> Result<(Vec<u8>, bool, Option<FrameDataSource>), String> {
+        let (data, is_extended) = self.encode_dbc_message(handle, msg_id, signal_values)?;
+        let source = if generators.is_empty() {
+            None
+        } else {
+            let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
+            let msg = lock
+                .channels
+                .get(&handle)
+                .and_then(|c| c.dbc.as_ref())
+                .and_then(|d| d.messages.get(&msg_id))
+                .cloned()
+                .ok_or_else(|| format!("Message 0x{msg_id:X} not in DBC"))?;
+            Some(build_frame_source(msg, signal_values.clone(), generators.clone()))
+        };
+        Ok((data, is_extended, source))
+    }
+
     pub fn add_periodic_message(
         &self,
         handle: u32,
         msg_id: u32,
         signal_values: &HashMap<String, f64>,
+        generators: &HashMap<String, SignalGen>,
         period_ms: u64,
     ) -> Result<u64, String> {
         let (backend_name, hw_index) = self.backend_index(handle)?;
-        let (data, is_extended) = self.encode_dbc_message(handle, msg_id, signal_values)?;
+        let (data, is_extended, source) = self.message_payload(handle, msg_id, signal_values, generators)?;
         self.cans.get(&backend_name).ok_or("Backend not found")?.add_periodic(
             hw_index,
             CanFrame {
@@ -686,7 +742,29 @@ impl CanManager {
                 timestamp_ms: None,
             },
             period_ms,
+            source,
         )
+    }
+
+    /// Re-encode a running periodic DBC message with new values/generators and
+    /// swap it in place. The entry's send deadline is preserved (no gap);
+    /// generator phase and counter state restart, since the payload closure is
+    /// rebuilt.
+    pub fn update_periodic_message(
+        &self,
+        handle: u32,
+        periodic_handle: u64,
+        msg_id: u32,
+        signal_values: &HashMap<String, f64>,
+        generators: &HashMap<String, SignalGen>,
+        period_ms: u64,
+    ) -> Result<(), String> {
+        let (backend_name, hw_index) = self.backend_index(handle)?;
+        let (data, _, source) = self.message_payload(handle, msg_id, signal_values, generators)?;
+        self.cans
+            .get(&backend_name)
+            .ok_or("Backend not found")?
+            .update_periodic(hw_index, periodic_handle, data, source, period_ms)
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
