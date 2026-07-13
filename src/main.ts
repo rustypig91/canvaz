@@ -42,6 +42,11 @@ interface DbcSignal {
     // IEEE float width from SIG_VALTYPE_ (32 or 64); absent = integer signal.
     // Float signals have no integer raw value — no quantization applies.
     float_bits?: number | null;
+    // GenSigStartValue attribute, already converted to a physical value by the
+    // backend; used as the default value for new sim entries.
+    start_value?: number | null;
+    // CM_ SG_ comment from the DBC.
+    comment?: string | null;
 }
 
 interface SignalEnumValue {
@@ -58,6 +63,11 @@ interface DbcMessage {
     is_extended?: boolean;
     signals: DbcSignal[];
     transmitter?: string | null;
+    // GenMsgCycleTime attribute; absent when the DBC declares none (or 0 = not
+    // cyclic). Prefills the period of new sim entries.
+    cycle_time_ms?: number | null;
+    // CM_ BO_ comment from the DBC.
+    comment?: string | null;
 }
 
 interface ParsedDbc {
@@ -1141,6 +1151,7 @@ function renderDbcTree(filter = "") {
         <span class="sig-range${mn === undefined ? " sig-value--empty" : ""}">${rangeText}</span>`;
         signalValueEls.set(key, row.querySelector<HTMLElement>(".sig-value")!);
         signalRangeEls.set(key, row.querySelector<HTMLElement>(".sig-range")!);
+        if (sig.comment) row.title = sig.comment;
         if (isKeyPlotted(key)) row.classList.add("in-plot");
         row.setAttribute("draggable", "true");
         // Drag / double-click behaviour is delegated on #dbc-tree (setupDbcTree).
@@ -1163,7 +1174,9 @@ function renderDbcTree(filter = "") {
 
         const summary = document.createElement("summary");
         const emptyHint = noSignals ? `<span class="msg-empty-hint">(no signals)</span>` : "";
-        summary.innerHTML = `${msg.name}${emptyHint}<span class="msg-id-badge">0x${msg.id.toString(16).toUpperCase().padStart(3, "0")}</span>`;
+        const cycleBadge = msg.cycle_time_ms ? `<span class="msg-cycle-badge">${msg.cycle_time_ms}ms</span>` : "";
+        summary.innerHTML = `${msg.name}${emptyHint}<span class="msg-id-badge">0x${msg.id.toString(16).toUpperCase().padStart(3, "0")}</span>${cycleBadge}`;
+        if (msg.comment) summary.title = msg.comment;
         // Drag / double-click behaviour is delegated on #dbc-tree (setupDbcTree).
         summary.setAttribute("draggable", "true");
         details.appendChild(summary);
@@ -2551,6 +2564,12 @@ function addSimSignal(handle: number, sig: DbcSignal) {
     addSimMessage(handle, msg);
 }
 
+// Default sim value for a signal: the DBC's GenSigStartValue when declared
+// (already converted to physical by the backend), else the range minimum.
+function simDefaultValue(sig: DbcSignal): number {
+    return sig.start_value ?? sig.min ?? 0;
+}
+
 // A message is always simulated as a whole (one entry, all its signals);
 // this also covers messages with zero signals — they get an entry with an
 // empty signal list, sending a zero-filled frame of the message's DLC.
@@ -2560,8 +2579,8 @@ function addSimMessage(handle: number, msg: DbcMessage) {
     const entry: SimMessageEntry = {
         kind: "message", channel: handle,
         messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
-        signals: msg.signals.map(s => ({ def: s, value: s.min ?? 0 })),
-        periodMs: 100, running: false, periodicHandle: null,
+        signals: msg.signals.map(s => ({ def: s, value: simDefaultValue(s) })),
+        periodMs: msg.cycle_time_ms ?? 100, running: false, periodicHandle: null,
     };
     simEntries.set(key, entry);
     document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
@@ -2996,7 +3015,7 @@ async function startApp() {
             const prevValues = new Map(entry.signals.map(s => [s.def.name, s.value]));
             entry.messageName = msg.name;
             entry.dlc = msg.dlc;
-            entry.signals = msg.signals.map(s => ({ def: s, value: prevValues.get(s.name) ?? s.min ?? 0 }));
+            entry.signals = msg.signals.map(s => ({ def: s, value: prevValues.get(s.name) ?? simDefaultValue(s) }));
             simContainer.querySelector(`[data-sim-key="${key}"]`)?.replaceWith(createSimEntryEl(key, entry));
         }
     }
@@ -3072,7 +3091,7 @@ async function startApp() {
             const simEntry: SimMessageEntry = {
                 kind: "message", channel: handle,
                 messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
-                signals: msg.signals.map(s => ({ def: s, value: valueByName.get(s.name) ?? s.min ?? 0 })),
+                signals: msg.signals.map(s => ({ def: s, value: valueByName.get(s.name) ?? simDefaultValue(s) })),
                 periodMs: m.period_ms, running: m.running ?? false, periodicHandle: null,
             };
             simEntries.set(key, simEntry);
