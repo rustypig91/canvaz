@@ -334,8 +334,14 @@ let pendingSimMessages: SimMessageConfig[] = [];
 interface GhostChannel { config: ChannelConfig; error: string; }
 let ghostChannels: GhostChannel[] = [];
 
-// Middle-mouse pan state
-let midPan: { startX: number; startMin: number; startMax: number; chartWidth: number } | null = null;
+// Middle-mouse pan state. X panning applies to every pane (they share the time
+// axis); Y panning applies only to the pane the drag started on, and commits a
+// Y-axis lock on release once the drag moved vertically.
+let midPan: {
+    startX: number; startMin: number; startMax: number; chartWidth: number;
+    pane: PlotPane; startY: number; startYMin: number; startYMax: number; chartHeight: number;
+    movedY: boolean;
+} | null = null;
 
 // X window shared by all panes just before zooming/panning began, so "reset
 // zoom" can restore every pane to it. The zoom plugin only remembers the pane
@@ -811,10 +817,30 @@ function createPlotPane(): PlotPane {
         canvas.style.cursor = cursorHit(e.offsetX) ? "ew-resize" : "";
     });
 
+    // Wheel zooms the Y axis around the value under the pointer. The result is
+    // committed as a Y-axis lock: applyYRange then leaves the range alone, the
+    // lock button/inputs reflect it, and the unlock button returns to
+    // auto-scale. The save is deferred until the wheel settles — one autosave
+    // per gesture instead of one per notch.
+    let wheelSaveTimer: ReturnType<typeof setTimeout> | null = null;
+    canvas.addEventListener("wheel", (e) => {
+        e.preventDefault(); // keep the page/pane list from scrolling
+        const ys = (pane.chart.scales as any)["y"];
+        const factor = e.deltaY < 0 ? 0.85 : 1 / 0.85;
+        const anchor = ys.getValueForPixel(e.offsetY);
+        const newMin = anchor - (anchor - ys.min) * factor;
+        const newMax = anchor + (ys.max - anchor) * factor;
+        if (!isFinite(newMin) || !isFinite(newMax) || !(newMax > newMin)) return;
+        setYLock(pane, { min: newMin, max: newMax }, false);
+        if (wheelSaveTimer) clearTimeout(wheelSaveTimer);
+        wheelSaveTimer = setTimeout(() => scheduleAutoSave("plot y-zoom"), 400);
+    }, { passive: false });
+
     canvas.addEventListener("mousedown", (e) => {
         if (e.button !== 1) return;
         e.preventDefault(); // suppress autoscroll cursor
         const xScale = (pane.chart.scales as any)["x"];
+        const yScale = (pane.chart.scales as any)["y"];
         const area = pane.chart.chartArea;
         if (!area) return;
         midPan = {
@@ -822,6 +848,12 @@ function createPlotPane(): PlotPane {
             startMin: xScale.min,
             startMax: xScale.max,
             chartWidth: area.right - area.left,
+            pane,
+            startY: e.clientY,
+            startYMin: yScale.min,
+            startYMax: yScale.max,
+            chartHeight: area.bottom - area.top,
+            movedY: false,
         };
         if (preZoomX === null) preZoomX = { min: xScale.min, max: xScale.max };
         // Freeze the view (only meaningful while capture is live and unpaused).
@@ -1946,6 +1978,19 @@ document.addEventListener("mousemove", (e) => {
     const dataDelta = ((e.clientX - midPan.startX) / midPan.chartWidth) * range;
     const newMin = midPan.startMin - dataDelta;
     const newMax = midPan.startMax - dataDelta;
+    // Vertical component pans the origin pane's Y axis (canvas y grows
+    // downward: dragging down reveals higher values). A few px of hysteresis
+    // so a plain horizontal pan doesn't pin the Y range as a side effect.
+    if (!midPan.movedY && Math.abs(e.clientY - midPan.startY) > 3) midPan.movedY = true;
+    if (midPan.movedY && midPan.chartHeight > 0) {
+        const yRange = midPan.startYMax - midPan.startYMin;
+        const dataDeltaY = ((e.clientY - midPan.startY) / midPan.chartHeight) * yRange;
+        const ys = (midPan.pane.chart.options.scales as any)["y"];
+        ys.min = midPan.startYMin + dataDeltaY;
+        ys.max = midPan.startYMax + dataDeltaY;
+        delete ys.suggestedMin;
+        delete ys.suggestedMax;
+    }
     for (const p of plotPanes) {
         const xs = (p.chart.options.scales as any)["x"];
         xs.min = newMin;
@@ -1953,7 +1998,16 @@ document.addEventListener("mousemove", (e) => {
         p.chart.update("none");
     }
 });
-document.addEventListener("mouseup", (e) => { if (e.button === 1) midPan = null; });
+document.addEventListener("mouseup", (e) => {
+    if (e.button !== 1) return;
+    // A drag with a vertical component leaves the pane on a manual Y range —
+    // commit it as a Y-axis lock so it persists and the lock UI reflects it.
+    if (midPan?.movedY) {
+        const ys = (midPan.pane.chart.scales as any)["y"];
+        setYLock(midPan.pane, { min: ys.min, max: ys.max });
+    }
+    midPan = null;
+});
 
 // ── Hover tooltip ─────────────────────────────────────────────────────────────
 // Native `title` tooltips don't reliably re-appear when the pointer moves
