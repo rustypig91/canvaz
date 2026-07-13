@@ -1213,6 +1213,11 @@ body.col-resizing { cursor: col-resize !important; user-select: none; }
   font-family: monospace;
   /* Short tips stay on one line; long ones (full data payloads) wrap instead
      of running off-screen. */
+  /* max-content: the width follows the content only, never the tooltip's
+     position — a fixed element placed near the right viewport edge otherwise
+     shrinks to the remaining space and reflows its text before the
+     positioning code flips it to the other side of the cursor. */
+  width: max-content;
   max-width: min(640px, 70vw);
   /* pre-line: long tips (full data payloads) still wrap instead of running
      off-screen, while multi-line tips (bus-stats chips) keep their newlines. */
