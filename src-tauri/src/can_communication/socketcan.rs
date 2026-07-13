@@ -4,15 +4,33 @@ use std::time::Duration;
 
 use socketcan::embedded_can::{ExtendedId, StandardId};
 use socketcan::CanFrame as SocketCanFrame;
-use socketcan::{CanDataFrame, CanSocket, EmbeddedFrame, Frame, Socket};
+use socketcan::{CanDataFrame, CanError, CanSocket, EmbeddedFrame, Frame, Socket, SocketOptions};
 
-use super::{CanBackend, CanFrame, CanOpenError, RxHandle, TxHandle};
+use super::{BusState, BusStatus, CanBackend, CanFrame, CanOpenError, RxHandle, TxHandle};
+
+// Error-frame class bits in the error frame's CAN id (linux/can/error.h).
+const CAN_ERR_CRTL: u32 = 0x0000_0004; // controller problems; detail in data[1]
+const CAN_ERR_BUSOFF: u32 = 0x0000_0040;
+const CAN_ERR_RESTARTED: u32 = 0x0000_0100;
+const CAN_ERR_CNT: u32 = 0x0000_0200; // TEC/REC in data[6]/data[7]
+
+// data[1] detail bits of a CAN_ERR_CRTL error frame.
+const CAN_ERR_CRTL_RX_WARNING: u8 = 0x04;
+const CAN_ERR_CRTL_TX_WARNING: u8 = 0x08;
+const CAN_ERR_CRTL_RX_PASSIVE: u8 = 0x10;
+const CAN_ERR_CRTL_TX_PASSIVE: u8 = 0x20;
+const CAN_ERR_CRTL_ACTIVE: u8 = 0x40;
 
 // ── RX handle ─────────────────────────────────────────────────────────────────
 
 pub(crate) struct SocketCanRxHandle {
     socket: Arc<CanSocket>,
     configured_timeout_ms: u64,
+    /// Latest controller state gleaned from kernel error frames. SocketCAN has
+    /// no polling API for this on a plain RAW socket, so the state is only as
+    /// fresh as the last error frame (the kernel emits one on each state
+    /// change, so a healthy-again bus is reported too via CRTL_ACTIVE).
+    last_status: BusStatus,
 }
 
 impl RxHandle for SocketCanRxHandle {
@@ -29,14 +47,59 @@ impl RxHandle for SocketCanRxHandle {
                 is_extended: df.is_extended(),
                 data: df.data().to_vec(),
                 timestamp_ms: None,
+                error: None,
             })),
+            Ok(SocketCanFrame::Error(ef)) => {
+                let bits = ef.error_bits();
+                let data = ef.data().to_vec();
+                self.update_status(bits, &data);
+                let desc = format!("{}", CanError::from(ef));
+                Ok(Some(CanFrame {
+                    can_id: 0,
+                    is_extended: false,
+                    data,
+                    timestamp_ms: None,
+                    error: Some(desc),
+                }))
+            }
             Ok(_) => Ok(None),
             Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => Ok(None),
             Err(e) => Err(e.to_string()),
         }
     }
 
+    fn poll_status(&mut self) -> Option<BusStatus> {
+        // Report only once something is known — before the first error frame
+        // there is nothing to say (and most captures never see one).
+        (self.last_status.bus_state.is_some() || self.last_status.tx_err.is_some()).then_some(self.last_status)
+    }
+
     fn close(&mut self) {}
+}
+
+impl SocketCanRxHandle {
+    fn update_status(&mut self, bits: u32, data: &[u8]) {
+        if bits & CAN_ERR_BUSOFF != 0 {
+            self.last_status.bus_state = Some(BusState::BusOff);
+        } else if bits & CAN_ERR_RESTARTED != 0 {
+            self.last_status.bus_state = Some(BusState::Active);
+        } else if bits & CAN_ERR_CRTL != 0 {
+            if let Some(&d) = data.get(1) {
+                if d & (CAN_ERR_CRTL_RX_PASSIVE | CAN_ERR_CRTL_TX_PASSIVE) != 0 {
+                    self.last_status.bus_state = Some(BusState::Passive);
+                } else if d & (CAN_ERR_CRTL_RX_WARNING | CAN_ERR_CRTL_TX_WARNING) != 0 {
+                    self.last_status.bus_state = Some(BusState::Warning);
+                } else if d & CAN_ERR_CRTL_ACTIVE != 0 {
+                    self.last_status.bus_state = Some(BusState::Active);
+                }
+            }
+        }
+        // Kernels ≥ 5.16 piggyback the error counters on every error frame.
+        if bits & CAN_ERR_CNT != 0 {
+            self.last_status.tx_err = data.get(6).map(|&b| b as u32);
+            self.last_status.rx_err = data.get(7).map(|&b| b as u32);
+        }
+    }
 }
 
 // ── TX handle ─────────────────────────────────────────────────────────────────
@@ -130,11 +193,18 @@ impl CanBackend for SocketCanBackend {
             CanSocket::open(&name).map_err(|e| CanOpenError::Other(format!("Failed to open socket on '{name}': {e}")))?,
         );
 
+        // Ask the kernel to deliver error frames (bus errors, controller state
+        // changes) on this socket — off by default on RAW sockets.
+        if let Err(e) = socket.set_error_filter_accept_all() {
+            log::warn!("set_error_filter failed on '{name}': {e} — error frames will not be shown");
+        }
+
         Ok((
             Box::new(SocketCanTxHandle { socket: Arc::clone(&socket) }),
             Box::new(SocketCanRxHandle {
                 socket,
                 configured_timeout_ms: 0,
+                last_status: BusStatus::default(),
             }),
         ))
     }

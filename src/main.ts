@@ -93,12 +93,14 @@ interface FrameInfo {
     dlc: number;
     data: number[];
     timestamp_ms: number;
-    direction: "rx" | "tx";
+    direction: "rx" | "tx" | "err";
     message_name: string | null;
     j1939?: J1939Info | null;
     // True if this row is a synthetic frame reassembled from a J1939 TP.CM /
     // TP.DT transfer rather than a frame that actually appeared on the bus.
     reassembled?: boolean;
+    // Bus error frame description; set only on error rows (direction "err").
+    error?: string | null;
     signals: FrameSignal[];
 }
 
@@ -109,12 +111,14 @@ interface CanFrameEvent {
     dlc: number;
     data: number[];
     timestamp_ms: number;
-    direction: "rx" | "tx";
+    direction: "rx" | "tx" | "err";
     // J1939 breakdown of the identifier; only present on J1939 channels.
     j1939?: J1939Info | null;
     // True if this row is a synthetic frame reassembled from a J1939 TP.CM /
     // TP.DT transfer rather than a frame that actually appeared on the bus.
     reassembled?: boolean;
+    // Bus error frame description; set only on error rows (direction "err").
+    error?: string | null;
     // Decoded signals as interleaved [value, raw, value, raw, …] pairs in DBC
     // message signal order. Names/units/message name are derived from the DBC by
     // position — no strings on the per-frame wire (they dominated GC churn).
@@ -3332,6 +3336,7 @@ async function startApp() {
 
     clearTrace();
     startScrollLoop();
+    startBusStatsPoll();
 
     const btn = document.getElementById("btn-app-run")!;
     btn.textContent = "■ Stop";
@@ -3349,6 +3354,7 @@ async function stopApp() {
     }
     appRunning = false;
     updatePauseViewBtn();
+    stopBusStatsPoll();
     // Close hardware connections; they will reopen on the next Start.
     for (const [handle, ch] of channels) {
         // A deliberate stop clears error badges — everything is closed now and
@@ -3840,11 +3846,13 @@ interface TraceEntry {
     messageName: string | null;
     timestampMs: number;
     cycleTimeMs: number | null;
-    direction: "rx" | "tx";
+    direction: "rx" | "tx" | "err";
     j1939: J1939Info | null;
     // True if this row is a synthetic frame reassembled from a J1939 TP.CM /
     // TP.DT transfer rather than a frame that actually appeared on the bus.
     reassembled: boolean;
+    // Bus error frame description; set only on error rows (direction "err").
+    error: string | null;
     // Interleaved [value, raw] pairs in DBC message signal order (see CanFrameEvent).
     signals: (number | null)[];
 }
@@ -3938,7 +3946,7 @@ let traceSortCol: TraceSortCol = null;
 let traceSortDir: "asc" | "desc" = "asc";
 let traceLocalBuffer: TraceEntry[] = [];
 
-function traceKey(handle: number, canId: number, direction: "rx" | "tx") {
+function traceKey(handle: number, canId: number, direction: "rx" | "tx" | "err") {
     return `${handle}::${canId}::${direction}`;
 }
 
@@ -4114,7 +4122,7 @@ function applyTraceSort() {
 }
 
 function buildTraceCellHtml(key: string, entry: TraceEntry): string {
-    const dirClass = entry.direction === "tx" ? "dir-tx" : "dir-rx";
+    const dirClass = entry.direction === "tx" ? "dir-tx" : entry.direction === "err" ? "dir-err" : "dir-rx";
     const j = entry.j1939;
     switch (key) {
         case "pgn": return `<td data-col="pgn" class="td-canid"${j ? ` data-tip="PGN ${j.pgn} (0x${j.pgn.toString(16).toUpperCase()})"` : ""}>${j ? fmtPgn(j.pgn) : "—"}</td>`;
@@ -4125,7 +4133,9 @@ function buildTraceCellHtml(key: string, entry: TraceEntry): string {
         case "dir": return `<td data-col="dir"><span class="dir-badge ${dirClass}">${entry.direction.toUpperCase()}</span></td>`;
         case "channel": return `<td data-col="channel">${escapeHtml(channelName(entry.channelHandle))}</td>`;
         case "canId": return `<td data-col="canId" class="td-canid">${entry.reassembled ? `<span class="tp-badge" data-tip="Reassembled from J1939 TP.CM/TP.DT — this frame did not appear on the bus in this form">${fmtId(entry.canId, entry.isExtended)}</span>` : fmtId(entry.canId, entry.isExtended)}</td>`;
-        case "msg": return `<td data-col="msg">${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>`;
+        case "msg": return entry.error
+            ? `<td data-col="msg" class="td-msg-err">${escapeHtml(entry.error)}</td>`
+            : `<td data-col="msg">${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>`;
         case "dlc": return `<td data-col="dlc">${entry.dlc}</td>`;
         case "data": return `<td data-col="data" class="td-data">${fmtData(entry.data)}</td>`;
         case "cycle": return `<td data-col="cycle" class="td-cycle">${entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—"}</td>`;
@@ -4140,11 +4150,12 @@ function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
         canId: parseInt(tr.dataset.canid ?? "0"),
         isExtended: tr.dataset.ext === "1",
         timestampMs: parseInt(tr.dataset.ts ?? "0"),
-        direction: (tr.dataset.dir as "rx" | "tx") ?? "rx",
+        direction: (tr.dataset.dir as "rx" | "tx" | "err") ?? "rx",
         messageName: tr.dataset.msg || null,
         dlc: parseInt(tr.dataset.dlc ?? "0"),
         cycleTimeMs: tr.dataset.cycle ? parseFloat(tr.dataset.cycle) : null,
         reassembled: tr.dataset.reassembled === "1",
+        error: tr.dataset.err || null,
         j1939: tr.dataset.pgn
             ? {
                 pgn: parseInt(tr.dataset.pgn),
@@ -4170,6 +4181,7 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
     tr.dataset.dlc = String(entry.dlc);
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
     if (entry.reassembled) tr.dataset.reassembled = "1";
+    if (entry.error) tr.dataset.err = entry.error;
     if (entry.j1939) {
         tr.dataset.pgn = String(entry.j1939.pgn);
         tr.dataset.prio = String(entry.j1939.priority);
@@ -4196,6 +4208,12 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     const dataCell = gc("data"); if (dataCell) dataCell.textContent = fmtData(entry.data);
     const cycleCell = gc("cycle"); if (cycleCell) cycleCell.textContent = entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—";
     const canIdCell = gc("canId"); if (canIdCell) canIdCell.outerHTML = buildTraceCellHtml("canId", entry);
+    // Error rows share one overwrite key per channel but the description can
+    // differ from frame to frame — keep the Message cell current.
+    if (entry.error) {
+        tr.dataset.err = entry.error;
+        const msgCell = gc("msg"); if (msgCell) msgCell.textContent = entry.error;
+    }
 
     // Refresh open expansion row with updated signal values + current min/max
     const next = tr.nextElementSibling as HTMLTableRowElement | null;
@@ -4244,18 +4262,23 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
     const appendEntries: TraceEntry[] = [];
 
     for (const ev of events) {
+        const isError = ev.error != null;
         // Message identity comes from the frontend's copy of the DBC (the event
         // carries no strings); both sides parsed the same file at open. On J1939
         // channels the lookup falls back to PGN + source-address matching,
-        // mirroring the backend.
-        const msg = dbcMessageFor(ev.channel_handle, ev.can_id, ev.is_extended);
+        // mirroring the backend. Error frames have no identifier to decode.
+        const msg = isError ? null : dbcMessageFor(ev.channel_handle, ev.can_id, ev.is_extended);
         const messageName = msg?.name ?? null;
 
-        // Update seen sets (for filter autocomplete) and cycle timing.
+        // Update seen sets (for filter autocomplete) and cycle timing. Error
+        // frames only contribute their channel — their id 0 would pollute the
+        // CAN-ID filter menu.
         traceSeenChannels.add(ev.channel_handle);
-        traceSeenCanIds.add(ev.can_id);
-        if (messageName) traceSeenMsgNames.add(messageName);
-        else traceSeenNoMsg = true;
+        if (!isError) {
+            traceSeenCanIds.add(ev.can_id);
+            if (messageName) traceSeenMsgNames.add(messageName);
+            else traceSeenNoMsg = true;
+        }
         if (ev.j1939) {
             traceSeenPgns.add(ev.j1939.pgn);
             traceSeenPrios.add(ev.j1939.priority);
@@ -4316,6 +4339,7 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
             direction,
             j1939: ev.j1939 ?? null,
             reassembled: ev.reassembled ?? false,
+            error: ev.error ?? null,
             signals: ev.signals,
         };
 
@@ -4424,7 +4448,8 @@ async function loadTraceFrames() {
         cycleTimes.set(k, f.timestamp_ms);
         if (f.message_name) traceSeenMsgNames.add(f.message_name);
         traceSeenChannels.add(f.channel_handle);
-        traceSeenCanIds.add(f.can_id);
+        // Error rows have no real identifier — keep id 0 out of the filter menu.
+        if (f.error == null) traceSeenCanIds.add(f.can_id);
         if (f.j1939) {
             traceSeenPgns.add(f.j1939.pgn);
             traceSeenPrios.add(f.j1939.priority);
@@ -4445,6 +4470,7 @@ async function loadTraceFrames() {
             direction: f.direction,
             j1939: f.j1939 ?? null,
             reassembled: f.reassembled ?? false,
+            error: f.error ?? null,
             // get_frames returns named signals; flatten to the interleaved
             // [value, raw] layout used everywhere else (same DBC order).
             signals: interleaveFrameSignals(f),
@@ -4893,7 +4919,7 @@ function setupTraceHeaders() {
             th.addEventListener("contextmenu", (e) => {
                 e.preventDefault();
                 showFilterMenu(e.clientX, e.clientY,
-                    [{ label: "RX", key: "rx" }, { label: "TX", key: "tx" }],
+                    [{ label: "RX", key: "rx" }, { label: "TX", key: "tx" }, { label: "ERR", key: "err" }],
                     traceFilterDir, (active) => { traceFilterDir = active; syncFilteredHeaders(); applyTraceFilter(); });
             });
         } else if (key === "dlc") {
@@ -5430,6 +5456,81 @@ function log(level: LogLevel, message: string, opts?: { ts?: string; toConsole?:
         fn(message);
     }
     if (level !== "debug" && opts?.toStatus !== false) queueStatus(message, level);
+}
+
+// ── Bus statistics strip ──────────────────────────────────────────────────────
+// One compact chip per open channel in the menubar while capture runs: bus
+// state dot, load % and frames/sec, with the full numbers in the tooltip.
+// Polled from the backend at 1 Hz — rates are computed over the poll interval.
+
+interface BusStatus {
+    bus_state?: "active" | "warning" | "passive" | "busoff" | null;
+    tx_err?: number | null;
+    rx_err?: number | null;
+    overrun?: number | null;
+}
+interface BusStats {
+    channel_handle: number;
+    rx_fps: number;
+    tx_fps: number;
+    bus_load: number;
+    error_frames: number;
+    status?: BusStatus | null;
+}
+
+let busStatsTimer: ReturnType<typeof setInterval> | null = null;
+
+function startBusStatsPoll() {
+    stopBusStatsPoll();
+    busStatsTimer = setInterval(async () => {
+        if (!appRunning) return;
+        try {
+            renderBusStats(await invoke<BusStats[]>("get_bus_stats"));
+        } catch (e) {
+            log("debug", `get_bus_stats failed: ${e}`);
+        }
+    }, 1000);
+}
+
+function stopBusStatsPoll() {
+    if (busStatsTimer) { clearInterval(busStatsTimer); busStatsTimer = null; }
+    document.getElementById("bus-stats")!.innerHTML = "";
+}
+
+const BUS_STATE_LABEL: Record<string, string> = {
+    active: "error active (healthy)",
+    warning: "error warning",
+    passive: "error passive",
+    busoff: "BUS OFF",
+};
+
+function renderBusStats(stats: BusStats[]) {
+    const el = document.getElementById("bus-stats")!;
+    el.innerHTML = "";
+    for (const s of stats) {
+        const st = s.status;
+        const state = st?.bus_state ?? null;
+        const fps = s.rx_fps + s.tx_fps;
+        const tipLines = [
+            channelName(s.channel_handle),
+            `Bus load: ${s.bus_load.toFixed(1)} % (estimated)`,
+            `RX: ${s.rx_fps.toFixed(0)} f/s · TX: ${s.tx_fps.toFixed(0)} f/s`,
+            `Error frames: ${s.error_frames}`,
+        ];
+        if (state) tipLines.push(`Bus state: ${BUS_STATE_LABEL[state] ?? state}`);
+        if (st?.tx_err != null && st?.rx_err != null) tipLines.push(`Error counters: TX ${st.tx_err} · RX ${st.rx_err}`);
+        if (st?.overrun != null && st.overrun > 0) tipLines.push(`Overruns: ${st.overrun}`);
+
+        const chip = document.createElement("span");
+        chip.className = `bus-chip${s.error_frames > 0 ? " has-errors" : ""}`;
+        chip.title = tipLines.join("\n");
+        const errPart = s.error_frames > 0 ? ` <span class="bus-err-count">${s.error_frames}⚠</span>` : "";
+        chip.innerHTML =
+            `<span class="bus-state${state && state !== "active" ? ` ${state}` : ""}"></span>` +
+            `<span class="bus-chip-name">${escapeHtml(channelName(s.channel_handle))}</span>` +
+            `<span>${s.bus_load.toFixed(1)}%</span><span>${fps.toFixed(0)}/s</span>${errPart}`;
+        el.appendChild(chip);
+    }
 }
 
 // ── Status bar ────────────────────────────────────────────────────────────────

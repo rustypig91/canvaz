@@ -569,6 +569,7 @@ mod tests {
             is_extended: true,
             data: vec![0; 8],
             timestamp_ms: None,
+            error: None,
         }
     }
 
