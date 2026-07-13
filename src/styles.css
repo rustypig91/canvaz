@@ -154,6 +154,17 @@ kbd {
   gap: 6px;
   flex-shrink: 0;
 }
+
+/* "N periodic TX" — visible only while the simulator is actively sending.
+   Warning-colored: the tool is driving the bus, not just observing it. */
+#sim-tx-status {
+  display: none;
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--warning);
+  white-space: nowrap;
+  cursor: default;
+}
 .bus-chip {
   display: inline-flex;
   align-items: center;

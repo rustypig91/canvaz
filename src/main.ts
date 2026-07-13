@@ -1857,6 +1857,14 @@ async function onChannelError(ev: ChannelErrorEvent) {
     try { await invoke("close_channel", { channelHandle: ev.channel_handle }); }
     catch (e) { log("debug", `Close after channel error failed: ${e}`); }
     ch.open = false;
+    // The channel's backend periodics died with the hardware handle; clear the
+    // stale registrations, otherwise recovery's startSim() bails on its
+    // "already registered" guard and the entries never resume sending (and the
+    // footer TX indicator would keep counting them).
+    for (const entry of simEntries.values()) {
+        if (entry.channel === ev.channel_handle) entry.periodicHandle = null;
+    }
+    updateSimTxStatus();
     renderChannelList();
     if (appRunning) scheduleChannelRecovery(ev.channel_handle);
 }
@@ -2756,6 +2764,27 @@ function renderSimEntries() {
 
 // ── Sim actions ───────────────────────────────────────────────────────────────
 
+// Footer indicator: how many periodic transmissions are actively registered
+// with the backend right now — a reminder that the tool is generating bus
+// traffic, not just observing. Counts backend registrations (periodicHandle),
+// not user intent (running): entries marked running while capture is stopped
+// transmit nothing. The tooltip lists each transmission.
+function updateSimTxStatus() {
+    const el = document.getElementById("sim-tx-status")!;
+    const active = [...simEntries.values()].filter(e => e.periodicHandle !== null);
+    if (active.length === 0) {
+        el.style.display = "none";
+        delete el.dataset.tip;
+        return;
+    }
+    el.style.display = "";
+    el.textContent = `▶ ${active.length} periodic TX`;
+    el.dataset.tip = active.map(e => e.kind === "message"
+        ? `${e.messageName} @ ${e.periodMs} ms → ${channelName(e.channel)}`
+        : `0x${e.canId.toString(16).toUpperCase()} @ ${e.periodMs} ms → ${channelName(e.channel)}`
+    ).join("\n");
+}
+
 function addSimSignal(handle: number, sig: DbcSignal) {
     const dbc = channels.get(handle)?.dbc;
     if (!dbc) { log("warn", "No DBC loaded for this channel"); return; }
@@ -2834,6 +2863,7 @@ async function startSim(key: string) {
             handle = await invoke<number>("add_periodic_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs, is_extended: entry.isExtended } });
         }
         entry.periodicHandle = handle;
+        updateSimTxStatus();
     } catch (e) {
         log("error", `Sim start error: ${e}`);
         entry.running = false;
@@ -2852,6 +2882,7 @@ async function stopSim(key: string) {
     entry.running = false;
     const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
     if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
+    updateSimTxStatus();
     scheduleAutoSave("sim stopped");
 }
 
@@ -3370,6 +3401,7 @@ async function stopApp() {
     for (const entry of simEntries.values()) {
         entry.periodicHandle = null;
     }
+    updateSimTxStatus();
     renderChannelList();
     const btn = document.getElementById("btn-app-run")!;
     btn.textContent = "▶ Start";
