@@ -38,10 +38,9 @@ const CAN_ERR_NOMSG: i32 = -2;
 // to other handles open on the same physical channel (including our own RX handle).
 const CANIOCTL_SET_LOCAL_TXECHO: u32 = 32;
 
-// canIOCTL_SET_BUSOUTPUT_CONTROL = 6: selects the CAN transceiver driver mode.
-// Must be set before canBusOn(). canDRIVER_SILENT puts the transceiver in
-// listen-only mode: no ACK bit is driven and no error frames are transmitted.
-const CANIOCTL_SET_BUSOUTPUT_CONTROL: u32 = 6;
+// Driver types for canSetBusOutputControl. canDRIVER_SILENT puts the CAN
+// controller's transceiver in listen-only mode: no ACK bit is driven and no
+// error frames are transmitted. Must be set before canBusOn().
 const CAN_DRIVER_NORMAL: u32 = 4;
 const CAN_DRIVER_SILENT: u32 = 1;
 
@@ -54,6 +53,7 @@ type FnSetBus = unsafe extern "system" fn(i32, c_long, u32, u32, u32, u32, u32) 
 type FnBusOn = unsafe extern "system" fn(i32) -> i32;
 type FnBusOff = unsafe extern "system" fn(i32) -> i32;
 type FnIoCtl = unsafe extern "system" fn(i32, u32, *mut std::ffi::c_void, u32) -> i32;
+type FnSetBusOutputControl = unsafe extern "system" fn(i32, u32) -> i32;
 type FnReadWait = unsafe extern "system" fn(i32, *mut c_long, *mut u8, *mut u32, *mut u32, *mut c_ulong, c_ulong) -> i32;
 type FnWriteWait = unsafe extern "system" fn(i32, c_long, *const u8, u32, u32, c_ulong) -> i32;
 type FnGetChannelData = unsafe extern "system" fn(i32, i32, *mut u8, usize) -> i32;
@@ -70,6 +70,7 @@ struct CanLib {
     bus_on: FnBusOn,
     bus_off: FnBusOff,
     ioctl: FnIoCtl,
+    set_bus_output_control: FnSetBusOutputControl,
     read_wait: FnReadWait,
     write_wait: FnWriteWait,
 }
@@ -102,6 +103,7 @@ impl CanLib {
                 bus_on: sym!(b"canBusOn\0", FnBusOn),
                 bus_off: sym!(b"canBusOff\0", FnBusOff),
                 ioctl: sym!(b"canIoCtl\0", FnIoCtl),
+                set_bus_output_control: sym!(b"canSetBusOutputControl\0", FnSetBusOutputControl),
                 read_wait: sym!(b"canReadWait\0", FnReadWait),
                 write_wait: sym!(b"canWriteWait\0", FnWriteWait),
                 _lib: lib,
@@ -340,13 +342,12 @@ impl CanBackend for KvaserBackend {
             }
         };
 
-        // Selects normal vs. silent transceiver mode. Must be called before
-        // canBusOn(); the buffer is an unsigned long (4 bytes) per the docs.
+        // Selects normal vs. silent transceiver mode. Must be called before canBusOn().
         let set_driver_mode = |h: i32| {
-            let mut mode: u32 = if listen_only { CAN_DRIVER_SILENT } else { CAN_DRIVER_NORMAL };
-            let s = unsafe { (lib.ioctl)(h, CANIOCTL_SET_BUSOUTPUT_CONTROL, &mut mode as *mut u32 as *mut _, 4) };
+            let mode = if listen_only { CAN_DRIVER_SILENT } else { CAN_DRIVER_NORMAL };
+            let s = unsafe { (lib.set_bus_output_control)(h, mode) };
             if s < CAN_OK {
-                log::warn!("canIoCtl(SET_BUSOUTPUT_CONTROL) failed: {} — listen-only may not be applied", canlib_err(s));
+                log::warn!("canSetBusOutputControl failed: {} — listen-only may not be applied", canlib_err(s));
             }
         };
 
