@@ -2302,10 +2302,10 @@ const SIM_GEN_OPTIONS: [string, string, string][] = [
     ["ramp", "ramp", "Ramp — sawtooth climbing from min to max over the period, then wrapping back to min"],
     ["sine", "sine", "Sine — oscillates between min and max over the period, starting at the midpoint going up"],
     ["toggle", "toggle", "Toggle — square wave: min for the first half of the period, max for the second"],
-    ["counter", "count", "Counter — raw value increments by 1 per sent frame, wrapping at the signal width (2^length)"],
-    ["xor8", "xor8", "XOR checksum — XOR of all frame bytes, computed after the other signals (incl. counters) are encoded, with this signal's bits zeroed"],
-    ["sum8", "sum8", "SUM checksum — sum of all frame bytes modulo 256, computed after the other signals (incl. counters) are encoded, with this signal's bits zeroed"],
-    ["crc8_sae", "crc8", "CRC-8 SAE J1850 (poly 0x1D, init/XOR-out 0xFF, AUTOSAR E2E profile 1) — computed after the other signals (incl. counters) are encoded, with this signal's bits zeroed"],
+    ["counter", "count", "Rolling counter — marks this signal as the frame's message counter: its raw value increments by 1 on every sent frame and wraps at the signal's bit width. Receiving ECUs check it to detect stale or frozen data"],
+    ["xor8", "xor8", "Checksum (XOR) — marks this signal as the frame's checksum field. The whole frame is protected: after every other signal (including counters) is encoded, the XOR of all frame bytes (with this field's bits zeroed) is written into this signal's bits"],
+    ["sum8", "sum8", "Checksum (SUM) — marks this signal as the frame's checksum field. The whole frame is protected: after every other signal (including counters) is encoded, the sum of all frame bytes modulo 256 (with this field's bits zeroed) is written into this signal's bits"],
+    ["crc8_sae", "crc8", "Checksum (CRC-8 SAE J1850: poly 0x1D, init/XOR-out 0xFF — AUTOSAR E2E profile 1) — marks this signal as the frame's checksum field. The whole frame is protected: after every other signal (including counters) is encoded, the CRC of all frame bytes (with this field's bits zeroed) is written into this signal's bits"],
 ];
 
 function simGenTooltip(value: string): string {
