@@ -5494,6 +5494,11 @@ function startBusStatsPoll() {
 
 function stopBusStatsPoll() {
     if (busStatsTimer) { clearInterval(busStatsTimer); busStatsTimer = null; }
+    // Removing a hovered chip fires no mouseout — hide its tooltip explicitly.
+    if (tipTarget && tipTarget.closest("#bus-stats")) {
+        tipTarget = null;
+        if (tooltipEl) tooltipEl.style.display = "none";
+    }
     document.getElementById("bus-stats")!.innerHTML = "";
 }
 
@@ -5504,13 +5509,29 @@ const BUS_STATE_LABEL: Record<string, string> = {
     busoff: "BUS OFF",
 };
 
+// Chips are updated in place (keyed by channel handle), never rebuilt: a
+// rebuild would destroy the hovered element every second and take the open
+// tooltip down with it. The tooltip is the app's own data-tip one (native
+// `title` has the same disappearing problem), and its text is refreshed live
+// while it is showing.
 function renderBusStats(stats: BusStats[]) {
     const el = document.getElementById("bus-stats")!;
-    el.innerHTML = "";
+    const seen = new Set<string>();
     for (const s of stats) {
+        const key = String(s.channel_handle);
+        seen.add(key);
+        let chip = el.querySelector<HTMLElement>(`.bus-chip[data-ch="${key}"]`);
+        if (!chip) {
+            chip = document.createElement("span");
+            chip.dataset.ch = key;
+            chip.innerHTML =
+                `<span class="bus-state"></span><span class="bus-chip-name"></span>` +
+                `<span class="bus-load"></span><span class="bus-fps"></span><span class="bus-err-count"></span>`;
+            el.appendChild(chip);
+        }
+
         const st = s.status;
         const state = st?.bus_state ?? null;
-        const fps = s.rx_fps + s.tx_fps;
         const tipLines = [
             channelName(s.channel_handle),
             `Bus load: ${s.bus_load.toFixed(1)} % (estimated)`,
@@ -5521,15 +5542,23 @@ function renderBusStats(stats: BusStats[]) {
         if (st?.tx_err != null && st?.rx_err != null) tipLines.push(`Error counters: TX ${st.tx_err} · RX ${st.rx_err}`);
         if (st?.overrun != null && st.overrun > 0) tipLines.push(`Overruns: ${st.overrun}`);
 
-        const chip = document.createElement("span");
         chip.className = `bus-chip${s.error_frames > 0 ? " has-errors" : ""}`;
-        chip.title = tipLines.join("\n");
-        const errPart = s.error_frames > 0 ? ` <span class="bus-err-count">${s.error_frames}⚠</span>` : "";
-        chip.innerHTML =
-            `<span class="bus-state${state && state !== "active" ? ` ${state}` : ""}"></span>` +
-            `<span class="bus-chip-name">${escapeHtml(channelName(s.channel_handle))}</span>` +
-            `<span>${s.bus_load.toFixed(1)}%</span><span>${fps.toFixed(0)}/s</span>${errPart}`;
-        el.appendChild(chip);
+        chip.dataset.tip = tipLines.join("\n");
+        chip.querySelector<HTMLElement>(".bus-state")!.className =
+            `bus-state${state && state !== "active" ? ` ${state}` : ""}`;
+        chip.querySelector<HTMLElement>(".bus-chip-name")!.textContent = channelName(s.channel_handle);
+        chip.querySelector<HTMLElement>(".bus-load")!.textContent = `${s.bus_load.toFixed(1)}%`;
+        chip.querySelector<HTMLElement>(".bus-fps")!.textContent = `${(s.rx_fps + s.tx_fps).toFixed(0)}/s`;
+        const errEl = chip.querySelector<HTMLElement>(".bus-err-count")!;
+        errEl.textContent = s.error_frames > 0 ? `${s.error_frames}⚠` : "";
+        errEl.style.display = s.error_frames > 0 ? "" : "none";
+
+        // Tooltip currently open on this chip: keep its numbers current.
+        if (tipTarget === chip && tooltipEl) tooltipEl.textContent = chip.dataset.tip;
+    }
+    // Channels closed since the last poll (e.g. a dead channel auto-closed).
+    for (const chip of Array.from(el.children) as HTMLElement[]) {
+        if (!seen.has(chip.dataset.ch ?? "")) chip.remove();
     }
 }
 

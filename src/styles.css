@@ -1214,7 +1214,9 @@ body.col-resizing { cursor: col-resize !important; user-select: none; }
   /* Short tips stay on one line; long ones (full data payloads) wrap instead
      of running off-screen. */
   max-width: min(640px, 70vw);
-  white-space: normal;
+  /* pre-line: long tips (full data payloads) still wrap instead of running
+     off-screen, while multi-line tips (bus-stats chips) keep their newlines. */
+  white-space: pre-line;
   overflow-wrap: break-word;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.4);
 }
