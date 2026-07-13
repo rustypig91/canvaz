@@ -2779,7 +2779,8 @@ function updateSimTxStatus() {
     }
     // Must be an explicit inline value: "" would fall back to the
     // stylesheet's display:none and the indicator would never appear.
-    el.style.display = "inline";
+    // inline-flex matches the .bus-chip layout the element is styled as.
+    el.style.display = "inline-flex";
     el.textContent = `▶ ${active.length} periodic TX`;
     el.dataset.tip = active.map(e => e.kind === "message"
         ? `${e.messageName} @ ${e.periodMs} ms → ${channelName(e.channel)}`
