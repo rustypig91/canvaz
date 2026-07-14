@@ -699,10 +699,40 @@ function snapshotPlotPanes() {
 function removeSigFromPane(pane: PlotPane, key: string) {
     if (!pane.series.delete(key)) return;
     if (pane.series.size === 0) { closePlotPane(pane.id); return; }
+    pane.hoveredDatasetIndex = null;
     syncDatasets(pane);
     updatePaneTitle(pane);
     updateSignalHighlights();
     scheduleAutoSave("plot signal removed");
+}
+
+// First PLOT_COLORS entry not already used by another series in the pane;
+// falls back to cycling through the palette once every color is taken.
+function pickPlotColor(pane: PlotPane): string {
+    const used = new Set([...pane.series.values()].map(s => s.color));
+    return PLOT_COLORS.find(c => !used.has(c)) ?? PLOT_COLORS[pane.series.size % PLOT_COLORS.length];
+}
+
+// Moves a signal from one pane's legend to another (drag-and-drop between
+// plots). A no-op if source and target are the same pane, or the signal is
+// already present in the target (the source copy is just dropped).
+function moveSigBetweenPanes(source: PlotPane, target: PlotPane, key: string) {
+    if (source === target) return;
+    const series = source.series.get(key);
+    if (!series) return;
+    source.series.delete(key);
+    if (!target.series.has(key)) {
+        series.color = pickPlotColor(target);
+        target.series.set(key, series);
+    }
+    source.hoveredDatasetIndex = null;
+    target.hoveredDatasetIndex = null;
+    if (source.series.size === 0) closePlotPane(source.id);
+    else { syncDatasets(source); updatePaneTitle(source); }
+    syncDatasets(target);
+    updatePaneTitle(target);
+    updateSignalHighlights();
+    scheduleAutoSave("plot signal moved");
 }
 
 function createPlotPane(): PlotPane {
@@ -734,6 +764,7 @@ function createPlotPane(): PlotPane {
       <button class="btn-export-png pane-btn" title="Save pane as PNG">⤓</button>
       <button class="btn-close-pane" title="Close plot">×</button>
     </div>
+    <div class="pane-legend"></div>
     <div class="pane-canvas-wrap">
       <canvas></canvas>
       <div class="cursor-readout" style="display:none"></div>
@@ -882,23 +913,9 @@ function createPlotPane(): PlotPane {
             interaction: { mode: "index", intersect: false },
             parsing: false,
             plugins: {
-                legend: {
-                    display: true,
-                    labels: { color: "#e4e4e7", boxWidth: 24, boxHeight: 2, padding: 12 },
-                    onHover: (_evt, item) => {
-                        pane.hoveredDatasetIndex = item.datasetIndex ?? null;
-                        (pane.chart as any).tooltip?.setActiveElements([], { x: 0, y: 0 });
-                        syncDatasets(pane);
-                    },
-                    onLeave: () => {
-                        pane.hoveredDatasetIndex = null;
-                        syncDatasets(pane);
-                    },
-                    onClick: (_evt, item) => {
-                        const key = [...pane.series.keys()][item.datasetIndex!];
-                        if (key) removeSigFromPane(pane, key);
-                    },
-                },
+                // Legend is rendered as HTML (see renderPaneLegend) instead of on the
+                // canvas so entries are real, draggable DOM nodes.
+                legend: { display: false },
                 zoom: {
                     zoom: {
                         drag: {
@@ -1014,7 +1031,7 @@ function closePlotPane(id: string) {
 async function addSignalToPane(pane: PlotPane, handle: number, sig: DbcSignal) {
     const key = plotKey(handle, sig.message_id, sig.name);
     if (pane.series.has(key)) return;
-    const color = PLOT_COLORS[pane.series.size % PLOT_COLORS.length];
+    const color = pickPlotColor(pane);
     const series: PlotSeries = {
         signalName: sig.name, messageName: sig.message_name, messageId: sig.message_id, unit: sig.unit,
         color, channel: handle, timestamps: [], data: [], lastValue: null, frozenData: null,
@@ -1075,21 +1092,42 @@ async function addMessageToNewPane(handle: number, msg: DbcMessage) {
     await addMessageSignalsToPane(createPlotPane(), handle, msg);
 }
 
+// "Add to Plot" from the trace window's signal context menu: always opens a
+// fresh pane rather than reusing an existing one, since the user picked a
+// specific signal out of a live frame rather than dragging onto a target.
+async function addSignalToNewPlotFromTrace(handle: number, sig: DbcSignal) {
+    const pane = createPlotPane();
+    await addSignalToPane(pane, handle, sig);
+    flashPlotTabButton();
+}
+
+// Briefly pulses the Plot tab button with a green hue so a signal added from
+// the trace window is noticed without switching the user away from Trace.
+function flashPlotTabButton() {
+    if (plotTabActive) return; // already visible, nothing to draw attention to
+    const btn = document.querySelector<HTMLElement>('.tab-btn[data-tab="plot"]');
+    if (!btn) return;
+    btn.classList.remove("tab-btn-flash");
+    void btn.offsetWidth; // reflow so re-adding the class restarts the animation
+    btn.classList.add("tab-btn-flash");
+    btn.addEventListener("animationend", () => btn.classList.remove("tab-btn-flash"), { once: true });
+}
+
 function syncDatasets(pane: PlotPane) {
     const tension = pane.interpolation === 'smooth' ? 0.4 : 0;
     const stepped: 'before' | false = pane.interpolation === 'none' ? 'before' : false;
-    const seriesArray = [...pane.series.values()];
+    const seriesEntries = [...pane.series.entries()];
 
     // Grow / shrink the datasets array to match the series count, mutating
     // existing objects in-place so Chart.js keeps its internal meta state
     // for each dataset instead of re-initialising and flashing blank.
-    while (pane.chart.data.datasets.length > seriesArray.length)
+    while (pane.chart.data.datasets.length > seriesEntries.length)
         pane.chart.data.datasets.pop();
-    while (pane.chart.data.datasets.length < seriesArray.length)
+    while (pane.chart.data.datasets.length < seriesEntries.length)
         pane.chart.data.datasets.push({} as any);
 
-    for (let i = 0; i < seriesArray.length; i++) {
-        const s = seriesArray[i];
+    for (let i = 0; i < seriesEntries.length; i++) {
+        const s = seriesEntries[i][1];
         const hovered = pane.hoveredDatasetIndex === i;
         const showDot = pane.showPoints || hovered;
         const ds = pane.chart.data.datasets[i] as any;
@@ -1104,11 +1142,60 @@ function syncDatasets(pane: PlotPane) {
         ds.tension = tension;
         ds.stepped = stepped;
     }
+    renderPaneLegend(pane, seriesEntries);
     // Route through the RAF loop so there is never more than one update()
     // per frame, even when syncDatasets is called synchronously (e.g. hover).
     // force=true: user-driven changes (interpolation, show-points, hover) must
     // redraw even while the view is paused or zoomed.
     markPaneDirty(pane, true);
+}
+
+// Renders the pane's HTML legend from its current series. Reuses existing
+// legend-item DOM nodes by position (only growing/shrinking the tail) so a
+// re-render triggered by a hover doesn't recreate the node under the mouse —
+// that would fire a spurious mouseleave and make the hover flicker.
+function renderPaneLegend(pane: PlotPane, seriesEntries: [string, PlotSeries][]) {
+    const container = pane.el.querySelector<HTMLElement>(".pane-legend")!;
+    while (container.children.length > seriesEntries.length)
+        container.lastElementChild!.remove();
+    while (container.children.length < seriesEntries.length) {
+        const item = document.createElement("div");
+        item.className = "legend-item";
+        item.draggable = true;
+        item.title = "Drag to move to another plot · click to remove";
+        item.innerHTML = `<span class="legend-swatch"></span><span class="legend-label"></span>`;
+        item.addEventListener("mouseenter", () => {
+            pane.hoveredDatasetIndex = [...container.children].indexOf(item);
+            (pane.chart as any).tooltip?.setActiveElements([], { x: 0, y: 0 });
+            syncDatasets(pane);
+        });
+        item.addEventListener("mouseleave", () => {
+            pane.hoveredDatasetIndex = null;
+            syncDatasets(pane);
+        });
+        item.addEventListener("click", () => {
+            const key = item.dataset.key;
+            if (key) removeSigFromPane(pane, key);
+        });
+        item.addEventListener("dragstart", (e) => {
+            const key = item.dataset.key;
+            if (!key) return;
+            const payload: DragPlotMove = { paneId: pane.id, key };
+            e.dataTransfer!.setData("application/can-plot-move", JSON.stringify(payload));
+            e.dataTransfer!.effectAllowed = "move";
+            item.classList.add("dragging");
+        });
+        item.addEventListener("dragend", () => item.classList.remove("dragging"));
+        container.appendChild(item);
+    }
+    for (let i = 0; i < seriesEntries.length; i++) {
+        const [key, s] = seriesEntries[i];
+        const item = container.children[i] as HTMLElement;
+        item.dataset.key = key;
+        item.classList.toggle("hovered", pane.hoveredDatasetIndex === i);
+        item.querySelector<HTMLElement>(".legend-swatch")!.style.background = s.color;
+        item.querySelector<HTMLElement>(".legend-label")!.textContent = s.signalName;
+    }
 }
 
 
@@ -1311,6 +1398,12 @@ interface DragMessage {
     msg: DbcMessage;
 }
 
+// A signal dragged off a plot pane's legend, to be moved to another pane.
+interface DragPlotMove {
+    paneId: string;
+    key: string;
+}
+
 function parseDragSignal(e: DragEvent): DragSignal | null {
     try { return JSON.parse(e.dataTransfer?.getData("application/can-signal") ?? "null"); }
     catch { return null; }
@@ -1318,6 +1411,11 @@ function parseDragSignal(e: DragEvent): DragSignal | null {
 
 function parseDragMessage(e: DragEvent): DragMessage | null {
     try { return JSON.parse(e.dataTransfer?.getData("application/can-message") ?? "null"); }
+    catch { return null; }
+}
+
+function parsePlotMove(e: DragEvent): DragPlotMove | null {
+    try { return JSON.parse(e.dataTransfer?.getData("application/can-plot-move") ?? "null"); }
     catch { return null; }
 }
 
@@ -1406,10 +1504,11 @@ function setupDbcTree() {
     });
 }
 
-// Both a lone signal and a whole message are draggable; drop targets accept either.
+// A lone signal, a whole message, or a signal dragged off another pane's
+// legend are all draggable; drop targets accept any of the three.
 function isCanDragEvent(e: DragEvent): boolean {
     const types = e.dataTransfer?.types;
-    return !!types && (types.includes("application/can-signal") || types.includes("application/can-message"));
+    return !!types && (types.includes("application/can-signal") || types.includes("application/can-message") || types.includes("application/can-plot-move"));
 }
 
 function setupPaneDrop(el: HTMLElement, pane: PlotPane) {
@@ -1422,7 +1521,7 @@ function setupPaneDrop(el: HTMLElement, pane: PlotPane) {
     el.addEventListener("dragover", (e) => {
         if (!isCanDragEvent(e)) return;
         e.preventDefault();
-        e.dataTransfer!.dropEffect = "copy";
+        e.dataTransfer!.dropEffect = e.dataTransfer!.types.includes("application/can-plot-move") ? "move" : "copy";
     });
     el.addEventListener("dragleave", () => {
         if (--dragDepth === 0) el.classList.remove("drag-over");
@@ -1431,6 +1530,12 @@ function setupPaneDrop(el: HTMLElement, pane: PlotPane) {
         e.preventDefault();
         dragDepth = 0;
         el.classList.remove("drag-over");
+        const moveData = parsePlotMove(e);
+        if (moveData) {
+            const source = plotPanes.find(p => p.id === moveData.paneId);
+            if (source) moveSigBetweenPanes(source, pane, moveData.key);
+            return;
+        }
         const msgData = parseDragMessage(e);
         if (msgData) { addMessageSignalsToPane(pane, msgData.channel, msgData.msg); return; }
         const data = parseDragSignal(e);
@@ -1449,7 +1554,7 @@ function setupDropZone() {
     zone.addEventListener("dragover", (e) => {
         if (!isCanDragEvent(e)) return;
         e.preventDefault();
-        e.dataTransfer!.dropEffect = "copy";
+        e.dataTransfer!.dropEffect = e.dataTransfer!.types.includes("application/can-plot-move") ? "move" : "copy";
     });
     zone.addEventListener("dragleave", () => {
         if (--dragDepth === 0) zone.classList.remove("drag-over");
@@ -1458,6 +1563,12 @@ function setupDropZone() {
         e.preventDefault();
         dragDepth = 0;
         zone.classList.remove("drag-over");
+        const moveData = parsePlotMove(e);
+        if (moveData) {
+            const source = plotPanes.find(p => p.id === moveData.paneId);
+            if (source) moveSigBetweenPanes(source, createPlotPane(), moveData.key);
+            return;
+        }
         const msgData = parseDragMessage(e);
         if (msgData) { addMessageToNewPane(msgData.channel, msgData.msg); return; }
         const data = parseDragSignal(e);
@@ -5333,6 +5444,24 @@ function setupTrace() {
             return;
         }
         expandTraceRow(tr);
+    });
+
+    // Right-click a signal row inside an expansion: offer to plot it.
+    document.getElementById("trace-tbody")!.addEventListener("contextmenu", (e) => {
+        const target = e.target as HTMLElement;
+        const sigRow = target.closest<HTMLTableRowElement>(".trace-expand-table tbody tr");
+        if (!sigRow) return;
+        const expandTr = sigRow.closest<HTMLTableCellElement>("td.trace-expand-cell")?.parentElement as HTMLTableRowElement | null;
+        if (!expandTr?.dataset.expand || !sigRow.dataset.sig) return;
+        const handle = parseInt(expandTr.dataset.handle ?? "0");
+        const msgId = parseInt(expandTr.dataset.msgid ?? "0");
+        const sig = channels.get(handle)?.dbc?.messages[msgId]?.signals
+            .find((s: DbcSignal) => s.name === sigRow.dataset.sig);
+        if (!sig) return;
+        e.preventDefault();
+        showContextMenu(e.clientX, e.clientY, [
+            { label: "Add to Plot", action: () => addSignalToNewPlotFromTrace(handle, sig) },
+        ]);
     });
 
     document.getElementById("btn-trace-overwrite")!.addEventListener("click", function () {
