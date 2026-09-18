@@ -1,6 +1,6 @@
-# Canvaz
+# Rusty's Canvaz - CAN Analyzer
 
-A desktop application for viewing and simulating CAN bus traffic using DBC files.
+Rusty's Canvaz is the CAN analyzer in the Rusty's toolchain family, alongside Rusty's Pigtail - Serial Terminal. View, decode, plot, and simulate CAN bus traffic using DBC files.
 
 ## Features
 
