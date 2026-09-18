@@ -3638,6 +3638,8 @@ interface LatestRelease {
 }
 
 let currentVersion = "";
+let updateBusy = false;
+let updateChecking = false;
 
 // The in-app version build.rs bakes in. Release builds are a clean "X.Y.Z";
 // dev builds carry a git-describe suffix ("0.1.0-5-gabc", "-modified") or are
@@ -3649,15 +3651,20 @@ function isReleaseBuild(version: string): boolean {
 // True when `latest` is genuinely newer than what we run. A dev build of the
 // same base version (e.g. "v0.1.0-5-gabc" vs released "v0.1.0") is not an update.
 function isNewerVersion(current: string, latest: string): boolean {
-    if (!latest) return false;
-    if (current === latest) return false;
-    if (current.startsWith(`${latest}-`)) return false;
-    return true;
+    const parse = (v: string) => /^v?(\d+)\.(\d+)\.(\d+)/.exec(v)?.slice(1).map(Number);
+    const cur = parse(current), next = parse(latest);
+    if (!next) return false;
+    if (!cur) return current !== latest;
+    for (let i = 0; i < 3; i++) {
+        if (next[i] !== cur[i]) return next[i] > cur[i];
+    }
+    return false;
 }
 
 async function fetchLatestRelease(): Promise<LatestRelease> {
     const resp = await fetch(RELEASES_LATEST_API, {
         headers: { Accept: "application/vnd.github+json" },
+        signal: AbortSignal.timeout(15000),
     });
     if (!resp.ok) throw new Error(`GitHub API returned ${resp.status}`);
     const data = await resp.json() as { tag_name?: string; html_url?: string };
@@ -3672,7 +3679,9 @@ function openUpdateDialog(opts: {
     message: string;
     downloadUrl: string | null;
     skipVersion: string | null;
+    installError?: string;
 }) {
+    if (updateBusy) return;
     document.getElementById("update-title")!.textContent = opts.title;
     document.getElementById("update-message")!.textContent = opts.message;
 
@@ -3681,13 +3690,51 @@ function openUpdateDialog(opts: {
     const closeBtn = document.getElementById("btn-update-close") as HTMLButtonElement;
     const dialog = document.getElementById("dialog-update") as HTMLDialogElement;
 
-    downloadBtn.style.display = opts.downloadUrl ? "" : "none";
+    const manualBtn = document.getElementById("btn-update-manual") as HTMLButtonElement;
+    const progress = document.getElementById("update-progress") as HTMLProgressElement;
+    progress.hidden = true;
+    manualBtn.style.display = opts.downloadUrl ? "" : "none";
+    manualBtn.onclick = () => { if (opts.downloadUrl) void openUrl(opts.downloadUrl); };
+    downloadBtn.style.display = opts.skipVersion && !opts.installError ? "" : "none";
+    downloadBtn.textContent = "Update and restart";
+    if (opts.installError) document.getElementById("update-message")!.textContent += ` ${opts.installError}`;
     skipBtn.style.display = opts.skipVersion ? "" : "none";
     // With no update to download, the dialog is just an acknowledgement — label the
     // dismiss button "Ok" instead of "Later" (which implies a pending action).
     closeBtn.textContent = opts.downloadUrl ? "Later" : "Ok";
 
-    downloadBtn.onclick = () => { if (opts.downloadUrl) openUrl(opts.downloadUrl); };
+    dialog.oncancel = event => { if (updateBusy) event.preventDefault(); };
+    downloadBtn.onclick = async () => {
+        if (!opts.skipVersion || updateBusy) return;
+        updateBusy = true;
+        const buttons = [downloadBtn, manualBtn, skipBtn, closeBtn];
+        buttons.forEach(button => button.disabled = true);
+        progress.hidden = false;
+        progress.value = 0;
+        const message = document.getElementById("update-message")!;
+        let unlisten: (() => void) | undefined;
+        try {
+            message.textContent = "Downloading update…";
+            unlisten = await listen<number>("update-progress", event => {
+                progress.value = event.payload;
+                message.textContent = `Downloading update… ${Math.round(event.payload * 100)}%`;
+            });
+            await invoke("download_update", { version: opts.skipVersion });
+            message.textContent = "Saving session and installing update…";
+            if (autoSaveTimer) clearTimeout(autoSaveTimer);
+            const sessionPath = sessionFilePath ?? `${await invoke<string>("get_app_data_dir")}/last-session.canvaz`;
+            await invoke("save_project", { path: sessionPath, project: buildProject() });
+            await invoke("install_update");
+        } catch (e) {
+            message.textContent = `Update failed: ${e}. You can retry or download manually.`;
+            downloadBtn.textContent = "Retry update";
+        } finally {
+            unlisten?.();
+            updateBusy = false;
+            buttons.forEach(button => button.disabled = false);
+            progress.hidden = true;
+        }
+    };
     skipBtn.onclick = () => {
         if (opts.skipVersion) { preferences.skippedVersion = opts.skipVersion; savePreferences(); }
         dialog.close();
@@ -3744,6 +3791,13 @@ function openSysResDialog() {
 // always reports a result and ignores the skip preference) from the silent
 // startup check (which only surfaces a brand-new, non-skipped release).
 async function checkForUpdates(manual: boolean) {
+    if (updateBusy || updateChecking) return;
+    updateChecking = true;
+    try { await performUpdateCheck(manual); }
+    finally { updateChecking = false; }
+}
+
+async function performUpdateCheck(manual: boolean) {
     if (manual) log("info", "Checking for updates…");
 
     let latest: LatestRelease;
@@ -3767,7 +3821,10 @@ async function checkForUpdates(manual: boolean) {
     // A newer release exists. Honour a prior skip only for the silent check.
     if (!manual && preferences.skippedVersion === latest.version) return;
 
+    let installError: string | undefined;
+    try { await invoke("update_support"); } catch (e) { installError = String(e); }
     openUpdateDialog({
+        installError,
         title: "Update available",
         message: `Version ${latest.version} is available — you're on ${currentVersion}.`,
         downloadUrl: latest.url,
