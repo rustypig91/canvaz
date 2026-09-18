@@ -3164,7 +3164,7 @@ function ensureCanvazExt(path: string): string {
 
 async function saveProjectAs() {
     try {
-        const raw = await dialogSave({ filters: [{ name: "Canvaz Project", extensions: ["canvaz"] }] });
+        const raw = await dialogSave({ filters: [{ name: "Rusty's Canvaz Project", extensions: ["canvaz"] }] });
         if (!raw) return;
         const path = ensureCanvazExt(raw);
         projectPath = path;
@@ -3178,7 +3178,7 @@ async function saveProjectAs() {
 
 async function openProject() {
     try {
-        const path = await dialogOpen({ filters: [{ name: "Canvaz Project", extensions: ["canvaz"] }], multiple: false });
+        const path = await dialogOpen({ filters: [{ name: "Rusty's Canvaz Project", extensions: ["canvaz"] }], multiple: false });
         if (!path || Array.isArray(path)) return;
         const project = await invoke<Project>("load_project", { path });
         projectPath = path;
@@ -5590,7 +5590,8 @@ const messageLog: LogEntry[] = [];
 const MAX_LOG_ENTRIES = 300;
 
 function updateWindowTitle() {
-    const base = projectPath ? `Canvaz — ${projectPath}` : "Canvaz";
+    const appName = "Rusty's Canvaz - CAN Analyzer";
+    const base = projectPath ? `${appName} — ${projectPath}` : appName;
     getCurrentWindow().setTitle(projectDirty ? `${base} ●` : base);
 }
 

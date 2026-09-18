@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Canvaz",
+  "productName": "Rusty's Canvaz - CAN Analyzer",
   "identifier": "com.christoffer.canvaz",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -12,7 +12,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "Canvaz",
+        "title": "Rusty's Canvaz - CAN Analyzer",
         "width": 1600,
         "height": 900,
         "minWidth": 900,
