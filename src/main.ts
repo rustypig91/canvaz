@@ -138,7 +138,7 @@ interface PlotPaneConfig {
 interface ChannelInfo { backend: string; name: string; }
 // create_channel result: the backend is where the name was actually found —
 // the backend searches all of them, so it can differ from the hint we sent.
-interface CreatedChannel { handle: number; backend: string; }
+interface CreatedChannel { handle: number; backend: string; available: boolean; }
 // `display_name` is the user-chosen operating name (shown in the UI, trace and
 // CSV exports); `name` stays the hardware identity used for lookup.
 interface ChannelConfig { name: string; display_name?: string | null; backend: string; dbc_path: string | null; bitrate: number | null; protocol: string | null; listen_only: boolean; }
@@ -147,6 +147,7 @@ interface Channel {
     info: ChannelInfo;       // backend + hardware name (immutable identity)
     config: ChannelConfig;   // user settings: DBC path + bitrate
     dbc: ParsedDbc | null;   // DBC tree, parsed by open_channel; null until opened
+    available: boolean;      // interface detected during the last hardware scan
     open: boolean;           // hardware currently open?
     error?: string | null;   // last fatal channel error; cleared on successful open
 }
@@ -328,13 +329,13 @@ let appRunning = false;
 let appStartTime = Date.now();
 let plotTabActive = false; // trace tab is the default active tab (see index.html)
 
-// Signals/sim entries to restore into panes after the next startApp (DBC comes from open_channel)
+// Saved entries restored after project channels and their DBCs are loaded.
 let pendingPaneSignals: PlotSignalEntry[][] = [];
-// Simulated message instances to restore on next startApp.
+// Simulated message instances awaiting project restoration.
 let pendingSimMessages: SimMessageConfig[] = [];
 
-// Channels that failed create_channel (hardware not present). Kept so the
-// project config is preserved and startApp can retry them.
+// Configurations that could not be registered (for example, duplicates).
+// Missing hardware uses ordinary channels with available=false.
 interface GhostChannel { config: ChannelConfig; error: string; }
 let ghostChannels: GhostChannel[] = [];
 
@@ -1898,7 +1899,7 @@ async function registerChannel(config: ChannelConfig): Promise<RegisterResult> {
         return { error: `'${config.name}' resolves to already-configured channel ${existing.info.backend}:${existing.info.name}` };
     }
     config.backend = created.backend;
-    channels.set(created.handle, { info: { backend: created.backend, name: config.name }, config, dbc: null, open: false });
+    channels.set(created.handle, { info: { backend: created.backend, name: config.name }, config, dbc: null, open: false, available: created.available });
     // Push the custom name to the backend so CSV exports use it too.
     if (config.display_name) {
         await invoke("set_channel_display_name", { channelHandle: created.handle, displayName: config.display_name })
@@ -2334,7 +2335,7 @@ async function renderChannelList() {
         item.className = `channel-item${isSelected ? " selected" : ""}`;
         item.dataset.channelHandle = String(h);
         item.innerHTML = `
-      <span class="dot${ch.open ? "" : ch.error ? " error" : " closed"}"${ch.error ? ` title="${escapeHtml(ch.error)}"` : ""}></span>
+      <span class="dot${ch.open ? "" : ch.error || !ch.available ? " error" : " closed"}"${ch.error ? ` title="${escapeHtml(ch.error)}"` : !ch.available ? ` title="Disconnected"` : ""}></span>
       <span class="ch-name" title="${escapeHtml(name === hwName ? name : `${name} (${hwName})`)}">${escapeHtml(name)}<span class="ch-backend label-muted"> ${backend}</span></span>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
       <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}${listenOnlyLabel}</span>
@@ -3217,7 +3218,7 @@ async function applyProject(project: Project) {
     rebuildTraceColumns(); // J1939 columns follow the loaded channels' protocols
 
     // Remove existing panes and create blank placeholders with correct settings.
-    // Signals are added after startApp opens channels and the DBC is available.
+    // Signals are restored below, using the preloaded DBCs even while offline.
     while (plotPanes.length) closePlotPane(plotPanes[0].id);
     pendingPaneSignals = [];
 
@@ -3244,7 +3245,7 @@ async function applyProject(project: Project) {
     simEntries.clear();
     document.getElementById("sim-entries")!.innerHTML = "";
 
-    // Defer sim message restoration until startApp opens channels and loads DBCs.
+    // Restore simulation entries below, once all saved pane settings are loaded.
     pendingSimMessages = project.simulate_messages ?? [];
 
     // Restore raw sim frames immediately (they don't need a DBC).
@@ -3261,6 +3262,8 @@ async function applyProject(project: Project) {
         simEntries.set(key, entry);
         document.getElementById("sim-entries")!.appendChild(createSimEntryEl(key, entry));
     }
+
+    await restoreProjectEntries();
 
     // Restore trace column layout
     if (project.trace_columns) {
@@ -3345,25 +3348,110 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
 
 // ── App recording start / stop ────────────────────────────────────────────────
 
-async function startApp() {
-    // Retry ghost channels (hardware may have been plugged in since they were
-    // added). Successfully recovered ghosts are moved into `channels` so they
-    // open normally below. create_channel searches every backend for the name,
-    // so a project channel saved with a stale backend still recovers.
+async function restoreProjectEntries() {
+    // Restore saved plots using DBC definitions; no hardware connection is needed.
+    if (pendingPaneSignals.length > 0) {
+        const toRestore = pendingPaneSignals;
+        pendingPaneSignals = [];
+        for (let i = 0; i < Math.min(plotPanes.length, toRestore.length); i++) {
+            for (const entry of toRestore[i]) {
+                const handle = idToHandle(entry.channel);
+                if (handle === undefined) continue;
+                const dbc = channels.get(handle)?.dbc;
+                const sig = dbc && Object.values(dbc.messages).flatMap((m: DbcMessage) => m.signals).find(
+                    (s: DbcSignal) => entry.message_id !== undefined
+                        ? s.message_id === entry.message_id && s.name === entry.signal_name
+                        : s.name === entry.signal_name
+                );
+                if (sig) await addSignalToPane(plotPanes[i], handle, sig);
+            }
+        }
+    }
+
+    // Restore simulation configuration without starting transmission.
+    if (pendingSimMessages.length > 0) {
+        const toRestore = pendingSimMessages;
+        pendingSimMessages = [];
+        const simContainer = document.getElementById("sim-entries")!;
+        for (const m of toRestore) {
+            const handle = idToHandle(m.channel);
+            if (handle === undefined) continue;
+            const msg = channels.get(handle)?.dbc?.messages[m.message_id];
+            if (!msg) continue;
+            const valueByName = new Map(m.signals.map(s => [s.name, s.value]));
+            const genByName = new Map(m.signals.map(s => [s.name, s.generator ?? null]));
+            const key = `msg::${++msgEntryCounter}`;
+            const simEntry: SimMessageEntry = {
+                kind: "message", channel: handle,
+                messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
+                signals: msg.signals.map(s => ({ def: s, value: valueByName.get(s.name) ?? simDefaultValue(s), gen: genByName.get(s.name) ?? null })),
+                periodMs: m.period_ms, running: m.running ?? false, periodicHandle: null,
+            };
+            simEntries.set(key, simEntry);
+            simContainer.appendChild(createSimEntryEl(key, simEntry));
+        }
+        renderSimEntries();
+        // The DBC tree was rendered above before these entries existed; re-apply the
+        // message-level simulation indicators now that simEntries is populated.
+        updateSignalHighlights();
+    }
+
+}
+
+async function refreshHardware(): Promise<boolean> {
+    let remapped: { old_handle: number; new_handle: number; backend: string; available: boolean }[];
+    try {
+        remapped = await invoke<{ old_handle: number; new_handle: number; backend: string; available: boolean }[]>("reload_backends");
+    } catch (e) {
+        log("error", `Backend reload failed: ${e}`);
+        return false;
+    }
+
+    // Apply old→new handle remapping. The resolved backend can differ from
+    // the previous one (the name is searched in every backend), so take it
+    // from the remap entry. Channels not in the remapping failed to
+    // re-register due to a registration failure and become ghosts.
+    const handleMap = new Map(remapped.map(r => [r.old_handle, r]));
+    const oldEntries = [...channels.entries()];
+    channels.clear();
+    for (const [oldHandle, ch] of oldEntries) {
+        const remap = handleMap.get(oldHandle);
+        if (remap !== undefined) {
+            ch.config.backend = remap.backend;
+            channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend }, open: false, available: remap.available });
+        } else {
+            ghostChannels.push({ config: ch.config, error: "Not found after backend reload" });
+        }
+    }
+
+    // Promote ghost channels whose hardware is now available. create_channel
+    // searches every backend for the name, so a guessed backend still works.
+    const recovered: GhostChannel[] = [];
     for (const ghost of [...ghostChannels]) {
         const res = await registerChannel(ghost.config);
-        if (res.handle !== undefined) {
-            ghostChannels.splice(ghostChannels.indexOf(ghost), 1);
-        } else {
-            ghost.error = res.error!;
-            log("error", `Channel ${ghost.config.name} (${ghost.config.backend}) not available: ${res.error}`);
-        }
+        if (res.handle !== undefined) recovered.push(ghost);
+        else ghost.error = res.error!; // stays as ghost
+    }
+    for (const g of recovered) ghostChannels.splice(ghostChannels.indexOf(g), 1);
+    renderChannelList();
+    return true;
+}
+
+async function startApp() {
+    if (!await refreshHardware()) return;
+    if (channels.size === 0 || ghostChannels.length > 0 || [...channels.values()].some(ch => !ch.available)) {
+        renderChannelList();
+        document.getElementById("btn-app-run")!.title = "Connect the configured CAN interfaces, then click Start to retry";
+        return;
     }
 
     // Open all configured channels (hardware connects here, not when added).
     // Each open_channel call parses the DBC fresh from disk and returns it.
     for (const handle of channels.keys()) {
-        await openChannelByHandle(handle);
+        if (!await openChannelByHandle(handle)) {
+            await stopApp();
+            return;
+        }
     }
     renderChannelList();
 
@@ -3428,52 +3516,7 @@ async function startApp() {
         pane.chart.update();
     }
 
-    // Restore pane signals deferred from applyProject (DBC is now available from open_channel).
-    if (pendingPaneSignals.length > 0) {
-        const toRestore = pendingPaneSignals;
-        pendingPaneSignals = [];
-        for (let i = 0; i < Math.min(plotPanes.length, toRestore.length); i++) {
-            for (const entry of toRestore[i]) {
-                const handle = idToHandle(entry.channel);
-                if (handle === undefined) continue;
-                const dbc = channels.get(handle)?.dbc;
-                const sig = dbc && Object.values(dbc.messages).flatMap((m: DbcMessage) => m.signals).find(
-                    (s: DbcSignal) => entry.message_id !== undefined
-                        ? s.message_id === entry.message_id && s.name === entry.signal_name
-                        : s.name === entry.signal_name
-                );
-                if (sig) await addSignalToPane(plotPanes[i], handle, sig);
-            }
-        }
-    }
-
-    // Restore per-instance sim message entries (new format) deferred from applyProject.
-    if (pendingSimMessages.length > 0) {
-        const toRestore = pendingSimMessages;
-        pendingSimMessages = [];
-        const simContainer = document.getElementById("sim-entries")!;
-        for (const m of toRestore) {
-            const handle = idToHandle(m.channel);
-            if (handle === undefined) continue;
-            const msg = channels.get(handle)?.dbc?.messages[m.message_id];
-            if (!msg) continue;
-            const valueByName = new Map(m.signals.map(s => [s.name, s.value]));
-            const genByName = new Map(m.signals.map(s => [s.name, s.generator ?? null]));
-            const key = `msg::${++msgEntryCounter}`;
-            const simEntry: SimMessageEntry = {
-                kind: "message", channel: handle,
-                messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
-                signals: msg.signals.map(s => ({ def: s, value: valueByName.get(s.name) ?? simDefaultValue(s), gen: genByName.get(s.name) ?? null })),
-                periodMs: m.period_ms, running: m.running ?? false, periodicHandle: null,
-            };
-            simEntries.set(key, simEntry);
-            simContainer.appendChild(createSimEntryEl(key, simEntry));
-        }
-        renderSimEntries();
-        // The DBC tree was rendered above before these entries existed; re-apply the
-        // message-level simulation indicators now that simEntries is populated.
-        updateSignalHighlights();
-    }
+    await restoreProjectEntries();
 
     // Register backend periodics for all entries the user has marked as running
     // (covers both restored entries and entries that survived a stop/start cycle).
@@ -5967,41 +6010,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     });
     document.getElementById("btn-reload-backends")!.addEventListener("click", async () => {
         if (!await confirmAndStop("Stop live capture to reload CAN backends?")) return;
-        let remapped: { old_handle: number; new_handle: number; backend: string }[];
-        try {
-            remapped = await invoke<{ old_handle: number; new_handle: number; backend: string }[]>("reload_backends");
-        } catch (e) {
-            log("error", `Backend reload failed: ${e}`);
-            return;
-        }
-
-        // Apply old→new handle remapping. The resolved backend can differ from
-        // the previous one (the name is searched in every backend), so take it
-        // from the remap entry. Channels not in the remapping failed to
-        // re-register (hardware absent) and become ghosts.
-        const handleMap = new Map(remapped.map(r => [r.old_handle, r]));
-        const oldEntries = [...channels.entries()];
-        channels.clear();
-        for (const [oldHandle, ch] of oldEntries) {
-            const remap = handleMap.get(oldHandle);
-            if (remap !== undefined) {
-                ch.config.backend = remap.backend;
-                channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend }, open: false });
-            } else {
-                ghostChannels.push({ config: ch.config, error: "Not found after backend reload" });
-            }
-        }
-
-        // Promote ghost channels whose hardware is now available. create_channel
-        // searches every backend for the name, so a guessed backend still works.
-        const recovered: GhostChannel[] = [];
-        for (const ghost of [...ghostChannels]) {
-            const res = await registerChannel(ghost.config);
-            if (res.handle !== undefined) recovered.push(ghost);
-            else ghost.error = res.error!; // stays as ghost
-        }
-        for (const g of recovered) ghostChannels.splice(ghostChannels.indexOf(g), 1);
-        renderChannelList();
+        await refreshHardware();
     });
     document.getElementById("btn-channel-cancel")!.addEventListener("click", () => chanDialog.close());
     document.getElementById("form-channel")!.addEventListener("submit", async (e) => { e.preventDefault(); await applyChannelDialog(); });
