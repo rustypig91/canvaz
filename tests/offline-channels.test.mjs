@@ -156,6 +156,7 @@ test("Start preserves duplicate offline channels, dependent entries and saved ID
         assert.equal(ctx.channels.get(8).config, duplicate.config);
         assert.equal(ctx.channels.get(8).dbc, duplicate.dbc);
         assert.equal(ctx.channels.get(8).available, false);
+        assert.equal(ctx.channels.get(8).error, "Resolves to an already-configured channel");
         assert.equal(ctx.ghostChannels.length, 0);
         assert.equal(duplicate.config.backend, "pcan");
         assert.equal(ctx.simEntries.get("message"), simulated);
@@ -166,6 +167,7 @@ test("Start preserves duplicate offline channels, dependent entries and saved ID
         reconnected = true;
         assert.equal(await ctx.refreshHardware(), true);
         assert.equal(ctx.channels.get(8).available, true);
+        assert.equal(ctx.channels.get(8).error, null);
         assert.equal(ctx.channels.get(8).dbc, duplicate.dbc);
         assert.equal(ctx.idToHandle("pcan:USB CAN"), 8);
     }

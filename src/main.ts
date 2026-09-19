@@ -3432,7 +3432,7 @@ async function refreshHardware(): Promise<boolean> {
         const remap = handleMap.get(oldHandle);
         if (remap !== undefined && remap.new_handle === oldHandle) {
             ch.config.backend = remap.backend;
-            channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend }, open: false, available: remap.available });
+            channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend }, open: false, available: remap.available, error: null });
         } else {
             // The destination owns the hardware mapping. The original offline
             // registration still exists and can reconnect under its own backend
