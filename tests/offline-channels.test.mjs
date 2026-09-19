@@ -170,3 +170,27 @@ test("Start preserves duplicate offline channels, dependent entries and saved ID
         assert.equal(ctx.idToHandle("pcan:USB CAN"), 8);
     }
 });
+
+test("one-shot simulation sends only on an open channel and preserves offline settings", async () => {
+    for (const kind of ["message", "raw"]) {
+        const entry = { kind, channel: 7, messageId: 123, canId: 123, data: [1, 2, 3], dlc: 2, isExtended: true, running: true, periodicHandle: null };
+        const before = structuredClone(entry);
+        const calls = [], warnings = [];
+        const ctx = harness(["sendSimOnce"], {
+            simEntries: new Map([["entry", entry]]), channels: new Map([[7, { open: false }]]),
+            invoke: async (command, args) => calls.push({ command, args }),
+            log: (level, message) => warnings.push({ level, message }),
+            simSignalValues: () => ({ RPM: 900 }), simGenerators: () => [],
+        });
+        await ctx.sendSimOnce("entry");
+        assert.equal(calls.length, 0);
+        assert.equal(warnings[0].level, "warn");
+        assert.deepEqual(entry, before);
+        ctx.channels.get(7).open = true;
+        await ctx.sendSimOnce("entry");
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0].command, kind === "message" ? "send_message" : "send_frame");
+        assert.equal(calls[0].args.cmd.channel_handle, 7);
+        if (kind === "raw") assert.deepEqual(calls[0].args.cmd.data, [1, 2]);
+    }
+});

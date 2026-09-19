@@ -2759,8 +2759,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             });
         });
         el.querySelector(".sim-send-once")!.addEventListener("click", async () => {
-            try { await invoke("send_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry) } }); }
-            catch (e) { log("error", `Send error: ${e}`); }
+            await sendSimOnce(key);
         });
 
     } else {
@@ -2856,8 +2855,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             });
         });
         el.querySelector(".sim-send-once")!.addEventListener("click", async () => {
-            try { await invoke("send_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), is_extended: entry.isExtended } }); }
-            catch (e) { log("error", `Send error: ${e}`); }
+            await sendSimOnce(key);
         });
     }
 
@@ -2955,6 +2953,22 @@ async function removeSimEntry(key: string) {
     document.querySelector(`[data-sim-key="${key}"]`)?.remove();
     updateSignalHighlights();
     scheduleAutoSave("sim entry removed");
+}
+
+async function sendSimOnce(key: string) {
+    const entry = simEntries.get(key);
+    if (!entry) return;
+    if (!channels.get(entry.channel)?.open) {
+        log("warn", "Cannot send: start capture with this channel connected first");
+        return;
+    }
+    try {
+        if (entry.kind === "message") {
+            await invoke("send_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry) } });
+        } else {
+            await invoke("send_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), is_extended: entry.isExtended } });
+        }
+    } catch (e) { log("error", `Send error: ${e}`); }
 }
 
 async function startSim(key: string) {
