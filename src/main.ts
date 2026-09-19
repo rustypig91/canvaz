@@ -5702,10 +5702,10 @@ function escapeHtml(s: string): string {
     return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-// Record an entry in the message log (array + panel DOM + console) and, unless
-// suppressed, rotate it through the status bar. `ts` defaults to now; the
-// rust-log relay passes the backend timestamp and writes its own (richer)
-// console line, and suppresses the status bar when replaying the backlog.
+// Record every entry in the message log (array + panel DOM + console). Only
+// warnings and errors rotate through the status bar unless suppressed.
+// `ts` defaults to now; the rust-log relay passes the backend timestamp, writes
+// its own console line, and suppresses the status bar when replaying the backlog.
 function log(level: LogLevel, message: string, opts?: { ts?: string; toConsole?: boolean; toStatus?: boolean }) {
     // Debug messages are for development only — dropped entirely in release builds.
     if (level === "debug" && !import.meta.env.DEV) return;
@@ -5722,7 +5722,7 @@ function log(level: LogLevel, message: string, opts?: { ts?: string; toConsole?:
                 : level === "info" ? console.info : console.debug;
         fn(message);
     }
-    if (level !== "debug" && opts?.toStatus !== false) queueStatus(message, level);
+    if ((level === "warn" || level === "error") && opts?.toStatus !== false) queueStatus(message, level);
 }
 
 // ── Bus statistics strip ──────────────────────────────────────────────────────
