@@ -141,6 +141,7 @@ pub struct ChannelInfo {
 pub struct CreatedChannel {
     pub handle: u32,
     pub backend: String,
+    pub available: bool,
 }
 
 /// One channel's live health/load numbers, returned by `get_bus_stats`.
@@ -468,12 +469,14 @@ impl CanManager {
     /// every other backend — the backend stored in a saved project can be
     /// stale (e.g. the same channel name moved to different hardware). Returns
     /// the handle used for all subsequent calls plus the backend the channel
-    /// was actually found in. The DBC is loaded later by `open_channel`.
+    /// was actually found in. Missing interfaces are registered with
+    /// `available: false`, so their configuration remains usable offline.
+    /// The backend DBC is loaded later by `open_channel`.
     /// Calling `create_channel` again for the same channel returns the
     /// existing handle.
     pub fn create_channel(&mut self, backend_name: &str, channel_name: &str) -> Result<CreatedChannel, String> {
         let find = |can: &Can| can.list_channels().iter().position(|n| n == channel_name).map(|i| i as u8);
-        let (backend_name, hw_index) = self
+        let found = self
             .cans
             .get(backend_name)
             .and_then(|can| find(can).map(|i| (backend_name.to_string(), i)))
@@ -482,36 +485,54 @@ impl CanManager {
                     .iter()
                     .filter(|(name, _)| name.as_str() != backend_name)
                     .find_map(|(name, can)| find(can).map(|i| (name.clone(), i)))
-            })
-            .ok_or_else(|| format!("Channel '{channel_name}' not found in any backend"))?;
+            });
+        let available = found.is_some();
+        let hinted_backend = backend_name;
+        let backend_name = found.as_ref().map(|(name, _)| name.as_str()).unwrap_or(backend_name).to_string();
 
         let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
 
-        // Already registered — return existing handle.
-        if let Some(&handle) = lock.index_to_handle.get(&(backend_name.clone(), hw_index)) {
-            return Ok(CreatedChannel {
-                handle,
-                backend: backend_name,
-            });
-        }
-
-        let handle = NEXT_CHANNEL_HANDLE.fetch_add(1, Ordering::Relaxed);
+        // Data and identity exist independently of the physical interface.
+        let handle = lock
+            .channels
+            .iter()
+            .find(|(_, ch)| ch.info.backend == backend_name && ch.info.name == channel_name)
+            .or_else(|| {
+                lock.channels
+                    .iter()
+                    .find(|(_, ch)| ch.info.backend == hinted_backend && ch.info.name == channel_name)
+            })
+            .map(|(&handle, _)| handle)
+            .unwrap_or_else(|| NEXT_CHANNEL_HANDLE.fetch_add(1, Ordering::Relaxed));
         let info = ChannelInfo {
             backend: backend_name.clone(),
             name: channel_name.to_string(),
         };
-        lock.index_to_handle.insert((backend_name.clone(), hw_index), handle);
-        lock.handle_to_index.insert(handle, (backend_name.clone(), hw_index));
-        lock.channels.insert(handle, ChannelData::new(info));
+        if let Some((_, hw_index)) = found {
+            lock.index_to_handle.insert((backend_name.clone(), hw_index), handle);
+            lock.handle_to_index.insert(handle, (backend_name.clone(), hw_index));
+        }
+        lock.channels
+            .entry(handle)
+            .and_modify(|ch| ch.info = info.clone())
+            .or_insert_with(|| ChannelData::new(info));
         info!("Created {backend_name} channel {channel_name} (handle: {handle})");
         Ok(CreatedChannel {
             handle,
             backend: backend_name,
+            available,
         })
     }
 
     pub fn remove_channel(&mut self, handle: u32) -> Result<(), String> {
         let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
+
+        if !lock.handle_to_index.contains_key(&handle) {
+            lock.channels
+                .remove(&handle)
+                .ok_or_else(|| format!("channel handle {handle} not found"))?;
+            return Ok(());
+        }
 
         let backend_name = lock
             .handle_to_index
@@ -641,7 +662,17 @@ impl CanManager {
             .map(|lock| lock.channels.iter().map(|(&h, d)| (h, d.info.clone())).collect())
             .unwrap_or_default();
 
+        // Keep handles and offline data stable so plots and simulation entries
+        // continue referring to the same channel after a hardware refresh.
+        let channels = self
+            .shared
+            .lock()
+            .map(|mut lock| std::mem::take(&mut lock.channels))
+            .unwrap_or_default();
         self.reset();
+        if let Ok(mut lock) = self.shared.lock() {
+            lock.channels = channels;
+        }
 
         // canUnloadLibrary() resets the "already initialised" flag inside CANlib
         // so the next canInitializeLibrary() performs a true hardware re-scan.

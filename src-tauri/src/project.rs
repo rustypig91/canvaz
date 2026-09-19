@@ -199,7 +199,7 @@ impl Project {
             debug!("Project file at '{}' unchanged, skipping write", path);
             return Ok(());
         }
-        info!("Saving project to '{}'", path);
+        debug!("Saving project to '{}'", path);
         std::fs::write(path, json).map_err(|e| format!("Write error: {e}"))
     }
 
