@@ -248,9 +248,12 @@ fn install(update: Prepared) -> Result<(), String> {
 fn restart_after_exit(target: &Path, pid: u32) -> Result<std::process::Child, String> {
     // The new instance auto-opens CAN channels. Wait until this process releases
     // its devices before starting it. Pass paths as arguments, never shell code.
+    // The runtime consumes --appimage-extract-and-run before launching us, so
+    // it cannot be recovered from our arguments. Use extraction on restart too
+    // so updates still launch on systems without FUSE.
     std::process::Command::new("/bin/sh")
         .args(["-c", r#"while kill -0 "$1" 2>/dev/null; do sleep 0.1; done
-exec "$2""#, "canvaz-restart"])
+exec "$2" --appimage-extract-and-run"#, "canvaz-restart"])
         .arg(pid.to_string())
         .arg(target)
         .stdin(std::process::Stdio::null())
@@ -298,7 +301,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("Canvaz's updated app");
-        std::fs::write(&target, "#!/bin/sh\nexit 42\n").unwrap();
+        std::fs::write(&target, "#!/bin/sh\n[ \"$#\" -eq 1 ] && [ \"$1\" = --appimage-extract-and-run ] || exit 1\nexit 42\n").unwrap();
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
         let mut parent = std::process::Command::new("sleep").arg("30").spawn().unwrap();
         let mut helper = restart_after_exit(&target, parent.id()).unwrap();
