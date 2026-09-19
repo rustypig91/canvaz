@@ -13,7 +13,7 @@ function harness(names, globals) {
     const code = ts.transpileModule(functions.map(n => n.getText(source)).join("\n"), {
         compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
     }).outputText;
-    const context = vm.createContext(globals);
+    const context = vm.createContext({ pendingPaneSignals: [], pendingSimMessages: [], ...globals });
     vm.runInContext(code, context);
     return context;
 }
@@ -246,4 +246,37 @@ test("one-shot simulation sends only on an open channel and preserves offline se
         assert.equal(calls[0].args.cmd.channel_handle, 7);
         if (kind === "raw") assert.deepEqual(calls[0].args.cmd.data, [1, 2]);
     }
+});
+
+test("backend migration preserves pending entries until their DBC becomes readable", async () => {
+    const signal = { name: "RPM", message_id: 123 };
+    const savedSignal = { channel: "kvaser:USB CAN", message_id: 123, signal_name: "RPM" };
+    const savedMessage = { channel: "kvaser:USB CAN", message_id: 123, period_ms: 100, signals: [{ name: "RPM", value: 900 }] };
+    const unrelated = { channel: "pcan:Other", message_id: 456, signal_name: "Speed" };
+    const added = [];
+    const ctx = harness(["refreshHardware", "restoreProjectEntries", "idToHandle"], {
+        channels: new Map([[7, { config: config(), info: { backend: "kvaser", name: "USB CAN" }, dbc: null, open: false }]]),
+        ghostChannels: [], pendingPaneSignals: [[savedSignal, unrelated]], pendingSimMessages: [savedMessage],
+        plotPanes: [{ id: 1 }], simEntries: new Map(), msgEntryCounter: 0,
+        renderChannelList() {}, log: () => assert.fail("Refresh should succeed"),
+        invoke: async () => [{ old_handle: 7, new_handle: 7, backend: "pcan", available: true }],
+        addSignalToPane: async (...args) => added.push(args),
+        document: { getElementById: () => ({ appendChild() {} }) },
+        createSimEntryEl: () => ({}), renderSimEntries() {}, updateSignalHighlights() {},
+    });
+    await ctx.refreshHardware();
+    await ctx.restoreProjectEntries();
+    assert.equal(savedSignal.channel, "pcan:USB CAN");
+    assert.equal(savedMessage.channel, "pcan:USB CAN");
+    assert.equal(unrelated.channel, "pcan:Other");
+    assert.equal(added.length, 0);
+    ctx.channels.get(7).dbc = { messages: { 123: { id: 123, name: "Engine", dlc: 8, signals: [signal] } } };
+    await ctx.restoreProjectEntries();
+    assert.equal(added.length, 1);
+    assert.equal(added[0][1], 7);
+    assert.equal(ctx.simEntries.size, 1);
+    assert.equal([...ctx.simEntries.values()][0].signals[0].value, 900);
+    assert.equal(ctx.pendingPaneSignals[0].length, 1);
+    assert.equal(ctx.pendingPaneSignals[0][0], unrelated);
+    assert.equal(ctx.pendingSimMessages.length, 0);
 });

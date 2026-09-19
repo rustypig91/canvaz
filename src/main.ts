@@ -3434,10 +3434,12 @@ async function refreshHardware(): Promise<boolean> {
     // keep their handles so plots, simulations and saved IDs remain valid.
     const handleMap = new Map(remapped.map(r => [r.old_handle, r]));
     const oldEntries = [...channels.entries()];
+    const renamedIds = new Map<string, string>();
     channels.clear();
     for (const [oldHandle, ch] of oldEntries) {
         const remap = handleMap.get(oldHandle);
         if (remap !== undefined && remap.new_handle === oldHandle) {
+            renamedIds.set(`${ch.info.backend}:${ch.info.name}`, `${remap.backend}:${ch.info.name}`);
             ch.config.backend = remap.backend;
             channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend }, open: false, available: remap.available, error: null });
         } else {
@@ -3449,6 +3451,13 @@ async function refreshHardware(): Promise<boolean> {
                 : "Not found after backend reload" });
         }
     }
+
+    // Entries waiting for a readable DBC still use persisted IDs rather than
+    // handles. Keep them attached when hardware resolves to another backend.
+    for (const entries of pendingPaneSignals) {
+        for (const entry of entries) entry.channel = renamedIds.get(entry.channel) ?? entry.channel;
+    }
+    for (const entry of pendingSimMessages) entry.channel = renamedIds.get(entry.channel) ?? entry.channel;
 
     // Promote ghost channels whose hardware is now available. create_channel
     // searches every backend for the name, so a guessed backend still works.
