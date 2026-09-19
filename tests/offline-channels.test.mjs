@@ -40,21 +40,36 @@ test("missing hardware still registers a normal channel and loads its DBC", asyn
     assert.deepEqual(calls, ["create_channel", "parse_dbc"]);
 });
 
-test("Start with a missing interface does not open any hardware or start capture", async () => {
-    let refreshed = false;
-    const button = {};
-    const ctx = harness(["startApp"], {
-        channels: new Map([[1, { available: true }], [2, { available: false }]]),
-        ghostChannels: [], appRunning: false,
-        refreshHardware: async () => { refreshed = true; return true; },
-        renderChannelList: () => {}, document: { getElementById: () => button },
-        openChannelByHandle: () => assert.fail("Must not partially start a run"),
-        log: () => assert.fail("Missing hardware is not an error"),
+test("Start reports missing interfaces and continues past failures to open other channels", async () => {
+    const attempted = [], errors = [];
+    const ctx = harness(["openConfiguredChannels"], {
+        channels: new Map([[1, { available: false, config: {}, info: { name: "Missing" } }],
+            [2, { available: true }], [3, { available: true }]]),
+        ghostChannels: [], refreshHardware: async () => true, renderChannelList: () => {},
+        openChannelByHandle: async handle => { attempted.push(handle); return handle === 3; },
+        log: (level, message) => errors.push({ level, message }),
     });
+    assert.equal(await ctx.openConfiguredChannels(true), true);
+    assert.deepEqual(attempted, [2, 3]);
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].level, "error");
+    assert.match(errors[0].message, /Missing.*interface not found/);
+});
+
+test("all missing channels keep capture stopped, with errors only on explicit Start", async () => {
+    const errors = [];
+    const ctx = harness(["openConfiguredChannels", "startApp"], {
+        channels: new Map([[1, { available: false, config: {}, info: { name: "Missing" } }]]),
+        ghostChannels: [], appRunning: false,
+        refreshHardware: async () => true, renderChannelList: () => {},
+        openChannelByHandle: () => assert.fail("Missing hardware must not be opened"),
+        log: (level, message) => errors.push({ level, message }),
+    });
+    await ctx.startApp(false);
+    assert.equal(errors.length, 0);
     await ctx.startApp();
-    assert.equal(refreshed, true);
+    assert.equal(errors.length, 1);
     assert.equal(ctx.appRunning, false);
-    assert.match(button.title, /Connect/);
 });
 
 test("hardware refresh preserves offline channel data and reconnects the same handle", async () => {

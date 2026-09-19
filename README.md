@@ -11,7 +11,7 @@ Rusty's Canvaz is the CAN analyzer in the Rusty's toolchain family, alongside Ru
 - **J1939** — per-channel protocol mode adding PGN / priority / SA / DA columns to the trace and passive transport-protocol reassembly (BAM and RTS/CTS)
 - **Project files** — save and restore your channel, plot, and simulator configuration (`.canvaz`)
 - **Session restore** — last working state is restored automatically on startup
-- **Offline channels** — missing interfaces appear red (disconnected), while DBC browsing, plots, and simulator configuration remain editable. Connect all configured interfaces and click *Start* to rescan and run, or use *Reload backends* to refresh their status.
+- **Offline channels** — missing interfaces appear red (disconnected), while DBC browsing, plots, and simulator configuration remain editable. Click *Start* to rescan and run available channels; channels that cannot start report an error without blocking the others. Use *Reload backends* to refresh their status.
 - **System resources** — built-in dialog showing the app's CPU and memory usage
 
 ## Hardware support

@@ -2970,7 +2970,7 @@ async function startSim(key: string) {
     scheduleAutoSave("sim started");
 
     // Register with backend only when the app (and its channels) is live.
-    if (!appRunning) return;
+    if (!appRunning || !channels.get(entry.channel)?.open) return;
 
     try {
         let handle: number;
@@ -3437,23 +3437,28 @@ async function refreshHardware(): Promise<boolean> {
     return true;
 }
 
-async function startApp() {
-    if (!await refreshHardware()) return;
-    if (channels.size === 0 || ghostChannels.length > 0 || [...channels.values()].some(ch => !ch.available)) {
-        renderChannelList();
-        document.getElementById("btn-app-run")!.title = "Connect the configured CAN interfaces, then click Start to retry";
-        return;
-    }
-
-    // Open all configured channels (hardware connects here, not when added).
-    // Each open_channel call parses the DBC fresh from disk and returns it.
-    for (const handle of channels.keys()) {
-        if (!await openChannelByHandle(handle)) {
-            await stopApp();
-            return;
+// Explicit Start reports missing interfaces; automatic startup stays quiet.
+async function openConfiguredChannels(reportMissing: boolean): Promise<boolean> {
+    if (!await refreshHardware()) return false;
+    if (reportMissing) {
+        for (const ghost of ghostChannels) {
+            log("error", `Cannot start channel ${ghost.config.name}: ${ghost.error}`);
         }
     }
+    let opened = false;
+    for (const [handle, ch] of channels) {
+        if (!ch.available) {
+            if (reportMissing) log("error", `Cannot start channel ${ch.config.display_name || ch.info.name}: interface not found`);
+            continue;
+        }
+        if (await openChannelByHandle(handle)) opened = true;
+    }
     renderChannelList();
+    return opened;
+}
+
+async function startApp(reportMissing = true) {
+    if (!await openConfiguredChannels(reportMissing)) return;
 
     // Reconcile simulated message entries with the reloaded DBC. Entries hold a
     // snapshot of each signal's definition, so after the DBC changes on disk we
@@ -6173,7 +6178,7 @@ window.addEventListener("DOMContentLoaded", async () => {
 
     // Auto-start only when at least one channel has been configured.
     if (channels.size > 0) {
-        await startApp();
+        await startApp(false);
     }
     // Otherwise the app stays in stopped state; user adds channels then presses Start.
 });
