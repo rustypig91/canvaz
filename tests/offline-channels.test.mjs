@@ -117,31 +117,56 @@ test("saved plots and simulation settings restore while disconnected without tra
     assert.equal(ctx.pendingSimMessages.length, 0);
 });
 
-test("refresh keeps both configurations when offline channels resolve to the same device", async () => {
+test("Start preserves duplicate offline channels, dependent entries and saved IDs until reconnection", async () => {
     for (const reverse of [false, true]) {
         const original = { config: config(), info: { backend: "kvaser", name: "USB CAN" }, dbc: { messages: {} }, open: false };
-        const duplicate = { config: { ...config(), backend: "pcan", bitrate: 250000 }, info: { backend: "pcan", name: "USB CAN" }, dbc: null, open: false };
+        const message = { id: 123, name: "Engine", dlc: 8, signals: [] };
+        const duplicate = { config: { ...config(), backend: "pcan", bitrate: 250000 }, info: { backend: "pcan", name: "USB CAN" }, dbc: { messages: { 123: message } }, open: false };
         const entries = [[7, original], [8, duplicate]];
-        const removed = [];
-        const ctx = harness(["refreshHardware", "registerChannel"], {
+        const simulated = { kind: "message", channel: 8, messageId: 123, signals: [], running: false };
+        const raw = { kind: "raw", channel: 8, running: false };
+        const plotted = { channel: 8, timestamps: [], data: [] };
+        const pane = { series: new Map([["rpm", plotted]]), chart: { options: { scales: { x: {} } }, update: () => {} } };
+        let reconnected = false;
+        const opened = [];
+        const element = { value: "", querySelector: () => null, classList: { add: () => {} } };
+        const ctx = harness(["refreshHardware", "registerChannel", "handleToId", "idToHandle", "openConfiguredChannels", "startApp"], {
             channels: new Map(reverse ? entries.reverse() : entries), ghostChannels: [], renderChannelList: () => {},
-            invoke: async (command, args) => {
+            simEntries: new Map([["message", simulated], ["raw", raw]]), plotPanes: [pane],
+            document: { getElementById: () => element },
+            appRunning: false, appStartTime: 0, traceFilterMsgNames: null,
+            signalLastValues: new Map(), signalLastRaw: new Map(), signalMinValues: new Map(), signalMaxValues: new Map(),
+            viewPaused: false, sidebarSnapshot: null, windowSizeSec: 10,
+            renderDbcTree: () => {}, updatePauseViewBtn: () => {}, setPaneCursors: () => {}, clearPaneZoom: () => {},
+            restoreProjectEntries: async () => {}, clearTrace: () => {}, startScrollLoop: () => {}, startBusStatsPoll: () => {}, log: () => {},
+            openChannelByHandle: async handle => { opened.push(handle); return true; },
+            invoke: async (command) => {
                 if (command === "reload_backends") return [
                     { old_handle: 7, new_handle: 7, backend: "kvaser", available: true },
-                    { old_handle: 8, new_handle: 7, backend: "kvaser", available: true },
+                    { old_handle: 8, new_handle: reconnected ? 8 : 7, backend: reconnected ? "pcan" : "kvaser", available: true },
                 ];
-                if (command === "remove_channel") { removed.push(args.channelHandle); return; }
-                if (command === "create_channel") return { handle: 7, backend: "kvaser", available: true };
                 assert.fail(command);
             },
         });
-        assert.equal(await ctx.refreshHardware(), true);
-        assert.equal(ctx.channels.size, 1);
+        await ctx.startApp();
+        assert.deepEqual(opened, [7]);
+        assert.equal(ctx.channels.size, 2);
         assert.equal(ctx.channels.get(7).config, original.config);
         assert.equal(ctx.channels.get(7).dbc, original.dbc);
-        assert.equal(ctx.ghostChannels.length, 1);
-        assert.equal(ctx.ghostChannels[0].config, duplicate.config);
+        assert.equal(ctx.channels.get(8).config, duplicate.config);
+        assert.equal(ctx.channels.get(8).dbc, duplicate.dbc);
+        assert.equal(ctx.channels.get(8).available, false);
+        assert.equal(ctx.ghostChannels.length, 0);
         assert.equal(duplicate.config.backend, "pcan");
-        assert.deepEqual(removed, [8]);
+        assert.equal(ctx.simEntries.get("message"), simulated);
+        for (const entry of [simulated, raw, plotted]) {
+            assert.equal(ctx.handleToId(entry.channel), "pcan:USB CAN");
+            assert.equal(ctx.idToHandle(ctx.handleToId(entry.channel)), 8);
+        }
+        reconnected = true;
+        assert.equal(await ctx.refreshHardware(), true);
+        assert.equal(ctx.channels.get(8).available, true);
+        assert.equal(ctx.channels.get(8).dbc, duplicate.dbc);
+        assert.equal(ctx.idToHandle("pcan:USB CAN"), 8);
     }
 });

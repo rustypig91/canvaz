@@ -3409,8 +3409,8 @@ async function refreshHardware(): Promise<boolean> {
 
     // Apply old→new handle remapping. The resolved backend can differ from
     // the previous one (the name is searched in every backend), so take it
-    // from the remap entry. Channels not in the remapping failed to
-    // re-register due to a registration failure and become ghosts.
+    // from the remap entry. The backend retains offline registrations too;
+    // keep their handles so plots, simulations and saved IDs remain valid.
     const handleMap = new Map(remapped.map(r => [r.old_handle, r]));
     const oldEntries = [...channels.entries()];
     channels.clear();
@@ -3420,15 +3420,12 @@ async function refreshHardware(): Promise<boolean> {
             ch.config.backend = remap.backend;
             channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend }, open: false, available: remap.available });
         } else {
-            // A previously offline channel can resolve to another configured
-            // channel. Keep its settings as a ghost instead of overwriting the
-            // destination channel (and silently losing one configuration).
-            ghostChannels.push({ config: ch.config, error: remap
+            // The destination owns the hardware mapping. The original offline
+            // registration still exists and can reconnect under its own backend
+            // later, so preserve its DBC and every reference to its handle.
+            channels.set(oldHandle, { ...ch, open: false, available: false, error: remap
                 ? "Resolves to an already-configured channel"
                 : "Not found after backend reload" });
-            if (remap) {
-                await invoke("remove_channel", { channelHandle: oldHandle });
-            }
         }
     }
 
