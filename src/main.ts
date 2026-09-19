@@ -1021,6 +1021,7 @@ function closePlotPane(id: string) {
     const idx = plotPanes.findIndex(p => p.id === id);
     if (idx === -1) return;
     const [pane] = plotPanes.splice(idx, 1);
+    pendingPaneSignals.splice(idx, 1);
     pane.chart.destroy();
     pane.el.remove();
     updateSignalHighlights();
@@ -2066,6 +2067,7 @@ async function applyChannelDialog() {
             await invoke("set_channel_display_name", { channelHandle: h, displayName: customName })
                 .catch(e => log("error", `Failed to set channel name: ${e}`));
             await loadChannelDbc(h);
+            await restoreProjectEntries();
         }
         const name = ch ? channelName(h) : String(h);
 
@@ -3078,7 +3080,7 @@ function buildProject(): Project {
             })),
         ],
         plot_panes: plotPanes.map((pane, index) => ({
-            signals: pendingPaneSignals[index] ?? [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: handleToId(s.channel), message_id: s.messageId })),
+            signals: [...(pendingPaneSignals[index] ?? []), ...[...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: handleToId(s.channel), message_id: s.messageId }))],
             interpolation: pane.interpolation,
             show_points: pane.showPoints,
             y_min: pane.yLock?.min ?? null,
@@ -3368,18 +3370,21 @@ async function restoreProjectEntries() {
         const toRestore = pendingPaneSignals;
         pendingPaneSignals = [];
         for (let i = 0; i < Math.min(plotPanes.length, toRestore.length); i++) {
+            const unresolved: PlotSignalEntry[] = [];
+            pendingPaneSignals[i] = unresolved;
             for (const entry of toRestore[i]) {
                 const handle = idToHandle(entry.channel);
-                if (handle === undefined) continue;
-                const dbc = channels.get(handle)?.dbc;
+                const dbc = handle === undefined ? null : channels.get(handle)?.dbc;
                 const sig = dbc && Object.values(dbc.messages).flatMap((m: DbcMessage) => m.signals).find(
                     (s: DbcSignal) => entry.message_id !== undefined
                         ? s.message_id === entry.message_id && s.name === entry.signal_name
                         : s.name === entry.signal_name
                 );
-                if (sig) await addSignalToPane(plotPanes[i], handle, sig);
+                if (sig && handle !== undefined) await addSignalToPane(plotPanes[i], handle, sig);
+                else unresolved.push(entry);
             }
         }
+        if (pendingPaneSignals.every(entries => entries.length === 0)) pendingPaneSignals = [];
     }
 
     // Restore simulation configuration without starting transmission.
@@ -3389,9 +3394,11 @@ async function restoreProjectEntries() {
         const simContainer = document.getElementById("sim-entries")!;
         for (const m of toRestore) {
             const handle = idToHandle(m.channel);
-            if (handle === undefined) continue;
-            const msg = channels.get(handle)?.dbc?.messages[m.message_id];
-            if (!msg) continue;
+            const msg = handle === undefined ? null : channels.get(handle)?.dbc?.messages[m.message_id];
+            if (!msg || handle === undefined) {
+                pendingSimMessages.push(m);
+                continue;
+            }
             const valueByName = new Map(m.signals.map(s => [s.name, s.value]));
             const genByName = new Map(m.signals.map(s => [s.name, s.generator ?? null]));
             const key = `msg::${++msgEntryCounter}`;

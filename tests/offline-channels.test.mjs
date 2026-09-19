@@ -117,6 +117,57 @@ test("saved plots and simulation settings restore while disconnected without tra
     assert.equal(ctx.pendingSimMessages.length, 0);
 });
 
+test("unreadable DBC preserves saved entries and retries restoration without duplicating entries", async () => {
+    const signal = { name: "RPM", message_id: 123 };
+    const savedSignal = { channel: "kvaser:USB CAN", message_id: 123, signal_name: "RPM" };
+    const savedMessage = { channel: "kvaser:USB CAN", message_id: 123, period_ms: 100, running: true, signals: [{ name: "RPM", value: 900 }] };
+    const added = [];
+    const channel = { open: false, available: false, dbc: null };
+    const ctx = harness(["restoreProjectEntries"], {
+        channels: new Map([[7, channel]]), pendingPaneSignals: [[savedSignal]], pendingSimMessages: [savedMessage],
+        plotPanes: [{ id: 1 }], simEntries: new Map(), msgEntryCounter: 0,
+        idToHandle: () => 7, addSignalToPane: async (...args) => added.push(args),
+        document: { getElementById: () => ({ appendChild: () => {} }) },
+        createSimEntryEl: () => ({}), renderSimEntries: () => {}, updateSignalHighlights: () => {},
+    });
+    await ctx.restoreProjectEntries();
+    assert.equal(ctx.pendingPaneSignals[0][0], savedSignal);
+    assert.equal(ctx.pendingSimMessages[0], savedMessage);
+    assert.equal(added.length, 0);
+    assert.equal(ctx.simEntries.size, 0);
+
+    channel.dbc = { messages: { 123: { id: 123, name: "Engine", dlc: 8, signals: [signal] } } };
+    await ctx.restoreProjectEntries();
+    await ctx.restoreProjectEntries();
+    assert.equal(added.length, 1);
+    assert.equal(ctx.simEntries.size, 1);
+    assert.equal([...ctx.simEntries.values()][0].signals[0].value, 900);
+    assert.equal(ctx.pendingPaneSignals.length, 0);
+    assert.equal(ctx.pendingSimMessages.length, 0);
+});
+
+test("saving partially restored panes retains both pending and visible signals after closing a pane", () => {
+    const saved = { channel: "kvaser:USB CAN", message_id: 123, signal_name: "RPM" };
+    const pane = id => ({ id, series: new Map(), chart: { destroy() {} }, el: { remove() {} } });
+    const remaining = pane("remaining");
+    remaining.series.set("speed", { signalName: "Speed", channel: 7, messageId: 456 });
+    const filters = Object.fromEntries([
+        "Channels", "CanIds", "MsgNames", "Dir", "Pgns", "Prios", "Sas", "Das", "Broadcast",
+        "DlcMin", "DlcMax", "CycleMin", "CycleMax", "Data",
+    ].map(name => [`traceFilter${name}`, null]));
+    const ctx = harness(["buildProject", "closePlotPane"], {
+        ...filters, channels: new Map(), ghostChannels: [], simEntries: new Map(),
+        plotPanes: [pane("closed"), remaining], pendingPaneSignals: [[], [saved]], pendingSimMessages: [],
+        handleToId: () => "kvaser:USB CAN", updateSignalHighlights() {}, scheduleAutoSave() {},
+        traceDataFormat: "hex", traceMaxRows: 100, windowSizeSec: 10, traceColOrder: [], traceColHidden: new Set(),
+    });
+    ctx.closePlotPane("closed");
+    const project = ctx.buildProject();
+    assert.equal(project.plot_panes.length, 1);
+    assert.deepEqual(JSON.parse(JSON.stringify(project.plot_panes[0].signals)), [saved,
+        { signal_name: "Speed", channel: "kvaser:USB CAN", message_id: 456 }]);
+});
+
 test("Start preserves duplicate offline channels, dependent entries and saved IDs until reconnection", async () => {
     for (const reverse of [false, true]) {
         const original = { config: config(), info: { backend: "kvaser", name: "USB CAN" }, dbc: { messages: {} }, open: false };
