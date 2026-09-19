@@ -25,6 +25,11 @@ libloading = { version = "0.8", optional = true }
 thiserror = "1"
 log = "0.4"
 sysinfo = "0.37"
+ureq = "3"
+sha2 = "0.10"
+tempfile = "3"
+url = "2"
+percent-encoding = "2"
 
 # Platform defaults: on each target these crates are non-optional, and the
 # backend cfg() gates accept target_os = "linux" as well, so a plain build gets

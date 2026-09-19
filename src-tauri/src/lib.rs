@@ -10,6 +10,7 @@ mod j1939;
 mod logger;
 mod project;
 mod sim_generator;
+mod updater;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -505,6 +506,7 @@ pub fn run() {
 
     debug!("Starting can-signals-tauri version {}", env!("GIT_VERSION"));
     tauri::Builder::default()
+        .manage(updater::UpdateState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
@@ -521,6 +523,9 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            updater::update_support,
+            updater::download_update,
+            updater::install_update,
             get_version,
             get_app_data_dir,
             write_text_file,

@@ -171,7 +171,8 @@ mod tests {
 
     /// 8-byte message: Speed (16 bit @ 0), Count (4 bit @ 16), Crc (8 bit @ 56).
     fn gen_dbc() -> ParsedDbc {
-        let path = std::env::temp_dir().join("canvaz_test_gen.dbc");
+        let directory = tempfile::tempdir().expect("create fixture directory");
+        let path = directory.path().join("generator.dbc");
         let content = "VERSION \"\"\n\nNS_ :\n\nBS_:\n\nBU_:\n\nBO_ 512 GenMsg: 8 Vector__XXX\n \
              SG_ Speed : 0|16@1+ (0.1,0) [0|6553.5] \"kmh\" Vector__XXX\n \
              SG_ Count : 16|4@1+ (1,0) [0|15] \"\" Vector__XXX\n \
