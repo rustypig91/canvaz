@@ -240,10 +240,24 @@ try {{
 fn install(update: Prepared) -> Result<(), String> {
     let _ = &update.directory;
     replace_appimage(&update.file, &update.target)?;
-    std::process::Command::new(&update.target)
-        .spawn()
-        .map_err(|e| format!("Updated, but could not restart: {e}"))?;
+    restart_after_exit(&update.target, std::process::id())?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn restart_after_exit(target: &Path, pid: u32) -> Result<std::process::Child, String> {
+    // The new instance auto-opens CAN channels. Wait until this process releases
+    // its devices before starting it. Pass paths as arguments, never shell code.
+    std::process::Command::new("/bin/sh")
+        .args(["-c", r#"while kill -0 "$1" 2>/dev/null; do sleep 0.1; done
+exec "$2""#, "canvaz-restart"])
+        .arg(pid.to_string())
+        .arg(target)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("Updated, but could not schedule restart: {e}"))
 }
 
 fn copy_verified(mut reader: impl Read, mut writer: impl Write, asset: &Asset, mut progress: impl FnMut(u64)) -> Result<(), String> {
@@ -277,6 +291,34 @@ fn copy_verified(mut reader: impl Read, mut writer: impl Write, asset: &Asset, m
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_waits_for_previous_process_to_exit() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("Canvaz's updated app");
+        std::fs::write(&target, "#!/bin/sh\nexit 42\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut parent = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let mut helper = restart_after_exit(&target, parent.id()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(helper.try_wait().unwrap().is_none());
+        parent.kill().unwrap();
+        parent.wait().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = helper.try_wait().unwrap() {
+                assert_eq!(status.code(), Some(42));
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = helper.kill();
+                panic!("Restart helper did not launch the updated application");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     #[cfg(windows)]
     #[test]

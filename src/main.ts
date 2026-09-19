@@ -3062,14 +3062,14 @@ function buildProject(): Project {
                 listen_only: g.config.listen_only,
             })),
         ],
-        plot_panes: plotPanes.map(pane => ({
-            signals: [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: handleToId(s.channel), message_id: s.messageId })),
+        plot_panes: plotPanes.map((pane, index) => ({
+            signals: pendingPaneSignals[index] ?? [...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: handleToId(s.channel), message_id: s.messageId })),
             interpolation: pane.interpolation,
             show_points: pane.showPoints,
             y_min: pane.yLock?.min ?? null,
             y_max: pane.yLock?.max ?? null,
         })),
-        simulate_messages: [...simEntries.values()]
+        simulate_messages: [...pendingSimMessages, ...[...simEntries.values()]
             .filter((e): e is SimMessageEntry => e.kind === "message")
             .map(e => ({
                 channel: handleToId(e.channel),
@@ -3077,7 +3077,7 @@ function buildProject(): Project {
                 period_ms: e.periodMs,
                 running: e.running,
                 signals: e.signals.map(s => ({ name: s.def.name, value: s.value, generator: s.gen ?? null })),
-            })),
+            }))],
         simulate_raw_frames: [...simEntries.values()]
             .filter((e): e is SimRawEntry => e.kind === "raw")
             .map(e => ({ channel: handleToId(e.channel), can_id: e.canId, is_extended: e.isExtended, dlc: e.dlc, data: e.data, period_ms: e.periodMs, running: e.running })),
