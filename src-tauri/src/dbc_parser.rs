@@ -552,7 +552,8 @@ mod tests {
     /// Parse a minimal J1939 DBC (one message, PGN 0xF004, SA 0x00) written to
     /// a temp file, since ParsedDbc only constructs from disk.
     fn j1939_dbc() -> ParsedDbc {
-        let path = std::env::temp_dir().join("canvaz_test_pgn_sa.dbc");
+        let directory = tempfile::tempdir().expect("create fixture directory");
+        let path = directory.path().join("pgn_sa.dbc");
         // BO_ id: 0x0CF00400 (prio 3, PGN F004, SA 00) with the DBC extended-id
         // flag (bit 31) set.
         let content = format!(
@@ -576,7 +577,8 @@ mod tests {
     /// Parse a minimal multiplexed DBC: an 8-bit switch, one 16-bit signal per
     /// mux group 0/1 sharing bits 8–23, and a plain signal.
     fn mux_dbc() -> ParsedDbc {
-        let path = std::env::temp_dir().join("canvaz_test_mux.dbc");
+        let directory = tempfile::tempdir().expect("create fixture directory");
+        let path = directory.path().join("mux.dbc");
         let content = "VERSION \"\"\n\nNS_ :\n\nBS_:\n\nBU_:\n\nBO_ 512 MuxMsg: 8 Vector__XXX\n \
              SG_ Mode M : 0|8@1+ (1,0) [0|255] \"\" Vector__XXX\n \
              SG_ SigA m0 : 8|16@1+ (1,0) [0|65535] \"\" Vector__XXX\n \
@@ -588,7 +590,8 @@ mod tests {
 
     #[test]
     fn extended_flag_comes_from_dbc_bit31_not_id_value() {
-        let path = std::env::temp_dir().join("canvaz_test_extid.dbc");
+        let directory = tempfile::tempdir().expect("create fixture directory");
+        let path = directory.path().join("extid.dbc");
         // BO_ 0x80000123: extended-id flag (bit 31) set with a 29-bit id of
         // 0x123 — an id that would pass for standard if inferred from its value.
         let content = format!(
@@ -607,7 +610,8 @@ mod tests {
     /// One float32 signal (factor 2, offset 10) and one double64 signal in
     /// separate messages, declared via SIG_VALTYPE_.
     fn float_dbc() -> ParsedDbc {
-        let path = std::env::temp_dir().join("canvaz_test_float.dbc");
+        let directory = tempfile::tempdir().expect("create fixture directory");
+        let path = directory.path().join("float.dbc");
         let content = "VERSION \"\"\n\nNS_ :\n\nBS_:\n\nBU_:\n\nBO_ 512 FMsg: 8 Vector__XXX\n \
              SG_ F32 : 0|32@1- (2,10) [0|0] \"V\" Vector__XXX\n\nBO_ 513 DMsg: 8 Vector__XXX\n \
              SG_ F64 : 0|64@1- (1,0) [0|0] \"\" Vector__XXX\n\n\
@@ -653,7 +657,8 @@ mod tests {
 
     #[test]
     fn attributes_and_comments_are_parsed() {
-        let path = std::env::temp_dir().join("canvaz_test_attrs.dbc");
+        let directory = tempfile::tempdir().expect("create fixture directory");
+        let path = directory.path().join("attrs.dbc");
         // Temp signal: raw start 70 with (0.5, -40) → physical -5.
         // NoCycle has GenMsgCycleTime 0, which means "not cyclic" → None.
         let content = "VERSION \"\"\n\nNS_ :\n\nBS_:\n\nBU_:\n\nBO_ 512 Status: 8 Vector__XXX\n \
