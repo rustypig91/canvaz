@@ -3416,11 +3416,19 @@ async function refreshHardware(): Promise<boolean> {
     channels.clear();
     for (const [oldHandle, ch] of oldEntries) {
         const remap = handleMap.get(oldHandle);
-        if (remap !== undefined) {
+        if (remap !== undefined && remap.new_handle === oldHandle) {
             ch.config.backend = remap.backend;
             channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend }, open: false, available: remap.available });
         } else {
-            ghostChannels.push({ config: ch.config, error: "Not found after backend reload" });
+            // A previously offline channel can resolve to another configured
+            // channel. Keep its settings as a ghost instead of overwriting the
+            // destination channel (and silently losing one configuration).
+            ghostChannels.push({ config: ch.config, error: remap
+                ? "Resolves to an already-configured channel"
+                : "Not found after backend reload" });
+            if (remap) {
+                await invoke("remove_channel", { channelHandle: oldHandle });
+            }
         }
     }
 

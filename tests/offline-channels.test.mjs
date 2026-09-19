@@ -116,3 +116,32 @@ test("saved plots and simulation settings restore while disconnected without tra
     assert.equal(ctx.pendingPaneSignals.length, 0);
     assert.equal(ctx.pendingSimMessages.length, 0);
 });
+
+test("refresh keeps both configurations when offline channels resolve to the same device", async () => {
+    for (const reverse of [false, true]) {
+        const original = { config: config(), info: { backend: "kvaser", name: "USB CAN" }, dbc: { messages: {} }, open: false };
+        const duplicate = { config: { ...config(), backend: "pcan", bitrate: 250000 }, info: { backend: "pcan", name: "USB CAN" }, dbc: null, open: false };
+        const entries = [[7, original], [8, duplicate]];
+        const removed = [];
+        const ctx = harness(["refreshHardware", "registerChannel"], {
+            channels: new Map(reverse ? entries.reverse() : entries), ghostChannels: [], renderChannelList: () => {},
+            invoke: async (command, args) => {
+                if (command === "reload_backends") return [
+                    { old_handle: 7, new_handle: 7, backend: "kvaser", available: true },
+                    { old_handle: 8, new_handle: 7, backend: "kvaser", available: true },
+                ];
+                if (command === "remove_channel") { removed.push(args.channelHandle); return; }
+                if (command === "create_channel") return { handle: 7, backend: "kvaser", available: true };
+                assert.fail(command);
+            },
+        });
+        assert.equal(await ctx.refreshHardware(), true);
+        assert.equal(ctx.channels.size, 1);
+        assert.equal(ctx.channels.get(7).config, original.config);
+        assert.equal(ctx.channels.get(7).dbc, original.dbc);
+        assert.equal(ctx.ghostChannels.length, 1);
+        assert.equal(ctx.ghostChannels[0].config, duplicate.config);
+        assert.equal(duplicate.config.backend, "pcan");
+        assert.deepEqual(removed, [8]);
+    }
+});
