@@ -3368,10 +3368,10 @@ async function restoreProjectEntries() {
     // Restore saved plots using DBC definitions; no hardware connection is needed.
     if (pendingPaneSignals.length > 0) {
         const toRestore = pendingPaneSignals;
-        pendingPaneSignals = [];
+        // addSignalToPane schedules autosave. Keep every not-yet-restored
+        // entry visible to buildProject while those asynchronous adds run.
+        pendingPaneSignals = toRestore.map(entries => [...entries]);
         for (let i = 0; i < Math.min(plotPanes.length, toRestore.length); i++) {
-            const unresolved: PlotSignalEntry[] = [];
-            pendingPaneSignals[i] = unresolved;
             for (const entry of toRestore[i]) {
                 const handle = idToHandle(entry.channel);
                 const dbc = handle === undefined ? null : channels.get(handle)?.dbc;
@@ -3380,8 +3380,11 @@ async function restoreProjectEntries() {
                         ? s.message_id === entry.message_id && s.name === entry.signal_name
                         : s.name === entry.signal_name
                 );
-                if (sig && handle !== undefined) await addSignalToPane(plotPanes[i], handle, sig);
-                else unresolved.push(entry);
+                if (sig && handle !== undefined) {
+                    const pending = pendingPaneSignals[i];
+                    pending.splice(pending.indexOf(entry), 1);
+                    await addSignalToPane(plotPanes[i], handle, sig);
+                }
             }
         }
         if (pendingPaneSignals.every(entries => entries.length === 0)) pendingPaneSignals = [];

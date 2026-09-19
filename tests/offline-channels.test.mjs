@@ -168,6 +168,23 @@ test("saving partially restored panes retains both pending and visible signals a
         { signal_name: "Speed", channel: "kvaser:USB CAN", message_id: 456 }]);
 });
 
+test("plot restoration autosaves retain unresolved entries in this pane and later panes", async () => {
+    const restored = { channel: "kvaser:USB CAN", message_id: 123, signal_name: "RPM" };
+    const missing = { channel: "pcan:Missing", message_id: 456, signal_name: "Speed" };
+    const snapshots = [];
+    const ctx = harness(["restoreProjectEntries"], {
+        channels: new Map([[7, { dbc: { messages: { 123: { signals: [{ name: "RPM", message_id: 123 }] } } } }]]),
+        pendingPaneSignals: [[restored, missing], [missing]], pendingSimMessages: [],
+        plotPanes: [{ id: 1 }, { id: 2 }],
+        idToHandle: id => id === restored.channel ? 7 : undefined,
+        // Production addSignalToPane schedules autosave after inserting its series.
+        addSignalToPane: async () => snapshots.push(JSON.parse(JSON.stringify(ctx.pendingPaneSignals))),
+    });
+    await ctx.restoreProjectEntries();
+    assert.deepEqual(snapshots, [[[missing], [missing]]]);
+    assert.deepEqual(JSON.parse(JSON.stringify(ctx.pendingPaneSignals)), [[missing], [missing]]);
+});
+
 test("Start preserves duplicate offline channels, dependent entries and saved IDs until reconnection", async () => {
     for (const reverse of [false, true]) {
         const original = { config: config(), info: { backend: "kvaser", name: "USB CAN" }, dbc: { messages: {} }, open: false };
