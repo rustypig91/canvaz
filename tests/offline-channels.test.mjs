@@ -185,6 +185,30 @@ test("plot restoration autosaves retain unresolved entries in this pane and late
     assert.deepEqual(JSON.parse(JSON.stringify(ctx.pendingPaneSignals)), [[missing], [missing]]);
 });
 
+test("closing a pane during history loading keeps restoration attached to the remaining panes", async () => {
+    const signal = { name: "RPM", message_id: 123 };
+    const saved = { channel: "kvaser:USB CAN", message_id: 123, signal_name: "RPM" };
+    const missing = { channel: "pcan:Missing", message_id: 456, signal_name: "Speed" };
+    const pane = id => ({ id, chart: { destroy() {} }, el: { remove() {} } });
+    const first = pane("first"), second = pane("second");
+    const added = [];
+    let finishHistory;
+    const history = new Promise(resolve => { finishHistory = resolve; });
+    const ctx = harness(["restoreProjectEntries", "closePlotPane"], {
+        channels: new Map([[7, { dbc: { messages: { 123: { signals: [signal] } } } }]]),
+        plotPanes: [first, second], pendingPaneSignals: [[saved, { ...saved }], [saved, missing]],
+        idToHandle: id => id === saved.channel ? 7 : undefined,
+        addSignalToPane: async target => { added.push(target.id); if (target === first) await history; },
+        updateSignalHighlights() {}, scheduleAutoSave() {},
+    });
+    const restoring = ctx.restoreProjectEntries();
+    ctx.closePlotPane("first");
+    finishHistory();
+    await restoring;
+    assert.deepEqual(added, ["first", "second"]);
+    assert.deepEqual(JSON.parse(JSON.stringify(ctx.pendingPaneSignals)), [[missing]]);
+});
+
 test("Start preserves duplicate offline channels, dependent entries and saved IDs until reconnection", async () => {
     for (const reverse of [false, true]) {
         const original = { config: config(), info: { backend: "kvaser", name: "USB CAN" }, dbc: { messages: {} }, open: false };

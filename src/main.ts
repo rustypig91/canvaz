@@ -3371,8 +3371,14 @@ async function restoreProjectEntries() {
         // addSignalToPane schedules autosave. Keep every not-yet-restored
         // entry visible to buildProject while those asynchronous adds run.
         pendingPaneSignals = toRestore.map(entries => [...entries]);
-        for (let i = 0; i < Math.min(plotPanes.length, toRestore.length); i++) {
-            for (const entry of toRestore[i]) {
+        const panesToRestore = plotPanes.slice(0, toRestore.length).map((pane, i) => ({
+            pane, entries: toRestore[i], pending: pendingPaneSignals[i],
+        }));
+        for (const { pane, entries, pending } of panesToRestore) {
+            for (const entry of entries) {
+                // Loading history yields to the UI. A pane may be closed (or
+                // the project replaced) while an earlier signal is loading.
+                if (!plotPanes.includes(pane)) break;
                 const handle = idToHandle(entry.channel);
                 const dbc = handle === undefined ? null : channels.get(handle)?.dbc;
                 const sig = dbc && Object.values(dbc.messages).flatMap((m: DbcMessage) => m.signals).find(
@@ -3381,9 +3387,8 @@ async function restoreProjectEntries() {
                         : s.name === entry.signal_name
                 );
                 if (sig && handle !== undefined) {
-                    const pending = pendingPaneSignals[i];
                     pending.splice(pending.indexOf(entry), 1);
-                    await addSignalToPane(plotPanes[i], handle, sig);
+                    await addSignalToPane(pane, handle, sig);
                 }
             }
         }
