@@ -3728,6 +3728,12 @@ async function stopApp() {
 function showConfirm(message: string, actionLabel: string): Promise<boolean> {
     return new Promise((resolve) => {
         const dialog = document.getElementById("dialog-confirm") as HTMLDialogElement;
+        // Global shortcuts can request another confirmation while this one is open.
+        // Keep the visible prompt tied to exactly one pending action.
+        if (dialog.open) {
+            resolve(false);
+            return;
+        }
         document.getElementById("dialog-confirm-msg")!.textContent = message;
 
         const ok = document.getElementById("btn-confirm-ok")!;

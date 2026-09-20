@@ -68,6 +68,22 @@ for (const [target, eventType] of [["btn-confirm-cancel", "click"], ["dialog-con
     });
 }
 
+test("overlapping project shortcuts cannot replace or approve another confirmation", async () => {
+    const { context, elements, getDialogOpenCalls } = harness();
+    const first = context.confirmAndStop("Stop capture and remove a channel?", "Stop & remove channel");
+    await context.openProject();
+    assert.equal(getDialogOpenCalls(), 0);
+    assert.equal(elements.get("dialog-confirm-msg").textContent, "Stop capture and remove a channel?");
+    assert.equal(elements.get("btn-confirm-ok").textContent, "Stop & remove channel");
+    assert.equal(elements.get("dialog-confirm").open, true);
+    assert.equal(context.appRunning, true);
+    elements.get("btn-confirm-ok").dispatchEvent(new Event("click"));
+    assert.equal(await first, true);
+    assert.equal(getDialogOpenCalls(), 0);
+    assert.equal(context.projectDirty, true);
+    assert.equal(context.projectPath, "original.canvaz");
+});
+
 test("capture stops only after confirmation; stopped capture needs no prompt", async () => {
     const { context, elements } = harness();
     const result = context.confirmAndStop("Stop live capture to reload CAN backends?", "Stop & reload backends");
