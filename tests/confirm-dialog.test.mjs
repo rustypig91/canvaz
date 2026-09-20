@@ -95,3 +95,29 @@ test("capture stops only after confirmation; stopped capture needs no prompt", a
     assert.equal(await context.confirmAndStop("Unused", "Unused"), true);
     assert.equal(elements.get("dialog-confirm").open, false);
 });
+
+for (const initiallyDirty of [false, true]) {
+    test(`opening rechecks edits made during loading (initially dirty: ${initiallyDirty})`, async () => {
+        const { context, elements } = harness();
+        context.projectDirty = initiallyDirty;
+        let finishLoading;
+        context.invoke = () => new Promise(resolve => { finishLoading = resolve; });
+        const result = context.openProject();
+        if (initiallyDirty) elements.get("btn-confirm-ok").dispatchEvent(new Event("click"));
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(typeof finishLoading, "function");
+        context.projectRevision++;
+        context.projectDirty = true;
+        finishLoading({});
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(elements.get("dialog-confirm").open, true);
+        assert.equal(elements.get("btn-confirm-ok").textContent, "Discard changes");
+        elements.get("btn-confirm-cancel").dispatchEvent(new Event("click"));
+        await result;
+        assert.equal(context.projectPath, "original.canvaz");
+        assert.equal(context.projectRevision, 8);
+        assert.equal(context.projectDirty, true);
+        assert.equal(context.restoringProject, false);
+        assert.equal(context.appRunning, true);
+    });
+}
