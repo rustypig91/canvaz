@@ -50,7 +50,7 @@
 
       </nav>
       <button id="btn-app-run" title="Start live capture">▶ Start</button>
-      <button id="btn-pause-view" class="btn btn-sm" title="Freeze the current view; data continues in the background" disabled>Pause</button>
+      <button id="btn-pause-view" class="btn btn-sm" title="Freeze the view. Capture and configured transmissions continue." disabled>Pause view</button>
       <div id="window-size-ctrl" title="Discard signal data older than this">
         <span>Window</span>
         <select id="select-window">
@@ -130,7 +130,11 @@
         <div id="tab-trace" class="tab-content active">
           <div id="trace-toolbar">
             <button id="btn-clear-trace" class="btn btn-sm">Clear</button>
-            <button id="btn-trace-overwrite" class="btn btn-sm active" title="Toggle overwrite mode">Overwrite</button>
+            <div id="trace-mode-control" class="trace-mode-control" role="group" aria-label="Trace display mode">
+              <span class="label-muted">Trace:</span>
+              <button id="btn-trace-latest" class="btn btn-sm active" type="button" aria-pressed="true" title="Show the latest frame for each channel, CAN ID, frame format, and direction.">Latest per ID</button>
+              <button id="btn-trace-all" class="btn btn-sm" type="button" aria-pressed="false" title="Show every captured frame in chronological order.">All frames</button>
+            </div>
             <button id="btn-trace-expand-all" class="btn btn-sm" title="Expand all decoded messages">Expand all</button>
             <button id="btn-trace-collapse-all" class="btn btn-sm" title="Collapse all expanded messages">Collapse all</button>
             <label class="label-muted">Max rows:</label>

@@ -1123,6 +1123,14 @@ body.resizing {
   font-size: 12px;
   table-layout: fixed;
 }
+
+.trace-mode-control {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.trace-mode-control .label-muted { margin-right: 2px; }
 #trace-empty {
   padding: 32px 24px;
   text-align: center;
