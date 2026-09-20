@@ -2340,6 +2340,7 @@ function refreshChannelList() {
 }
 
 async function renderChannelList() {
+    updateTraceEmptyState();
     const list = document.getElementById("channel-list")!;
 
     list.innerHTML = "";
@@ -4333,6 +4334,7 @@ type TraceSortCol = "ts" | "dir" | "channel" | "canId" | "pgn" | "prio" | "sa" |
 let traceSortCol: TraceSortCol = null;
 let traceSortDir: "asc" | "desc" = "asc";
 let traceLocalBuffer: TraceEntry[] = [];
+const traceEntryRows = new WeakMap<TraceEntry, HTMLTableRowElement>();
 
 function traceKey(handle: number, canId: number, direction: "rx" | "tx" | "err", isExtended: boolean) {
     return `${handle}::${canId}::${direction}::${isExtended ? "ext" : "std"}`;
@@ -4394,6 +4396,58 @@ function traceRowVisible(channelHandle: number, canId: number, bytes: number[], 
     return true;
 }
 
+function updateTraceEmptyState() {
+    const panel = document.getElementById("trace-empty");
+    if (!panel) return;
+    const rows = (document.getElementById("trace-tbody") as HTMLTableSectionElement).rows;
+    let visible = false;
+    for (const row of rows) {
+        if (!row.dataset.expand && row.style.display !== "none") { visible = true; break; }
+    }
+    panel.hidden = visible;
+    if (visible) return;
+
+    const configured = [...channels.values()];
+    const details = configured.flatMap(ch => {
+        const error = ch.error || (!ch.available ? "Interface not found" : "");
+        return error ? [`${ch.config.display_name || ch.info.name}: ${error}`] : [];
+    }).concat(ghostChannels.map(g => `${g.config.display_name || g.config.name}: ${g.error}`));
+    let title: string, description: string, action = "", target = "";
+    if ((rows.length > 0 || traceLocalBuffer.length > 0) && anyFilterActive() && !viewPaused) {
+        title = "All frames are hidden by filters";
+        description = "Clear the trace filters to see captured frames.";
+        action = "Clear filters"; target = "btn-clear-filters";
+    } else if (configured.length + ghostChannels.length === 0) {
+        title = "No channels configured";
+        description = "Add a CAN channel to begin capturing traffic.";
+        action = "Add channel"; target = "btn-add-channel";
+    } else if (!configured.some(ch => ch.open) && (details.length > 0 || appRunning)) {
+        title = "Channels disconnected or unable to start";
+        description = "Check the hardware connection and channel settings, then reload hardware and start capture.";
+        action = "Reload hardware"; target = "btn-reload-backends";
+    } else if (!appRunning) {
+        title = "Capture stopped";
+        description = "Start capture to display CAN traffic.";
+        action = "Start capture"; target = "btn-app-run";
+    } else if (viewPaused) {
+        title = "Trace view paused";
+        description = "Resume the view using the pause control to display incoming frames.";
+    } else {
+        title = "Waiting for traffic";
+        description = "Capture is running. Frames will appear when a connected channel receives traffic.";
+    }
+    // Avoid repeating live-region announcements for every incoming frame batch.
+    for (const [id, text] of [["trace-empty-title", title], ["trace-empty-description", description],
+        ["trace-empty-details", details.join("\n")]]) {
+        const element = document.getElementById(id)!;
+        if (element.textContent !== text) element.textContent = text;
+    }
+    const button = document.getElementById("trace-empty-action") as HTMLButtonElement;
+    button.hidden = !action;
+    button.textContent = action;
+    button.onclick = () => document.getElementById(target)?.click();
+}
+
 function applyTraceFilter() {
     const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
     if (traceMode === "append") {
@@ -4406,6 +4460,7 @@ function applyTraceFilter() {
             }
         }
         applyTraceSort();
+        updateTraceEmptyState();
         return;
     }
     // Overwrite mode: toggle visibility on the fixed set of rows.
@@ -4435,6 +4490,7 @@ function applyTraceFilter() {
         }
     }
     updateClearFiltersBtn();
+    updateTraceEmptyState();
     scheduleAutoSave("trace filter changed");
 }
 
@@ -4558,6 +4614,7 @@ function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
 
 function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
     const tr = document.createElement("tr");
+    traceEntryRows.set(entry, tr);
     traceRowSignals.set(tr, entry.signals);
     tr.dataset.bytes = JSON.stringify(entry.data);
     tr.dataset.channelHandle = String(entry.channelHandle);
@@ -4776,36 +4833,33 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
     }
 
     if (appendEntries.length > 0) {
+        // Retain filtered-out live frames so clearing filters can restore them.
+        traceLocalBuffer = appendEntries.slice().reverse().concat(traceLocalBuffer);
+        // Evict the same entries from the display, even when newer frames are
+        // filtered out. Entry identity also handles equal timestamps and sorting.
+        for (const entry of traceLocalBuffer.splice(traceMaxRows)) {
+            const row = traceEntryRows.get(entry);
+            if (!row) continue;
+            const next = row.nextElementSibling as HTMLTableRowElement | null;
+            if (next?.dataset.expand) collapseTraceRow(row, next);
+            row.remove();
+        }
         const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
         // Events arrive oldest→newest; insert in reverse so the newest ends up on top.
         const frag = document.createDocumentFragment();
-        for (let i = appendEntries.length - 1; i >= 0; i--) {
+        for (let i = appendEntries.length - 1; i >= Math.max(0, appendEntries.length - traceMaxRows); i--) {
             const e = appendEntries[i];
             if (traceRowVisible(e.channelHandle, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName, e.j1939)) {
                 frag.appendChild(buildTraceRow(e));
             }
         }
         tbody.insertBefore(frag, tbody.firstChild);
-        // Cap the row count by dropping the oldest rows. Unsorted, the oldest
-        // sit at the bottom; with an active column sort the bottom row is just
-        // whatever sorts last, so evict by timestamp instead.
-        if (!traceSortCol) {
-            while (tbody.rows.length > traceMaxRows) tbody.deleteRow(-1);
-        } else if (tbody.rows.length > traceMaxRows) {
-            const rows = (Array.from(tbody.rows) as HTMLTableRowElement[]).filter(r => !r.dataset.expand);
-            rows.sort((a, b) => parseInt(a.dataset.ts ?? "0") - parseInt(b.dataset.ts ?? "0"));
-            const excess = tbody.rows.length - traceMaxRows;
-            for (let i = 0; i < excess && i < rows.length; i++) {
-                const next = rows[i].nextElementSibling as HTMLTableRowElement | null;
-                if (next?.dataset.expand) next.remove();
-                rows[i].remove();
-            }
-        }
     }
 
     // Keep the user's column sort applied as rows arrive and update in place
     // (no-op when no sort is active or the order is already correct).
     if (latestOverwrite.size > 0 || appendEntries.length > 0) applyTraceSort();
+    updateTraceEmptyState();
 }
 
 // Rebuild the interleaved [value, raw] layout from get_frames' named signals.
@@ -4882,6 +4936,7 @@ function clearTrace() {
     traceSeenDas.clear();
     traceSeenNoJ1939 = false;
     traceLocalBuffer = [];
+    updateTraceEmptyState();
 }
 
 function refreshTraceFormat() {
@@ -5585,6 +5640,7 @@ function collapseTraceRow(tr: HTMLTableRowElement, expandTr: HTMLTableRowElement
 
 function setupTrace() {
     rebuildTraceColumns();
+    updateTraceEmptyState();
 
     document.getElementById("btn-clear-trace")!.addEventListener("click", clearTrace);
 
@@ -5744,6 +5800,7 @@ function updatePauseViewBtn() {
     btn.classList.toggle("running", viewPaused);
     // Pausing only makes sense while capture is live.
     btn.disabled = !appRunning;
+    updateTraceEmptyState();
 }
 
 // Rewrite every rendered sidebar row from the latest value maps. Used on resume
@@ -5783,6 +5840,7 @@ function resumeFromPause() {
         }
         tracePendingOverwrite.clear();
         applyTraceSort();
+        updateTraceEmptyState();
     } else {
         // Re-render visible rows from the backend (newest first after refresh).
         loadTraceFrames().then(() => {
@@ -5799,6 +5857,7 @@ function resumeFromPause() {
             }
             tbody.appendChild(frag);
             applyTraceSort();
+            updateTraceEmptyState();
         });
     }
 
