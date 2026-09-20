@@ -36,6 +36,22 @@ npm run tauri dev      # development
 npm run tauri build    # production
 ```
 
+### Linux startup from a Snap IDE
+
+Canvaz removes inherited Snap GTK/GIO module paths before starting its native
+WebKit runtime. This prevents the `libpthread.so.0: undefined symbol:
+__libc_pthread_init, version GLIBC_PRIVATE` crash when launching from VS Code
+installed through Snap. Host and AppImage library paths are preserved.
+
+If you are running an older build, launch it from a terminal outside the Snap
+IDE, or temporarily clear the affected variables for that command:
+
+```sh
+env -u GTK_PATH -u GTK_EXE_PREFIX -u GTK_IM_MODULE_FILE -u GIO_MODULE_DIR \
+  -u GIO_EXTRA_MODULES -u GDK_PIXBUF_MODULE_FILE -u GDK_PIXBUF_MODULEDIR \
+  -u GSETTINGS_SCHEMA_DIR npm run tauri dev
+```
+
 ### Build Windows installers locally
 
 Install Node.js, the Windows x64 MSVC Rust toolchain, and Visual Studio Build

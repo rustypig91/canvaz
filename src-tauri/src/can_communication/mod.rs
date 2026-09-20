@@ -44,6 +44,35 @@ pub struct CanFrame {
     pub error: Option<String>,
 }
 
+impl CanFrame {
+    fn validate_transmit(&self) -> Result<(), String> {
+        let max_id = if self.is_extended { 0x1FFF_FFFF } else { 0x7FF };
+        if self.can_id > max_id {
+            return Err("CAN ID is outside the selected frame format's range".into());
+        }
+        validate_payload(&self.data)?;
+        if self.error.is_some() {
+            return Err("Error frames cannot be transmitted".into());
+        }
+        Ok(())
+    }
+}
+
+fn validate_payload(data: &[u8]) -> Result<(), String> {
+    // All current transmit backends use classic CAN, including DBC sends.
+    if data.len() > 8 {
+        return Err("Classic CAN payloads cannot exceed 8 bytes".into());
+    }
+    Ok(())
+}
+
+fn validate_period(period_ms: u64) -> Result<(), String> {
+    if period_ms == 0 || Instant::now().checked_add(Duration::from_millis(period_ms)).is_none() {
+        return Err("Transmit period must be positive and fit the system clock".into());
+    }
+    Ok(())
+}
+
 // ── Bus status ────────────────────────────────────────────────────────────────
 
 /// CAN controller fault-confinement state, as reported by the backend.
@@ -285,6 +314,7 @@ impl Can {
 
     /// Enqueue a frame to be sent exactly once.
     pub fn send_once(&self, channel: u8, frame: CanFrame) -> Result<(), String> {
+        frame.validate_transmit()?;
         debug!("Enqueuing one-shot frame on channel {channel}: id=0x{:X}", frame.can_id);
         let q = self.queue(channel)?;
         let (lock, cvar) = q.as_ref();
@@ -304,6 +334,8 @@ impl Can {
         period_ms: u64,
         source: Option<FrameDataSource>,
     ) -> Result<u64, String> {
+        frame.validate_transmit()?;
+        validate_period(period_ms)?;
         let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
         debug!(
             "Adding periodic frame on channel {channel}: id=0x{:X}, period={}ms, handle={handle}",
@@ -334,6 +366,8 @@ impl Can {
         source: Option<FrameDataSource>,
         period_ms: u64,
     ) -> Result<(), String> {
+        validate_payload(&data)?;
+        validate_period(period_ms)?;
         debug!("Updating periodic frame on channel {channel}: handle={handle}, period={period_ms}ms");
         let q = self.queue(channel)?;
         let (lock, cvar) = q.as_ref();
@@ -515,4 +549,58 @@ fn tx_loop(
         let _ = cvar.wait_timeout(q, timeout);
     }
     tx.close();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(id: u32, extended: bool, size: usize) -> CanFrame {
+        CanFrame { can_id: id, is_extended: extended, data: vec![0; size], timestamp_ms: None, error: None }
+    }
+
+    #[test]
+    fn validates_classic_can_transmit_boundaries() {
+        for f in [frame(0x7FF, false, 8), frame(0x1FFF_FFFF, true, 8), frame(0, true, 0)] {
+            assert!(f.validate_transmit().is_ok());
+        }
+        for f in [frame(0x800, false, 8), frame(0x2000_0000, true, 8), frame(0, false, 9)] {
+            assert!(f.validate_transmit().is_err());
+        }
+        assert!(validate_period(0).is_err());
+        assert!(validate_period(1).is_ok());
+    }
+
+    struct UnusedBackend;
+    impl CanBackend for UnusedBackend {
+        fn list_channels(&self) -> Vec<String> { vec![] }
+        fn open_channel(&mut self, _: u8, _: u32, _: bool, _: Option<&str>)
+            -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> { unreachable!() }
+    }
+
+    #[test]
+    fn invalid_updates_leave_the_previous_periodic_entry_intact() {
+        let mut can = Can::new(UnusedBackend, |_, _| {}, |_, _| {}, |_, _, _| {}, |_, _| {});
+        let queue = Arc::new((Mutex::new(vec![]), Condvar::new()));
+        can.channels.insert(0, OpenChannel {
+            queue: queue.clone(), stop: Arc::new(AtomicBool::new(false)),
+            rx_thread: std::thread::spawn(|| {}), tx_thread: std::thread::spawn(|| {}),
+        });
+        assert!(can.send_once(0, frame(0x800, false, 1)).is_err());
+        assert!(can.add_periodic(0, frame(1, false, 1), 0, None).is_err());
+        assert!(queue.0.lock().unwrap().is_empty());
+        let handle = can.add_periodic(0, frame(1, false, 1), 100, None).unwrap();
+        assert!(can.update_periodic(0, handle, vec![1], None, 0).is_err());
+        assert!(can.update_periodic(0, handle, vec![1; 9], None, 100).is_err());
+        let entries = queue.0.lock().unwrap();
+        match &entries[0] {
+            SendEntry::Periodic { frame, period_ms, .. } => {
+                assert_eq!(frame.data, [0]);
+                assert_eq!(*period_ms, 100);
+            }
+            _ => panic!("expected unchanged periodic entry"),
+        }
+        drop(entries);
+        can.close(0).unwrap();
+    }
 }

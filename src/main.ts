@@ -3378,6 +3378,15 @@ async function openProject() {
 async function applyProject(project: Project) {
     // Stop any active capture before applying a new project.
     if (appRunning) await stopApp();
+    // Remove old hardware registrations before reusing any channel identities.
+    await invoke("reset_backend");
+    clearTrace();
+    signalLastValues.clear();
+    signalLastRaw.clear();
+    signalMinValues.clear();
+    signalMaxValues.clear();
+    sigKeyCache.clear();
+    pgnMapCache.clear();
 
     channels.clear();
     ghostChannels = [];
@@ -4060,7 +4069,7 @@ function openSysResDialog() {
             .then(({ processes, frame_count, frame_bytes }) => {
                 tbody.innerHTML = processes.map(p =>
                     `<tr>
-                        <td>${p.name}</td>
+                        <td>${escapeHtml(p.name)}</td>
                         <td>${p.pid}</td>
                         <td>${p.cpu.toFixed(1)} %</td>
                         <td>${mb(p.memory)}</td>

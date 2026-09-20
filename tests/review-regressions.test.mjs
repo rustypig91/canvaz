@@ -264,3 +264,31 @@ test("raw frame edits and DBC period edits schedule persistence while stopped", 
     assert.equal(saved.length, before + 1);
     assert.equal(message.periodMs, 500);
 });
+
+test("opening another project resets backend registrations and cached traffic before registering channels", async () => {
+    const calls = [];
+    const oldChannels = new Map([[7, { info: { name: "old" } }]]);
+    const caches = Object.fromEntries(["signalLastValues", "signalLastRaw", "signalMinValues", "signalMaxValues", "sigKeyCache", "pgnMapCache"].map(k => [k, new Map([["old", 1]])]));
+    const ctx = harness(["applyProject"], {
+        ...caches, appRunning: true, channels: oldChannels, ghostChannels: [], plotPanes: [],
+        simEntries: new Map(), pendingPaneSignals: [], pendingSimMessages: [], DEFAULT_WINDOW_SEC: 60,
+        stopApp: async () => calls.push("stop"),
+        invoke: async command => {
+            assert.equal(command, "reset_backend");
+            assert.equal(oldChannels.size, 1);
+            calls.push("reset");
+        },
+        clearTrace: () => calls.push("clear trace"),
+        registerChannel: async config => {
+            assert.equal(oldChannels.size, 0);
+            for (const cache of Object.values(caches)) assert.equal(cache.size, 0);
+            calls.push(`register ${config.name}`);
+            return { handle: 8 };
+        },
+        document: { getElementById: () => ({ innerHTML: "" }) },
+        refreshChannelList() {}, renderDbcTree() {}, rebuildTraceColumns() {}, setWindowSize() {},
+        restoreProjectEntries: async () => {},
+    });
+    await ctx.applyProject({ channels: [{ name: "new" }], plot_panes: [] });
+    assert.deepEqual(calls, ["stop", "reset", "clear trace", "register new"]);
+});

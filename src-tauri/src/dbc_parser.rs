@@ -246,7 +246,7 @@ impl ParsedMessage {
                     };
                     pack_bits(&mut buf, bits, sig.start_bit, sig.length, sig.little_endian);
                 } else {
-                    encode(&mut buf, v, sig.start_bit, sig.length, sig.little_endian, sig.factor, sig.offset);
+                    encode(&mut buf, v, sig.start_bit, sig.length, sig.little_endian, sig.signed, sig.factor, sig.offset);
                 }
             }
         }
@@ -301,6 +301,37 @@ impl ParsedDbc {
 
         let mut messages = HashMap::new();
         for msg in &dbc.messages {
+            // Classic CAN, CAN FD and J1939 TP messages share this decoder.
+            // Bound allocations and bit arithmetic before accepting a DBC.
+            if msg.size > 1785 {
+                return Err(format!("Message {} exceeds the maximum supported payload (1785 bytes)", msg.name));
+            }
+            for sig in &msg.signals {
+                if !(1..=64).contains(&sig.size) {
+                    return Err(format!("Signal {}.{} must be between 1 and 64 bits", msg.name, sig.name));
+                }
+                let mut bit = sig.start_bit;
+                for _ in 0..sig.size {
+                    if bit >= msg.size * 8 {
+                        return Err(format!("Signal {}.{} extends beyond its message payload", msg.name, sig.name));
+                    }
+                    bit = if sig.byte_order == ByteOrder::LittleEndian {
+                        bit + 1
+                    } else if bit % 8 == 0 {
+                        bit + 15
+                    } else {
+                        bit - 1
+                    };
+                }
+                let width = match dbc.extended_value_type_for_signal(msg.id, &sig.name) {
+                    Some(SignalExtendedValueType::IEEEfloat32Bit) => Some(32),
+                    Some(SignalExtendedValueType::IEEEdouble64bit) => Some(64),
+                    _ => None,
+                };
+                if width.is_some_and(|width| sig.size != width) {
+                    return Err(format!("Signal {}.{} has an invalid IEEE float width", msg.name, sig.name));
+                }
+            }
             let (raw_id, is_extended) = match msg.id {
                 MessageId::Standard(id) => (u32::from(id), false),
                 MessageId::Extended(id) => (id, true),
@@ -427,16 +458,18 @@ impl ParsedDbc {
 
 }
 
-fn encode(data: &mut [u8], value: f64, start_bit: u64, length: u64, little_endian: bool, factor: f64, offset: f64) {
+fn encode(data: &mut [u8], value: f64, start_bit: u64, length: u64, little_endian: bool, signed: bool, factor: f64, offset: f64) {
     // A degenerate factor of 0 means every raw value encodes the same physical
     // (the offset) — use raw 0 rather than dividing to ±inf and saturating.
     let raw = if factor == 0.0 {
         0
+    } else if signed {
+        ((value - offset) / factor).round() as i64 as u64
     } else {
-        ((value - offset) / factor).round() as i64
+        ((value - offset) / factor).round() as u64
     };
     let mask = if length >= 64 { u64::MAX } else { (1u64 << length) - 1 };
-    let raw_u64 = (raw as u64) & mask;
+    let raw_u64 = raw & mask;
     pack_bits(data, raw_u64, start_bit, length, little_endian);
 }
 
@@ -454,14 +487,8 @@ fn raw_signed(raw: u64, length: u64, signed: bool) -> i64 {
 }
 
 fn apply_scaling(raw: u64, length: u64, signed: bool, factor: f64, offset: f64) -> f64 {
-    let physical = if signed && length > 0 {
-        let msb_mask = 1u64 << (length - 1);
-        if raw & msb_mask != 0 {
-            let sign_extended = raw | !((1u64 << length) - 1);
-            sign_extended as i64 as f64
-        } else {
-            raw as f64
-        }
+    let physical = if signed {
+        raw_signed(raw, length, true) as f64
     } else {
         raw as f64
     };
@@ -558,6 +585,54 @@ fn numeric_to_f64(v: NumericValue) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn integer_dbc(length: u64, start: u64, order: u8, sign: char, dlc: u64) -> Result<ParsedDbc, String> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("integer.dbc");
+        std::fs::write(&path, format!(
+            "VERSION \"\"\n\nNS_ :\n\nBS_:\n\nBU_:\n\nBO_ 512 Integer: {dlc} Vector__XXX\n SG_ Value : {start}|{length}@{order}{sign} (1,0) [0|0] \"\" Vector__XXX\n"
+        )).unwrap();
+        ParsedDbc::new(path.to_str().unwrap())
+    }
+
+    #[test]
+    fn signed_64_bit_values_decode_without_shift_overflow() {
+        for (order, start) in [(1, 0), (0, 7)] {
+            let dbc = integer_dbc(64, start, order, '-', 8).unwrap();
+            let msg = &dbc.messages[&512];
+            for value in [-1i64, i64::MIN, 0, 42] {
+                let data = if order == 1 { value.to_le_bytes() } else { value.to_be_bytes() };
+                let decoded = msg.decode_data(&data);
+                assert_eq!(decoded.signals[0].raw, value);
+                assert_eq!(decoded.signals[0].physical, value as f64);
+            }
+        }
+    }
+
+    #[test]
+    fn unsigned_64_bit_encoding_preserves_values_above_i64_max() {
+        for (order, start) in [(1, 0), (0, 7)] {
+            let dbc = integer_dbc(64, start, order, '+', 8).unwrap();
+            let msg = &dbc.messages[&512];
+            let value = 1u64 << 63;
+            let encoded = msg.encode_signals(&[("Value".into(), value as f64)].into());
+            let expected = if order == 1 { value.to_le_bytes() } else { value.to_be_bytes() };
+            assert_eq!(encoded, expected);
+            assert_eq!(msg.decode_data(&encoded).signals[0].physical, value as f64);
+        }
+    }
+
+    #[test]
+    fn invalid_signal_layouts_are_rejected_before_decoding() {
+        for (length, start, order, dlc) in [
+            (0, 0, 1, 8), (65, 0, 1, 16), (8, 64, 1, 8),
+            (16, 7, 0, 1), (8, u64::MAX, 1, 8), (8, 0, 1, 1786),
+        ] {
+            assert!(integer_dbc(length, start, order, '+', dlc).is_err());
+        }
+        assert!(integer_dbc(8, 7, 0, '+', 1).is_ok());
+        assert!(integer_dbc(64, 0, 1, '+', 1785).is_ok());
+    }
 
     /// Parse a minimal J1939 DBC (one message, PGN 0xF004, SA 0x00) written to
     /// a temp file, since ParsedDbc only constructs from disk.
