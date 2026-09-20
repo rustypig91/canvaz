@@ -98,13 +98,19 @@ for (const mode of ["overwrite", "append"]) {
         h.context.document.createDocumentFragment = () => ({ rows: [], appendChild(row) { this.rows.push(row); } });
         Object.assign(h.context, {
             appRunning: true, traceMode: mode, traceTabActive: true, filtered: true,
-            traceMaxRows: 2, traceSortCol: null, traceRowEls: new Map(), traceLastTs: new Map(),
+            traceEntryRows: new WeakMap(), traceMaxRows: 2, traceSortCol: null, traceRowEls: new Map(), traceLastTs: new Map(),
             traceSeenChannels: new Set(), traceSeenCanIds: new Set(), traceSeenMsgNames: new Set(),
             traceSeenNoMsg: false, traceSeenNoJ1939: false,
             signalValueEls: new Map(), signalRangeEls: new Map(),
             dbcMessageFor: () => null, traceKey: (handle, id) => `${handle}:${id}`,
             traceRowVisible: () => !h.context.filtered,
-            buildTraceRow: entry => ({ dataset: { handle: String(entry.channelHandle), canid: String(entry.canId), bytes: "[]" }, style: { display: h.context.filtered ? "none" : "" } }),
+            buildTraceRow: entry => {
+                const row = { dataset: { handle: String(entry.channelHandle), canid: String(entry.canId), bytes: "[]" },
+                    style: { display: h.context.filtered ? "none" : "" },
+                    remove() { tbody.rows = tbody.rows.filter(r => r !== row); } };
+                h.context.traceEntryRows.set(entry, row);
+                return row;
+            },
             applyTraceSort() {}, destroyAllTracePlots() {}, updateClearFiltersBtn() {}, scheduleAutoSave() {},
         });
         h.context.channels.set(1, channel({ open: true }));
@@ -118,5 +124,18 @@ for (const mode of ["overwrite", "append"]) {
         assert.equal(h.elements.get("trace-empty").hidden, true);
         assert.equal(tbody.rows.length, mode === "append" ? 2 : 3);
         assert.ok(tbody.rows.every(row => row.style.display !== "none"));
+        if (mode === "append") {
+            // A filtered batch must evict older visible rows from the same window.
+            h.context.filtered = true;
+            h.context.onCanFrameBatch([event(4), event(5), event(6)]);
+            assert.equal(tbody.rows.length, 0);
+            assert.equal(h.title(), "All frames are hidden by filters");
+            h.context.filtered = false;
+            h.context.applyTraceFilter();
+            assert.deepEqual(tbody.rows.map(r => r.dataset.canid), ["6", "5"]);
+            // Oversized visible batches must not render entries outside the buffer.
+            h.context.onCanFrameBatch([event(7), event(8), event(9)]);
+            assert.deepEqual(tbody.rows.map(r => r.dataset.canid), ["9", "8"]);
+        }
     });
 }

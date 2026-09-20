@@ -4334,6 +4334,7 @@ type TraceSortCol = "ts" | "dir" | "channel" | "canId" | "pgn" | "prio" | "sa" |
 let traceSortCol: TraceSortCol = null;
 let traceSortDir: "asc" | "desc" = "asc";
 let traceLocalBuffer: TraceEntry[] = [];
+const traceEntryRows = new WeakMap<TraceEntry, HTMLTableRowElement>();
 
 function traceKey(handle: number, canId: number, direction: "rx" | "tx" | "err", isExtended: boolean) {
     return `${handle}::${canId}::${direction}::${isExtended ? "ext" : "std"}`;
@@ -4613,6 +4614,7 @@ function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
 
 function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
     const tr = document.createElement("tr");
+    traceEntryRows.set(entry, tr);
     traceRowSignals.set(tr, entry.signals);
     tr.dataset.bytes = JSON.stringify(entry.data);
     tr.dataset.channelHandle = String(entry.channelHandle);
@@ -4832,32 +4834,26 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
 
     if (appendEntries.length > 0) {
         // Retain filtered-out live frames so clearing filters can restore them.
-        traceLocalBuffer = appendEntries.slice().reverse().concat(traceLocalBuffer).slice(0, traceMaxRows);
+        traceLocalBuffer = appendEntries.slice().reverse().concat(traceLocalBuffer);
+        // Evict the same entries from the display, even when newer frames are
+        // filtered out. Entry identity also handles equal timestamps and sorting.
+        for (const entry of traceLocalBuffer.splice(traceMaxRows)) {
+            const row = traceEntryRows.get(entry);
+            if (!row) continue;
+            const next = row.nextElementSibling as HTMLTableRowElement | null;
+            if (next?.dataset.expand) collapseTraceRow(row, next);
+            row.remove();
+        }
         const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
         // Events arrive oldest→newest; insert in reverse so the newest ends up on top.
         const frag = document.createDocumentFragment();
-        for (let i = appendEntries.length - 1; i >= 0; i--) {
+        for (let i = appendEntries.length - 1; i >= Math.max(0, appendEntries.length - traceMaxRows); i--) {
             const e = appendEntries[i];
             if (traceRowVisible(e.channelHandle, e.canId, e.data, e.direction, e.cycleTimeMs, e.dlc, e.messageName, e.j1939)) {
                 frag.appendChild(buildTraceRow(e));
             }
         }
         tbody.insertBefore(frag, tbody.firstChild);
-        // Cap the row count by dropping the oldest rows. Unsorted, the oldest
-        // sit at the bottom; with an active column sort the bottom row is just
-        // whatever sorts last, so evict by timestamp instead.
-        if (!traceSortCol) {
-            while (tbody.rows.length > traceMaxRows) tbody.deleteRow(-1);
-        } else if (tbody.rows.length > traceMaxRows) {
-            const rows = (Array.from(tbody.rows) as HTMLTableRowElement[]).filter(r => !r.dataset.expand);
-            rows.sort((a, b) => parseInt(a.dataset.ts ?? "0") - parseInt(b.dataset.ts ?? "0"));
-            const excess = tbody.rows.length - traceMaxRows;
-            for (let i = 0; i < excess && i < rows.length; i++) {
-                const next = rows[i].nextElementSibling as HTMLTableRowElement | null;
-                if (next?.dataset.expand) next.remove();
-                rows[i].remove();
-            }
-        }
     }
 
     // Keep the user's column sort applied as rows arrive and update in place
