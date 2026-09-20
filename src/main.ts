@@ -5014,7 +5014,8 @@ function renderTraceFilterSummary() {
     if (!summary) return;
     const criteria = traceFilterCriteria();
     summary.hidden = criteria.length === 0;
-    summary.replaceChildren();
+    const list = document.getElementById("trace-filter-criteria")!;
+    list.replaceChildren();
     for (const criterion of criteria) {
         const button = document.createElement("button");
         button.type = "button";
@@ -5027,10 +5028,10 @@ function renderTraceFilterSummary() {
             ctxMenu?.remove(); ctxMenu = null;
             criterion.clear();
             applyTraceFilter();
-            const remaining = summary.querySelectorAll<HTMLButtonElement>("button");
+            const remaining = list.querySelectorAll<HTMLButtonElement>("button");
             (remaining[Math.min(index, remaining.length - 1)] ?? document.querySelector<HTMLButtonElement>(".trace-filter-button"))?.focus();
         });
-        summary.appendChild(button);
+        list.appendChild(button);
     }
 }
 
