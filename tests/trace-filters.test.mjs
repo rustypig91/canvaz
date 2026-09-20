@@ -54,6 +54,34 @@ test("clear all removes every criterion and preserves byte count", () => {
     assert.equal(h.anyFilterActive(), false);
 });
 
+for (const mode of ["append", "overwrite"]) {
+    test(`applying a filter refreshes controls and saves changes in ${mode} mode`, () => {
+        const h = harness();
+        const applyCode = ts.transpileModule(source.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === "applyTraceFilter").getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+        const tbody = { rows: [], innerHTML: "" };
+        let controlsUpdated = 0;
+        let saves = 0;
+        let emptyStateUpdated = 0;
+        Object.assign(h, {
+            traceMode: mode, traceLocalBuffer: [],
+            document: { getElementById: () => tbody },
+            destroyAllTracePlots() {}, applyTraceSort() {},
+            updateClearFiltersBtn() { controlsUpdated++; },
+            scheduleAutoSave() { saves++; },
+            updateTraceEmptyState() { emptyStateUpdated++; },
+        });
+        vm.runInContext(applyCode, h);
+        h.traceFilterDir = new Set(["rx"]);
+        const criterion = h.traceFilterCriteria()[0];
+        criterion.clear();
+        h.applyTraceFilter();
+        assert.equal(h.anyFilterActive(), false);
+        assert.equal(controlsUpdated, 1);
+        assert.equal(saves, 1);
+        assert.equal(emptyStateUpdated, 1);
+    });
+}
+
 test("visible filter activation and context menu share behavior without sorting or dragging", () => {
     const h = harness();
     const element = () => ({ listeners: {}, classList: { add() {} }, dataset: {},

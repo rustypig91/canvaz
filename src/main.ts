@@ -4464,6 +4464,8 @@ function updateTraceEmptyState() {
 }
 
 function applyTraceFilter() {
+    updateClearFiltersBtn();
+    scheduleAutoSave("trace filter changed");
     const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
     if (traceMode === "append") {
         // Rebuild DOM entirely from the in-memory buffer — never keep invisible rows in the DOM.
@@ -4504,9 +4506,7 @@ function applyTraceFilter() {
             if (next?.dataset.expand) collapseTraceRow(tr, next);
         }
     }
-    updateClearFiltersBtn();
     updateTraceEmptyState();
-    scheduleAutoSave("trace filter changed");
 }
 
 // Sort key of one row for the given column, read from the row's datasets.
