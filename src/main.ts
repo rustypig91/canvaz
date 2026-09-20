@@ -2550,6 +2550,9 @@ interface SimMessageEntry {
 interface SimRawEntry {
     kind: "raw";
     channel: number;
+    // Stable persisted id retained while a duplicate/offline channel has no
+    // frontend handle yet. Cleared once hardware refresh registers it.
+    pendingChannelId?: string;
     canId: number;
     isExtended: boolean;
     dlc: number;
@@ -2769,10 +2772,14 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
 
     } else {
         const idHex = entry.canId.toString(16).toUpperCase().padStart(3, "0");
+        const pendingChannelOption = entry.pendingChannelId
+            ? `<option value="" selected disabled>${escapeHtml(entry.pendingChannelId)}</option>`
+            : "";
         el.innerHTML = `
       <div class="sim-group-header">
         <span class="sim-kind-badge kind-raw">RAW</span>
         <select class="sim-channel-sel">
+          ${pendingChannelOption}
           ${[...channels].map(([h, ch]) => `<option value="${h}"${h === entry.channel ? " selected" : ""}>${escapeHtml(ch.config.display_name || ch.info.name)}</option>`).join("")}
         </select>
         <span class="label-muted">Period</span>
@@ -2806,6 +2813,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             const wasRunning = entry.running;
             if (wasRunning) await stopSim(key);
             entry.channel = parseInt((e.target as HTMLSelectElement).value);
+            delete entry.pendingChannelId;
             const listenOnly = isChannelListenOnly(entry.channel);
             const sendBtn = el.querySelector<HTMLButtonElement>(".sim-send-once")!;
             const toggleBtn = el.querySelector<HTMLButtonElement>(".sim-toggle")!;
@@ -3100,7 +3108,7 @@ function buildProject(): Project {
             }))],
         simulate_raw_frames: [...simEntries.values()]
             .filter((e): e is SimRawEntry => e.kind === "raw")
-            .map(e => ({ channel: handleToId(e.channel), can_id: e.canId, is_extended: e.isExtended, dlc: e.dlc, data: e.data, period_ms: e.periodMs, running: e.running })),
+            .map(e => ({ channel: e.pendingChannelId ?? handleToId(e.channel), can_id: e.canId, is_extended: e.isExtended, dlc: e.dlc, data: e.data, period_ms: e.periodMs, running: e.running })),
         trace_filters: {
             channels: traceFilterChannels ? [...traceFilterChannels].map(handleToId) : null,
             can_ids: traceFilterCanIds ? [...traceFilterCanIds] : null,
@@ -3271,9 +3279,10 @@ async function applyProject(project: Project) {
     // Preserve running intent: entry shows "Stop" if it was running when saved.
     for (const raw of project.simulate_raw_frames ?? []) {
         const key = `raw::${++rawEntryCounter}`;
-        const rawHandle = idToHandle(raw.channel) ?? 0;
+        const rawHandle = idToHandle(raw.channel);
         const entry: SimRawEntry = {
-            kind: "raw", channel: rawHandle,
+            kind: "raw", channel: rawHandle ?? 0,
+            pendingChannelId: rawHandle === undefined ? raw.channel : undefined,
             canId: raw.can_id, isExtended: raw.is_extended,
             dlc: raw.dlc, data: raw.data,
             periodMs: raw.period_ms, running: raw.running ?? false, periodicHandle: null,
@@ -3470,6 +3479,11 @@ async function refreshHardware(): Promise<boolean> {
         for (const entry of entries) entry.channel = renamedIds.get(entry.channel) ?? entry.channel;
     }
     for (const entry of pendingSimMessages) entry.channel = renamedIds.get(entry.channel) ?? entry.channel;
+    for (const entry of simEntries.values()) {
+        if (entry.kind === "raw" && entry.pendingChannelId) {
+            entry.pendingChannelId = renamedIds.get(entry.pendingChannelId) ?? entry.pendingChannelId;
+        }
+    }
 
     // Promote ghost channels whose hardware is now available. create_channel
     // searches every backend for the name, so a guessed backend still works.
@@ -3480,6 +3494,16 @@ async function refreshHardware(): Promise<boolean> {
         else ghost.error = res.error!; // stays as ghost
     }
     for (const g of recovered) ghostChannels.splice(ghostChannels.indexOf(g), 1);
+    let resolvedRawChannel = false;
+    for (const entry of simEntries.values()) {
+        if (entry.kind !== "raw" || !entry.pendingChannelId) continue;
+        const handle = idToHandle(entry.pendingChannelId);
+        if (handle === undefined) continue;
+        entry.channel = handle;
+        delete entry.pendingChannelId;
+        resolvedRawChannel = true;
+    }
+    if (resolvedRawChannel) renderSimEntries();
     renderChannelList();
     return true;
 }

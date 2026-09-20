@@ -76,7 +76,7 @@ test("hardware refresh preserves offline channel data and reconnects the same ha
     const ch = { config: config(), info: { backend: "kvaser", name: "USB CAN" }, dbc: { messages: {} }, open: false, available: false };
     let available = false;
     const ctx = harness(["refreshHardware"], {
-        channels: new Map([[7, ch]]), ghostChannels: [], renderChannelList: () => {},
+        channels: new Map([[7, ch]]), ghostChannels: [], simEntries: new Map(), renderChannelList: () => {},
         invoke: async () => [{ old_handle: 7, new_handle: 7, backend: "kvaser", available }],
         log: () => assert.fail("Hardware refresh must not report missing interfaces as errors"),
     });
@@ -156,7 +156,10 @@ test("saving partially restored panes retains both pending and visible signals a
         "DlcMin", "DlcMax", "CycleMin", "CycleMax", "Data",
     ].map(name => [`traceFilter${name}`, null]));
     const ctx = harness(["buildProject", "closePlotPane"], {
-        ...filters, channels: new Map(), ghostChannels: [], simEntries: new Map(),
+        ...filters, channels: new Map(), ghostChannels: [], simEntries: new Map([["raw", {
+            kind: "raw", channel: 0, pendingChannelId: "pcan:Missing", canId: 1,
+            isExtended: false, dlc: 1, data: [0], periodMs: 100, running: false,
+        }]]),
         plotPanes: [pane("closed"), remaining], pendingPaneSignals: [[], [saved]], pendingSimMessages: [],
         handleToId: () => "kvaser:USB CAN", updateSignalHighlights() {}, scheduleAutoSave() {},
         traceDataFormat: "hex", traceMaxRows: 100, windowSizeSec: 10, traceColOrder: [], traceColHidden: new Set(),
@@ -166,6 +169,7 @@ test("saving partially restored panes retains both pending and visible signals a
     assert.equal(project.plot_panes.length, 1);
     assert.deepEqual(JSON.parse(JSON.stringify(project.plot_panes[0].signals)), [saved,
         { signal_name: "Speed", channel: "kvaser:USB CAN", message_id: 456 }]);
+    assert.equal(project.simulate_raw_frames[0].channel, "pcan:Missing");
 });
 
 test("plot restoration autosaves retain unresolved entries in this pane and later panes", async () => {
@@ -375,4 +379,30 @@ test("backend migration preserves pending entries until their DBC becomes readab
     assert.equal(ctx.pendingPaneSignals[0].length, 1);
     assert.equal(ctx.pendingPaneSignals[0][0], unrelated);
     assert.equal(ctx.pendingSimMessages.length, 0);
+});
+
+test("raw simulation keeps a ghost channel id and reconnects when hardware appears", async () => {
+    const ghostConfig = { ...config(), backend: "pcan", dbc_path: null };
+    const raw = {
+        kind: "raw", channel: 0, pendingChannelId: "pcan:USB CAN",
+        canId: 123, isExtended: false, dlc: 2, data: [1, 2],
+        periodMs: 100, running: true, periodicHandle: null,
+    };
+    let rendered = 0;
+    const ctx = harness(["refreshHardware", "registerChannel", "loadChannelDbc", "idToHandle"], {
+        channels: new Map(), ghostChannels: [{ config: ghostConfig, error: "duplicate" }],
+        simEntries: new Map([["raw", raw]]), pendingPaneSignals: [], pendingSimMessages: [],
+        sigKeyCache: new Map(), pgnMapCache: new Map(),
+        renderChannelList() {}, renderSimEntries: () => { rendered++; }, log: () => assert.fail("Refresh should succeed"),
+        invoke: async command => {
+            if (command === "reload_backends") return [];
+            if (command === "create_channel") return { handle: 8, backend: "pcan", available: true };
+            assert.fail(command);
+        },
+    });
+    await ctx.refreshHardware();
+    assert.equal(ctx.ghostChannels.length, 0);
+    assert.equal(raw.channel, 8);
+    assert.equal(raw.pendingChannelId, undefined);
+    assert.equal(rendered, 1);
 });
