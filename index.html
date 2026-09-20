@@ -259,11 +259,12 @@
     </dialog>
 
     <!-- Confirm dialog -->
-    <dialog id="dialog-confirm">
+    <dialog id="dialog-confirm" aria-labelledby="dialog-confirm-title" aria-describedby="dialog-confirm-msg">
+      <h3 id="dialog-confirm-title">Confirm action</h3>
       <p id="dialog-confirm-msg"></p>
       <div class="dialog-actions">
-        <button type="button" id="btn-confirm-cancel" class="btn">Cancel</button>
-        <button type="button" id="btn-confirm-ok" class="btn btn-primary">Stop &amp; Continue</button>
+        <button type="button" id="btn-confirm-cancel" class="btn" autofocus>Cancel</button>
+        <button type="button" id="btn-confirm-ok" class="btn btn-primary"></button>
       </div>
     </dialog>
 
