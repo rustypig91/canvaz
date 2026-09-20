@@ -5,7 +5,7 @@ import vm from "node:vm";
 import ts from "typescript";
 
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
-const names = ["simEntryStatus", "updateSimEntryStatus", "updateSimTxStatus", "queueSimOperation", "startSim", "stopSim", "stopApp"];
+const names = ["simEntryStatus", "updateSimEntryStatus", "updateSimTxStatus", "queueSimOperation", "startSim", "stopSim", "stopApp", "onChannelError"];
 const code = ts.transpileModule(source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text)).map(n => n.getText(source)).join("\n"), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
@@ -24,7 +24,7 @@ function harness(kind = "raw", invoke = async () => 42) {
         channels: new Map([[1, ch]]), simEntries: new Map([["entry", entry]]), appRunning: true,
         document: { querySelector: () => row, getElementById: id => id === "sim-tx-status" ? footer : count },
         invoke, scheduleAutoSave() {}, log() {}, channelName: () => "CAN 1", simSignalValues: () => ({}), simGenerators: () => [],
-        viewPaused: false, updatePauseViewBtn() {}, stopBusStatsPoll() {}, renderChannelList() {},
+        viewPaused: false, updatePauseViewBtn() {}, stopBusStatsPoll() {}, renderChannelList() {}, scheduleChannelRecovery() {},
     });
     vm.runInContext(code, ctx);
     const refresh = () => ctx.updateSimTxStatus();
@@ -181,6 +181,35 @@ test("closing capture clears a failed removal error and returns the entry to Arm
     assert.match(h.state(), /^Armed/);
     assert.equal(h.entry.periodicHandle, null);
     assert.equal(h.entry.txError, undefined);
+    assert.equal(h.footer.style.display, "");
+    assert.equal(h.controls[".sim-toggle"].textContent, "Disarm");
+});
+
+test("stopping capture disables Send while channel closure is pending", async () => {
+    const closing = deferred(), entered = deferred();
+    const h = harness("raw", async command => {
+        if (command === "close_channel") { entered.resolve(); await closing.promise; }
+    });
+    h.refresh();
+    assert.equal(h.controls[".sim-send-once"].disabled, false);
+    const stopping = h.ctx.stopApp();
+    await entered.promise;
+    assert.equal(h.controls[".sim-send-once"].disabled, true);
+    closing.resolve();
+    await stopping;
+});
+
+test("channel failure replaces a stale removal error with Disconnected", async () => {
+    const h = harness("raw", async command => {
+        if (command.startsWith("add_periodic")) return 42;
+        if (command === "remove_periodic") throw new Error("removal refused");
+    });
+    await h.ctx.startSim("entry");
+    await assert.rejects(h.ctx.stopSim("entry"));
+    await h.ctx.onChannelError({ channel_handle: 1, fatal: true, error: "device unplugged" });
+    assert.match(h.state(), /^Disconnected.*device unplugged.*armed/);
+    assert.equal(h.entry.txError, undefined);
+    assert.equal(h.entry.periodicHandle, null);
     assert.equal(h.footer.style.display, "");
     assert.equal(h.controls[".sim-toggle"].textContent, "Disarm");
 });

@@ -1997,7 +1997,10 @@ async function onChannelError(ev: ChannelErrorEvent) {
     // "already registered" guard and the entries never resume sending (and the
     // footer TX indicator would keep counting them).
     for (const entry of simEntries.values()) {
-        if (entry.channel === ev.channel_handle) entry.periodicHandle = null;
+        if (entry.channel === ev.channel_handle) {
+            entry.periodicHandle = null;
+            delete entry.txError;
+        }
     }
     updateSimTxStatus();
     renderChannelList();
@@ -3776,6 +3779,7 @@ async function stopApp() {
         resumeFromPause();
     }
     appRunning = false;
+    updateSimTxStatus();
     updatePauseViewBtn();
     stopBusStatsPoll();
     await Promise.all([...simEntries.values()].map(entry => entry.operation?.catch(() => {})));
