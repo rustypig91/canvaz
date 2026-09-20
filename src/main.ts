@@ -2340,6 +2340,7 @@ function refreshChannelList() {
 }
 
 async function renderChannelList() {
+    updateTraceEmptyState();
     const list = document.getElementById("channel-list")!;
 
     list.innerHTML = "";
@@ -4394,6 +4395,58 @@ function traceRowVisible(channelHandle: number, canId: number, bytes: number[], 
     return true;
 }
 
+function updateTraceEmptyState() {
+    const panel = document.getElementById("trace-empty");
+    if (!panel) return;
+    const rows = (document.getElementById("trace-tbody") as HTMLTableSectionElement).rows;
+    let visible = false;
+    for (const row of rows) {
+        if (!row.dataset.expand && row.style.display !== "none") { visible = true; break; }
+    }
+    panel.hidden = visible;
+    if (visible) return;
+
+    const configured = [...channels.values()];
+    const details = configured.flatMap(ch => {
+        const error = ch.error || (!ch.available ? "Interface not found" : "");
+        return error ? [`${ch.config.display_name || ch.info.name}: ${error}`] : [];
+    }).concat(ghostChannels.map(g => `${g.config.display_name || g.config.name}: ${g.error}`));
+    let title: string, description: string, action = "", target = "";
+    if (traceLocalBuffer.length > 0 && anyFilterActive() && !viewPaused) {
+        title = "All frames are hidden by filters";
+        description = "Clear the trace filters to see captured frames.";
+        action = "Clear filters"; target = "btn-clear-filters";
+    } else if (configured.length + ghostChannels.length === 0) {
+        title = "No channels configured";
+        description = "Add a CAN channel to begin capturing traffic.";
+        action = "Add channel"; target = "btn-add-channel";
+    } else if (!configured.some(ch => ch.open) && (details.length > 0 || appRunning)) {
+        title = "Channels disconnected or unable to start";
+        description = "Check the hardware connection and channel settings, then reload hardware and start capture.";
+        action = "Reload hardware"; target = "btn-reload-backends";
+    } else if (!appRunning) {
+        title = "Capture stopped";
+        description = "Start capture to display CAN traffic.";
+        action = "Start capture"; target = "btn-app-run";
+    } else if (viewPaused) {
+        title = "Trace view paused";
+        description = "Resume the view using the pause control to display incoming frames.";
+    } else {
+        title = "Waiting for traffic";
+        description = "Capture is running. Frames will appear when a connected channel receives traffic.";
+    }
+    // Avoid repeating live-region announcements for every incoming frame batch.
+    for (const [id, text] of [["trace-empty-title", title], ["trace-empty-description", description],
+        ["trace-empty-details", details.join("\n")]]) {
+        const element = document.getElementById(id)!;
+        if (element.textContent !== text) element.textContent = text;
+    }
+    const button = document.getElementById("trace-empty-action") as HTMLButtonElement;
+    button.hidden = !action;
+    button.textContent = action;
+    button.onclick = () => document.getElementById(target)?.click();
+}
+
 function applyTraceFilter() {
     const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
     if (traceMode === "append") {
@@ -4406,6 +4459,7 @@ function applyTraceFilter() {
             }
         }
         applyTraceSort();
+        updateTraceEmptyState();
         return;
     }
     // Overwrite mode: toggle visibility on the fixed set of rows.
@@ -4435,6 +4489,7 @@ function applyTraceFilter() {
         }
     }
     updateClearFiltersBtn();
+    updateTraceEmptyState();
     scheduleAutoSave("trace filter changed");
 }
 
@@ -4806,6 +4861,7 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
     // Keep the user's column sort applied as rows arrive and update in place
     // (no-op when no sort is active or the order is already correct).
     if (latestOverwrite.size > 0 || appendEntries.length > 0) applyTraceSort();
+    updateTraceEmptyState();
 }
 
 // Rebuild the interleaved [value, raw] layout from get_frames' named signals.
@@ -4882,6 +4938,7 @@ function clearTrace() {
     traceSeenDas.clear();
     traceSeenNoJ1939 = false;
     traceLocalBuffer = [];
+    updateTraceEmptyState();
 }
 
 function refreshTraceFormat() {
@@ -5585,6 +5642,7 @@ function collapseTraceRow(tr: HTMLTableRowElement, expandTr: HTMLTableRowElement
 
 function setupTrace() {
     rebuildTraceColumns();
+    updateTraceEmptyState();
 
     document.getElementById("btn-clear-trace")!.addEventListener("click", clearTrace);
 
@@ -5744,6 +5802,7 @@ function updatePauseViewBtn() {
     btn.classList.toggle("running", viewPaused);
     // Pausing only makes sense while capture is live.
     btn.disabled = !appRunning;
+    updateTraceEmptyState();
 }
 
 // Rewrite every rendered sidebar row from the latest value maps. Used on resume
@@ -5783,6 +5842,7 @@ function resumeFromPause() {
         }
         tracePendingOverwrite.clear();
         applyTraceSort();
+        updateTraceEmptyState();
     } else {
         // Re-render visible rows from the backend (newest first after refresh).
         loadTraceFrames().then(() => {
@@ -5799,6 +5859,7 @@ function resumeFromPause() {
             }
             tbody.appendChild(frag);
             applyTraceSort();
+            updateTraceEmptyState();
         });
     }
 

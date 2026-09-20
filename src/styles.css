@@ -1123,6 +1123,14 @@ body.resizing {
   font-size: 12px;
   table-layout: fixed;
 }
+#trace-empty {
+  padding: 32px 24px;
+  text-align: center;
+  color: var(--text);
+}
+#trace-empty p { margin: 10px 0; }
+#trace-empty-details { white-space: pre-wrap; overflow-wrap: anywhere; }
+#trace-empty[hidden], #trace-empty-action[hidden] { display: none; }
 .col-drag-ghost {
   position: fixed; pointer-events: none; z-index: 9999;
   background: var(--bg3); border: 1px solid var(--accent);
