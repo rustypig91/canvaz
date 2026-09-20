@@ -3142,6 +3142,7 @@ async function stopSim(key: string) {
                 throw e;
             }
         }
+        delete entry.txError;
         updateSimTxStatus();
         scheduleAutoSave("sim stopped");
     }, "pendingStops");
@@ -3792,6 +3793,7 @@ async function stopApp() {
     // entries auto-restart on next Start and the UI shows "Armed".
     for (const entry of simEntries.values()) {
         entry.periodicHandle = null;
+        delete entry.txError;
     }
     updateSimTxStatus();
     renderChannelList();

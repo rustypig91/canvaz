@@ -5,14 +5,14 @@ import vm from "node:vm";
 import ts from "typescript";
 
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
-const names = ["simEntryStatus", "updateSimEntryStatus", "updateSimTxStatus", "queueSimOperation", "startSim", "stopSim"];
+const names = ["simEntryStatus", "updateSimEntryStatus", "updateSimTxStatus", "queueSimOperation", "startSim", "stopSim", "stopApp"];
 const code = ts.transpileModule(source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text)).map(n => n.getText(source)).join("\n"), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
 function element() {
     const classes = new Set();
     return { textContent: "", disabled: false, title: "", dataset: {}, style: {},
-        classList: { toggle: (name, on) => on ? classes.add(name) : classes.delete(name) } };
+        classList: { toggle: (name, on) => on ? classes.add(name) : classes.delete(name), remove: name => classes.delete(name) } };
 }
 function harness(kind = "raw", invoke = async () => 42) {
     const entry = { kind, channel: 1, canId: 123, messageId: 123, messageName: "Engine", signals: [], data: [0], dlc: 1, periodMs: 100, running: false, periodicHandle: null };
@@ -24,6 +24,7 @@ function harness(kind = "raw", invoke = async () => 42) {
         channels: new Map([[1, ch]]), simEntries: new Map([["entry", entry]]), appRunning: true,
         document: { querySelector: () => row, getElementById: id => id === "sim-tx-status" ? footer : count },
         invoke, scheduleAutoSave() {}, log() {}, channelName: () => "CAN 1", simSignalValues: () => ({}), simGenerators: () => [],
+        viewPaused: false, updatePauseViewBtn() {}, stopBusStatsPoll() {}, renderChannelList() {},
     });
     vm.runInContext(code, ctx);
     const refresh = () => ctx.updateSimTxStatus();
@@ -149,4 +150,37 @@ test("unavailable channels explain restrictions and preserve disarm action", () 
     h.ctx.channels.clear();
     h.refresh();
     assert.match(h.state(), /^Disconnected/);
+});
+
+test("a queued Stop clears an error from a failed pending registration", async () => {
+    const entered = deferred(), release = deferred();
+    const h = harness("raw", async () => {
+        entered.resolve();
+        await release.promise;
+        throw new Error("registration refused");
+    });
+    const starting = h.ctx.startSim("entry");
+    await entered.promise;
+    const stopping = h.ctx.stopSim("entry");
+    release.resolve();
+    await Promise.all([starting, stopping]);
+    assert.equal(h.state(), "Idle");
+    assert.equal(h.controls[".sim-toggle"].textContent, "Start");
+    assert.equal(h.entry.txError, undefined);
+});
+
+test("closing capture clears a failed removal error and returns the entry to Armed", async () => {
+    const h = harness("raw", async command => {
+        if (command.startsWith("add_periodic")) return 42;
+        if (command === "remove_periodic") throw new Error("removal refused");
+    });
+    await h.ctx.startSim("entry");
+    await assert.rejects(h.ctx.stopSim("entry"));
+    assert.match(h.state(), /^Error/);
+    await h.ctx.stopApp();
+    assert.match(h.state(), /^Armed/);
+    assert.equal(h.entry.periodicHandle, null);
+    assert.equal(h.entry.txError, undefined);
+    assert.equal(h.footer.style.display, "");
+    assert.equal(h.controls[".sim-toggle"].textContent, "Disarm");
 });
