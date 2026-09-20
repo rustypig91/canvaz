@@ -5119,6 +5119,25 @@ function traceAbsorberCol(visible: string[]): string {
     return visible[visible.length - 1] ?? "";
 }
 
+// Reserve room for the complete uppercase label, sort arrow, filter icon and
+// resize handle. Apply this to restored widths too, including older projects.
+function traceColumnMinWidth(key: string): number {
+    const label = TRACE_COL_DEFS.find(d => d.key === key)!.label;
+    return label.length * 7 + (key === "ts" ? 26 : 38);
+}
+
+function traceColumnWidth(key: string): number {
+    const def = TRACE_COL_DEFS.find(d => d.key === key)!;
+    return Math.max(traceColumnMinWidth(key), traceColWidths[key] ?? def.defaultWidth);
+}
+
+function updateTraceTableMinWidth() {
+    // Keep the flexible last column readable when the viewport is narrow;
+    // the existing trace container supplies horizontal scrolling.
+    const width = visibleTraceCols().reduce((sum, key) => sum + traceColumnWidth(key), 0);
+    (document.getElementById("trace-table") as HTMLTableElement).style.minWidth = `${width}px`;
+}
+
 function rebuildTraceColumns() {
     const visible = visibleTraceCols();
     const absorber = traceAbsorberCol(visible);
@@ -5126,9 +5145,11 @@ function rebuildTraceColumns() {
     const colgroup = document.querySelector("#trace-table colgroup")!;
     colgroup.innerHTML = visible.map(k => {
         if (k === absorber) return `<col>`;
-        const w = traceColWidths[k] ?? TRACE_COL_DEFS.find(d => d.key === k)!.defaultWidth;
+        const w = traceColumnWidth(k);
         return w ? `<col style="width:${w}px">` : `<col>`;
     }).join("");
+
+    updateTraceTableMinWidth();
 
     const headerRow = document.querySelector("#trace-table thead tr")!;
     headerRow.innerHTML = visible.map(k => {
@@ -5181,9 +5202,10 @@ function setupTraceHeaders() {
                 handle.classList.add("active");
                 document.body.classList.add("col-resizing");
                 const onMove = (ev: MouseEvent) => {
-                    const w = Math.max(40, startW + ev.clientX - startX);
+                    const w = Math.max(traceColumnMinWidth(key), startW + ev.clientX - startX);
                     if (traceCols[i]) traceCols[i].style.width = `${w}px`;
                     traceColWidths[key] = w;
+                    updateTraceTableMinWidth();
                 };
                 const onUp = () => {
                     handle.classList.remove("active"); document.body.classList.remove("col-resizing");

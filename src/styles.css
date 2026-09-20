@@ -1171,14 +1171,14 @@ body.resizing {
 #trace-table > thead th { cursor: pointer; user-select: none; }
 #trace-table > thead th:hover { color: var(--text); }
 #trace-table > thead th.th-filtered { color: var(--accent); }
-#trace-table > thead th.th-filterable { padding-right: 30px; }
+#trace-table > thead th.th-filterable { padding-right: 24px; }
 .trace-filter-button {
   position: absolute; right: 5px; top: 2px; bottom: 2px;
-  width: 23px; padding: 3px; border: 1px solid var(--border); border-radius: 3px;
-  background: var(--bg2); color: var(--text-muted); cursor: pointer;
+  width: 18px; padding: 2px; border: 0; border-radius: 2px;
+  background: transparent; color: var(--text-muted); cursor: pointer;
 }
 .trace-filter-button svg { width: 14px; height: 14px; fill: none; stroke: currentColor; }
-.th-filtered .trace-filter-button { color: var(--accent); border-color: var(--accent); }
+.th-filtered .trace-filter-button { color: var(--accent); }
 .th-filtered .trace-filter-button svg { fill: currentColor; }
 .trace-filter-button:focus-visible, .trace-filter-chip:focus-visible,
 .ctx-menu button:focus-visible, .ctx-menu input:focus-visible {
