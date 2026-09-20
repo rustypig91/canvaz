@@ -2235,6 +2235,11 @@ function showFilterMenu(
     controls.append(allBtn, noneBtn);
     menu.appendChild(controls);
 
+    if (!items.length) {
+        const empty = document.createElement("p");
+        empty.textContent = "No values captured yet.";
+        menu.appendChild(empty);
+    }
     const checkboxes: { el: HTMLInputElement; key: string }[] = [];
     for (const item of items) {
         const lbl = document.createElement("label");
@@ -2292,6 +2297,7 @@ function showRangeFilterMenu(
         lbl.textContent = key === "min" ? "Min:" : "Max:";
         const inp = document.createElement("input");
         inp.type = "number"; inp.min = "0";
+        inp.setAttribute("aria-label", `${label} ${key === "min" ? "minimum" : "maximum"}`);
         inp.className = "range-filter-inp";
         inp.placeholder = "—";
         if (state[key] !== null) inp.value = String(state[key]);
@@ -3387,6 +3393,15 @@ function syncFilteredHeaders() {
     th("dlc")?.classList.toggle("th-filtered", traceFilterDlcMin !== null || traceFilterDlcMax !== null);
     th("cycle")?.classList.toggle("th-filtered", traceFilterCycleMin !== null || traceFilterCycleMax !== null);
     th("data")?.classList.toggle("th-filtered", traceFilterData.some(v => v !== null));
+    for (const def of TRACE_COL_DEFS) {
+        const header = th(def.key);
+        const button = header?.querySelector<HTMLButtonElement>(".trace-filter-button");
+        if (!button) continue;
+        const active = header!.classList.contains("th-filtered");
+        button.setAttribute("aria-label", `Filter ${def.label}: ${active ? "active" : "not filtered"}`);
+        button.title = `Filter ${def.label}${active ? " (active)" : ""}`;
+    }
+    renderTraceFilterSummary();
 }
 
 function restoreTraceFilters(f: TraceFiltersConfig) {
@@ -4449,6 +4464,8 @@ function updateTraceEmptyState() {
 }
 
 function applyTraceFilter() {
+    updateClearFiltersBtn();
+    scheduleAutoSave("trace filter changed");
     const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
     if (traceMode === "append") {
         // Rebuild DOM entirely from the in-memory buffer — never keep invisible rows in the DOM.
@@ -4489,9 +4506,7 @@ function applyTraceFilter() {
             if (next?.dataset.expand) collapseTraceRow(tr, next);
         }
     }
-    updateClearFiltersBtn();
     updateTraceEmptyState();
-    scheduleAutoSave("trace filter changed");
 }
 
 // Sort key of one row for the given column, read from the row's datasets.
@@ -4965,12 +4980,69 @@ function anyFilterActive(): boolean {
         || traceFilterData.some(v => v !== null);
 }
 
+function traceFilterCriteria(): { key: string; text: string; clear: () => void }[] {
+    const criteria: { key: string; text: string; clear: () => void }[] = [];
+    const addSet = <T,>(key: string, label: string, values: Set<T> | null, format: (v: T) => string, clear: () => void) => {
+        if (values !== null) criteria.push({ key, text: `${label}: ${values.size ? [...values].map(format).join(", ") : "None (all frames hidden)"}`, clear });
+    };
+    addSet("channel", "Channel", traceFilterChannels, channelName, () => { traceFilterChannels = null; });
+    addSet("canId", "CAN ID", traceFilterCanIds, id => fmtId(id, id > 0x7FF), () => { traceFilterCanIds = null; });
+    addSet("msg", "Message", traceFilterMsgNames, name => name || "(no message)", () => { traceFilterMsgNames = null; });
+    addSet("dir", "Direction", traceFilterDir, dir => dir.toUpperCase(), () => { traceFilterDir = null; });
+    const j1939 = (format: (v: number) => string) => (v: number) => v === -1 ? "(non-J1939)" : format(v);
+    addSet("pgn", "PGN", traceFilterPgns, j1939(fmtPgn), () => { traceFilterPgns = null; });
+    addSet("prio", "Priority", traceFilterPrios, j1939(String), () => { traceFilterPrios = null; });
+    addSet("sa", "Source", traceFilterSas, j1939(fmtJ1939Addr), () => { traceFilterSas = null; });
+    addSet("da", "Destination", traceFilterDas, j1939(v => v === 255 ? "All (FFh)" : fmtJ1939Addr(v)), () => { traceFilterDas = null; });
+    if (traceFilterBroadcast !== null) criteria.push({ key: "broadcast", text: `PGN type: ${traceFilterBroadcast ? "Broadcast" : "Destination-specific"}`, clear: () => { traceFilterBroadcast = null; } });
+    for (const [key, label, value, clear] of [
+        ["dlc-min", "DLC ≥", traceFilterDlcMin, () => { traceFilterDlcMin = null; }],
+        ["dlc-max", "DLC ≤", traceFilterDlcMax, () => { traceFilterDlcMax = null; }],
+        ["cycle-min", "Cycle (ms) ≥", traceFilterCycleMin, () => { traceFilterCycleMin = null; }],
+        ["cycle-max", "Cycle (ms) ≤", traceFilterCycleMax, () => { traceFilterCycleMax = null; }],
+    ] as const) {
+        if (value !== null) criteria.push({ key, text: `${label} ${value}`, clear });
+    }
+    traceFilterData.forEach((value, i) => {
+        if (value !== null) criteria.push({ key: `data-${i}`, text: `Data byte ${i}: 0x${value.toString(16).toUpperCase().padStart(2, "0")}`, clear: () => { traceFilterData[i] = null; } });
+    });
+    return criteria;
+}
+
+function renderTraceFilterSummary() {
+    const summary = document.getElementById("trace-filter-summary");
+    if (!summary) return;
+    const criteria = traceFilterCriteria();
+    summary.hidden = criteria.length === 0;
+    const list = document.getElementById("trace-filter-criteria")!;
+    list.replaceChildren();
+    for (const criterion of criteria) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "trace-filter-chip";
+        button.dataset.criterion = criterion.key;
+        button.textContent = `${criterion.text} ×`;
+        button.setAttribute("aria-label", `Clear ${criterion.text}`);
+        button.addEventListener("click", () => {
+            const index = criteria.indexOf(criterion);
+            ctxMenu?.remove(); ctxMenu = null;
+            criterion.clear();
+            applyTraceFilter();
+            const remaining = list.querySelectorAll<HTMLButtonElement>("button");
+            (remaining[Math.min(index, remaining.length - 1)] ?? document.querySelector<HTMLButtonElement>(".trace-filter-button"))?.focus();
+        });
+        list.appendChild(button);
+    }
+}
+
 function updateClearFiltersBtn() {
     const btn = document.getElementById("btn-clear-filters") as HTMLButtonElement | null;
     if (btn) btn.style.display = anyFilterActive() ? "" : "none";
+    syncFilteredHeaders();
 }
 
 function clearAllFilters() {
+    const restoreFocus = document.getElementById("trace-filter-summary")?.contains(document.activeElement);
     traceFilterChannels = null;
     traceFilterCanIds = null;
     traceFilterMsgNames = null;
@@ -4987,6 +5059,7 @@ function clearAllFilters() {
     traceFilterData.fill(null);
     syncFilteredHeaders();
     applyTraceFilter();
+    if (restoreFocus) document.querySelector<HTMLButtonElement>(".trace-filter-button")?.focus();
 }
 
 function updateSortIndicators() {
@@ -5049,6 +5122,25 @@ function traceAbsorberCol(visible: string[]): string {
     return visible[visible.length - 1] ?? "";
 }
 
+// Reserve room for the complete uppercase label, sort arrow, filter icon and
+// resize handle. Apply this to restored widths too, including older projects.
+function traceColumnMinWidth(key: string): number {
+    const label = TRACE_COL_DEFS.find(d => d.key === key)!.label;
+    return label.length * 7 + (key === "ts" ? 26 : 38);
+}
+
+function traceColumnWidth(key: string): number {
+    const def = TRACE_COL_DEFS.find(d => d.key === key)!;
+    return Math.max(traceColumnMinWidth(key), traceColWidths[key] ?? def.defaultWidth);
+}
+
+function updateTraceTableMinWidth() {
+    // Keep the flexible last column readable when the viewport is narrow;
+    // the existing trace container supplies horizontal scrolling.
+    const width = visibleTraceCols().reduce((sum, key) => sum + traceColumnWidth(key), 0);
+    (document.getElementById("trace-table") as HTMLTableElement).style.minWidth = `${width}px`;
+}
+
 function rebuildTraceColumns() {
     const visible = visibleTraceCols();
     const absorber = traceAbsorberCol(visible);
@@ -5056,9 +5148,11 @@ function rebuildTraceColumns() {
     const colgroup = document.querySelector("#trace-table colgroup")!;
     colgroup.innerHTML = visible.map(k => {
         if (k === absorber) return `<col>`;
-        const w = traceColWidths[k] ?? TRACE_COL_DEFS.find(d => d.key === k)!.defaultWidth;
+        const w = traceColumnWidth(k);
         return w ? `<col style="width:${w}px">` : `<col>`;
     }).join("");
+
+    updateTraceTableMinWidth();
 
     const headerRow = document.querySelector("#trace-table thead tr")!;
     headerRow.innerHTML = visible.map(k => {
@@ -5111,9 +5205,10 @@ function setupTraceHeaders() {
                 handle.classList.add("active");
                 document.body.classList.add("col-resizing");
                 const onMove = (ev: MouseEvent) => {
-                    const w = Math.max(40, startW + ev.clientX - startX);
+                    const w = Math.max(traceColumnMinWidth(key), startW + ev.clientX - startX);
                     if (traceCols[i]) traceCols[i].style.width = `${w}px`;
                     traceColWidths[key] = w;
+                    updateTraceTableMinWidth();
                 };
                 const onUp = () => {
                     handle.classList.remove("active"); document.body.classList.remove("col-resizing");
@@ -5177,22 +5272,66 @@ function setupTraceHeaders() {
             document.addEventListener("mouseup", onUp);
         });
 
-        // Filter context menus
+        const onFilterOpen = (open: (e: { clientX: number; clientY: number; preventDefault(): void }) => void) => {
+            const label = TRACE_COL_DEFS.find(d => d.key === key)!.label;
+            const button = document.createElement("button");
+            button.type = "button";
+            button.className = "trace-filter-button";
+            button.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 3h12L9 9v4l-2-1V9z"/></svg>';
+            button.setAttribute("aria-haspopup", "dialog");
+            button.addEventListener("mousedown", e => e.stopPropagation());
+            let ownedMenu: HTMLElement | null = null;
+            const show = (x: number, y: number) => {
+                open({ clientX: x, clientY: y, preventDefault() {} });
+                const menu = ctxMenu;
+                if (!menu) return;
+                ownedMenu = menu;
+                menu.setAttribute("role", "dialog");
+                menu.setAttribute("aria-label", `${label} filter`);
+                // A Clear action may remove the dialog while its button has focus.
+                menu.addEventListener("click", () => {
+                    if (!menu.isConnected && ctxMenu === null) button.focus();
+                });
+                menu.addEventListener("keydown", e => {
+                    if (e.key === "Escape") {
+                        e.stopPropagation();
+                        menu.remove(); ctxMenu = null; button.focus();
+                    }
+                });
+                menu.querySelector<HTMLElement>("input, button")?.focus();
+            };
+            button.addEventListener("click", e => {
+                e.stopPropagation();
+                if (ownedMenu && ctxMenu === ownedMenu) {
+                    ownedMenu.remove();
+                    ctxMenu = null;
+                    button.focus();
+                    return;
+                }
+                const rect = button.getBoundingClientRect();
+                show(rect.left, rect.bottom);
+            });
+            th.addEventListener("contextmenu", e => {
+                e.preventDefault(); show(e.clientX, e.clientY);
+            });
+            th.classList.add("th-filterable");
+            th.appendChild(button);
+        };
+
+        // Both the visible button and context menu open the same filter.
         if (key === "msg") {
-            th.addEventListener("contextmenu", (e) => {
+            onFilterOpen((e) => {
                 e.preventDefault();
                 const items = [...traceSeenMsgNames].sort().map(n => ({ label: n, key: n }));
                 if (traceSeenNoMsg) items.push({ label: "(no message)", key: "" });
-                if (!items.length) return;
                 showFilterMenu(e.clientX, e.clientY, items, traceFilterMsgNames, (active) => {
                     traceFilterMsgNames = active; syncFilteredHeaders(); applyTraceFilter();
                 });
             });
         } else if (key === "channel") {
-            th.addEventListener("contextmenu", (e) => {
+            onFilterOpen((e) => {
                 e.preventDefault();
                 const items = [...traceSeenChannels].sort((a, b) => a - b).map(h => ({ label: channelName(h), key: String(h) }));
-                if (!items.length) return;
                 showFilterMenu(e.clientX, e.clientY, items,
                     traceFilterChannels !== null ? new Set([...traceFilterChannels].map(String)) : null,
                     (active) => {
@@ -5201,10 +5340,9 @@ function setupTraceHeaders() {
                     });
             });
         } else if (key === "canId") {
-            th.addEventListener("contextmenu", (e) => {
+            onFilterOpen((e) => {
                 e.preventDefault();
                 const items = [...traceSeenCanIds].sort((a, b) => a - b).map(id => ({ label: fmtId(id, id > 0x7FF), key: String(id) }));
-                if (!items.length) return;
                 showFilterMenu(e.clientX, e.clientY, items,
                     traceFilterCanIds !== null ? new Set([...traceFilterCanIds].map(String)) : null,
                     (active) => {
@@ -5213,12 +5351,11 @@ function setupTraceHeaders() {
                     });
             });
         } else if (key === "pgn") {
-            th.addEventListener("contextmenu", (e) => {
+            onFilterOpen((e) => {
                 e.preventDefault();
                 const items = [...traceSeenPgns].sort((a, b) => a - b)
                     .map(p => ({ label: `${fmtPgn(p)}${j1939IsBroadcast(p) ? "" : " (dest.)"}`, key: String(p) }));
                 if (traceSeenNoJ1939) items.push({ label: "(non-J1939)", key: "-1" });
-                if (!items.length) return;
                 // Broadcast / destination-specific selector shown above the PGN list.
                 const bRow = document.createElement("div");
                 bRow.className = "data-fmt-row";
@@ -5257,11 +5394,10 @@ function setupTraceHeaders() {
                     get: () => traceFilterDas, set: (v: Set<number> | null) => { traceFilterDas = v; },
                 },
             }[key];
-            th.addEventListener("contextmenu", (e) => {
+            onFilterOpen((e) => {
                 e.preventDefault();
                 const items = [...cfg.seen].sort((a, b) => a - b).map(v => ({ label: cfg.fmt(v), key: String(v) }));
                 if (traceSeenNoJ1939) items.push({ label: "(non-J1939)", key: "-1" });
-                if (!items.length) return;
                 const current = cfg.get();
                 showFilterMenu(e.clientX, e.clientY, items,
                     current !== null ? new Set([...current].map(String)) : null,
@@ -5271,7 +5407,7 @@ function setupTraceHeaders() {
                     });
             });
         } else if (key === "data") {
-            th.addEventListener("contextmenu", (e) => {
+            onFilterOpen((e) => {
                 e.preventDefault();
                 if (ctxMenu) ctxMenu.remove();
                 const menu = document.createElement("div");
@@ -5301,6 +5437,7 @@ function setupTraceHeaders() {
                 const countInp = document.createElement("input");
                 countInp.type = "number"; countInp.min = "1"; countInp.max = String(MAX_DATA_FILTER_BYTES);
                 countInp.className = "range-filter-inp";
+                countInp.setAttribute("aria-label", "Bytes to check");
                 countInp.value = String(traceFilterData.length);
                 countRow.append(countLbl, countInp);
                 menu.appendChild(countRow);
@@ -5316,6 +5453,7 @@ function setupTraceHeaders() {
                         const lbl = document.createElement("span"); lbl.className = "data-filter-lbl"; lbl.textContent = String(idx);
                         const inp = document.createElement("input");
                         inp.type = "text"; inp.className = "data-filter-inp"; inp.placeholder = "—"; inp.maxLength = 4;
+                        inp.setAttribute("aria-label", `Data byte ${idx}`);
                         const cur = traceFilterData[idx];
                         if (cur !== null) inp.value = cur.toString(16).toUpperCase().padStart(2, "0");
                         inp.addEventListener("input", () => {
@@ -5359,21 +5497,21 @@ function setupTraceHeaders() {
                 if (rect.bottom > window.innerHeight) menu.style.top = `${e.clientY - rect.height}px`;
             });
         } else if (key === "dir") {
-            th.addEventListener("contextmenu", (e) => {
+            onFilterOpen((e) => {
                 e.preventDefault();
                 showFilterMenu(e.clientX, e.clientY,
                     [{ label: "RX", key: "rx" }, { label: "TX", key: "tx" }, { label: "ERR", key: "err" }],
                     traceFilterDir, (active) => { traceFilterDir = active; syncFilteredHeaders(); applyTraceFilter(); });
             });
         } else if (key === "dlc") {
-            th.addEventListener("contextmenu", (e) => {
+            onFilterOpen((e) => {
                 e.preventDefault();
                 showRangeFilterMenu(e.clientX, e.clientY, "DLC", traceFilterDlcMin, traceFilterDlcMax, (mn, mx) => {
                     traceFilterDlcMin = mn; traceFilterDlcMax = mx; syncFilteredHeaders(); applyTraceFilter();
                 });
             });
         } else if (key === "cycle") {
-            th.addEventListener("contextmenu", (e) => {
+            onFilterOpen((e) => {
                 e.preventDefault();
                 showRangeFilterMenu(e.clientX, e.clientY, "Cycle (ms)", traceFilterCycleMin, traceFilterCycleMax, (mn, mx) => {
                     traceFilterCycleMin = mn; traceFilterCycleMax = mx; syncFilteredHeaders(); applyTraceFilter();
