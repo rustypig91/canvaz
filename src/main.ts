@@ -1075,6 +1075,9 @@ async function addSignalToPane(pane: PlotPane, handle: number, sig: DbcSignal) {
         } catch { /* channel not open or no DBC yet — data will stream in via events */ }
     }
 
+    // History loading yields to the UI; the pane may have been closed or
+    // replaced by another project before the request completes.
+    if (!plotPanes.includes(pane)) return;
     syncDatasets(pane);
     updatePaneTitle(pane);
     updateSignalHighlights();

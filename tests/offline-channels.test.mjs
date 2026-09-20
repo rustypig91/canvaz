@@ -209,6 +209,36 @@ test("closing a pane during history loading keeps restoration attached to the re
     assert.deepEqual(JSON.parse(JSON.stringify(ctx.pendingPaneSignals)), [[missing]]);
 });
 
+test("history completion skips closed charts and continues restoring the remaining pane", async () => {
+    const signal = { name: "RPM", message_id: 123 };
+    const saved = { channel: "kvaser:USB CAN", message_id: 123, signal_name: "RPM" };
+    const pane = id => ({ id, series: new Map(), destroyed: false,
+        chart: { destroy() {} }, el: { remove() {} } });
+    const first = pane("first"), second = pane("second");
+    first.chart.destroy = () => { first.destroyed = true; };
+    let finishHistory;
+    const history = new Promise(resolve => { finishHistory = resolve; });
+    const rendered = [];
+    const ctx = harness(["restoreProjectEntries", "addSignalToPane", "closePlotPane"], {
+        channels: new Map([[7, { dbc: { messages: { 123: { signals: [signal] } } } }]]),
+        plotPanes: [first, second], pendingPaneSignals: [[saved], [saved]],
+        idToHandle: () => 7, plotKey: () => "rpm", pickPlotColor: () => "red", appStartTime: 0,
+        invoke: async () => history,
+        syncDatasets: target => {
+            assert.equal(target.destroyed, false, "Must not update a destroyed chart");
+            rendered.push(target.id);
+        },
+        updatePaneTitle() {}, updateSignalHighlights() {}, scheduleAutoSave() {},
+    });
+    const restoring = ctx.restoreProjectEntries();
+    ctx.closePlotPane("first");
+    finishHistory([{ timestamp_ms: 1000, value: 900 }]);
+    await restoring;
+    assert.deepEqual(rendered, ["second"]);
+    assert.equal(second.series.get("rpm").lastValue, 900);
+    assert.equal(ctx.pendingPaneSignals.length, 0);
+});
+
 test("Start preserves duplicate offline channels, dependent entries and saved IDs until reconnection", async () => {
     for (const reverse of [false, true]) {
         const original = { config: config(), info: { backend: "kvaser", name: "USB CAN" }, dbc: { messages: {} }, open: false };
