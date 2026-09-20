@@ -9,7 +9,7 @@ use tauri::{AppHandle, Emitter};
 
 use crate::app_state::AppState;
 use crate::can_communication::{BusStatus, Can, CanFrame, FrameDataSource};
-use crate::dbc_parser::ParsedDbc;
+use crate::dbc_parser::{message_key, ParsedDbc};
 use crate::j1939::{self, J1939Info, TpReassembler};
 use crate::sim_generator::{build_frame_source, SignalGen};
 
@@ -311,9 +311,9 @@ impl ChannelData {
     fn get_signal_history(&self, can_id: u32, signal_name: &str, since_ms: u64) -> Vec<SignalSample> {
         self.frames
             .iter()
-            // dbc_msg_id covers J1939 frames whose wire id differs from the DBC
-            // id the caller knows (priority/SA bits vary per sender).
-            .filter(|f| f.timestamp_ms >= since_ms && (f.can_id == can_id || f.dbc_msg_id == Some(can_id)))
+            // Match the decoded identity, not just the wire ID: standard and
+            // extended frames may share an ID, and J1939 priority/DA may vary.
+            .filter(|f| f.timestamp_ms >= since_ms && f.dbc_msg_id == Some(can_id))
             .filter_map(|f| {
                 f.signals.iter().find(|s| s.name == signal_name).map(|s| SignalSample {
                     timestamp_ms: f.timestamp_ms,
@@ -749,7 +749,7 @@ impl CanManager {
         self.cans.get(&backend_name).ok_or("Backend not found")?.send_once(
             hw_index,
             CanFrame {
-                can_id: msg_id,
+                can_id: msg_id & 0x1FFF_FFFF,
                 is_extended,
                 data,
                 timestamp_ms: None,
@@ -855,7 +855,7 @@ impl CanManager {
         self.cans.get(&backend_name).ok_or("Backend not found")?.add_periodic(
             hw_index,
             CanFrame {
-                can_id: msg_id,
+                can_id: msg_id & 0x1FFF_FFFF,
                 is_extended,
                 data,
                 timestamp_ms: None,
@@ -1233,7 +1233,7 @@ fn ingest_frame(
     let decoded = match protocol {
         _ if is_error => None,
         Protocol::J1939 => dbc.and_then(|d| d.decode_frame_j1939(&raw)),
-        Protocol::None => dbc.and_then(|d| d.decode_frame(&raw)).map(|m| (m, raw.can_id)),
+        Protocol::None => dbc.and_then(|d| d.decode_frame(&raw)).map(|m| (m, message_key(raw.can_id, raw.is_extended))),
     };
     let (decoded_msg, dbc_msg_id) = match decoded {
         Some((m, id)) => (Some(m), Some(id)),
@@ -1312,7 +1312,29 @@ fn now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::estimate_frame_bits;
+    use super::*;
+
+    #[test]
+    fn signal_history_separates_frame_formats_and_keeps_j1939_matching() {
+        let mut channel = ChannelData::new(ChannelInfo { backend: "test".into(), name: "test".into() });
+        for (can_id, extended, dbc_id, value) in [
+            (0x123, false, 0x123, 1.0),
+            (0x123, true, message_key(0x123, true), 2.0),
+            (0x18F00400, true, 0x0CF00400, 3.0),
+        ] {
+            channel.frames.push_back(StoredFrame {
+                can_id, is_extended: extended, data: vec![0; 8], timestamp_ms: 100, direction: "rx",
+                message_name: Some("Message".into()), j1939: None, reassembled: false, error: None,
+                dbc_msg_id: Some(dbc_id),
+                signals: vec![StoredSignal { name: "Value".into(), value, raw: value as i64, unit: String::new() }],
+            });
+        }
+        for (id, expected) in [(0x123, 1.0), (message_key(0x123, true), 2.0), (0x0CF00400, 3.0)] {
+            let samples = channel.get_signal_history(id, "Value", 0);
+            assert_eq!(samples.len(), 1);
+            assert_eq!(samples[0].value, expected);
+        }
+    }
 
     #[test]
     fn frame_bits_estimate_brackets_reality() {

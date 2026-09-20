@@ -11,7 +11,7 @@ use crate::can_communication::CanFrame;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedDbc {
     pub path: String,
-    /// Keyed by CAN id. Serializes to a JSON object; the frontend treats it as a map.
+    /// Keyed by message_key: low extended IDs carry bit 31 to avoid standard-ID collisions.
     pub messages: HashMap<u32, ParsedMessage>,
     /// J1939 (PGN, source address) → key into `messages`, for matching on J1939
     /// channels where the frame's priority bits (and destination address for
@@ -30,6 +30,8 @@ pub struct ParsedDbc {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedMessage {
+    /// Stable application identity; `id` remains the actual wire identifier.
+    pub key: u32,
     pub id: u32,
     pub name: String,
     pub dlc: u64,
@@ -123,9 +125,15 @@ pub struct DecodedCanMessage {
     pub signals: Vec<DecodedCanSignal>,
 }
 
+/// IDs above 0x7FF are already unambiguously extended. Preserve their legacy
+/// project keys; tag low extended IDs with the DBC format bit.
+pub fn message_key(can_id: u32, is_extended: bool) -> u32 {
+    if is_extended && can_id <= 0x7FF { can_id | 0x8000_0000 } else { can_id }
+}
+
 impl ParsedMessage {
     pub fn decode_frame(&self, frame: &CanFrame) -> Result<DecodedCanMessage, String> {
-        if frame.can_id != self.id {
+        if frame.can_id != self.id || frame.is_extended != self.is_extended {
             return Err(format!("Frame CAN ID {} does not match message ID {}", frame.can_id, self.id));
         }
         Ok(self.decode_data(&frame.data))
@@ -297,6 +305,7 @@ impl ParsedDbc {
                 MessageId::Standard(id) => (u32::from(id), false),
                 MessageId::Extended(id) => (id, true),
             };
+            let key = message_key(raw_id, is_extended);
             let msg_name = msg.name.clone();
 
             let signals = msg
@@ -333,7 +342,7 @@ impl ParsedDbc {
                         .map(|raw| raw * sig.factor + sig.offset);
                     ParsedSignal {
                         name: sig.name.clone(),
-                        message_id: raw_id,
+                        message_id: key,
                         message_name: msg_name.clone(),
                         start_bit: sig.start_bit,
                         length: sig.size,
@@ -360,8 +369,9 @@ impl ParsedDbc {
             };
 
             messages.insert(
-                raw_id,
+                key,
                 ParsedMessage {
+                    key,
                     id: raw_id,
                     name: msg_name,
                     dlc: msg.size,
@@ -383,7 +393,7 @@ impl ParsedDbc {
             .filter(|m| m.is_extended)
             .map(|m| {
                 let j = crate::j1939::decode_id(m.id);
-                ((j.pgn << 8) | j.sa as u32, m.id)
+                ((j.pgn << 8) | j.sa as u32, m.key)
             })
             .collect();
         self.messages = messages;
@@ -394,7 +404,7 @@ impl ParsedDbc {
 
     /// Decode a raw frame against the matching message, if one exists.
     pub fn decode_frame(&self, frame: &CanFrame) -> Option<DecodedCanMessage> {
-        self.messages.get(&frame.can_id).and_then(|msg| msg.decode_frame(frame).ok())
+        self.messages.get(&message_key(frame.can_id, frame.is_extended)).and_then(|msg| msg.decode_frame(frame).ok())
     }
 
     /// Decode a frame on a J1939 channel: exact id match first, then by
@@ -403,8 +413,8 @@ impl ParsedDbc {
     /// DBC message id it matched, which callers store so signal-history
     /// queries keyed on the DBC id can find these frames.
     pub fn decode_frame_j1939(&self, frame: &CanFrame) -> Option<(DecodedCanMessage, u32)> {
-        if let Some(msg) = self.messages.get(&frame.can_id) {
-            return Some((msg.decode_data(&frame.data), msg.id));
+        if let Some(msg) = self.messages.get(&message_key(frame.can_id, frame.is_extended)) {
+            return Some((msg.decode_data(&frame.data), msg.key));
         }
         if !frame.is_extended {
             return None;
@@ -412,7 +422,7 @@ impl ParsedDbc {
         let j = crate::j1939::decode_id(frame.can_id);
         let key = (j.pgn << 8) | j.sa as u32;
         let msg = self.pgn_index.get(&key).and_then(|id| self.messages.get(id))?;
-        Some((msg.decode_data(&frame.data), msg.id))
+        Some((msg.decode_data(&frame.data), msg.key))
     }
 
 }
@@ -589,6 +599,30 @@ mod tests {
     }
 
     #[test]
+    fn standard_and_extended_messages_with_same_id_decode_independently() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("collision.dbc");
+        std::fs::write(&path, "VERSION \"\"\n\nNS_ :\n\nBS_:\n\nBU_:\n\nBO_ 291 Standard: 8 Vector__XXX\n SG_ Value : 0|8@1+ (1,0) [0|255] \"\" Vector__XXX\n\nBO_ 2147483939 Extended: 8 Vector__XXX\n SG_ Value : 0|8@1+ (2,0) [0|510] \"\" Vector__XXX\n").unwrap();
+        let dbc = ParsedDbc::new(path.to_str().unwrap()).unwrap();
+        assert_eq!(dbc.messages.len(), 2);
+        for (extended, expected_name, expected_value) in [(false, "Standard", 5.0), (true, "Extended", 10.0)] {
+            let mut raw = frame(0x123);
+            raw.is_extended = extended;
+            raw.data[0] = 5;
+            let key = message_key(raw.can_id, extended);
+            let msg = &dbc.messages[&key];
+            assert_eq!(msg.id, 0x123, "the wire ID never includes the identity tag");
+            assert_eq!(msg.signals[0].message_id, key);
+            let decoded = dbc.decode_frame(&raw).unwrap();
+            assert_eq!(decoded.name, expected_name);
+            assert_eq!(decoded.signals[0].physical, expected_value);
+            assert_eq!(dbc.decode_frame_j1939(&raw).unwrap().1, key);
+            raw.is_extended = !extended;
+            assert!(msg.decode_frame(&raw).is_err(), "opposite frame format must not decode");
+        }
+    }
+
+    #[test]
     fn extended_flag_comes_from_dbc_bit31_not_id_value() {
         let directory = tempfile::tempdir().expect("create fixture directory");
         let path = directory.path().join("extid.dbc");
@@ -602,7 +636,7 @@ mod tests {
         );
         std::fs::write(&path, content).expect("write temp dbc");
         let dbc = ParsedDbc::new(path.to_str().unwrap()).expect("parse dbc");
-        let ext = dbc.messages.get(&0x123).expect("extended message keyed by its 29-bit id");
+        let ext = dbc.messages.get(&message_key(0x123, true)).expect("extended message keyed by its format and id");
         assert!(ext.is_extended, "29-bit message with id ≤ 0x7FF must keep the extended flag");
         assert!(!dbc.messages.get(&768).expect("standard message").is_extended);
     }

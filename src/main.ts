@@ -55,6 +55,7 @@ interface SignalEnumValue {
 }
 
 interface DbcMessage {
+    key?: number;
     id: number;
     name: string;
     dlc: number;
@@ -544,6 +545,16 @@ async function exportPanePng(pane: PlotPane) {
     }
 }
 
+function dbcMessageId(canId: number, isExtended: boolean): number {
+    return isExtended && canId <= 0x7FF ? canId + 0x80000000 : canId;
+}
+
+// Old projects used a bare numeric ID for low extended messages. Resolve those
+// references when unambiguous; new saves retain the format-aware key.
+function savedDbcMessage(dbc: ParsedDbc | null | undefined, id: number): DbcMessage | undefined {
+    return dbc?.messages[id] ?? (id <= 0x7FF ? dbc?.messages[dbcMessageId(id, true)] : undefined);
+}
+
 function plotKey(channel: number, messageId: number, signalName: string) {
     return `${channel}::${messageId}::${signalName}`;
 }
@@ -555,10 +566,10 @@ const sigKeyCache = new Map<number, Map<number, string[]>>();
 function sigKeysFor(handle: number, msg: DbcMessage): string[] {
     let byMsg = sigKeyCache.get(handle);
     if (!byMsg) { byMsg = new Map(); sigKeyCache.set(handle, byMsg); }
-    let keys = byMsg.get(msg.id);
+    let keys = byMsg.get(msg.key ?? msg.id);
     if (!keys) {
-        keys = msg.signals.map(s => plotKey(handle, msg.id, s.name));
-        byMsg.set(msg.id, keys);
+        keys = msg.signals.map(s => plotKey(handle, msg.key ?? msg.id, s.name));
+        byMsg.set(msg.key ?? msg.id, keys);
     }
     return keys;
 }
@@ -604,14 +615,14 @@ function dbcMessageFor(handle: number, canId: number, isExtended: boolean): DbcM
     const ch = channels.get(handle);
     const dbc = ch?.dbc;
     if (!dbc) return null;
-    const exact = dbc.messages[canId];
-    if (exact) return exact;
+    const exact = dbc.messages[dbcMessageId(canId, isExtended)];
+    if (exact && !!exact.is_extended === isExtended) return exact;
     if (ch!.config.protocol !== "j1939" || !isExtended) return null;
     let map = pgnMapCache.get(handle);
     if (!map) {
         map = new Map();
         for (const m of Object.values(dbc.messages)) {
-            if (m.id > 0x7FF) map.set(j1939MatchKey(m.id), m);
+            if (m.is_extended) map.set(j1939MatchKey(m.id), m);
         }
         pgnMapCache.set(handle, map);
     }
@@ -1298,7 +1309,7 @@ function renderDbcTree(filter = "") {
         const details = document.createElement("details");
         details.className = "msg-group";
         details.dataset.channel = String(selectedChannel!);
-        details.dataset.messageId = String(msg.id);
+        details.dataset.messageId = String(msg.key ?? msg.id);
 
         const summary = document.createElement("summary");
         const emptyHint = noSignals ? `<span class="msg-empty-hint">(no signals)</span>` : "";
@@ -1471,7 +1482,7 @@ function setupDbcTree() {
             if (!found) { e.preventDefault(); return; }
             const payload: DragMessage = {
                 channel: found.handle,
-                messageId: found.msg.id,
+                messageId: found.msg.key ?? found.msg.id,
                 messageName: found.msg.name,
                 msg: found.msg,
             };
@@ -1664,14 +1675,20 @@ let sessionFilePath: string | null = null;
 let autoSaveTimer: ReturnType<typeof setTimeout> | null = null;
 
 let projectDirty = false;
+let restoringProject = false;
+let projectRevision = 0;
 function scheduleAutoSave(reason: string) {
     if (import.meta.env.DEV) {
         // stack[0] = "Error", [1] = scheduleAutoSave itself, [2] = the caller.
         const caller = new Error().stack?.split("\n")[2]?.trim().replace(/^at\s+/, "") ?? "unknown";
         log("debug", `Autosave scheduled: ${reason} (${caller})`);
     }
-    if (!sessionFilePath) return;
+    if (!sessionFilePath || restoringProject) return;
+    const revision = ++projectRevision;
+    const path = sessionFilePath;
     const project = buildProject();
+    projectDirty = true;
+    updateWindowTitle();
 
     // Derive dirty state from an actual content comparison against the saved
     // project file, rather than assuming every edit leaves the project
@@ -1679,7 +1696,7 @@ function scheduleAutoSave(reason: string) {
     // keep the title's dirty marker lit.
     if (projectPath) {
         invoke<boolean>("project_has_changes", { path: projectPath, project })
-            .then(changed => { projectDirty = changed; updateWindowTitle(); })
+            .then(changed => { if (revision === projectRevision) { projectDirty = changed; updateWindowTitle(); } })
             .catch(e => log("debug", `Dirty check failed: ${e}`));
     } else {
         projectDirty = true;
@@ -1689,7 +1706,7 @@ function scheduleAutoSave(reason: string) {
     if (autoSaveTimer) clearTimeout(autoSaveTimer);
     autoSaveTimer = setTimeout(async () => {
         try {
-            await invoke("save_project", { path: sessionFilePath, project });
+            await invoke("save_project", { path, project });
         }
         // warn, not error: don't light up the error badge for a transient miss,
         // but the user should still see their session isn't being persisted.
@@ -2545,6 +2562,7 @@ interface SimMessageEntry {
     periodMs: number;
     running: boolean;
     periodicHandle: number | null;
+    operation?: Promise<void>;
 }
 
 interface SimRawEntry {
@@ -2560,6 +2578,7 @@ interface SimRawEntry {
     periodMs: number;
     running: boolean;
     periodicHandle: number | null;
+    operation?: Promise<void>;
 }
 
 type SimEntry = SimMessageEntry | SimRawEntry;
@@ -2585,7 +2604,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
     const txDisabledAttr = isChannelListenOnly(entry.channel) ? ` disabled title="${LISTEN_ONLY_TITLE}"` : "";
 
     if (entry.kind === "message") {
-        const idHex = "0x" + entry.messageId.toString(16).toUpperCase().padStart(3, "0");
+        const idHex = "0x" + (entry.messageId & 0x1FFFFFFF).toString(16).toUpperCase().padStart(3, "0");
         // Reserve the enum column for the whole message (not per-row) so the raw
         // inputs stay aligned whether or not a given signal has named values.
         const hasEnums = entry.signals.some(s => (s.def.enum_values ?? []).length > 0);
@@ -2665,6 +2684,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
 
         el.querySelector<HTMLInputElement>(".sim-period")!.addEventListener("input", async (e) => {
             entry.periodMs = parseInt((e.target as HTMLInputElement).value) || 100;
+            scheduleAutoSave("sim period changed");
             await updateRunningSim(key);
         });
 
@@ -2811,9 +2831,10 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
 
         el.querySelector<HTMLSelectElement>(".sim-channel-sel")!.addEventListener("change", async (e) => {
             const wasRunning = entry.running;
-            if (wasRunning) await stopSim(key);
+            await stopSim(key);
             entry.channel = parseInt((e.target as HTMLSelectElement).value);
             delete entry.pendingChannelId;
+            scheduleAutoSave("sim channel changed");
             const listenOnly = isChannelListenOnly(entry.channel);
             const sendBtn = el.querySelector<HTMLButtonElement>(".sim-send-once")!;
             const toggleBtn = el.querySelector<HTMLButtonElement>(".sim-toggle")!;
@@ -2825,7 +2846,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         });
         el.querySelector<HTMLInputElement>(".sim-canid-input")!.addEventListener("input", async (e) => {
             const wasRunning = entry.running;
-            if (wasRunning) await stopSim(key);
+            await stopSim(key);
             entry.canId = parseInt((e.target as HTMLInputElement).value, 16) || 0;
             // An id that doesn't fit in 11 bits can only be an extended frame;
             // reflect that in the checkbox so the UI matches what will be sent.
@@ -2833,6 +2854,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
                 entry.isExtended = true;
                 el.querySelector<HTMLInputElement>(".sim-ext-cb")!.checked = true;
             }
+            scheduleAutoSave("sim CAN ID changed");
             if (wasRunning) await startSim(key);
         });
         el.querySelector<HTMLInputElement>(".sim-ext-cb")!.addEventListener("change", async (e) => {
@@ -2843,11 +2865,13 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
                 return;
             }
             entry.isExtended = cb.checked;
+            scheduleAutoSave("sim frame format changed");
             // Re-register a running periodic so the new frame format takes effect.
             if (entry.running) { await stopSim(key); await startSim(key); }
         });
         el.querySelector<HTMLSelectElement>(".sim-dlc-sel")!.addEventListener("change", async (e) => {
             entry.dlc = parseInt((e.target as HTMLSelectElement).value);
+            scheduleAutoSave("sim DLC changed");
             el.querySelectorAll<HTMLInputElement>(".sim-byte").forEach((inp, i) => {
                 inp.disabled = i >= entry.dlc;
             });
@@ -2855,11 +2879,13 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         });
         el.querySelector<HTMLInputElement>(".sim-period")!.addEventListener("input", async (e) => {
             entry.periodMs = parseInt((e.target as HTMLInputElement).value) || 100;
+            scheduleAutoSave("sim period changed");
             await updateRunningSim(key);
         });
         el.querySelectorAll<HTMLInputElement>(".sim-byte").forEach(inp => {
             inp.addEventListener("input", async () => {
                 entry.data[parseInt(inp.dataset.idx ?? "0")] = parseInt(inp.value, 16) || 0;
+                scheduleAutoSave("sim data changed");
                 await updateRunningSim(key);
             });
             inp.addEventListener("blur", () => {
@@ -2935,7 +2961,7 @@ function addSimMessage(handle: number, msg: DbcMessage) {
 
     const entry: SimMessageEntry = {
         kind: "message", channel: handle,
-        messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
+        messageId: msg.key ?? msg.id, messageName: msg.name, dlc: msg.dlc,
         signals: msg.signals.map(s => ({ def: s, value: simDefaultValue(s), gen: null })),
         periodMs: msg.cycle_time_ms ?? 100, running: false, periodicHandle: null,
     };
@@ -2961,7 +2987,7 @@ function addRawFrame() {
 
 async function removeSimEntry(key: string) {
     const entry = simEntries.get(key);
-    if (entry?.running) await stopSim(key);
+    if (entry) await stopSim(key);
     simEntries.delete(key);
     document.querySelector(`[data-sim-key="${key}"]`)?.remove();
     updateSignalHighlights();
@@ -2984,50 +3010,62 @@ async function sendSimOnce(key: string) {
     } catch (e) { log("error", `Send error: ${e}`); }
 }
 
+// Serialize registration/removal per entry: a Stop must wait for an in-flight
+// add to return its handle before removing it. A following Start queues behind it.
+function queueSimOperation(entry: SimEntry, action: () => Promise<void>): Promise<void> {
+    const operation = (entry.operation ?? Promise.resolve()).catch(() => {}).then(action);
+    entry.operation = operation;
+    return operation;
+}
+
 async function startSim(key: string) {
     const entry = simEntries.get(key);
-    // Guard: already sending (backend periodic registered).
-    if (!entry || entry.periodicHandle !== null) return;
+    if (!entry) return;
     if (!entry.channel) { log("warn", "Select a channel first"); return; }
-
-    // Mark user intent immediately — button shows "Stop" even while app is stopped.
     entry.running = true;
+    scheduleAutoSave("sim started");
     const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
     if (btn) { btn.textContent = "Stop"; btn.classList.add("running"); }
-    scheduleAutoSave("sim started");
-
-    // Register with backend only when the app (and its channels) is live.
-    if (!appRunning || !channels.get(entry.channel)?.open) return;
-
-    try {
-        let handle: number;
-        if (entry.kind === "message") {
-            handle = await invoke<number>("add_periodic_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry), period_ms: entry.periodMs } });
-        } else {
-            handle = await invoke<number>("add_periodic_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs, is_extended: entry.isExtended } });
+    await queueSimOperation(entry, async () => {
+        if (simEntries.get(key) !== entry || !entry.running || entry.periodicHandle !== null) return;
+        if (!appRunning || !channels.get(entry.channel)?.open) return;
+        try {
+            if (entry.kind === "message") {
+                entry.periodicHandle = await invoke<number>("add_periodic_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry), period_ms: entry.periodMs } });
+            } else {
+                entry.periodicHandle = await invoke<number>("add_periodic_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs, is_extended: entry.isExtended } });
+            }
+            updateSimTxStatus();
+        } catch (e) {
+            log("error", `Sim start error: ${e}`);
+            entry.running = false;
+            if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
+            scheduleAutoSave("sim start failed");
         }
-        entry.periodicHandle = handle;
-        updateSimTxStatus();
-    } catch (e) {
-        log("error", `Sim start error: ${e}`);
-        entry.running = false;
-        if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
-        scheduleAutoSave("sim start failed");
-    }
+    });
 }
 
 async function stopSim(key: string) {
     const entry = simEntries.get(key);
-    if (!entry || !entry.running) return;
-    if (entry.periodicHandle !== null) {
-        try { await invoke("remove_periodic", { cmd: { channel_handle: entry.channel, periodic_handle: entry.periodicHandle } }); } catch { }
-        entry.periodicHandle = null;
-    }
+    if (!entry) return;
     entry.running = false;
-    const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
-    if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
-    updateSimTxStatus();
-    scheduleAutoSave("sim stopped");
+    await queueSimOperation(entry, async () => {
+        if (entry.periodicHandle !== null) {
+            try {
+                await invoke("remove_periodic", { cmd: { channel_handle: entry.channel, periodic_handle: entry.periodicHandle } });
+                entry.periodicHandle = null;
+            } catch (e) {
+                entry.running = true;
+                log("error", `Sim stop error: ${e}`);
+                scheduleAutoSave("sim stop failed");
+                throw e;
+            }
+        }
+        const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
+        if (btn && !entry.running) { btn.textContent = "Start"; btn.classList.remove("running"); }
+        updateSimTxStatus();
+        scheduleAutoSave("sim stopped");
+    });
 }
 
 // Push an edited entry's current values/generators/period to its running
@@ -3037,14 +3075,18 @@ async function stopSim(key: string) {
 // update fails (e.g. the handle went stale with a channel recovery).
 async function updateRunningSim(key: string) {
     const entry = simEntries.get(key);
-    if (!entry || entry.periodicHandle === null) return;
+    if (!entry) return;
     try {
-        if (entry.kind === "message") {
-            await invoke("update_periodic_message", { cmd: { channel_handle: entry.channel, periodic_handle: entry.periodicHandle, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry), period_ms: entry.periodMs } });
-        } else {
-            await invoke("update_periodic_frame", { cmd: { channel_handle: entry.channel, periodic_handle: entry.periodicHandle, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs } });
-        }
+        await queueSimOperation(entry, async () => {
+            if (simEntries.get(key) !== entry || !entry.running || entry.periodicHandle === null) return;
+            if (entry.kind === "message") {
+                await invoke("update_periodic_message", { cmd: { channel_handle: entry.channel, periodic_handle: entry.periodicHandle, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry), period_ms: entry.periodMs } });
+            } else {
+                await invoke("update_periodic_frame", { cmd: { channel_handle: entry.channel, periodic_handle: entry.periodicHandle, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs } });
+            }
+        });
     } catch (e) {
+        if (!entry.running || simEntries.get(key) !== entry) return;
         log("warn", `In-place sim update failed (${e}); restarting entry`);
         await stopSim(key);
         await startSim(key);
@@ -3139,47 +3181,58 @@ async function newProject() {
     if (projectDirty) {
         if (!await showConfirm("Discard unsaved changes and start a new project?")) return;
     }
-    if (appRunning) await stopApp();
+    restoringProject = true;
+    ++projectRevision;
+    if (autoSaveTimer) clearTimeout(autoSaveTimer);
+    try {
+        if (appRunning) await stopApp();
 
-    for (const h of [...channels.keys()]) {
-        try { await invoke("remove_channel", { channelHandle: h }); } catch { }
-    }
-    channels.clear();
-    ghostChannels = [];
-
-    while (plotPanes.length) closePlotPane(plotPanes[0].id);
-    pendingPaneSignals = [];
-    pendingSimMessages = [];
-
-    for (const [key, entry] of simEntries) {
-        if (entry.running) {
-            try { await invoke("remove_periodic", { cmd: { channel_handle: entry.channel, periodic_handle: entry.periodicHandle } }); } catch { }
+        for (const h of [...channels.keys()]) {
+            try { await invoke("remove_channel", { channelHandle: h }); } catch { }
         }
-        simEntries.delete(key);
-    }
-    document.getElementById("sim-entries")!.innerHTML = "";
+        channels.clear();
+        ghostChannels = [];
 
-    clearTrace();
-    signalLastValues.clear();
-    signalLastRaw.clear();
-    signalMinValues.clear();
-    signalMaxValues.clear();
+        while (plotPanes.length) closePlotPane(plotPanes[0].id);
+        pendingPaneSignals = [];
+        pendingSimMessages = [];
 
-    projectPath = null;
+        for (const [key, entry] of simEntries) {
+            if (entry.running) {
+                try { await invoke("remove_periodic", { cmd: { channel_handle: entry.channel, periodic_handle: entry.periodicHandle } }); } catch { }
+            }
+            simEntries.delete(key);
+        }
+        document.getElementById("sim-entries")!.innerHTML = "";
+
+        clearTrace();
+        signalLastValues.clear();
+        signalLastRaw.clear();
+        signalMinValues.clear();
+        signalMaxValues.clear();
+
+        projectPath = null;
+        projectDirty = false;
+        persistLastProjectPath("");
+        updateWindowTitle();
+        refreshChannelList();
+        rebuildTraceColumns();
+        renderDbcTree();
+        log("info", "New project");
+    } finally { restoringProject = false; }
+    scheduleAutoSave("new project");
     projectDirty = false;
-    sessionFilePath = null;
     updateWindowTitle();
-    refreshChannelList();
-    rebuildTraceColumns();
-    renderDbcTree();
-    log("info", "New project");
 }
 
 async function saveProject() {
     if (projectPath) {
         try {
-            await invoke("save_project", { path: projectPath, project: buildProject() });
-            projectDirty = false;
+            const project = buildProject();
+            const savedContent = JSON.stringify(project);
+            await invoke("save_project", { path: projectPath, project });
+            ++projectRevision;
+            projectDirty = JSON.stringify(buildProject()) !== savedContent;
             updateWindowTitle();
             log("info", `Saved: ${projectPath}`);
         } catch (e) { log("error", `Save error: ${e}`); }
@@ -3195,11 +3248,14 @@ async function saveProjectAs() {
         const raw = await dialogSave({ filters: [{ name: "Rusty's Canvaz Project", extensions: ["canvaz"] }] });
         if (!raw) return;
         const path = ensureCanvazExt(raw);
+        const project = buildProject();
+        const savedContent = JSON.stringify(project);
+        await invoke("save_project", { path, project });
         projectPath = path;
-        projectDirty = false;
+        ++projectRevision;
+        projectDirty = JSON.stringify(buildProject()) !== savedContent;
         updateWindowTitle();
         persistLastProjectPath(path);
-        await invoke("save_project", { path, project: buildProject() });
         log("info", `Saved: ${path}`);
     } catch (e) { log("error", `Save error: ${e}`); }
 }
@@ -3209,11 +3265,18 @@ async function openProject() {
         const path = await dialogOpen({ filters: [{ name: "Rusty's Canvaz Project", extensions: ["canvaz"] }], multiple: false });
         if (!path || Array.isArray(path)) return;
         const project = await invoke<Project>("load_project", { path });
-        projectPath = path;
+        if (projectDirty && !await showConfirm("Discard unsaved changes and open another project?")) return;
+        restoringProject = true;
+        ++projectRevision;
+        if (autoSaveTimer) clearTimeout(autoSaveTimer);
+        try {
+            await applyProject(project);
+            projectPath = path;
+            persistLastProjectPath(path);
+        } finally { restoringProject = false; }
+        scheduleAutoSave("project opened");
         projectDirty = false;
         updateWindowTitle();
-        persistLastProjectPath(path);
-        await applyProject(project);
         log("info", `Loaded: ${path}`);
     } catch (e) { log("error", `Load error: ${e}`); }
 }
@@ -3396,7 +3459,7 @@ async function restoreProjectEntries() {
                 const dbc = handle === undefined ? null : channels.get(handle)?.dbc;
                 const sig = dbc && Object.values(dbc.messages).flatMap((m: DbcMessage) => m.signals).find(
                     (s: DbcSignal) => entry.message_id !== undefined
-                        ? s.message_id === entry.message_id && s.name === entry.signal_name
+                        ? s.message_id === (savedDbcMessage(dbc, entry.message_id)?.key ?? entry.message_id) && s.name === entry.signal_name
                         : s.name === entry.signal_name
                 );
                 if (sig && handle !== undefined) {
@@ -3415,7 +3478,7 @@ async function restoreProjectEntries() {
         const simContainer = document.getElementById("sim-entries")!;
         for (const m of toRestore) {
             const handle = idToHandle(m.channel);
-            const msg = handle === undefined ? null : channels.get(handle)?.dbc?.messages[m.message_id];
+            const msg = handle === undefined ? null : savedDbcMessage(channels.get(handle)?.dbc, m.message_id);
             if (!msg || handle === undefined) {
                 pendingSimMessages.push(m);
                 continue;
@@ -3425,7 +3488,7 @@ async function restoreProjectEntries() {
             const key = `msg::${++msgEntryCounter}`;
             const simEntry: SimMessageEntry = {
                 kind: "message", channel: handle,
-                messageId: msg.id, messageName: msg.name, dlc: msg.dlc,
+                messageId: msg.key ?? msg.id, messageName: msg.name, dlc: msg.dlc,
                 signals: msg.signals.map(s => ({ def: s, value: valueByName.get(s.name) ?? simDefaultValue(s), gen: genByName.get(s.name) ?? null })),
                 periodMs: m.period_ms, running: m.running ?? false, periodicHandle: null,
             };
@@ -3621,6 +3684,7 @@ async function stopApp() {
     appRunning = false;
     updatePauseViewBtn();
     stopBusStatsPoll();
+    await Promise.all([...simEntries.values()].map(entry => entry.operation?.catch(() => {})));
     // Close hardware connections; they will reopen on the next Start.
     for (const [handle, ch] of channels) {
         // A deliberate stop clears error badges — everything is closed now and
@@ -4270,8 +4334,8 @@ let traceSortCol: TraceSortCol = null;
 let traceSortDir: "asc" | "desc" = "asc";
 let traceLocalBuffer: TraceEntry[] = [];
 
-function traceKey(handle: number, canId: number, direction: "rx" | "tx" | "err") {
-    return `${handle}::${canId}::${direction}`;
+function traceKey(handle: number, canId: number, direction: "rx" | "tx" | "err", isExtended: boolean) {
+    return `${handle}::${canId}::${direction}::${isExtended ? "ext" : "std"}`;
 }
 
 function fmtId(canId: number, isExtended: boolean): string {
@@ -4558,7 +4622,7 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
                 }
                 // Keyed by the DBC message id (not the wire id): J1939 frames from
                 // different senders share the same signal series.
-                const key = plotKey(entry.channelHandle, msg.id, sig.name);
+                const key = plotKey(entry.channelHandle, msg.key ?? msg.id, sig.name);
                 const mn = signalMinValues.get(key);
                 const mx = signalMaxValues.get(key);
                 if (minCells[i]) {
@@ -4613,7 +4677,7 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
         }
 
         const direction = ev.direction ?? "rx";
-        const key = traceKey(ev.channel_handle, ev.can_id, direction);
+        const key = traceKey(ev.channel_handle, ev.can_id, direction, ev.is_extended);
         const prev = traceLastTs.get(key);
         const cycleTime = prev != null ? ev.timestamp_ms - prev : null;
         traceLastTs.set(key, ev.timestamp_ms);
@@ -4766,7 +4830,7 @@ async function loadTraceFrames() {
     const cycleTimes = new Map<string, number>();
     // Backend returns oldest-first; we want newest-first in traceLocalBuffer.
     traceLocalBuffer = frames.map(f => {
-        const k = traceKey(f.channel_handle, f.can_id, f.direction);
+        const k = traceKey(f.channel_handle, f.can_id, f.direction, f.is_extended);
         const prev = cycleTimes.get(k);
         const cycleTimeMs = prev != null ? f.timestamp_ms - prev : null;
         cycleTimes.set(k, f.timestamp_ms);
@@ -5469,7 +5533,7 @@ function expandTraceRow(tr: HTMLTableRowElement) {
     expandTr.dataset.expand = "1";
     // Identity for the inline signal plots (DBC message id, not the wire id).
     expandTr.dataset.handle = String(trHandle);
-    expandTr.dataset.msgid = String(msg.id);
+    expandTr.dataset.msgid = String(msg.key ?? msg.id);
     const td = document.createElement("td");
     td.colSpan = visibleTraceCols().length;
     td.className = "trace-expand-cell";
@@ -5488,7 +5552,7 @@ function expandTraceRow(tr: HTMLTableRowElement) {
         const hasVal = 2 * i + 1 < vals.length && vals[2 * i] != null;
         // DBC message id, not the wire id — matches the keys written by
         // onCanFrameBatch (J1939 wire ids embed the sender's address).
-        const key = plotKey(trHandle, msg.id, sig.name);
+        const key = plotKey(trHandle, msg.key ?? msg.id, sig.name);
         const mn = signalMinValues.get(key);
         const mx = signalMaxValues.get(key);
         const fmt = (v: number | undefined) => v !== undefined ? formatSigValue(v, "") : "—";

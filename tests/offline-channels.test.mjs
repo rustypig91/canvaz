@@ -8,6 +8,7 @@ import ts from "typescript";
 // Tauri IPC. No CAN driver or physical interface is needed for these scenarios.
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 function harness(names, globals) {
+    names = [...new Set([...names, "savedDbcMessage", "dbcMessageId"])];
     const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text));
     assert.equal(functions.length, names.length);
     const code = ts.transpileModule(functions.map(n => n.getText(source)).join("\n"), {
