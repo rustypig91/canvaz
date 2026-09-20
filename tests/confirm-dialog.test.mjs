@@ -19,16 +19,17 @@ function harness() {
         close() { this.open = false; }
     }
     const elements = new Map(["dialog-confirm", "dialog-confirm-msg", "btn-confirm-ok", "btn-confirm-cancel"].map(id => [id, new Element()]));
+    let dialogOpenCalls = 0;
     const context = vm.createContext({
         document, appRunning: true, projectDirty: true, projectRevision: 7,
         projectPath: "original.canvaz", restoringProject: false,
         stopApp: async () => { context.appRunning = false; },
-        dialogOpen: async () => "another.canvaz",
+        dialogOpen: async () => { dialogOpenCalls++; return "another.canvaz"; },
         invoke: async command => { assert.equal(command, "load_project"); return {}; },
         log: () => assert.fail("Unexpected project error"),
     });
     vm.runInContext(code, context);
-    return { context, elements, document };
+    return { context, elements, document, getDialogOpenCalls: () => dialogOpenCalls };
 }
 
 test("confirmation uses each caller's label and initially focuses Cancel", async () => {
@@ -47,9 +48,8 @@ test("confirmation uses each caller's label and initially focuses Cancel", async
 for (const [target, eventType] of [["btn-confirm-cancel", "click"], ["dialog-confirm", "cancel"]]) {
     test(`${eventType} preserves capture and unsaved projects`, async () => {
         for (const operation of ["confirmAndStop", "newProject", "openProject"]) {
-            const { context, elements } = harness();
+            const { context, elements, getDialogOpenCalls } = harness();
             const result = context[operation]("Stop live capture to add a channel?", "Stop & add channel");
-            // Opening a project reads the selected file before asking to discard.
             await new Promise(resolve => setImmediate(resolve));
             assert.equal(elements.get("dialog-confirm").open, true);
             if (operation !== "confirmAndStop") assert.equal(elements.get("btn-confirm-ok").textContent, "Discard changes");
@@ -63,6 +63,7 @@ for (const [target, eventType] of [["btn-confirm-cancel", "click"], ["dialog-con
             assert.equal(context.projectRevision, 7);
             assert.equal(context.projectPath, "original.canvaz");
             assert.equal(context.restoringProject, false);
+            if (operation === "openProject") assert.equal(getDialogOpenCalls(), 0);
         }
     });
 }

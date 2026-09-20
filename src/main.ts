@@ -3269,10 +3269,10 @@ async function saveProjectAs() {
 
 async function openProject() {
     try {
+        if (projectDirty && !await showConfirm("Discard unsaved changes and open another project?", "Discard changes")) return;
         const path = await dialogOpen({ filters: [{ name: "Rusty's Canvaz Project", extensions: ["canvaz"] }], multiple: false });
         if (!path || Array.isArray(path)) return;
         const project = await invoke<Project>("load_project", { path });
-        if (projectDirty && !await showConfirm("Discard unsaved changes and open another project?", "Discard changes")) return;
         restoringProject = true;
         ++projectRevision;
         if (autoSaveTimer) clearTimeout(autoSaveTimer);
