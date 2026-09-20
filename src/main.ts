@@ -2346,6 +2346,7 @@ function refreshChannelList() {
 }
 
 async function renderChannelList() {
+    updateSimTxStatus();
     updateTraceEmptyState();
     const list = document.getElementById("channel-list")!;
 
@@ -2570,6 +2571,9 @@ interface SimMessageEntry {
     running: boolean;
     periodicHandle: number | null;
     operation?: Promise<void>;
+    pendingStarts?: number;
+    pendingStops?: number;
+    txError?: string;
 }
 
 interface SimRawEntry {
@@ -2586,6 +2590,9 @@ interface SimRawEntry {
     running: boolean;
     periodicHandle: number | null;
     operation?: Promise<void>;
+    pendingStarts?: number;
+    pendingStops?: number;
+    txError?: string;
 }
 
 type SimEntry = SimMessageEntry | SimRawEntry;
@@ -2598,8 +2605,6 @@ let msgEntryCounter = 0;
 
 // ── Sim entry element builders ────────────────────────────────────────────────
 
-const LISTEN_ONLY_TITLE = "Channel is listen-only — sending is disabled";
-
 function isChannelListenOnly(handle: number): boolean {
     return channels.get(handle)?.config.listen_only ?? false;
 }
@@ -2608,7 +2613,6 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
     const el = document.createElement("div");
     el.className = "sim-group";
     el.dataset.simKey = key;
-    const txDisabledAttr = isChannelListenOnly(entry.channel) ? ` disabled title="${LISTEN_ONLY_TITLE}"` : "";
 
     if (entry.kind === "message") {
         const idHex = "0x" + (entry.messageId & 0x1FFFFFFF).toString(16).toUpperCase().padStart(3, "0");
@@ -2633,9 +2637,10 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         <span class="label-muted">Period</span>
         <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
         <span class="label-muted">ms</span>
+        <span class="sim-state" role="status" aria-live="polite"></span>
         <div class="sim-actions">
-          <button class="btn btn-sm sim-send-once"${txDisabledAttr}>Send</button>
-          <button class="btn btn-sm sim-toggle${entry.running ? " running" : ""}"${txDisabledAttr}>${entry.running ? "Stop" : "Start"}</button>
+          <button class="btn btn-sm sim-send-once">Send</button>
+          <button class="btn btn-sm sim-toggle">Start</button>
           <button class="btn btn-sm btn-danger sim-remove">✕</button>
         </div>
       </div>
@@ -2812,9 +2817,10 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         <span class="label-muted">Period</span>
         <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
         <span class="label-muted">ms</span>
+        <span class="sim-state" role="status" aria-live="polite"></span>
         <div class="sim-actions">
-          <button class="btn btn-sm sim-send-once"${txDisabledAttr}>Send</button>
-          <button class="btn btn-sm sim-toggle${entry.running ? " running" : ""}"${txDisabledAttr}>${entry.running ? "Stop" : "Start"}</button>
+          <button class="btn btn-sm sim-send-once">Send</button>
+          <button class="btn btn-sm sim-toggle">Start</button>
           <button class="btn btn-sm btn-danger sim-remove">✕</button>
         </div>
       </div>
@@ -2843,13 +2849,8 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             delete entry.pendingChannelId;
             scheduleAutoSave("sim channel changed");
             const listenOnly = isChannelListenOnly(entry.channel);
-            const sendBtn = el.querySelector<HTMLButtonElement>(".sim-send-once")!;
-            const toggleBtn = el.querySelector<HTMLButtonElement>(".sim-toggle")!;
-            sendBtn.disabled = listenOnly;
-            sendBtn.title = listenOnly ? LISTEN_ONLY_TITLE : "";
-            toggleBtn.disabled = listenOnly;
-            toggleBtn.title = listenOnly ? LISTEN_ONLY_TITLE : "";
             if (wasRunning && !listenOnly) await startSim(key);
+            updateSimTxStatus();
         });
         el.querySelector<HTMLInputElement>(".sim-canid-input")!.addEventListener("input", async (e) => {
             const wasRunning = entry.running;
@@ -2906,9 +2907,15 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
     }
 
     el.querySelector(".sim-toggle")!.addEventListener("click", async () => {
-        entry.running ? await stopSim(key) : await startSim(key);
+        try {
+            entry.running || entry.periodicHandle !== null ? await stopSim(key) : await startSim(key);
+        } catch { /* stopSim retains the handle and displays the error for retry. */ }
     });
-    el.querySelector(".sim-remove")!.addEventListener("click", () => { removeSimEntry(key); });
+    el.querySelector(".sim-remove")!.addEventListener("click", async () => {
+        try { await removeSimEntry(key); }
+        catch { /* Keep the entry visible when backend removal fails. */ }
+    });
+    updateSimEntryStatus(el, entry);
     return el;
 }
 
@@ -2922,12 +2929,69 @@ function renderSimEntries() {
 
 // ── Sim actions ───────────────────────────────────────────────────────────────
 
+// Use the same confirmed registration as the footer, including while removal is pending.
+function simEntryStatus(entry: SimEntry) {
+    const ch = channels.get(entry.channel);
+    const active = entry.periodicHandle !== null;
+    const busy = !!(entry.pendingStarts || entry.pendingStops);
+    const unavailable = !ch || ch.available === false ? "Channel disconnected; reconnect it and start capture"
+        : ch.config.listen_only ? "Channel is listen-only; sending is disabled"
+        : ch.error && !ch.open ? `Channel unavailable: ${ch.error}` : "";
+    let label = "Idle", detail = "";
+    if (entry.pendingStops) {
+        label = "Stopping";
+        detail = active ? "Transmission registered until removal completes" : "Waiting for pending registration to finish";
+    } else if (entry.txError) {
+        label = "Error";
+        detail = `${entry.txError}${active ? "; transmission still registered" : ""}`;
+    } else if (active) {
+        label = "Transmitting";
+    } else if (entry.pendingStarts && appRunning && ch?.open && !unavailable) {
+        label = "Starting";
+        detail = "Registration pending";
+    } else if (unavailable) {
+        label = ch?.config.listen_only ? "Listen-only" : "Disconnected";
+        detail = `${unavailable}${entry.running ? "; armed" : ""}`;
+    } else if (entry.running) {
+        label = "Armed";
+        detail = "Waiting for capture to start";
+    }
+    const stopping = entry.running || active;
+    return {
+        label, detail, active,
+        action: stopping ? (active ? "Stop" : "Disarm") : entry.txError ? "Retry" : appRunning && ch?.open ? "Start" : "Arm",
+        toggleDisabled: busy || (!stopping && !!unavailable),
+        sendDisabled: busy || !!unavailable || !appRunning || !ch?.open,
+        reason: unavailable || (!appRunning || !ch?.open ? "Start capture before sending" : ""),
+    };
+}
+
+function updateSimEntryStatus(el: HTMLElement, entry: SimEntry) {
+    const state = simEntryStatus(entry);
+    const status = el.querySelector<HTMLElement>(".sim-state")!;
+    status.textContent = state.detail ? `${state.label}: ${state.detail}` : state.label;
+    status.dataset.state = state.label.toLowerCase();
+    const toggle = el.querySelector<HTMLButtonElement>(".sim-toggle")!;
+    toggle.textContent = state.action;
+    toggle.disabled = state.toggleDisabled;
+    toggle.title = state.toggleDisabled ? state.reason || state.detail : "";
+    toggle.classList.toggle("running", state.active);
+    const send = el.querySelector<HTMLButtonElement>(".sim-send-once")!;
+    send.disabled = state.sendDisabled;
+    send.title = state.sendDisabled ? state.reason || state.detail : "Send one frame";
+    el.querySelector<HTMLButtonElement>(".sim-remove")!.disabled = !!(entry.pendingStarts || entry.pendingStops);
+}
+
 // Footer indicator: how many periodic transmissions are actively registered
 // with the backend right now — a reminder that the tool is generating bus
 // traffic, not just observing. Counts backend registrations (periodicHandle),
 // not user intent (running): entries marked running while capture is stopped
 // transmit nothing. The tooltip lists each transmission.
 function updateSimTxStatus() {
+    for (const [key, entry] of simEntries) {
+        const row = document.querySelector<HTMLElement>(`[data-sim-key="${key}"]`);
+        if (row) updateSimEntryStatus(row, entry);
+    }
     const el = document.getElementById("sim-tx-status")!;
     const active = [...simEntries.values()].filter(e => e.periodicHandle !== null);
     if (active.length === 0) {
@@ -3019,8 +3083,17 @@ async function sendSimOnce(key: string) {
 
 // Serialize registration/removal per entry: a Stop must wait for an in-flight
 // add to return its handle before removing it. A following Start queues behind it.
-function queueSimOperation(entry: SimEntry, action: () => Promise<void>): Promise<void> {
-    const operation = (entry.operation ?? Promise.resolve()).catch(() => {}).then(action);
+function queueSimOperation(entry: SimEntry, action: () => Promise<void>, pending?: "pendingStarts" | "pendingStops"): Promise<void> {
+    if (pending) {
+        entry[pending] = (entry[pending] ?? 0) + 1;
+        updateSimTxStatus();
+    }
+    const operation = (entry.operation ?? Promise.resolve()).catch(() => {}).then(action).finally(() => {
+        if (pending) {
+            entry[pending] = (entry[pending] ?? 1) - 1;
+            updateSimTxStatus();
+        }
+    });
     entry.operation = operation;
     return operation;
 }
@@ -3030,12 +3103,11 @@ async function startSim(key: string) {
     if (!entry) return;
     if (!entry.channel) { log("warn", "Select a channel first"); return; }
     entry.running = true;
+    delete entry.txError;
     scheduleAutoSave("sim started");
-    const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
-    if (btn) { btn.textContent = "Stop"; btn.classList.add("running"); }
     await queueSimOperation(entry, async () => {
         if (simEntries.get(key) !== entry || !entry.running || entry.periodicHandle !== null) return;
-        if (!appRunning || !channels.get(entry.channel)?.open) return;
+        if (!appRunning || !channels.get(entry.channel)?.open || channels.get(entry.channel)?.config?.listen_only) return;
         try {
             if (entry.kind === "message") {
                 entry.periodicHandle = await invoke<number>("add_periodic_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry), period_ms: entry.periodMs } });
@@ -3046,16 +3118,17 @@ async function startSim(key: string) {
         } catch (e) {
             log("error", `Sim start error: ${e}`);
             entry.running = false;
-            if (btn) { btn.textContent = "Start"; btn.classList.remove("running"); }
+            entry.txError = `Start failed: ${e}`;
             scheduleAutoSave("sim start failed");
         }
-    });
+    }, "pendingStarts");
 }
 
 async function stopSim(key: string) {
     const entry = simEntries.get(key);
     if (!entry) return;
     entry.running = false;
+    delete entry.txError;
     await queueSimOperation(entry, async () => {
         if (entry.periodicHandle !== null) {
             try {
@@ -3063,16 +3136,15 @@ async function stopSim(key: string) {
                 entry.periodicHandle = null;
             } catch (e) {
                 entry.running = true;
+                entry.txError = `Stop failed: ${e}`;
                 log("error", `Sim stop error: ${e}`);
                 scheduleAutoSave("sim stop failed");
                 throw e;
             }
         }
-        const btn = document.querySelector<HTMLButtonElement>(`[data-sim-key="${key}"] .sim-toggle`);
-        if (btn && !entry.running) { btn.textContent = "Start"; btn.classList.remove("running"); }
         updateSimTxStatus();
         scheduleAutoSave("sim stopped");
-    });
+    }, "pendingStops");
 }
 
 // Push an edited entry's current values/generators/period to its running
@@ -3683,6 +3755,7 @@ async function startApp(reportMissing = true) {
         if (entry.running) await startSim(key);
     }
 
+    updateSimTxStatus();
     clearTrace();
     startScrollLoop();
     startBusStatsPoll();
@@ -3716,7 +3789,7 @@ async function stopApp() {
         ch.open = false;
     }
     // Channels are closed so backend periodics are gone; preserve running intent so
-    // entries auto-restart on next Start and the UI keeps showing "Stop".
+    // entries auto-restart on next Start and the UI shows "Armed".
     for (const entry of simEntries.values()) {
         entry.periodicHandle = null;
     }

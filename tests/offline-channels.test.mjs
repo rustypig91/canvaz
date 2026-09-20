@@ -290,7 +290,7 @@ test("Start preserves duplicate offline channels, dependent entries and saved ID
             signalLastValues: new Map(), signalLastRaw: new Map(), signalMinValues: new Map(), signalMaxValues: new Map(),
             viewPaused: false, sidebarSnapshot: null, windowSizeSec: 10,
             renderDbcTree: () => {}, updatePauseViewBtn: () => {}, setPaneCursors: () => {}, clearPaneZoom: () => {},
-            restoreProjectEntries: async () => {}, clearTrace: () => {}, startScrollLoop: () => {}, startBusStatsPoll: () => {}, log: () => {},
+            updateSimTxStatus() {}, restoreProjectEntries: async () => {}, clearTrace: () => {}, startScrollLoop: () => {}, startBusStatsPoll: () => {}, log: () => {},
             openChannelByHandle: async handle => { opened.push(handle); return true; },
             invoke: async (command) => {
                 if (command === "reload_backends") return [
