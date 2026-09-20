@@ -213,3 +213,35 @@ test("channel failure replaces a stale removal error with Disconnected", async (
     assert.equal(h.footer.style.display, "");
     assert.equal(h.controls[".sim-toggle"].textContent, "Disarm");
 });
+
+for (const kind of ["raw", "message"]) {
+    test(`${kind}: channel failure drains pending registration before closing`, async () => {
+        const entered = deferred(), add = deferred();
+        const calls = [];
+        const h = harness(kind, async command => {
+            calls.push(command);
+            if (command.startsWith("add_periodic")) {
+                entered.resolve();
+                return add.promise;
+            }
+        });
+        const starting = h.ctx.startSim("entry");
+        await entered.promise;
+        const failing = h.ctx.onChannelError({ channel_handle: 1, fatal: true, error: "device unplugged" });
+        assert.equal(h.controls[".sim-send-once"].disabled, true);
+        await Promise.resolve();
+        assert.equal(calls.includes("close_channel"), false);
+        add.resolve(42);
+        await Promise.all([starting, failing]);
+        assert.equal(calls.at(-1), "close_channel");
+        assert.equal(h.entry.periodicHandle, null);
+        assert.match(h.state(), /^Disconnected/);
+        assert.equal(h.footer.style.display, "");
+        // Recovery must be able to register the armed entry again.
+        h.ch.open = true;
+        h.ch.error = null;
+        await h.ctx.startSim("entry");
+        assert.equal(calls.filter(command => command.startsWith("add_periodic")).length, 2);
+        assert.equal(h.state(), "Transmitting");
+    });
+}

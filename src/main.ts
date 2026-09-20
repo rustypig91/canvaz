@@ -1987,6 +1987,13 @@ async function onChannelError(ev: ChannelErrorEvent) {
     }
     log("error", `Channel ${name} stopped receiving: ${ev.error}`);
     ch.error = ev.error;
+    // Block new transmissions immediately and drain pending registrations before
+    // closing, so a late IPC response cannot restore a dead periodic handle.
+    ch.open = false;
+    updateSimTxStatus();
+    await Promise.all([...simEntries.values()]
+        .filter(entry => entry.channel === ev.channel_handle)
+        .map(entry => entry.operation?.catch(() => {})));
     // The RX thread is gone but the hardware handle is still registered as
     // open; close it so the next open starts from a clean state.
     try { await invoke("close_channel", { channelHandle: ev.channel_handle }); }
