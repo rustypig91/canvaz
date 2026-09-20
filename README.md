@@ -19,8 +19,7 @@ Rusty's Canvaz is the CAN analyzer in the Rusty's toolchain family, alongside Ru
 Use Tab to reach channel selection, Edit, and Add channel buttons. In the DBC
 browser, Up/Down and Home/End navigate visible items; Right expands groups and
 Left collapses them or returns to the parent. Enter or Space toggles a group.
-With a message or signal focused, P adds it to Plot and S adds its message to
-Simulate. Enter or Space on a signal adds it to the active Plot or Simulate view.
+Enter or Space on a signal adds it to the active Plot or Simulate view.
 Adding a simulation entry does not start transmission.
 
 Use Left/Right or Home/End on the view tabs. Menu buttons open with Enter or

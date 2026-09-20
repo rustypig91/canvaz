@@ -89,8 +89,7 @@
             <button id="btn-collapse-all" class="btn-icon" title="Collapse all" aria-label="Collapse all">−</button>
             <input id="signal-search" aria-label="Filter DBC messages and signals" type="text" placeholder="Filter…" class="search-input" />
           </div>
-          <p id="dbc-keyboard-help" class="hint dbc-keyboard-help">Arrow keys navigate and expand. P adds to Plot; S adds to Simulate. Enter adds a signal to the active tab.</p>
-          <div id="dbc-tree" aria-label="DBC messages and signals" aria-describedby="dbc-keyboard-help"></div>
+          <div id="dbc-tree" aria-label="DBC messages and signals"></div>
         </section>
       </aside>
 
@@ -120,7 +119,7 @@
         <div id="tab-simulate" role="tabpanel" aria-labelledby="view-simulate" class="tab-content">
           <div id="sim-toolbar">
             <button id="btn-add-raw-frame" class="btn btn-sm">+ Raw Frame</button>
-            <span class="hint">Drag, double-click, or press S on a DBC signal or message to add its message</span>
+            <span class="hint">Drag or double-click a DBC signal or message to add its message</span>
           </div>
           <div id="drop-zone-sim" class="drop-zone">
             <span>↓ Drop a signal or message here to add it</span>

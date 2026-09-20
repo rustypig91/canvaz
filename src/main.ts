@@ -1274,7 +1274,6 @@ function renderDbcTree(filter = "") {
         row.tabIndex = 0;
         row.setAttribute("role", "button");
         row.setAttribute("aria-label", sig.name);
-        row.setAttribute("aria-describedby", "dbc-keyboard-help");
         row.dataset.signal = sig.name;
         row.dataset.messageId = String(sig.message_id);
         row.dataset.channel = String(selectedChannel!);
@@ -1323,7 +1322,6 @@ function renderDbcTree(filter = "") {
         if (msg.comment) summary.title = msg.comment;
         // Drag / double-click behaviour is delegated on #dbc-tree (setupDbcTree).
         summary.setAttribute("draggable", "true");
-        summary.setAttribute("aria-describedby", "dbc-keyboard-help");
         details.appendChild(summary);
 
         // Signal rows are built on first expand. A large DBC would otherwise keep
@@ -1468,13 +1466,6 @@ function setupDbcTree() {
     tree.addEventListener("keydown", (e) => {
         const target = (e.target as HTMLElement).closest<HTMLElement>("summary, .signal-row");
         if (!target || e.altKey || e.ctrlKey || e.metaKey) return;
-        const key = e.key.toLowerCase();
-        if (["p", "s"].includes(key) && target.matches(".signal-row, .msg-group > summary")) {
-            e.preventDefault();
-            document.querySelector<HTMLButtonElement>(`.tab-btn[data-tab="${key === "p" ? "plot" : "simulate"}"]`)!.click();
-            activate(target);
-            return;
-        }
         if (target.matches(".signal-row") && ["Enter", " "].includes(e.key)) {
             e.preventDefault();
             activate(target);
