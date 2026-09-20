@@ -5,7 +5,7 @@ import vm from "node:vm";
 import ts from "typescript";
 
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
-const names = ["showConfirm", "confirmAndStop", "newProject", "openProject"];
+const names = ["showConfirm", "confirmAndStop", "newProject", "openProject", "setupMenuBar"];
 const code = ts.transpileModule(source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text)).map(n => n.getText(source)).join("\n"), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
@@ -31,6 +31,38 @@ function harness() {
     vm.runInContext(code, context);
     return { context, elements, document, getDialogOpenCalls: () => dialogOpenCalls };
 }
+
+test("project shortcuts respect an open modal even when the project is clean", async () => {
+    const { context, elements, document } = harness();
+    const events = new EventTarget();
+    document.addEventListener = events.addEventListener.bind(events);
+    document.querySelectorAll = () => [];
+    document.querySelector = () => elements.get("dialog-confirm").open ? elements.get("dialog-confirm") : null;
+    for (const id of ["btn-about-close", "btn-update-close", "btn-sysres-close", "btn-github"]) elements.set(id, new EventTarget());
+    const actions = [];
+    context.closeAllMenus = () => {};
+    context.handleMenuAction = action => actions.push(action);
+    context.projectDirty = false;
+    context.setupMenuBar();
+    const pending = context.confirmAndStop("Stop capture and remove a channel?", "Stop & remove channel");
+    const shortcut = (key, shiftKey = false) => {
+        const event = new Event("keydown", { cancelable: true });
+        Object.assign(event, { key, ctrlKey: true, shiftKey });
+        events.dispatchEvent(event);
+        assert.equal(event.defaultPrevented, true);
+    };
+    shortcut("o");
+    shortcut("s");
+    shortcut("S", true);
+    assert.deepEqual(actions, []);
+    elements.get("btn-confirm-cancel").dispatchEvent(new Event("click"));
+    assert.equal(await pending, false);
+    assert.equal(context.appRunning, true);
+    shortcut("o");
+    shortcut("s");
+    shortcut("S", true);
+    assert.deepEqual(actions, ["open-project", "save-project", "save-as-project"]);
+});
 
 test("confirmation uses each caller's label and initially focuses Cancel", async () => {
     const { context, elements, document } = harness();

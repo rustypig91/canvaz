@@ -4223,6 +4223,11 @@ function setupMenuBar() {
         openUrl("https://github.com/rustypig91/canvaz");
     });
     document.addEventListener("keydown", (e) => {
+        // Modal dialogs make the page inert, but document shortcuts still fire.
+        if (document.querySelector("dialog[open]")) {
+            if (e.ctrlKey && ["o", "s"].includes(e.key.toLowerCase())) e.preventDefault();
+            return;
+        }
         if (e.ctrlKey && !e.shiftKey && e.key === "o") { e.preventDefault(); handleMenuAction("open-project"); }
         if (e.ctrlKey && !e.shiftKey && e.key === "s") { e.preventDefault(); handleMenuAction("save-project"); }
         if (e.ctrlKey && e.shiftKey && e.key === "S") { e.preventDefault(); handleMenuAction("save-as-project"); }
