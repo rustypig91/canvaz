@@ -14,6 +14,29 @@ Rusty's Canvaz is the CAN analyzer in the Rusty's toolchain family, alongside Ru
 - **Offline channels** — missing interfaces appear red (disconnected), while DBC browsing, plots, and simulator configuration remain editable. Click *Start* to rescan and run available channels; channels that cannot start report an error without blocking the others. Use *Reload backends* to refresh their status.
 - **System resources** — built-in dialog showing the app's CPU and memory usage
 
+## Keyboard controls
+
+Use Tab to reach channel selection, Edit, and Add channel buttons. In the DBC
+browser, Up/Down and Home/End navigate visible items; Right expands groups and
+Left collapses them or returns to the parent. Enter or Space toggles a group.
+With a message or signal focused, P adds it to Plot and S adds its message to
+Simulate. Enter or Space on a signal adds it to the active Plot or Simulate view.
+Adding a simulation entry does not start transmission.
+
+Use Left/Right or Home/End on the view tabs. Menu buttons open with Enter or
+Space; Up/Down navigate actions and Escape closes the menu. Each trace column
+has a focusable filter button; Escape returns focus from its filter popup.
+
+The optional browser regression check exercises these workflows using keyboard
+input and mocked Tauri IPC (no CAN hardware required):
+
+```sh
+npm install --no-save --package-lock=false playwright
+npx playwright install chromium
+npm run build
+node tests/accessibility.browser.mjs
+```
+
 ## Hardware support
 
 | Backend | Platforms | Runtime requirement |

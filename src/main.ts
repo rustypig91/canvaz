@@ -760,21 +760,21 @@ function createPlotPane(): PlotPane {
     el.innerHTML = `
     <div class="pane-header">
       <span class="pane-title">Plot ${paneCounter}</span>
-      <button class="btn-reset-zoom pane-btn" title="Reset zoom" style="display:none">⟲</button>
-      <button class="btn-show-points pane-btn" title="Show data points: off">•</button>
-      <select class="sel-interp" title="Interpolation">
+      <button class="btn-reset-zoom pane-btn" title="Reset zoom" style="display:none" aria-label="Reset zoom">⟲</button>
+      <button class="btn-show-points pane-btn" title="Show data points: off" aria-label="Show data points" aria-pressed="false">•</button>
+      <select class="sel-interp" aria-label="Interpolation" title="Interpolation">
         <option value="none">None</option>
         <option value="linear">Linear</option>
         <option value="smooth">Smooth</option>
       </select>
-      <button class="btn-cursors pane-btn" title="Measurement cursors">⌖</button>
-      <button class="btn-ylock pane-btn" title="Lock Y axis to current range">Y</button>
+      <button class="btn-cursors pane-btn" title="Measurement cursors" aria-label="Measurement cursors">⌖</button>
+      <button class="btn-ylock pane-btn" title="Lock Y axis to current range" aria-label="Lock Y axis to current range">Y</button>
       <span class="ylock-inputs" style="display:none">
         <input type="number" step="any" class="ylock-min" title="Y axis minimum">
         <input type="number" step="any" class="ylock-max" title="Y axis maximum">
       </span>
-      <button class="btn-export-png pane-btn" title="Save pane as PNG">⤓</button>
-      <button class="btn-close-pane" title="Close plot">×</button>
+      <button class="btn-export-png pane-btn" title="Save pane as PNG" aria-label="Save pane as PNG">⤓</button>
+      <button class="btn-close-pane" title="Close plot" aria-label="Close plot">×</button>
     </div>
     <div class="pane-legend"></div>
     <div class="pane-canvas-wrap">
@@ -787,6 +787,7 @@ function createPlotPane(): PlotPane {
         pane.showPoints = !pane.showPoints;
         const btn = e.currentTarget as HTMLButtonElement;
         btn.classList.toggle("active", pane.showPoints);
+        btn.setAttribute("aria-pressed", String(pane.showPoints));
         btn.title = `Show data points: ${pane.showPoints ? "on" : "off"}`;
         syncDatasets(pane);
         scheduleAutoSave("plot show-points toggled");
@@ -1270,6 +1271,10 @@ function renderDbcTree(filter = "") {
     const buildSignalRow = (sig: DbcSignal): HTMLElement => {
         const row = document.createElement("div");
         row.className = "signal-row";
+        row.tabIndex = 0;
+        row.setAttribute("role", "button");
+        row.setAttribute("aria-label", sig.name);
+        row.setAttribute("aria-describedby", "dbc-keyboard-help");
         row.dataset.signal = sig.name;
         row.dataset.messageId = String(sig.message_id);
         row.dataset.channel = String(selectedChannel!);
@@ -1318,6 +1323,7 @@ function renderDbcTree(filter = "") {
         if (msg.comment) summary.title = msg.comment;
         // Drag / double-click behaviour is delegated on #dbc-tree (setupDbcTree).
         summary.setAttribute("draggable", "true");
+        summary.setAttribute("aria-describedby", "dbc-keyboard-help");
         details.appendChild(summary);
 
         // Signal rows are built on first expand. A large DBC would otherwise keep
@@ -1459,6 +1465,41 @@ function msgFromSummary(summary: HTMLElement): { handle: number; msg: DbcMessage
 // listeners per signal row.
 function setupDbcTree() {
     const tree = document.getElementById("dbc-tree")!;
+    tree.addEventListener("keydown", (e) => {
+        const target = (e.target as HTMLElement).closest<HTMLElement>("summary, .signal-row");
+        if (!target || e.altKey || e.ctrlKey || e.metaKey) return;
+        const key = e.key.toLowerCase();
+        if (["p", "s"].includes(key) && target.matches(".signal-row, .msg-group > summary")) {
+            e.preventDefault();
+            document.querySelector<HTMLButtonElement>(`.tab-btn[data-tab="${key === "p" ? "plot" : "simulate"}"]`)!.click();
+            activate(target);
+            return;
+        }
+        if (target.matches(".signal-row") && ["Enter", " "].includes(e.key)) {
+            e.preventDefault();
+            activate(target);
+            return;
+        }
+        const visible = Array.from(tree.querySelectorAll<HTMLElement>("summary, .signal-row"))
+            .filter(el => el.getClientRects().length > 0);
+        const index = visible.indexOf(target);
+        let next: HTMLElement | undefined;
+        const group = target.parentElement as HTMLDetailsElement;
+        if (e.key === "ArrowDown") next = visible[Math.min(index + 1, visible.length - 1)];
+        else if (e.key === "ArrowUp") next = visible[Math.max(0, index - 1)];
+        else if (e.key === "Home") next = visible[0];
+        else if (e.key === "End") next = visible[visible.length - 1];
+        else if (e.key === "ArrowRight") {
+            if (target.matches("summary") && !group.open) group.open = true;
+            else if (target.matches("summary") && group.contains(visible[index + 1])) next = visible[index + 1];
+        } else if (e.key === "ArrowLeft") {
+            if (target.matches("summary") && group.open) group.open = false;
+            else next = target.parentElement?.closest("details")?.querySelector<HTMLElement>(":scope > summary") ?? undefined;
+            if (next === target) next = group.parentElement?.closest("details")?.querySelector<HTMLElement>(":scope > summary") ?? undefined;
+        } else return;
+        e.preventDefault();
+        next?.focus();
+    });
     tree.addEventListener("dragstart", (e) => {
         const target = e.target as HTMLElement;
         const row = target.closest<HTMLElement>(".signal-row");
@@ -1490,8 +1531,7 @@ function setupDbcTree() {
             e.dataTransfer!.effectAllowed = "copy";
         }
     });
-    tree.addEventListener("dblclick", (e) => {
-        const target = e.target as HTMLElement;
+    const activate = (target: HTMLElement) => {
         const row = target.closest<HTMLElement>(".signal-row");
         if (row) {
             const found = sigFromRow(row);
@@ -1517,7 +1557,8 @@ function setupDbcTree() {
                 addSimMessage(found.handle, found.msg);
             }
         }
-    });
+    };
+    tree.addEventListener("dblclick", e => activate(e.target as HTMLElement));
 }
 
 // A lone signal, a whole message, or a signal dragged off another pane's
@@ -1778,6 +1819,7 @@ function setBitrateInDialog(bitrate: number | null, isVcan: boolean) {
 }
 
 async function openChannelDialog(mode: DialogMode, handle?: number) {
+    const opener = document.activeElement as HTMLElement | null;
     dialogMode = mode;
     dialogEditTarget = handle ?? null;
 
@@ -1844,7 +1886,12 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         selectChannel(handle!);
     }
 
-    (document.activeElement as HTMLElement)?.blur();
+    dialog.addEventListener("close", () => {
+        if (document.activeElement !== document.body && !dialog.contains(document.activeElement)) return;
+        const fallback = handle === undefined ? document.getElementById("btn-add-channel")
+            : document.querySelector<HTMLElement>(`[data-channel-handle="${handle}"] .btn-edit-ch`);
+        (opener?.isConnected ? opener : fallback ?? document.getElementById("btn-add-channel"))?.focus();
+    }, { once: true });
     dialog.showModal();
 }
 
@@ -1858,7 +1905,6 @@ function promptSudoPassword(): Promise<string | null> {
         const cancel = document.getElementById("btn-sudo-cancel")!;
 
         input.value = "";
-        (document.activeElement as HTMLElement)?.blur();
         dialog.showModal();
         // Delay focus so the dialog is visible first
         setTimeout(() => input.focus(), 50);
@@ -2359,6 +2405,10 @@ async function renderChannelList() {
     updateSimTxStatus();
     updateTraceEmptyState();
     const list = document.getElementById("channel-list")!;
+    const focused = document.activeElement as HTMLElement | null;
+    const focusedChannel = focused?.closest<HTMLElement>("[data-channel-handle]")?.dataset.channelHandle;
+    const focusedControl = focused?.classList.contains("ch-name") ? ".ch-name"
+        : focused?.classList.contains("btn-edit-ch") ? ".btn-edit-ch" : ".btn-close-ch";
 
     list.innerHTML = "";
     for (const [h, ch] of channels) {
@@ -2376,14 +2426,19 @@ async function renderChannelList() {
         item.dataset.channelHandle = String(h);
         item.innerHTML = `
       <span class="dot${ch.open ? "" : ch.error || !ch.available ? " error" : " closed"}"${ch.error ? ` title="${escapeHtml(ch.error)}"` : !ch.available ? ` title="Disconnected"` : ""}></span>
-      <span class="ch-name" title="${escapeHtml(name === hwName ? name : `${name} (${hwName})`)}">${escapeHtml(name)}<span class="ch-backend label-muted"> ${backend}</span></span>
+      <button type="button" class="ch-name" aria-pressed="${isSelected}" title="${escapeHtml(name === hwName ? name : `${name} (${hwName})`)}" aria-label="${escapeHtml(name === hwName ? name : `${name} (${hwName})`)}">${escapeHtml(name)}<span class="ch-backend label-muted"> ${backend}</span></button>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
       <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}${listenOnlyLabel}</span>
-      <button class="btn-close-ch" title="Remove channel">×</button>
+      <button class="btn-edit-ch btn btn-sm" type="button" aria-label="Configure ${escapeHtml(name)}">Edit</button>
+      <button class="btn-close-ch" aria-label="Remove channel" title="Remove channel">×</button>
     `;
         item.addEventListener("click", (e) => {
-            if ((e.target as HTMLElement).closest(".btn-close-ch")) return;
+            if ((e.target as HTMLElement).closest(".btn-close-ch, .btn-edit-ch")) return;
             selectChannel(h);
+        });
+        item.querySelector(".btn-edit-ch")!.addEventListener("click", async () => {
+            if (!await confirmAndStop(`Stop live capture to configure "${name}"?`, "Stop & configure channel")) return;
+            openChannelDialog("edit", h);
         });
         item.addEventListener("contextmenu", async (e) => {
             e.preventDefault();
@@ -2441,7 +2496,7 @@ async function renderChannelList() {
       <span class="ch-name" title="${escapeHtml(ghostName === config.name ? ghostName : `${ghostName} (${config.name})`)}">${escapeHtml(ghostName)}<span class="ch-backend label-muted"> ${config.backend}</span></span>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
       <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}${listenOnlyLabel}</span>
-      <button class="btn-close-ch" title="Remove channel">×</button>
+      <button class="btn-close-ch" title="Remove channel" aria-label="Remove channel">×</button>
     `;
         item.querySelector(".btn-close-ch")!.addEventListener("click", (e) => {
             e.stopPropagation();
@@ -2451,6 +2506,10 @@ async function renderChannelList() {
             scheduleAutoSave("ghost channel removed");
         });
         list.appendChild(item);
+    }
+    if (focusedChannel && !focused?.isConnected) {
+        (list.querySelector<HTMLElement>(`[data-channel-handle="${focusedChannel}"] ${focusedControl}`)
+            ?? document.getElementById("btn-add-channel"))?.focus();
     }
 }
 
@@ -2645,13 +2704,13 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         <span class="label-muted sim-msg-id">${idHex}</span>
         <span class="ch-badge">${escapeHtml(channelName(entry.channel))}</span>
         <span class="label-muted">Period</span>
-        <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
+        <input type="number" class="sim-period small-input" aria-label="Transmission period in milliseconds" value="${entry.periodMs}" min="10">
         <span class="label-muted">ms</span>
         <span class="sim-state" role="status" aria-live="polite"></span>
         <div class="sim-actions">
           <button class="btn btn-sm sim-send-once">Send</button>
           <button class="btn btn-sm sim-toggle">Start</button>
-          <button class="btn btn-sm btn-danger sim-remove">✕</button>
+          <button class="btn btn-sm btn-danger sim-remove" aria-label="Remove simulation entry">✕</button>
         </div>
       </div>
       <div class="sim-group-body${hasEnums ? " has-enums" : ""}">
@@ -2666,7 +2725,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             const enums = s.def.enum_values ?? [];
             const generated = s.gen != null;
             const enumSel = enums.length ? `
-            <select class="sim-enum-sel" data-idx="${i}" title="Named values"${generated ? " disabled" : ""}>
+            <select class="sim-enum-sel" aria-label="${escapeHtml(s.def.name)}: Named signal value" data-idx="${i}" title="Named values"${generated ? " disabled" : ""}>
               <option value="" hidden disabled${enums.some(e => e.value === raw) ? "" : " selected"}>—</option>
               ${enums.map(e => `<option value="${e.value}"${e.value === raw ? " selected" : ""}>${e.description} (${e.value})</option>`).join("")}
             </select>` : "";
@@ -2678,7 +2737,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             const inactive = s.def.mux_value != null && s.def.mux_value !== muxRaw0;
             const genVal = simGenSelValue(s.gen);
             const genSel = `
-            <select class="sim-gen-sel" data-idx="${i}" title="${simGenTooltip(genVal)}">
+            <select class="sim-gen-sel" aria-label="${escapeHtml(s.def.name)}: Signal generator" data-idx="${i}" title="${simGenTooltip(genVal)}">
               ${SIM_GEN_OPTIONS.map(([v, label, tip]) => `<option value="${v}" title="${tip}"${v === genVal ? " selected" : ""}>${label}</option>`).join("")}
             </select>`;
             const wave = isWaveformGen(s.gen);
@@ -2686,19 +2745,19 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
           <div class="sim-signal-row${inactive ? " sim-sig-inactive" : ""}">
             <span class="sim-sig-name" title="${rangeTitle}">${s.def.name}${muxBadge}</span>
             ${genSel}
-            <input type="number" class="sim-phys-input" data-idx="${i}" value="${fmtNum(phys)}" step="${physStep}"${rangeTitle ? ` min="${s.def.min}" max="${s.def.max}"` : ""}${generated ? " disabled" : ""} title="Physical value${isFloat ? "" : ` — step ${fmtNum(Math.abs(s.def.factor))}`}${s.def.unit ? " " + s.def.unit : ""}${rangeTitle ? " — " + rangeTitle : ""}">
+            <input type="number" class="sim-phys-input" aria-label="${escapeHtml(s.def.name)}: Physical signal value" data-idx="${i}" value="${fmtNum(phys)}" step="${physStep}"${rangeTitle ? ` min="${s.def.min}" max="${s.def.max}"` : ""}${generated ? " disabled" : ""} title="Physical value${isFloat ? "" : ` — step ${fmtNum(Math.abs(s.def.factor))}`}${s.def.unit ? " " + s.def.unit : ""}${rangeTitle ? " — " + rangeTitle : ""}">
             <span class="sim-sig-unit label-muted">${s.def.unit || ""}</span>
-            <input type="number" class="sim-raw-input" data-idx="${i}" value="${isFloat ? fmtNum(raw) : raw}"${generated ? " disabled" : ""}${isFloat ? ` step="any" title="Unscaled IEEE float value"` : ` step="1" min="${rr.min}" max="${rr.max}" title="Raw value — range ${rr.min} … ${rr.max}"`}>
+            <input type="number" class="sim-raw-input" aria-label="${escapeHtml(s.def.name)}: Raw signal value" data-idx="${i}" value="${isFloat ? fmtNum(raw) : raw}"${generated ? " disabled" : ""}${isFloat ? ` step="any" title="Unscaled IEEE float value"` : ` step="1" min="${rr.min}" max="${rr.max}" title="Raw value — range ${rr.min} … ${rr.max}"`}>
             <span class="sim-sig-raw-lbl label-muted">raw</span>
             ${enumSel}
           </div>
           <div class="sim-gen-params" data-idx="${i}"${wave ? "" : ` style="display:none"`}>
             <span class="label-muted">min</span>
-            <input type="number" class="gen-min small-input" step="any" value="${fmtNum(s.gen?.min ?? 0)}">
+            <input type="number" class="gen-min small-input" aria-label="${escapeHtml(s.def.name)}: Generator minimum" step="any" value="${fmtNum(s.gen?.min ?? 0)}">
             <span class="label-muted">max</span>
-            <input type="number" class="gen-max small-input" step="any" value="${fmtNum(s.gen?.max ?? 0)}">
+            <input type="number" class="gen-max small-input" aria-label="${escapeHtml(s.def.name)}: Generator maximum" step="any" value="${fmtNum(s.gen?.max ?? 0)}">
             <span class="label-muted">period</span>
-            <input type="number" class="gen-period small-input" min="1" value="${s.gen?.period_ms ?? 1000}">
+            <input type="number" class="gen-period small-input" aria-label="${escapeHtml(s.def.name)}: Generator period in milliseconds" min="1" value="${s.gen?.period_ms ?? 1000}">
             <span class="label-muted">ms</span>
           </div>`;
         }).join("")}
@@ -2820,34 +2879,34 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         el.innerHTML = `
       <div class="sim-group-header">
         <span class="sim-kind-badge kind-raw">RAW</span>
-        <select class="sim-channel-sel">
+        <select class="sim-channel-sel" aria-label="CAN channel">
           ${pendingChannelOption}
           ${[...channels].map(([h, ch]) => `<option value="${h}"${h === entry.channel ? " selected" : ""}>${escapeHtml(ch.config.display_name || ch.info.name)}</option>`).join("")}
         </select>
         <span class="label-muted">Period</span>
-        <input type="number" class="sim-period small-input" value="${entry.periodMs}" min="10">
+        <input type="number" class="sim-period small-input" aria-label="Transmission period in milliseconds" value="${entry.periodMs}" min="10">
         <span class="label-muted">ms</span>
         <span class="sim-state" role="status" aria-live="polite"></span>
         <div class="sim-actions">
           <button class="btn btn-sm sim-send-once">Send</button>
           <button class="btn btn-sm sim-toggle">Start</button>
-          <button class="btn btn-sm btn-danger sim-remove">✕</button>
+          <button class="btn btn-sm btn-danger sim-remove" aria-label="Remove simulation entry">✕</button>
         </div>
       </div>
       <div class="sim-group-body">
         <div class="sim-raw-data-row">
           <span class="label-muted">ID</span>
-          <input type="text" class="sim-canid-input small-input" value="${idHex}" maxlength="8" placeholder="hex">
+          <input type="text" class="sim-canid-input small-input" aria-label="CAN ID in hexadecimal" value="${idHex}" maxlength="8" placeholder="hex">
           <label class="sim-ext-label label-muted"><input type="checkbox" class="sim-ext-cb"${entry.isExtended ? " checked" : ""}> Ext</label>
         </div>
         <div class="sim-raw-data-row">
           <span class="label-muted">DLC</span>
-          <select class="sim-dlc-sel">
+          <select class="sim-dlc-sel" aria-label="Data length">
             ${[1, 2, 3, 4, 5, 6, 7, 8].map(n => `<option value="${n}"${n === entry.dlc ? " selected" : ""}>${n}</option>`).join("")}
           </select>
           <span class="label-muted">Data</span>
           <div class="sim-bytes">
-            ${entry.data.map((b, i) => `<input type="text" class="sim-byte" data-idx="${i}" value="${b.toString(16).toUpperCase().padStart(2, "0")}" maxlength="2"${i >= entry.dlc ? " disabled" : ""}>`).join("")}
+            ${entry.data.map((b, i) => `<input type="text" class="sim-byte" aria-label="Data byte ${i + 1} in hexadecimal" data-idx="${i}" value="${b.toString(16).toUpperCase().padStart(2, "0")}" maxlength="2"${i >= entry.dlc ? " disabled" : ""}>`).join("")}
           </div>
         </div>
       </div>`;
@@ -3417,6 +3476,7 @@ async function applyProject(project: Project) {
             const btn = pane.el.querySelector<HTMLButtonElement>(".btn-show-points")!;
             btn.classList.add("active");
             btn.title = "Show data points: on";
+            btn.setAttribute("aria-pressed", "true");
         }
         if (paneConfig.y_min != null && paneConfig.y_max != null) {
             setYLock(pane, { min: paneConfig.y_min, max: paneConfig.y_max }, false);
@@ -4039,7 +4099,6 @@ function openUpdateDialog(opts: {
         dialog.close();
     };
 
-    (document.activeElement as HTMLElement)?.blur();
     dialog.showModal();
 }
 
@@ -4082,7 +4141,6 @@ function openSysResDialog() {
     refresh();
     const timer = setInterval(refresh, 1000);
     dialog.addEventListener("close", () => clearInterval(timer), { once: true });
-    (document.activeElement as HTMLElement)?.blur();
     dialog.showModal();
 }
 
@@ -4272,17 +4330,40 @@ function setupSidebarResize() {
 function setupMenuBar() {
     document.querySelectorAll<HTMLElement>(".menu-item").forEach(item => {
         const trigger = item.querySelector<HTMLButtonElement>(".menu-trigger")!;
+        trigger.setAttribute("aria-expanded", "false");
+        const dropdown = item.querySelector<HTMLElement>(".menu-dropdown")!;
+        dropdown.id = `${item.id}-actions`;
+        trigger.setAttribute("aria-controls", dropdown.id);
+        item.addEventListener("keydown", e => {
+            const actions = Array.from(item.querySelectorAll<HTMLButtonElement>(".menu-action"));
+            if (e.key === "Escape") { e.preventDefault(); closeAllMenus(); trigger.focus(); }
+            else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
+                e.preventDefault();
+                item.classList.add("open"); trigger.setAttribute("aria-expanded", "true");
+                const index = actions.indexOf(document.activeElement as HTMLButtonElement);
+                const next = e.key === "Home" ? 0 : e.key === "End" ? actions.length - 1
+                    : index < 0 ? (e.key === "ArrowDown" ? 0 : actions.length - 1)
+                    : (index + (e.key === "ArrowDown" ? 1 : actions.length - 1)) % actions.length;
+                actions[next]?.focus();
+            }
+        });
+        item.addEventListener("focusout", () => queueMicrotask(() => {
+            if (!item.contains(document.activeElement)) {
+                item.classList.remove("open"); trigger.setAttribute("aria-expanded", "false");
+            }
+        }));
         trigger.addEventListener("click", (e) => {
             e.stopPropagation();
             const isOpen = item.classList.contains("open");
             closeAllMenus();
-            if (!isOpen) item.classList.add("open");
+            if (!isOpen) { item.classList.add("open"); trigger.setAttribute("aria-expanded", "true"); }
         });
         trigger.addEventListener("mouseenter", () => {
             const anyOpen = document.querySelector(".menu-item.open");
             if (anyOpen && anyOpen !== item) {
                 closeAllMenus();
                 item.classList.add("open");
+                trigger.setAttribute("aria-expanded", "true");
             }
         });
     });
@@ -4294,7 +4375,7 @@ function setupMenuBar() {
     });
 
     document.querySelectorAll<HTMLButtonElement>(".menu-action").forEach(btn => {
-        btn.addEventListener("click", () => { closeAllMenus(); handleMenuAction(btn.dataset.action ?? ""); });
+        btn.addEventListener("click", () => { btn.closest(".menu-item")!.querySelector<HTMLElement>(".menu-trigger")!.focus(); closeAllMenus(); handleMenuAction(btn.dataset.action ?? ""); });
     });
     document.getElementById("btn-about-close")!.addEventListener("click", () => {
         (document.getElementById("dialog-about") as HTMLDialogElement).close();
@@ -4322,7 +4403,10 @@ function setupMenuBar() {
 }
 
 function closeAllMenus() {
-    document.querySelectorAll(".menu-item.open").forEach(el => el.classList.remove("open"));
+    document.querySelectorAll(".menu-item.open").forEach(el => {
+        el.classList.remove("open");
+        el.querySelector(".menu-trigger")!.setAttribute("aria-expanded", "false");
+    });
 }
 
 function handleMenuAction(action: string) {
@@ -4336,7 +4420,6 @@ function handleMenuAction(action: string) {
         case "export-trace-csv": exportTraceCsv(); break;
         case "about":
             invoke<string>("get_version").then(v => { document.getElementById("about-version")!.textContent = v; }).catch(() => { });
-            (document.activeElement as HTMLElement)?.blur();
             (document.getElementById("dialog-about") as HTMLDialogElement).showModal();
             break;
         case "system-resources": openSysResDialog(); break;
@@ -6431,7 +6514,19 @@ window.addEventListener("DOMContentLoaded", async () => {
 
     // Tab switching
     document.querySelectorAll<HTMLButtonElement>(".tab-btn").forEach(btn => {
+        btn.addEventListener("keydown", e => {
+            const tabs = Array.from(document.querySelectorAll<HTMLButtonElement>(".tab-btn"));
+            const index = tabs.indexOf(btn);
+            const next = e.key === "Home" ? tabs[0] : e.key === "End" ? tabs[tabs.length - 1]
+                : e.key === "ArrowRight" ? tabs[(index + 1) % tabs.length]
+                : e.key === "ArrowLeft" ? tabs[(index + tabs.length - 1) % tabs.length] : undefined;
+            if (next) { e.preventDefault(); next.click(); next.focus(); }
+        });
         btn.addEventListener("click", () => {
+            document.querySelectorAll<HTMLButtonElement>(".tab-btn").forEach(b => {
+                b.setAttribute("aria-selected", String(b === btn));
+                b.tabIndex = b === btn ? 0 : -1;
+            });
             document.querySelectorAll(".tab-btn").forEach(b => b.classList.remove("active"));
             document.querySelectorAll(".tab-content").forEach(c => c.classList.remove("active"));
             btn.classList.add("active");
@@ -6525,6 +6620,8 @@ window.addEventListener("DOMContentLoaded", async () => {
         logPanel.classList.toggle("pinned", pinned);
         pinLogBtn.classList.toggle("active", pinned);
         pinLogBtn.title = pinned ? "Unpin log panel" : "Pin log panel to the layout";
+        pinLogBtn.setAttribute("aria-label", pinLogBtn.title);
+        pinLogBtn.setAttribute("aria-pressed", String(pinned));
     };
     pinLogBtn.addEventListener("click", () => {
         setLogPinned(!logPinned);
