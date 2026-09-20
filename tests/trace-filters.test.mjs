@@ -15,6 +15,7 @@ function harness() {
         traceFilterCycleMin: null, traceFilterCycleMax: null, traceFilterData: Array(64).fill(null),
         channelName: h => `Channel ${h}`, fmtId: n => n.toString(16), fmtPgn: String, fmtJ1939Addr: n => n.toString(16),
         syncFilteredHeaders() {}, applyTraceFilter() {},
+        document: { getElementById: () => null },
     });
     vm.runInContext(code, context);
     return context;
@@ -53,6 +54,23 @@ test("clear all removes every criterion and preserves byte count", () => {
     assert.equal(h.traceFilterData.length, 64);
     assert.equal(h.anyFilterActive(), false);
 });
+
+for (const focusedInSummary of [true, false]) {
+    test(`clear all restores header focus only when focus was in the summary (${focusedInSummary})`, () => {
+        const h = harness();
+        const activeElement = {};
+        let focused = false;
+        h.document = {
+            activeElement,
+            getElementById: () => ({ contains: el => el === activeElement && focusedInSummary }),
+            querySelector: () => ({ focus() { focused = true; } }),
+        };
+        h.applyTraceFilter = () => { h.document.activeElement = null; };
+        h.traceFilterDlcMin = 1;
+        h.clearAllFilters();
+        assert.equal(focused, focusedInSummary);
+    });
+}
 
 for (const mode of ["append", "overwrite"]) {
     test(`applying a filter refreshes controls and saves changes in ${mode} mode`, () => {
@@ -120,4 +138,13 @@ test("visible filter activation and context menu share behavior without sorting 
     stopped = false;
     th.child.listeners.mousedown({ stopPropagation() { stopped = true; } });
     assert.equal(stopped, true);
+    th.child.focused = false;
+    h.ctxMenu = menu;
+    menu.isConnected = true;
+    menu.listeners.click();
+    assert.equal(th.child.focused, false, "editing an open dialog retains focus inside it");
+    menu.isConnected = false;
+    h.ctxMenu = null;
+    menu.listeners.click();
+    assert.equal(th.child.focused, true, "a Clear action that removes the dialog restores header focus");
 });

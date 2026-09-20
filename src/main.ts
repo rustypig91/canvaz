@@ -5042,6 +5042,7 @@ function updateClearFiltersBtn() {
 }
 
 function clearAllFilters() {
+    const restoreFocus = document.getElementById("trace-filter-summary")?.contains(document.activeElement);
     traceFilterChannels = null;
     traceFilterCanIds = null;
     traceFilterMsgNames = null;
@@ -5058,6 +5059,7 @@ function clearAllFilters() {
     traceFilterData.fill(null);
     syncFilteredHeaders();
     applyTraceFilter();
+    if (restoreFocus) document.querySelector<HTMLButtonElement>(".trace-filter-button")?.focus();
 }
 
 function updateSortIndicators() {
@@ -5286,6 +5288,10 @@ function setupTraceHeaders() {
                 ownedMenu = menu;
                 menu.setAttribute("role", "dialog");
                 menu.setAttribute("aria-label", `${label} filter`);
+                // A Clear action may remove the dialog while its button has focus.
+                menu.addEventListener("click", () => {
+                    if (!menu.isConnected && ctxMenu === null) button.focus();
+                });
                 menu.addEventListener("keydown", e => {
                     if (e.key === "Escape") {
                         e.stopPropagation();
