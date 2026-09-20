@@ -3370,18 +3370,19 @@ function restoreTraceFilters(f: TraceFiltersConfig) {
 async function restoreProjectEntries() {
     // Restore saved plots using DBC definitions; no hardware connection is needed.
     if (pendingPaneSignals.length > 0) {
-        const toRestore = pendingPaneSignals;
         // addSignalToPane schedules autosave. Keep every not-yet-restored
         // entry visible to buildProject while those asynchronous adds run.
-        pendingPaneSignals = toRestore.map(entries => [...entries]);
-        const panesToRestore = plotPanes.slice(0, toRestore.length).map((pane, i) => ({
-            pane, entries: toRestore[i], pending: pendingPaneSignals[i],
+        // Share the pending arrays across overlapping restoration requests so
+        // an older request cannot restore entries consumed by a newer one.
+        const panesToRestore = plotPanes.slice(0, pendingPaneSignals.length).map((pane, i) => ({
+            pane, entries: [...pendingPaneSignals[i]], pending: pendingPaneSignals[i],
         }));
         for (const { pane, entries, pending } of panesToRestore) {
             for (const entry of entries) {
                 // Loading history yields to the UI. A pane may be closed (or
                 // the project replaced) while an earlier signal is loading.
                 if (!plotPanes.includes(pane)) break;
+                if (!pending.includes(entry)) continue;
                 const handle = idToHandle(entry.channel);
                 const dbc = handle === undefined ? null : channels.get(handle)?.dbc;
                 const sig = dbc && Object.values(dbc.messages).flatMap((m: DbcMessage) => m.signals).find(

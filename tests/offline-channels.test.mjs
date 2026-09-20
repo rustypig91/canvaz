@@ -209,6 +209,31 @@ test("closing a pane during history loading keeps restoration attached to the re
     assert.deepEqual(JSON.parse(JSON.stringify(ctx.pendingPaneSignals)), [[missing]]);
 });
 
+test("overlapping restoration consumes each signal once and retains unresolved entries", async () => {
+    const saved = name => ({ channel: "kvaser:USB CAN", message_id: 123, signal_name: name });
+    const first = saved("RPM"), second = saved("Speed"), missing = saved("Missing");
+    const added = [];
+    let finishHistory;
+    const history = new Promise(resolve => { finishHistory = resolve; });
+    const ctx = harness(["restoreProjectEntries"], {
+        channels: new Map([[7, { dbc: { messages: { 123: { signals: [
+            { name: "RPM", message_id: 123 }, { name: "Speed", message_id: 123 },
+        ] } } } }]]),
+        plotPanes: [{ id: 1 }], pendingPaneSignals: [[first, second, missing]],
+        idToHandle: () => 7,
+        addSignalToPane: async (_pane, _handle, signal) => {
+            added.push(signal.name);
+            if (signal.name === "RPM") await history;
+        },
+    });
+    const restoring = ctx.restoreProjectEntries();
+    await ctx.restoreProjectEntries();
+    finishHistory();
+    await restoring;
+    assert.deepEqual(added, ["RPM", "Speed"]);
+    assert.deepEqual(JSON.parse(JSON.stringify(ctx.pendingPaneSignals)), [[missing]]);
+});
+
 test("history completion skips closed charts and continues restoring the remaining pane", async () => {
     const signal = { name: "RPM", message_id: 123 };
     const saved = { channel: "kvaser:USB CAN", message_id: 123, signal_name: "RPM" };
