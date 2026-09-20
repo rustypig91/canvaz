@@ -5277,10 +5277,12 @@ function setupTraceHeaders() {
             button.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 3h12L9 9v4l-2-1V9z"/></svg>';
             button.setAttribute("aria-haspopup", "dialog");
             button.addEventListener("mousedown", e => e.stopPropagation());
+            let ownedMenu: HTMLElement | null = null;
             const show = (x: number, y: number) => {
                 open({ clientX: x, clientY: y, preventDefault() {} });
                 const menu = ctxMenu;
                 if (!menu) return;
+                ownedMenu = menu;
                 menu.setAttribute("role", "dialog");
                 menu.setAttribute("aria-label", `${label} filter`);
                 menu.addEventListener("keydown", e => {
@@ -5293,6 +5295,12 @@ function setupTraceHeaders() {
             };
             button.addEventListener("click", e => {
                 e.stopPropagation();
+                if (ownedMenu && ctxMenu === ownedMenu) {
+                    ownedMenu.remove();
+                    ctxMenu = null;
+                    button.focus();
+                    return;
+                }
                 const rect = button.getBoundingClientRect();
                 show(rect.left, rect.bottom);
             });
