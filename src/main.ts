@@ -4412,7 +4412,7 @@ function updateTraceEmptyState() {
         return error ? [`${ch.config.display_name || ch.info.name}: ${error}`] : [];
     }).concat(ghostChannels.map(g => `${g.config.display_name || g.config.name}: ${g.error}`));
     let title: string, description: string, action = "", target = "";
-    if (traceLocalBuffer.length > 0 && anyFilterActive() && !viewPaused) {
+    if ((rows.length > 0 || traceLocalBuffer.length > 0) && anyFilterActive() && !viewPaused) {
         title = "All frames are hidden by filters";
         description = "Clear the trace filters to see captured frames.";
         action = "Clear filters"; target = "btn-clear-filters";
@@ -4831,6 +4831,8 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
     }
 
     if (appendEntries.length > 0) {
+        // Retain filtered-out live frames so clearing filters can restore them.
+        traceLocalBuffer = appendEntries.slice().reverse().concat(traceLocalBuffer).slice(0, traceMaxRows);
         const tbody = document.getElementById("trace-tbody") as HTMLTableSectionElement;
         // Events arrive oldest→newest; insert in reverse so the newest ends up on top.
         const frag = document.createDocumentFragment();

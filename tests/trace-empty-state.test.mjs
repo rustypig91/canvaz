@@ -5,8 +5,8 @@ import vm from "node:vm";
 import ts from "typescript";
 
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
-const fn = source.statements.find(n => ts.isFunctionDeclaration(n) && n.name?.text === "updateTraceEmptyState");
-const code = ts.transpileModule(fn.getText(source), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && ["updateTraceEmptyState", "onCanFrameBatch", "applyTraceFilter"].includes(n.name?.text));
+const code = ts.transpileModule(functions.map(fn => fn.getText(source)).join("\n"), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
 
 function harness() {
     const elements = new Map();
@@ -87,3 +87,36 @@ test("paused incoming traffic does not incorrectly claim filters hide frames", (
     h.update();
     assert.equal(h.title(), "Trace view paused");
 });
+
+for (const mode of ["overwrite", "append"]) {
+    test(`${mode}: live filtered traffic offers recovery and clearing filters restores it`, () => {
+        const h = harness();
+        const tbody = h.elements.get("trace-tbody");
+        tbody.appendChild = row => tbody.rows.push(row);
+        tbody.insertBefore = fragment => tbody.rows.unshift(...fragment.rows);
+        Object.defineProperty(tbody, "innerHTML", { set: () => { tbody.rows = []; } });
+        h.context.document.createDocumentFragment = () => ({ rows: [], appendChild(row) { this.rows.push(row); } });
+        Object.assign(h.context, {
+            appRunning: true, traceMode: mode, traceTabActive: true, filtered: true,
+            traceMaxRows: 2, traceSortCol: null, traceRowEls: new Map(), traceLastTs: new Map(),
+            traceSeenChannels: new Set(), traceSeenCanIds: new Set(), traceSeenMsgNames: new Set(),
+            traceSeenNoMsg: false, traceSeenNoJ1939: false,
+            signalValueEls: new Map(), signalRangeEls: new Map(),
+            dbcMessageFor: () => null, traceKey: (handle, id) => `${handle}:${id}`,
+            traceRowVisible: () => !h.context.filtered,
+            buildTraceRow: entry => ({ dataset: { handle: String(entry.channelHandle), canid: String(entry.canId), bytes: "[]" }, style: { display: h.context.filtered ? "none" : "" } }),
+            applyTraceSort() {}, destroyAllTracePlots() {}, updateClearFiltersBtn() {}, scheduleAutoSave() {},
+        });
+        h.context.channels.set(1, channel({ open: true }));
+        const event = id => ({ channel_handle: 1, can_id: id, timestamp_ms: id, data: [], dlc: 0, signals: [] });
+        h.context.onCanFrameBatch([event(1)]);
+        assert.equal(h.title(), "All frames are hidden by filters");
+        h.context.onCanFrameBatch([event(2), event(3)]);
+        if (mode === "append") assert.deepEqual(Array.from(h.context.traceLocalBuffer, e => e.canId), [3, 2]);
+        h.context.filtered = false;
+        h.context.applyTraceFilter();
+        assert.equal(h.elements.get("trace-empty").hidden, true);
+        assert.equal(tbody.rows.length, mode === "append" ? 2 : 3);
+        assert.ok(tbody.rows.every(row => row.style.display !== "none"));
+    });
+}
