@@ -239,6 +239,7 @@ test("raw frame edits and DBC period edits schedule persistence while stopped", 
     }
     const saved = [];
     const ctx = harness(["createSimEntryEl", "escapeHtml"], {
+        updateSimEntryStatus() {}, updateSimTxStatus() {},
         document: { createElement: () => new Element() }, channels: new Map(), isChannelListenOnly: () => false,
         channelName: () => "Channel", scheduleAutoSave: reason => saved.push(reason), updateRunningSim: async () => {}, stopSim: async () => {},
     });

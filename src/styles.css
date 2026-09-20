@@ -1504,3 +1504,12 @@ textarea:focus-visible {
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
 }
+
+.sim-state {
+  font-size: 11px;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.sim-state[data-state="transmitting"] { color: #fb923c; }
+.sim-state[data-state="error"],
+.sim-state[data-state="disconnected"] { color: var(--danger); }
