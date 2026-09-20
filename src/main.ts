@@ -5622,7 +5622,7 @@ async function toggleTracePlot(sigRow: HTMLTableRowElement, handle: number, msgI
     // stable slot that keeps receiving updates. In append mode each row is a
     // historical snapshot that scrolls away, so there is nothing to plot onto.
     if (traceMode !== "overwrite") {
-        log("warn", "Inline plots require Overwrite mode.");
+        log("warn", "Inline plots require Latest per ID mode.");
         return;
     }
 
@@ -5898,11 +5898,9 @@ function setupTrace() {
         ]);
     });
 
-    document.getElementById("btn-trace-overwrite")!.addEventListener("click", function () {
-        const active = this.classList.toggle("active");
-        traceMode = active ? "overwrite" : "append";
-        clearTrace();
-    });
+    document.getElementById("btn-trace-latest")!.addEventListener("click", () => setTraceMode("overwrite"));
+    document.getElementById("btn-trace-all")!.addEventListener("click", () => setTraceMode("append"));
+    updateTraceModeControls();
 
     document.getElementById("input-trace-max")!.addEventListener("change", (e) => {
         traceMaxRows = parseInt((e.target as HTMLInputElement).value) || 100;
@@ -5934,11 +5932,33 @@ function setupTrace() {
 
 function updatePauseViewBtn() {
     const btn = document.getElementById("btn-pause-view") as HTMLButtonElement;
-    btn.textContent = viewPaused ? "Resume" : "Pause";
+    btn.textContent = viewPaused ? "Resume view" : "Pause view";
     btn.classList.toggle("running", viewPaused);
     // Pausing only makes sense while capture is live.
     btn.disabled = !appRunning;
+    btn.title = !appRunning
+        ? "Start live capture to enable view pause."
+        : viewPaused
+            ? "Resume the live view. Capture and configured transmissions have continued."
+            : "Freeze the view. Capture and configured transmissions continue.";
     updateTraceEmptyState();
+}
+
+function updateTraceModeControls() {
+    const latest = document.getElementById("btn-trace-latest") as HTMLButtonElement;
+    const all = document.getElementById("btn-trace-all") as HTMLButtonElement;
+    const latestActive = traceMode === "overwrite";
+    latest.classList.toggle("active", latestActive);
+    all.classList.toggle("active", !latestActive);
+    latest.setAttribute("aria-pressed", String(latestActive));
+    all.setAttribute("aria-pressed", String(!latestActive));
+}
+
+function setTraceMode(mode: TraceMode) {
+    if (traceMode === mode) return;
+    traceMode = mode;
+    updateTraceModeControls();
+    clearTrace();
 }
 
 // Rewrite every rendered sidebar row from the latest value maps. Used on resume
