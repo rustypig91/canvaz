@@ -134,6 +134,7 @@ struct RemappedChannel {
     /// Backend the channel resolved to after the reload — may differ from the
     /// backend it had before when the name moved backends.
     backend: String,
+    available: bool,
 }
 
 #[tauri::command]
@@ -145,6 +146,7 @@ fn reload_backends(state: State<'_, TauriState>) -> Result<Vec<RemappedChannel>,
             old_handle,
             new_handle: created.handle,
             backend: created.backend,
+            available: created.available,
         })
         .collect())
 }
