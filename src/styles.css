@@ -1437,6 +1437,7 @@ dialog { min-width: 380px; }
 #dialog-channel .form-row select { flex: 1; }
 #dialog-confirm { min-width: 320px; max-width: 420px; }
 #dialog-confirm p { margin: 0 0 20px; line-height: 1.5; }
+#btn-confirm-ok { font-weight: 600; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 
 /* ── About dialog ────────────────────────────────────────────────────────── */

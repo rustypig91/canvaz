@@ -2379,13 +2379,13 @@ async function renderChannelList() {
             showContextMenu(e.clientX, e.clientY, [
                 {
                     label: "Configure…", action: async () => {
-                        if (!await confirmAndStop(`Stop live capture to configure "${name}"?`)) return;
+                        if (!await confirmAndStop(`Stop live capture to configure "${name}"?`, "Stop & configure channel")) return;
                         openChannelDialog("edit", h);
                     }
                 },
                 {
                     label: "Remove Channel", danger: true, action: async () => {
-                        if (!await confirmAndStop(`Stop live capture and remove "${name}"?`)) return;
+                        if (!await confirmAndStop(`Stop live capture and remove "${name}"?`, "Stop & remove channel")) return;
                         channels.delete(h);
                         if (selectedChannel === h) selectChannel(null);
                         renderChannelList();
@@ -2397,7 +2397,7 @@ async function renderChannelList() {
         });
         item.querySelector(".btn-close-ch")!.addEventListener("click", async (e) => {
             e.stopPropagation();
-            if (!await confirmAndStop(`Stop live capture and remove "${name}"?`)) return;
+            if (!await confirmAndStop(`Stop live capture and remove "${name}"?`, "Stop & remove channel")) return;
 
             try { await invoke("remove_channel", { channelHandle: h }); }
             catch (e) {
@@ -3186,7 +3186,7 @@ function buildProject(): Project {
 
 async function newProject() {
     if (projectDirty) {
-        if (!await showConfirm("Discard unsaved changes and start a new project?")) return;
+        if (!await showConfirm("Discard unsaved changes and start a new project?", "Discard changes")) return;
     }
     restoringProject = true;
     ++projectRevision;
@@ -3269,10 +3269,14 @@ async function saveProjectAs() {
 
 async function openProject() {
     try {
+        if (projectDirty && !await showConfirm("Discard unsaved changes and open another project?", "Discard changes")) return;
+        const confirmedRevision = projectRevision;
         const path = await dialogOpen({ filters: [{ name: "Rusty's Canvaz Project", extensions: ["canvaz"] }], multiple: false });
         if (!path || Array.isArray(path)) return;
         const project = await invoke<Project>("load_project", { path });
-        if (projectDirty && !await showConfirm("Discard unsaved changes and open another project?")) return;
+        // Picking and loading a file can outlive edits to the current project.
+        if (projectRevision !== confirmedRevision && projectDirty
+            && !await showConfirm("Discard unsaved changes and open another project?", "Discard changes")) return;
         restoringProject = true;
         ++projectRevision;
         if (autoSaveTimer) clearTimeout(autoSaveTimer);
@@ -3725,13 +3729,20 @@ async function stopApp() {
     log("info", "Stopped");
 }
 
-function showConfirm(message: string): Promise<boolean> {
+function showConfirm(message: string, actionLabel: string): Promise<boolean> {
     return new Promise((resolve) => {
         const dialog = document.getElementById("dialog-confirm") as HTMLDialogElement;
+        // Global shortcuts can request another confirmation while this one is open.
+        // Keep the visible prompt tied to exactly one pending action.
+        if (dialog.open) {
+            resolve(false);
+            return;
+        }
         document.getElementById("dialog-confirm-msg")!.textContent = message;
 
         const ok = document.getElementById("btn-confirm-ok")!;
         const cancel = document.getElementById("btn-confirm-cancel")!;
+        ok.textContent = actionLabel;
 
         const done = (result: boolean) => {
             ok.removeEventListener("click", onOk);
@@ -3741,20 +3752,23 @@ function showConfirm(message: string): Promise<boolean> {
             resolve(result);
         };
         const onOk = () => done(true);
-        const onCancel = () => done(false);
+        const onCancel = (event: Event) => {
+            event.preventDefault();
+            done(false);
+        };
 
         ok.addEventListener("click", onOk);
         cancel.addEventListener("click", onCancel);
         dialog.addEventListener("cancel", onCancel); // Escape key
-        (document.activeElement as HTMLElement)?.blur();
         dialog.showModal();
+        cancel.focus();
     });
 }
 
 // Shows a confirm dialog if running, stops capture, then returns true so the caller can proceed.
-async function confirmAndStop(prompt: string): Promise<boolean> {
+async function confirmAndStop(prompt: string, actionLabel: string): Promise<boolean> {
     if (!appRunning) return true;
-    if (!await showConfirm(prompt)) return false;
+    if (!await showConfirm(prompt, actionLabel)) return false;
     await stopApp();
     return true;
 }
@@ -4209,6 +4223,11 @@ function setupMenuBar() {
         openUrl("https://github.com/rustypig91/canvaz");
     });
     document.addEventListener("keydown", (e) => {
+        // Modal dialogs make the page inert, but document shortcuts still fire.
+        if (document.querySelector("dialog[open]")) {
+            if (e.ctrlKey && ["o", "s"].includes(e.key.toLowerCase())) e.preventDefault();
+            return;
+        }
         if (e.ctrlKey && !e.shiftKey && e.key === "o") { e.preventDefault(); handleMenuAction("open-project"); }
         if (e.ctrlKey && !e.shiftKey && e.key === "s") { e.preventDefault(); handleMenuAction("save-project"); }
         if (e.ctrlKey && e.shiftKey && e.key === "S") { e.preventDefault(); handleMenuAction("save-as-project"); }
@@ -6362,11 +6381,11 @@ window.addEventListener("DOMContentLoaded", async () => {
     // Channel dialog
     const chanDialog = document.getElementById("dialog-channel") as HTMLDialogElement;
     document.getElementById("btn-add-channel")!.addEventListener("click", async () => {
-        if (!await confirmAndStop("Stop live capture to add a channel?")) return;
+        if (!await confirmAndStop("Stop live capture to add a channel?", "Stop & add channel")) return;
         openChannelDialog("add");
     });
     document.getElementById("btn-reload-backends")!.addEventListener("click", async () => {
-        if (!await confirmAndStop("Stop live capture to reload CAN backends?")) return;
+        if (!await confirmAndStop("Stop live capture to reload CAN backends?", "Stop & reload backends")) return;
         await refreshHardware();
     });
     document.getElementById("btn-channel-cancel")!.addEventListener("click", () => chanDialog.close());
