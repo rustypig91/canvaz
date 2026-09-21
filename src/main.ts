@@ -5014,7 +5014,7 @@ async function loadTraceFrames() {
     const generation = ++traceLoadGeneration;
     const frames = await invoke<FrameInfo[]>("get_frames", { handle: null, limit: traceMaxRows });
     // A clear or newer load supersedes this response, including project switches.
-    if (generation !== traceLoadGeneration) return;
+    if (generation !== traceLoadGeneration) return false;
     const cycleTimes = new Map<string, number>();
     // Backend returns oldest-first; we want newest-first in traceLocalBuffer.
     traceLocalBuffer = frames.map(f => {
@@ -5052,6 +5052,7 @@ async function loadTraceFrames() {
             signals: interleaveFrameSignals(f),
         };
     }).reverse();
+    return true;
 }
 
 function clearTrace() {
@@ -6121,7 +6122,8 @@ function resumeFromPause() {
         updateTraceEmptyState();
     } else {
         // Re-render visible rows from the backend (newest first after refresh).
-        loadTraceFrames().then(() => {
+        loadTraceFrames().then(loaded => {
+            if (!loaded) return;
             destroyAllTracePlots();
             tbody.innerHTML = "";
             const frag = document.createDocumentFragment();
@@ -6455,7 +6457,7 @@ window.addEventListener("DOMContentLoaded", async () => {
             traceTabActive = btn.dataset.tab === "trace";
             if (plotTabActive && appRunning && !viewPaused) startScrollLoop();
             if (traceTabActive && appRunning) {
-                loadTraceFrames().then(() => applyTraceFilter());
+                loadTraceFrames().then(loaded => { if (loaded) applyTraceFilter(); });
             }
         });
     });

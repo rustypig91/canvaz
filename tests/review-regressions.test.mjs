@@ -311,7 +311,7 @@ test("clearing trace invalidates an in-flight fetch from the previous project", 
     ctx.clearTrace();
     // A stale frame must never reach mapping (or repopulate filter caches).
     pending.resolve([{ channel_handle: 7, can_id: 123 }]);
-    await loading;
+    assert.equal(await loading, false);
     assert.equal(ctx.traceLocalBuffer.length, 0);
     for (const cache of Object.values(caches)) assert.equal(cache.size, 0);
 });
@@ -326,8 +326,24 @@ test("an older trace response cannot overwrite a newer load", async () => {
     const older = ctx.loadTraceFrames();
     const newer = ctx.loadTraceFrames();
     second.resolve([]);
-    await newer;
+    assert.equal(await newer, true);
     first.resolve([{ channel_handle: 7, can_id: 123 }]);
-    await older;
+    assert.equal(await older, false);
     assert.equal(ctx.traceLocalBuffer.length, 0);
+});
+
+test("a superseded resume fetch leaves the current trace view intact", async () => {
+    const pending = deferred();
+    const tbody = { innerHTML: "new project rows" };
+    const ctx = harness(["resumeFromPause"], {
+        sidebarSnapshot: {}, refreshSidebarValues() {},
+        document: { getElementById: () => tbody },
+        traceMode: "append", loadTraceFrames: () => pending.promise,
+        destroyAllTracePlots() { assert.fail("stale resume must not destroy current plots"); },
+        appStartTime: Date.now(), plotPanes: [], startScrollLoop() {},
+    });
+    ctx.resumeFromPause();
+    pending.resolve(false);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(tbody.innerHTML, "new project rows");
 });
