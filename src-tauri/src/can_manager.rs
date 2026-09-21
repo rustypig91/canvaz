@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc, Mutex,
@@ -527,6 +527,7 @@ impl CanManager {
 
     /// Atomically reassign hardware without replacing logical channel data.
     pub fn assign_channels(&mut self, assignments: Vec<(u32, ChannelInfo)>) -> Result<Vec<bool>, String> {
+        validate_assignment_handles(&assignments)?;
         let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
         let mut resolved = Vec::new();
         for (handle, info) in &assignments {
@@ -1348,9 +1349,31 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn validate_assignment_handles(assignments: &[(u32, ChannelInfo)]) -> Result<(), String> {
+    let mut handles = HashSet::with_capacity(assignments.len());
+    if assignments.iter().any(|(handle, _)| !handles.insert(*handle)) {
+        return Err("Channel assigned more than once".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_assignment_handles_are_rejected() {
+        let info = ChannelInfo {
+            backend: "test".into(),
+            name: "CAN 1".into(),
+        };
+        let assignments = vec![(7, info.clone()), (7, info)];
+
+        assert_eq!(
+            validate_assignment_handles(&assignments),
+            Err("Channel assigned more than once".into())
+        );
+    }
 
     #[test]
     fn signal_history_separates_frame_formats_and_keeps_j1939_matching() {
