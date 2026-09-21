@@ -52,7 +52,7 @@
       <button id="btn-app-run" title="Start live capture">▶ Start</button>
       <button id="btn-pause-view" class="btn btn-sm" title="Freeze the view. Capture and configured transmissions continue." disabled>Pause view</button>
       <div id="window-size-ctrl" title="Discard signal data older than this">
-        <span>Window</span>
+        <label for="select-window">Window</label>
         <select id="select-window">
           <option value="30">30 s</option>
           <option value="60">1 min</option>
@@ -61,7 +61,7 @@
           <option value="1800">30 min</option>
           <option value="custom">Custom…</option>
         </select>
-        <input id="input-window-custom" type="number" min="1" placeholder="sec" />
+        <input id="input-window-custom" aria-label="Window duration in seconds" type="number" min="1" placeholder="sec" />
       </div>
       <span id="status-bar"><span id="status-text"></span></span>
       <button id="btn-show-log" title="View message log">Log</button>
@@ -75,8 +75,8 @@
         <section class="sidebar-section">
           <div class="section-header">
             <span>CAN Channels</span>
-            <button id="btn-reload-backends" class="btn-icon" title="Reload CAN backends (re-detect hardware)">&#8635;</button>
-            <button id="btn-add-channel" class="btn-icon" title="Add CAN channel">+</button>
+            <button id="btn-reload-backends" class="btn-icon" title="Reload CAN backends (re-detect hardware)" aria-label="Reload CAN backends (re-detect hardware)">&#8635;</button>
+            <button id="btn-add-channel" class="btn-icon" title="Add CAN channel" aria-label="Add CAN channel">+</button>
           </div>
           <div id="channel-list"></div>
         </section>
@@ -85,11 +85,11 @@
         <section class="sidebar-section sidebar-dbc">
           <div class="section-header">
             <span>DBC Signals</span>
-            <button id="btn-expand-all" class="btn-icon" title="Expand all">+</button>
-            <button id="btn-collapse-all" class="btn-icon" title="Collapse all">−</button>
-            <input id="signal-search" type="text" placeholder="Filter…" class="search-input" />
+            <button id="btn-expand-all" class="btn-icon" title="Expand all" aria-label="Expand all">+</button>
+            <button id="btn-collapse-all" class="btn-icon" title="Collapse all" aria-label="Collapse all">−</button>
+            <input id="signal-search" aria-label="Filter DBC messages and signals" type="text" placeholder="Filter…" class="search-input" />
           </div>
-          <div id="dbc-tree"></div>
+          <div id="dbc-tree" aria-label="DBC messages and signals"></div>
         </section>
       </aside>
 
@@ -99,14 +99,14 @@
       <!-- Main content -->
       <main id="content">
         <!-- Tab bar -->
-        <nav id="tab-bar">
-          <button class="tab-btn active" data-tab="trace">Trace</button>
-          <button class="tab-btn" data-tab="plot">Plot</button>
-          <button class="tab-btn" data-tab="simulate">Simulate</button>
+        <nav id="tab-bar" role="tablist" aria-label="Views">
+          <button class="tab-btn active" data-tab="trace" id="view-trace" role="tab" aria-controls="tab-trace" aria-selected="true" tabindex="0">Trace</button>
+          <button class="tab-btn" data-tab="plot" id="view-plot" role="tab" aria-controls="tab-plot" aria-selected="false" tabindex="-1">Plot</button>
+          <button class="tab-btn" data-tab="simulate" id="view-simulate" role="tab" aria-controls="tab-simulate" aria-selected="false" tabindex="-1">Simulate</button>
         </nav>
 
         <!-- Plot tab -->
-        <div id="tab-plot" class="tab-content">
+        <div id="tab-plot" role="tabpanel" aria-labelledby="view-plot" class="tab-content">
           <div id="plot-panes-container">
             <!-- plot panes injected here by JS -->
             <div id="drop-zone-new" class="drop-zone">
@@ -116,7 +116,7 @@
         </div>
 
         <!-- Simulate tab -->
-        <div id="tab-simulate" class="tab-content">
+        <div id="tab-simulate" role="tabpanel" aria-labelledby="view-simulate" class="tab-content">
           <div id="sim-toolbar">
             <button id="btn-add-raw-frame" class="btn btn-sm">+ Raw Frame</button>
             <span class="hint">Drag or double-click a DBC signal or message to add its message</span>
@@ -127,7 +127,7 @@
           <div id="sim-entries"></div>
         </div>
         <!-- Trace tab -->
-        <div id="tab-trace" class="tab-content active">
+        <div id="tab-trace" role="tabpanel" aria-labelledby="view-trace" class="tab-content active">
           <div id="trace-toolbar">
             <button id="btn-clear-trace" class="btn btn-sm">Clear</button>
             <div id="trace-mode-control" class="trace-mode-control" role="group" aria-label="Trace display mode">
@@ -137,7 +137,7 @@
             </div>
             <button id="btn-trace-expand-all" class="btn btn-sm" title="Expand all decoded messages">Expand all</button>
             <button id="btn-trace-collapse-all" class="btn btn-sm" title="Collapse all expanded messages">Collapse all</button>
-            <label class="label-muted">Max rows:</label>
+            <label for="input-trace-max" class="label-muted">Max rows:</label>
             <input id="input-trace-max" type="number" value="1000" min="100" max="10000" step="100" class="small-input" />
             <button id="btn-trace-cols" class="btn btn-sm" title="Show/hide columns">Columns ▾</button>
           </div>
@@ -169,12 +169,12 @@
         <div id="log-panel-header">
           <span>Message Log</span>
           <button id="btn-clear-log" class="btn btn-sm">Clear</button>
-          <button id="btn-pin-log" class="btn-icon" title="Pin log panel to the layout">
+          <button id="btn-pin-log" class="btn-icon" title="Pin log panel to the layout" aria-label="Pin log panel to the layout">
             <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor" aria-hidden="true">
               <path d="M5 1h6v1l-1 1v3l2 2v1H9v4l-1 2-1-2V9H4V8l2-2V3L5 2V1z"/>
             </svg>
           </button>
-          <button id="btn-close-log" class="btn-icon" title="Close">✕</button>
+          <button id="btn-close-log" class="btn-icon" title="Close" aria-label="Close">✕</button>
         </div>
         <div id="log-entries"></div>
       </div>
@@ -188,22 +188,22 @@
     </footer>
 
     <!-- Channel dialog (add + edit) -->
-    <dialog id="dialog-channel">
+    <dialog id="dialog-channel" aria-labelledby="dialog-channel-title">
       <form id="form-channel">
         <h3 id="dialog-channel-title">Add CAN Channel</h3>
 
         <div class="form-row" id="row-iface">
-          <label>Interface</label>
+          <label for="select-iface">Interface</label>
           <select id="select-iface"></select>
         </div>
 
         <div class="form-row">
-          <label>Display Name</label>
+          <label for="input-channel-name">Display Name</label>
           <input id="input-channel-name" type="text" maxlength="64" placeholder="Optional — defaults to interface name" />
         </div>
 
         <div class="form-row">
-          <label>Bitrate</label>
+          <label for="select-bitrate">Bitrate</label>
           <select id="select-bitrate">
             <option value="125000">125 kbps</option>
             <option value="250000">250 kbps</option>
@@ -212,11 +212,11 @@
             <option value="custom">Custom…</option>
             <option value="vcan">Virtual (vcan)</option>
           </select>
-          <input id="input-bitrate-custom" type="number" placeholder="bits/s" style="display:none" />
+          <input id="input-bitrate-custom" aria-label="Custom bitrate in bits per second" type="number" placeholder="bits/s" style="display:none" />
         </div>
 
         <div class="form-row">
-          <label>Protocol</label>
+          <label for="select-protocol">Protocol</label>
           <select id="select-protocol">
             <option value="" selected>None (raw CAN)</option>
             <option value="j1939">SAE J1939</option>
@@ -224,12 +224,12 @@
         </div>
 
         <div class="form-row">
-          <label>Listen-only</label>
+          <label for="input-listen-only">Listen-only</label>
           <label class="checkbox-label"><input type="checkbox" id="input-listen-only"> Silent — no ACKs, no error flags, send &amp; simulate disabled</label>
         </div>
 
         <div class="form-row">
-          <label>DBC File</label>
+          <label for="btn-browse-dbc">DBC File</label>
           <span id="lbl-dbc-path" class="label-muted dbc-path-label">None</span>
           <button type="button" id="btn-browse-dbc" class="btn btn-sm">Browse…</button>
           <button type="button" id="btn-clear-dbc" class="btn btn-sm">Clear</button>
@@ -243,12 +243,12 @@
     </dialog>
 
     <!-- Sudo password prompt -->
-    <dialog id="dialog-sudo">
+    <dialog id="dialog-sudo" aria-label="Authentication required">
       <form id="form-sudo">
         <h3>Authentication Required</h3>
         <p class="sudo-hint">Administrator privileges are needed to configure the network interface.</p>
         <div class="form-row">
-          <label>Password</label>
+          <label for="input-sudo-pw">Password</label>
           <input id="input-sudo-pw" type="password" autocomplete="new-password" />
         </div>
         <div class="dialog-actions">
@@ -269,7 +269,7 @@
     </dialog>
 
     <!-- About dialog -->
-    <dialog id="dialog-about">
+    <dialog id="dialog-about" aria-label="About Canvaz">
       <div class="about-content">
         <img class="about-icon" src="/icon.png" alt="Rusty's Canvaz icon" />
         <h2>Rusty's Canvaz - CAN Analyzer</h2>
@@ -283,7 +283,7 @@
     </dialog>
 
     <!-- System Resources dialog -->
-    <dialog id="dialog-sysres">
+    <dialog id="dialog-sysres" aria-label="System resources">
       <h3>System Resources</h3>
       <table class="sysres-table">
         <thead>
@@ -307,7 +307,7 @@
     </dialog>
 
     <!-- Update dialog -->
-    <dialog id="dialog-update">
+    <dialog id="dialog-update" aria-label="Application update">
       <div class="about-content">
         <h2 id="update-title">Update available</h2>
         <p id="update-message">…</p>
