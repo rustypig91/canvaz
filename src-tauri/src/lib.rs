@@ -7,6 +7,8 @@ mod can_communication;
 mod can_manager;
 mod dbc_parser;
 mod j1939;
+#[cfg(target_os = "linux")]
+mod linux_environment;
 mod logger;
 mod project;
 mod sim_generator;
@@ -445,7 +447,7 @@ fn system_resources(state: State<'_, TauriState>) -> Result<SystemResources, Str
     let mut sys = state.sys.lock().map_err(|e| e.to_string())?;
     let mut webkit_pids = state.webkit_pids.lock().map_err(|e| e.to_string())?;
 
-    let nproc = sys.cpus().len();
+    let nproc = std::thread::available_parallelism().map_or(1, |n| n.get());
 
     if webkit_pids.is_none() {
         // One-time full scan to find WebKit child processes by name.
@@ -504,6 +506,8 @@ fn system_resources(state: State<'_, TauriState>) -> Result<SystemResources, Str
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    linux_environment::prepare();
     logger::init();
 
     debug!("Starting can-signals-tauri version {}", env!("GIT_VERSION"));

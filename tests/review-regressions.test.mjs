@@ -264,3 +264,86 @@ test("raw frame edits and DBC period edits schedule persistence while stopped", 
     assert.equal(saved.length, before + 1);
     assert.equal(message.periodMs, 500);
 });
+
+test("opening another project resets backend registrations and cached traffic before registering channels", async () => {
+    const calls = [];
+    const oldChannels = new Map([[7, { info: { name: "old" } }]]);
+    const caches = Object.fromEntries(["signalLastValues", "signalLastRaw", "signalMinValues", "signalMaxValues", "sigKeyCache", "pgnMapCache"].map(k => [k, new Map([["old", 1]])]));
+    const ctx = harness(["applyProject"], {
+        ...caches, appRunning: true, channels: oldChannels, ghostChannels: [], plotPanes: [],
+        simEntries: new Map(), pendingPaneSignals: [], pendingSimMessages: [], DEFAULT_WINDOW_SEC: 60,
+        stopApp: async () => calls.push("stop"),
+        invoke: async command => {
+            assert.equal(command, "reset_backend");
+            assert.equal(oldChannels.size, 1);
+            calls.push("reset");
+        },
+        clearTrace: () => calls.push("clear trace"),
+        registerChannel: async config => {
+            assert.equal(oldChannels.size, 0);
+            for (const cache of Object.values(caches)) assert.equal(cache.size, 0);
+            calls.push(`register ${config.name}`);
+            return { handle: 8 };
+        },
+        document: { getElementById: () => ({ innerHTML: "" }) },
+        refreshChannelList() {}, renderDbcTree() {}, rebuildTraceColumns() {}, setWindowSize() {},
+        restoreProjectEntries: async () => {},
+    });
+    await ctx.applyProject({ channels: [{ name: "new" }], plot_panes: [] });
+    assert.deepEqual(calls, ["stop", "reset", "clear trace", "register new"]);
+});
+
+test("clearing trace invalidates an in-flight fetch from the previous project", async () => {
+    const pending = deferred();
+    const caches = Object.fromEntries([
+        "traceRowEls", "tracePendingOverwrite", "traceLastTs", "traceSeenChannels",
+        "traceSeenCanIds", "traceSeenMsgNames", "traceSeenPgns", "traceSeenPrios",
+        "traceSeenSas", "traceSeenDas",
+    ].map(key => [key, new Map([["old", 1]])]));
+    const ctx = harness(["loadTraceFrames", "clearTrace"], {
+        ...caches, traceLoadGeneration: 0, traceMaxRows: 100,
+        traceLocalBuffer: ["old"], traceSeenNoMsg: true, traceSeenNoJ1939: true,
+        invoke: () => pending.promise,
+        destroyAllTracePlots() {}, updateTraceEmptyState() {},
+        document: { getElementById: () => ({ innerHTML: "old" }) },
+    });
+    const loading = ctx.loadTraceFrames();
+    ctx.clearTrace();
+    // A stale frame must never reach mapping (or repopulate filter caches).
+    pending.resolve([{ channel_handle: 7, can_id: 123 }]);
+    assert.equal(await loading, false);
+    assert.equal(ctx.traceLocalBuffer.length, 0);
+    for (const cache of Object.values(caches)) assert.equal(cache.size, 0);
+});
+
+test("an older trace response cannot overwrite a newer load", async () => {
+    const first = deferred(), second = deferred();
+    const responses = [first.promise, second.promise];
+    const ctx = harness(["loadTraceFrames"], {
+        traceLoadGeneration: 0, traceMaxRows: 100, traceLocalBuffer: ["old"],
+        invoke: () => responses.shift(),
+    });
+    const older = ctx.loadTraceFrames();
+    const newer = ctx.loadTraceFrames();
+    second.resolve([]);
+    assert.equal(await newer, true);
+    first.resolve([{ channel_handle: 7, can_id: 123 }]);
+    assert.equal(await older, false);
+    assert.equal(ctx.traceLocalBuffer.length, 0);
+});
+
+test("a superseded resume fetch leaves the current trace view intact", async () => {
+    const pending = deferred();
+    const tbody = { innerHTML: "new project rows" };
+    const ctx = harness(["resumeFromPause"], {
+        sidebarSnapshot: {}, refreshSidebarValues() {},
+        document: { getElementById: () => tbody },
+        traceMode: "append", loadTraceFrames: () => pending.promise,
+        destroyAllTracePlots() { assert.fail("stale resume must not destroy current plots"); },
+        appStartTime: Date.now(), plotPanes: [], startScrollLoop() {},
+    });
+    ctx.resumeFromPause();
+    pending.resolve(false);
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(tbody.innerHTML, "new project rows");
+});

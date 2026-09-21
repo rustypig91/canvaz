@@ -87,6 +87,10 @@ impl TpReassembler {
     pub fn handle_frame(&mut self, frame: &CanFrame, ts: u64) -> Option<CanFrame> {
         self.drop_stale(ts);
 
+        if !frame.is_extended || frame.error.is_some() {
+            return None;
+        }
+
         let id = decode_id(frame.can_id);
         match id.pgn {
             PGN_TP_CM => {
@@ -99,7 +103,7 @@ impl TpReassembler {
     }
 
     fn handle_cm(&mut self, id: J1939Info, data: &[u8], ts: u64) {
-        if data.len() < 8 {
+        if data.len() != 8 {
             return;
         }
         let key = (id.sa, id.da);
@@ -108,7 +112,10 @@ impl TpReassembler {
                 let total_size = u16::from_le_bytes([data[1], data[2]]) as usize;
                 let num_packets = data[3];
                 let pgn = u32::from(data[5]) | u32::from(data[6]) << 8 | u32::from(data[7]) << 16;
-                if total_size == 0 || total_size > TP_MAX_SIZE || num_packets == 0 {
+                if total_size == 0 || total_size > TP_MAX_SIZE
+                    || usize::from(num_packets) != total_size.div_ceil(7)
+                    || pgn > 0x3_FFFF
+                {
                     self.sessions.remove(&key);
                     return;
                 }
@@ -128,7 +135,14 @@ impl TpReassembler {
                 );
             }
             TP_CM_ABORT => {
-                self.sessions.remove(&key);
+                // Either endpoint may abort; the receiver reverses SA and DA.
+                // An abort for another PGN must not cancel the current transfer.
+                let pgn = u32::from(data[5]) | u32::from(data[6]) << 8 | u32::from(data[7]) << 16;
+                for pair in [key, (id.da, id.sa)] {
+                    if self.sessions.get(&pair).is_some_and(|s| s.pgn == pgn) {
+                        self.sessions.remove(&pair);
+                    }
+                }
             }
             // CTS / EndOfMsgAck flow from the receiver; nothing to reassemble.
             _ => {}
@@ -136,10 +150,11 @@ impl TpReassembler {
     }
 
     fn handle_dt(&mut self, id: J1939Info, data: &[u8], ts: u64) -> Option<CanFrame> {
-        if data.len() < 2 {
+        let key = (id.sa, id.da);
+        if data.len() != 8 {
+            self.sessions.remove(&key);
             return None;
         }
-        let key = (id.sa, id.da);
         let session = self.sessions.get_mut(&key)?;
 
         let seq = data[0];
@@ -284,5 +299,30 @@ mod tests {
         assert!(tp
             .handle_frame(&frame(dt_id, vec![2, 8, 9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), 3)
             .is_none());
+    }
+
+    #[test]
+    fn receiver_abort_cancels_only_the_announced_pgn() {
+        let mut tp = TpReassembler::default();
+        let cm = build_id(6, PGN_TP_CM, 0x20, 0x10);
+        let reverse = build_id(6, PGN_TP_CM, 0x10, 0x20);
+        tp.handle_frame(&frame(cm, vec![16, 9, 0, 2, 0xFF, 0, 0xEF, 0]), 0);
+        tp.handle_frame(&frame(reverse, vec![255, 1, 0xFF, 0xFF, 0xFF, 0xCA, 0xFE, 0]), 1);
+        assert_eq!(tp.sessions.len(), 1);
+        tp.handle_frame(&frame(reverse, vec![255, 1, 0xFF, 0xFF, 0xFF, 0, 0xEF, 0]), 2);
+        assert!(tp.sessions.is_empty());
+    }
+
+    #[test]
+    fn malformed_transport_packets_do_not_produce_shifted_payloads() {
+        let mut tp = TpReassembler::default();
+        let cm = build_id(7, PGN_TP_CM, 0xFF, 0x21);
+        let dt = build_id(7, PGN_TP_DT, 0xFF, 0x21);
+        tp.handle_frame(&frame(cm, vec![32, 9, 0, 3, 0xFF, 0xCA, 0xFE, 0]), 0);
+        assert!(tp.sessions.is_empty(), "packet count must match payload size");
+        tp.handle_frame(&frame(cm, vec![32, 9, 0, 2, 0xFF, 0xCA, 0xFE, 0]), 1);
+        assert!(tp.handle_frame(&frame(dt, vec![1, 1, 2, 3]), 2).is_none());
+        assert!(tp.handle_frame(&frame(dt, vec![2, 8, 9, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF]), 3).is_none());
+        assert!(tp.sessions.is_empty());
     }
 }

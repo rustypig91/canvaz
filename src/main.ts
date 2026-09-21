@@ -3378,6 +3378,15 @@ async function openProject() {
 async function applyProject(project: Project) {
     // Stop any active capture before applying a new project.
     if (appRunning) await stopApp();
+    // Remove old hardware registrations before reusing any channel identities.
+    await invoke("reset_backend");
+    clearTrace();
+    signalLastValues.clear();
+    signalLastRaw.clear();
+    signalMinValues.clear();
+    signalMaxValues.clear();
+    sigKeyCache.clear();
+    pgnMapCache.clear();
 
     channels.clear();
     ghostChannels = [];
@@ -4060,7 +4069,7 @@ function openSysResDialog() {
             .then(({ processes, frame_count, frame_bytes }) => {
                 tbody.innerHTML = processes.map(p =>
                     `<tr>
-                        <td>${p.name}</td>
+                        <td>${escapeHtml(p.name)}</td>
                         <td>${p.pid}</td>
                         <td>${p.cpu.toFixed(1)} %</td>
                         <td>${mb(p.memory)}</td>
@@ -4999,8 +5008,13 @@ function interleaveFrameSignals(f: FrameInfo): (number | null)[] {
     });
 }
 
+let traceLoadGeneration = 0;
+
 async function loadTraceFrames() {
+    const generation = ++traceLoadGeneration;
     const frames = await invoke<FrameInfo[]>("get_frames", { handle: null, limit: traceMaxRows });
+    // A clear or newer load supersedes this response, including project switches.
+    if (generation !== traceLoadGeneration) return false;
     const cycleTimes = new Map<string, number>();
     // Backend returns oldest-first; we want newest-first in traceLocalBuffer.
     traceLocalBuffer = frames.map(f => {
@@ -5038,9 +5052,11 @@ async function loadTraceFrames() {
             signals: interleaveFrameSignals(f),
         };
     }).reverse();
+    return true;
 }
 
 function clearTrace() {
+    ++traceLoadGeneration;
     destroyAllTracePlots();
     (document.getElementById("trace-tbody") as HTMLTableSectionElement).innerHTML = "";
     traceRowEls.clear();
@@ -6106,7 +6122,8 @@ function resumeFromPause() {
         updateTraceEmptyState();
     } else {
         // Re-render visible rows from the backend (newest first after refresh).
-        loadTraceFrames().then(() => {
+        loadTraceFrames().then(loaded => {
+            if (!loaded) return;
             destroyAllTracePlots();
             tbody.innerHTML = "";
             const frag = document.createDocumentFragment();
@@ -6440,7 +6457,7 @@ window.addEventListener("DOMContentLoaded", async () => {
             traceTabActive = btn.dataset.tab === "trace";
             if (plotTabActive && appRunning && !viewPaused) startScrollLoop();
             if (traceTabActive && appRunning) {
-                loadTraceFrames().then(() => applyTraceFilter());
+                loadTraceFrames().then(loaded => { if (loaded) applyTraceFilter(); });
             }
         });
     });
