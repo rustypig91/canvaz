@@ -62,6 +62,11 @@ fn create_channel(backend_name: String, channel_name: String, state: State<'_, T
 }
 
 #[tauri::command]
+fn assign_channels(assignments: Vec<(u32, ChannelInfo)>, state: State<'_, TauriState>) -> Result<Vec<bool>, String> {
+    state.can_manager.lock().map_err(|e| e.to_string())?.assign_channels(assignments)
+}
+
+#[tauri::command]
 fn remove_channel(channel_handle: u32, state: State<'_, TauriState>) -> Result<(), String> {
     state.can_manager.lock().map_err(|e| e.to_string())?.remove_channel(channel_handle)
 }
@@ -542,6 +547,7 @@ pub fn run() {
             get_logs,
             list_can_interfaces,
             create_channel,
+            assign_channels,
             remove_channel,
             set_channel_display_name,
             open_channel,
