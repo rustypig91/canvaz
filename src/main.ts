@@ -5008,8 +5008,13 @@ function interleaveFrameSignals(f: FrameInfo): (number | null)[] {
     });
 }
 
+let traceLoadGeneration = 0;
+
 async function loadTraceFrames() {
+    const generation = ++traceLoadGeneration;
     const frames = await invoke<FrameInfo[]>("get_frames", { handle: null, limit: traceMaxRows });
+    // A clear or newer load supersedes this response, including project switches.
+    if (generation !== traceLoadGeneration) return;
     const cycleTimes = new Map<string, number>();
     // Backend returns oldest-first; we want newest-first in traceLocalBuffer.
     traceLocalBuffer = frames.map(f => {
@@ -5050,6 +5055,7 @@ async function loadTraceFrames() {
 }
 
 function clearTrace() {
+    ++traceLoadGeneration;
     destroyAllTracePlots();
     (document.getElementById("trace-tbody") as HTMLTableSectionElement).innerHTML = "";
     traceRowEls.clear();

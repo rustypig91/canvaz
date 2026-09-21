@@ -292,3 +292,42 @@ test("opening another project resets backend registrations and cached traffic be
     await ctx.applyProject({ channels: [{ name: "new" }], plot_panes: [] });
     assert.deepEqual(calls, ["stop", "reset", "clear trace", "register new"]);
 });
+
+test("clearing trace invalidates an in-flight fetch from the previous project", async () => {
+    const pending = deferred();
+    const caches = Object.fromEntries([
+        "traceRowEls", "tracePendingOverwrite", "traceLastTs", "traceSeenChannels",
+        "traceSeenCanIds", "traceSeenMsgNames", "traceSeenPgns", "traceSeenPrios",
+        "traceSeenSas", "traceSeenDas",
+    ].map(key => [key, new Map([["old", 1]])]));
+    const ctx = harness(["loadTraceFrames", "clearTrace"], {
+        ...caches, traceLoadGeneration: 0, traceMaxRows: 100,
+        traceLocalBuffer: ["old"], traceSeenNoMsg: true, traceSeenNoJ1939: true,
+        invoke: () => pending.promise,
+        destroyAllTracePlots() {}, updateTraceEmptyState() {},
+        document: { getElementById: () => ({ innerHTML: "old" }) },
+    });
+    const loading = ctx.loadTraceFrames();
+    ctx.clearTrace();
+    // A stale frame must never reach mapping (or repopulate filter caches).
+    pending.resolve([{ channel_handle: 7, can_id: 123 }]);
+    await loading;
+    assert.equal(ctx.traceLocalBuffer.length, 0);
+    for (const cache of Object.values(caches)) assert.equal(cache.size, 0);
+});
+
+test("an older trace response cannot overwrite a newer load", async () => {
+    const first = deferred(), second = deferred();
+    const responses = [first.promise, second.promise];
+    const ctx = harness(["loadTraceFrames"], {
+        traceLoadGeneration: 0, traceMaxRows: 100, traceLocalBuffer: ["old"],
+        invoke: () => responses.shift(),
+    });
+    const older = ctx.loadTraceFrames();
+    const newer = ctx.loadTraceFrames();
+    second.resolve([]);
+    await newer;
+    first.resolve([{ channel_handle: 7, can_id: 123 }]);
+    await older;
+    assert.equal(ctx.traceLocalBuffer.length, 0);
+});
