@@ -213,8 +213,17 @@ try {{
             }}
         }}
         if (-not $scope) {{ throw 'Could not determine the installation scope. Please update using setup.exe.' }}
-        # NSIS requires /D to be last and its path must not be quoted.
-        $process = Start-Process -FilePath {file} -ArgumentList @('/P','/UPDATE',$scope,('/D='+{dir})) -Wait -PassThru
+        # The mixed-scope NSIS manifest requests highestAvailable before it can
+        # read /CurrentUser. Keep a confirmed HKCU update (and its uninstaller)
+        # at the caller's privileges. All-users updates retain normal elevation.
+        $previousCompatibility = $env:__COMPAT_LAYER
+        try {{
+            if ($scope -eq '/CurrentUser') {{ $env:__COMPAT_LAYER = 'RunAsInvoker' }}
+            # NSIS requires /D to be last and its path must not be quoted.
+            $process = Start-Process -FilePath {file} -ArgumentList @('/P','/UPDATE',$scope,('/D='+{dir})) -WindowStyle Hidden -Wait -PassThru
+        }} finally {{
+            $env:__COMPAT_LAYER = $previousCompatibility
+        }}
     }}
     if ($process.ExitCode -notin @(0, 3010)) {{ throw "Installer exited with code $($process.ExitCode)." }}
 }} catch {{
@@ -345,6 +354,69 @@ mod tests {
             .creation_flags(0x08000000)
             .status().unwrap();
         assert!(status.success());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_update_preserves_scope_and_limits_compatibility_to_installer() {
+        use std::os::windows::process::CommandExt;
+        let directory = tempfile::tempdir().unwrap();
+        let update = Prepared {
+            file: directory.path().join("setup.exe"),
+            target: directory.path().join("O'Brien $() space").join("canvaz.exe"),
+            directory,
+        };
+        let log = update.directory.path().join("calls.jsonl");
+        let helper = update.directory.path().join("test.ps1");
+        // Execute the generated helper with OS side effects replaced. No real
+        // installation, registry changes, cleanup, or application launch occurs.
+        let mocks = r#"
+$env:__COMPAT_LAYER = $env:CANVAZ_UPDATE_TEST_COMPATIBILITY
+function Get-Process { param($Id, $ErrorAction) return $null }
+function Get-ItemProperty {
+    param($LiteralPath, $ErrorAction)
+    if ($LiteralPath.StartsWith($env:CANVAZ_UPDATE_TEST_HIVE)) {
+        return @{ InstallLocation = '"' + $destination.ToUpperInvariant() + '\"' }
+    }
+    return $null
+}
+function Start-Process {
+    param($FilePath, $ArgumentList, $WindowStyle, [switch]$Wait, [switch]$PassThru, $WorkingDirectory)
+    @{ file = $FilePath; arguments = $ArgumentList; waited = [bool]$Wait; compatibility = $env:__COMPAT_LAYER } |
+        ConvertTo-Json -Compress | Add-Content -LiteralPath $env:CANVAZ_UPDATE_TEST_LOG
+    if ($Wait) { return @{ ExitCode = 0 } }
+}
+function Remove-Item { param($LiteralPath, [switch]$Recurse, [switch]$Force, $ErrorAction) }
+"#;
+        std::fs::write(&helper, format!("\u{feff}{mocks}\n{}", setup_script(&update).unwrap())).unwrap();
+        for (hive, scope) in [("HKCU:", "/CurrentUser"), ("HKLM:", "/AllUsers")] {
+            for previous in ["", "HighDpiAware"] {
+                let _ = std::fs::remove_file(&log);
+                let output = std::process::Command::new("powershell.exe")
+                    .args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File"])
+                    .arg(&helper)
+                    .env("CANVAZ_UPDATE_TEST_LOG", &log)
+                    .env("CANVAZ_UPDATE_TEST_HIVE", hive)
+                    .env("CANVAZ_UPDATE_TEST_COMPATIBILITY", previous)
+                    .creation_flags(0x08000000)
+                    .output().unwrap();
+                assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+                let calls: Vec<serde_json::Value> = std::fs::read_to_string(&log).unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str(line.trim_start_matches('\u{feff}')).unwrap())
+                    .collect();
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[0]["file"], update.file.to_str().unwrap());
+                assert_eq!(calls[0]["waited"], true);
+                assert_eq!(calls[0]["arguments"], serde_json::json!([
+                    "/P", "/UPDATE", scope, format!("/D={}", update.target.parent().unwrap().display())
+                ]));
+                let expected = if hive == "HKCU:" { "RunAsInvoker" } else { previous };
+                assert_eq!(calls[0]["compatibility"].as_str().unwrap_or_default(), expected);
+                assert_eq!(calls[1]["file"], update.target.to_str().unwrap());
+                assert_eq!(calls[1]["compatibility"].as_str().unwrap_or_default(), previous);
+            }
+        }
     }
 
     #[test]
