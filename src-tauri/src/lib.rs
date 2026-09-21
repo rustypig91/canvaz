@@ -41,6 +41,21 @@ struct TauriState {
 // ── Sudo ──────────────────────────────────────────────────────────────────────
 
 #[tauri::command]
+async fn start_recording(path: String, start_ms: u64, state: State<'_, TauriState>) -> Result<can_manager::RecordingStatus, String> {
+    state.can_manager.lock().map_err(|e| e.to_string())?.start_recording(path, start_ms)
+}
+
+#[tauri::command]
+async fn stop_recording(state: State<'_, TauriState>) -> Result<can_manager::RecordingStatus, String> {
+    Ok(state.can_manager.lock().map_err(|e| e.to_string())?.stop_recording())
+}
+
+#[tauri::command]
+fn recording_status(state: State<'_, TauriState>) -> Result<can_manager::RecordingStatus, String> {
+    Ok(state.can_manager.lock().map_err(|e| e.to_string())?.recording_status())
+}
+
+#[tauri::command]
 fn provide_admin_password(password: Option<String>, state: State<'_, TauriState>) {
     state.app_state.provide_admin_password(password);
 }
@@ -545,6 +560,9 @@ pub fn run() {
             file_exists,
             provide_admin_password,
             get_logs,
+            start_recording,
+            stop_recording,
+            recording_status,
             list_can_interfaces,
             create_channel,
             assign_channels,
@@ -574,6 +592,11 @@ pub fn run() {
             load_project,
             system_resources,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| {
+            if matches!(event, tauri::RunEvent::Exit) {
+                app.state::<TauriState>().can_manager.lock().unwrap().stop_recording();
+            }
+        });
 }

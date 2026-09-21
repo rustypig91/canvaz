@@ -178,3 +178,9 @@ The downloads page remains available as a manual fallback.
 The existing GitHub release workflow supplies the installers and AppImage.
 Automatic installation requires GitHub's SHA-256 asset digest and a completed
 upload; releases without a digest can still be downloaded manually.
+
+### Continuous CAN recording
+
+Choose **Data > Log to disk...** and select a CSV file to record all incoming and transmitted CAN frames across all channels, including error and reassembled J1939 rows. Recording starts with new frames and is independent of display filters, pausing the trace, and the RAM data-retention window. The CSV uses the same format as trace export.
+
+While recording, a compact status indicator shows the written frame count and file size; click it or choose **Data > Stop logging to disk** to finish. Closing the app also drains and flushes the recording. Recording stays active across a UI reload and is off on the next app launch. Disk errors or a writer that cannot keep up stop recording and report an error in the message log; such a file may be incomplete.

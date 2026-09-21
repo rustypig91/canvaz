@@ -3985,6 +3985,63 @@ async function exportCsv() {
     } catch (e) { log("error", `Export error: ${e}`); }
 }
 
+interface RecordingStatus {
+    active: boolean;
+    path: string;
+    frames: number;
+    bytes: number;
+    error: string | null;
+}
+
+let recordingBusy = false;
+let lastRecordingError: string | null = null;
+
+function reflectRecording(status: RecordingStatus) {
+    const indicator = document.getElementById("recording-status") as HTMLButtonElement;
+    const action = document.querySelector('[data-action="log-to-disk"]') as HTMLButtonElement;
+    action.textContent = status.active ? "Stop logging to disk" : "Log to disk\u2026";
+    action.disabled = recordingBusy;
+    indicator.hidden = !status.active;
+    indicator.disabled = recordingBusy;
+    indicator.textContent = `\u25cf Recording \u00b7 ${status.frames.toLocaleString()} frames \u00b7 ${(status.bytes / 1048576).toFixed(2)} MB \u00b7 Stop`;
+    indicator.title = `Saving all CAN frames to ${status.path}. Click to stop.`;
+    if (status.error && status.error !== lastRecordingError) log("error", status.error);
+    lastRecordingError = status.error;
+}
+
+async function toggleRecording() {
+    if (recordingBusy) return;
+    recordingBusy = true;
+    try {
+        const status = await invoke<RecordingStatus>("recording_status");
+        reflectRecording(status);
+        if (status.active) {
+            const stopped = await invoke<RecordingStatus>("stop_recording");
+            reflectRecording(stopped);
+            if (!stopped.error) log("info", `Saved ${stopped.frames.toLocaleString()} frames to ${stopped.path}`);
+        } else {
+            const path = await dialogSave({
+                title: "Log all CAN frames to disk",
+                defaultPath: `can-recording-${new Date().toISOString().replace(/[:.]/g, "-")}.csv`,
+                filters: [{ name: "CSV Files", extensions: ["csv"] }],
+            });
+            if (path) {
+                reflectRecording(await invoke<RecordingStatus>("start_recording", { path, startMs: appStartTime }));
+                log("info", `Logging all CAN frames to ${path}`);
+            }
+        }
+    } catch (e) { log("error", `Log to disk: ${e}`); }
+    finally {
+        recordingBusy = false;
+        await refreshRecordingStatus();
+    }
+}
+
+async function refreshRecordingStatus() {
+    try { reflectRecording(await invoke<RecordingStatus>("recording_status")); }
+    catch (e) { log("debug", `Recording status unavailable: ${e}`); }
+}
+
 async function exportTraceCsv() {
     const path = await dialogSave({
         defaultPath: "trace.csv",
@@ -4330,6 +4387,9 @@ function setupWindowSize() {
 
     // Periodically discard data older than the window.
     setInterval(pruneOldData, 1000);
+    document.getElementById("recording-status")!.addEventListener("click", toggleRecording);
+    void refreshRecordingStatus();
+    setInterval(() => { if (!recordingBusy) void refreshRecordingStatus(); }, 1000);
 }
 
 // ── Sidebar resize ─────────────────────────────────────────────────────────────
@@ -4401,11 +4461,13 @@ function setupMenuBar() {
                 actions[next]?.focus();
             }
         });
-        item.addEventListener("focusout", () => queueMicrotask(() => {
-            if (!item.contains(document.activeElement)) {
+        item.addEventListener("focusout", e => {
+            // activeElement can temporarily be body during a pointer focus change.
+            // Use the destination so the dropdown stays open until the click lands.
+            if (!(e.relatedTarget instanceof Node) || !item.contains(e.relatedTarget)) {
                 item.classList.remove("open"); trigger.setAttribute("aria-expanded", "false");
             }
-        }));
+        });
         trigger.addEventListener("click", (e) => {
             e.stopPropagation();
             const isOpen = item.classList.contains("open");
@@ -4472,6 +4534,7 @@ function handleMenuAction(action: string) {
         case "reload": location.reload(); break;
         case "export-csv": exportCsv(); break;
         case "export-trace-csv": exportTraceCsv(); break;
+        case "log-to-disk": toggleRecording(); break;
         case "about":
             invoke<string>("get_version").then(v => { document.getElementById("about-version")!.textContent = v; }).catch(() => { });
             (document.getElementById("dialog-about") as HTMLDialogElement).showModal();
