@@ -1,6 +1,6 @@
 [package]
 name = "canvaz"
-version = "0.6.1"
+version = "0.6.2"
 description = "Rusty's Canvaz - CAN Analyzer: view, decode, plot, and simulate CAN bus traffic"
 authors = ["Christoffer Zakrisson"]
 edition = "2021"
