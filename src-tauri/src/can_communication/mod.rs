@@ -511,7 +511,7 @@ fn tx_loop(
             match &mut q[i] {
                 SendEntry::OneShot(_) => {
                     if let SendEntry::OneShot(mut f) = q.remove(i) {
-                        let r = tx.send(&mut f);
+                        let r = f.validate_transmit().and_then(|()| tx.send(&mut f));
                         report_tx(r, f);
                     }
                 }
@@ -528,7 +528,7 @@ fn tx_loop(
                         }
                         let mut f = frame.clone();
                         *next = now + Duration::from_millis(*period_ms);
-                        let r = tx.send(&mut f);
+                        let r = f.validate_transmit().and_then(|()| tx.send(&mut f));
                         report_tx(r, f);
                     }
                     next_deadline = Some(match next_deadline {
@@ -569,6 +569,34 @@ mod tests {
         }
         assert!(validate_period(0).is_err());
         assert!(validate_period(1).is_ok());
+    }
+
+    #[test]
+    fn generated_payloads_are_validated_before_reaching_the_driver() {
+        struct NoSend;
+        impl TxHandle for NoSend {
+            fn send(&mut self, _: &mut CanFrame) -> Result<(), String> {
+                panic!("oversized generated payload reached the driver");
+            }
+            fn close(&mut self) {}
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let error_stop = stop.clone();
+        let queue = Arc::new((Mutex::new(vec![SendEntry::Periodic {
+            handle: 1,
+            frame: frame(1, false, 8),
+            period_ms: 1,
+            next: Instant::now(),
+            source: Some(Box::new(|| vec![0; 9])),
+        }]), Condvar::new()));
+        tx_loop(Box::new(NoSend), queue, stop.clone(), 0,
+            Arc::new(|_, _| panic!("invalid payload reported as transmitted")),
+            Arc::new(move |_, error, fatal| {
+                assert!(error.contains("8 bytes"));
+                assert!(!fatal);
+                error_stop.store(true, Ordering::Relaxed);
+            }));
+        assert!(stop.load(Ordering::Relaxed));
     }
 
     struct UnusedBackend;
