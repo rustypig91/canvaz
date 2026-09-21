@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
     Arc, Mutex,
@@ -259,7 +259,7 @@ impl ChannelData {
     /// Name shown to the user: the custom display name when set, else the
     /// hardware name.
     fn display_name(&self) -> &str {
-        self.display_name.as_deref().unwrap_or(&self.info.name)
+        self.display_name.as_deref().unwrap_or(if self.info.backend == "none" { "Unassigned" } else { &self.info.name })
     }
 
     /// Push a frame, evicting frames older than `window_ms` first.
@@ -476,7 +476,7 @@ impl CanManager {
     /// existing handle.
     pub fn create_channel(&mut self, backend_name: &str, channel_name: &str) -> Result<CreatedChannel, String> {
         let find = |can: &Can| can.list_channels().iter().position(|n| n == channel_name).map(|i| i as u8);
-        let found = self
+        let found = if backend_name == "none" { None } else { self
             .cans
             .get(backend_name)
             .and_then(|can| find(can).map(|i| (backend_name.to_string(), i)))
@@ -485,7 +485,8 @@ impl CanManager {
                     .iter()
                     .filter(|(name, _)| name.as_str() != backend_name)
                     .find_map(|(name, can)| find(can).map(|i| (name.clone(), i)))
-            });
+            })
+        };
         let available = found.is_some();
         let hinted_backend = backend_name;
         let backend_name = found.as_ref().map(|(name, _)| name.as_str()).unwrap_or(backend_name).to_string();
@@ -522,6 +523,44 @@ impl CanManager {
             backend: backend_name,
             available,
         })
+    }
+
+    /// Atomically reassign hardware without replacing logical channel data.
+    pub fn assign_channels(&mut self, assignments: Vec<(u32, ChannelInfo)>) -> Result<Vec<bool>, String> {
+        validate_assignment_handles(&assignments)?;
+        let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
+        let mut resolved = Vec::new();
+        for (handle, info) in &assignments {
+            if !lock.channels.contains_key(handle) { return Err("Channel not found".into()); }
+            if let Some((backend, index)) = lock.handle_to_index.get(handle) {
+                if self.cans.get(backend).is_some_and(|can| can.is_open(*index)) {
+                    return Err("Stop capture before changing channels".into());
+                }
+            }
+            let index = if info.backend == "none" { None } else {
+                self.cans.get(&info.backend).and_then(|can| can.list_channels().iter().position(|name| name == &info.name)).map(|i| i as u8)
+            };
+            for (&other, channel) in &lock.channels {
+                let target = assignments.iter().find(|(h, _)| *h == other).map(|(_, i)| i).unwrap_or(&channel.info);
+                if other != *handle && target.backend == info.backend && target.name == info.name {
+                    return Err("Interface already assigned".into());
+                }
+            }
+            resolved.push(index);
+        }
+        for (handle, _) in &assignments {
+            if let Some(key) = lock.handle_to_index.remove(handle) { lock.index_to_handle.remove(&key); }
+        }
+        for ((handle, info), index) in assignments.into_iter().zip(&resolved) {
+            if let Some(index) = index {
+                let key = (info.backend.clone(), *index);
+                lock.index_to_handle.insert(key.clone(), handle);
+                lock.handle_to_index.insert(handle, key);
+            }
+            let channel = lock.channels.get_mut(&handle).unwrap();
+            channel.info = info;
+        }
+        Ok(resolved.iter().map(Option::is_some).collect())
     }
 
     pub fn remove_channel(&mut self, handle: u32) -> Result<(), String> {
@@ -1310,9 +1349,31 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn validate_assignment_handles(assignments: &[(u32, ChannelInfo)]) -> Result<(), String> {
+    let mut handles = HashSet::with_capacity(assignments.len());
+    if assignments.iter().any(|(handle, _)| !handles.insert(*handle)) {
+        return Err("Channel assigned more than once".into());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duplicate_assignment_handles_are_rejected() {
+        let info = ChannelInfo {
+            backend: "test".into(),
+            name: "CAN 1".into(),
+        };
+        let assignments = vec![(7, info.clone()), (7, info)];
+
+        assert_eq!(
+            validate_assignment_handles(&assignments),
+            Err("Channel assigned more than once".into())
+        );
+    }
 
     #[test]
     fn signal_history_separates_frame_formats_and_keeps_j1939_matching() {

@@ -1664,7 +1664,7 @@ let availableIfaces: ChannelInfo[] = [];
 // hardware interface name.
 function channelName(handle: number): string {
     const ch = channels.get(handle);
-    return ch ? (ch.config.display_name || ch.info.name) : String(handle);
+    return ch ? (ch.config.display_name || (ch.info.backend === "none" ? "Unassigned" : ch.info.name)) : String(handle);
 }
 const signalLastValues = new Map<string, number>();
 const signalLastRaw = new Map<string, number>();
@@ -1827,6 +1827,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         applyBtn.textContent = "Add";
         ifaceRow.style.display = "";
         sel.innerHTML = "";
+        sel.onchange = null;
         dialogPendingDbc = null;
         setDbcLabel(null);
         setBitrateInDialog(500000, false);
@@ -1863,10 +1864,16 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         if (available[0]?.name.startsWith("vcan")) setBitrateInDialog(null, true);
     } else {
         const ch = channels.get(handle!);
-        const hwName = ch?.info.name ?? String(handle!);
+        const hwName = ch?.info.backend === "none" ? "Unassigned" : ch?.info.name ?? String(handle!);
         title.textContent = `Channel: ${channelName(handle!)}`;
         applyBtn.textContent = "Apply";
-        ifaceRow.style.display = "none";
+        ifaceRow.style.display = "";
+        availableIfaces = await invoke<ChannelInfo[]>("list_can_interfaces").catch(() => []);
+        if (ch && ch.info.backend !== "none" && !availableIfaces.some(i => i.backend === ch.info.backend && i.name === ch.info.name)) availableIfaces.push(ch.info);
+        sel.innerHTML = '<option value="">No hardware channel</option>' + availableIfaces.map((i, index) =>
+            `<option value="${index}">${escapeHtml(i.name)} (${escapeHtml(i.backend)})</option>`).join("");
+        sel.value = ch?.info.backend === "none" ? "" : String(availableIfaces.findIndex(i => i.backend === ch?.info.backend && i.name === ch?.info.name));
+        sel.onchange = () => setBitrateInDialog(getBitrateFromDialog(), sel.value !== "" && availableIfaces[Number(sel.value)].name.startsWith("vcan"));
         dialogPendingDbc = ch?.config.dbc_path ?? null;
         setDbcLabel(dialogPendingDbc);
         setBitrateInDialog(ch?.config.bitrate ?? null, hwName.startsWith("vcan"));
@@ -2073,7 +2080,45 @@ function scheduleChannelRecovery(handle: number) {
     }, CHANNEL_RECOVERY_INTERVAL_MS));
 }
 
+// Unique persisted identities keep unassigned channels distinct across project reloads.
+async function changeChannelAssignment(handle: number, target: ChannelInfo | null): Promise<boolean> {
+    const ch = channels.get(handle)!;
+    if ((!target && ch.info.backend === "none") || (target?.backend === ch.info.backend && target?.name === ch.info.name)) return true;
+    const conflicts = target ? [...channels].filter(([h, c]) => h !== handle && c.info.backend === target.backend && c.info.name === target.name) : [];
+    if (conflicts.length && !await showConfirm(
+        `${target!.name} is already configured for ${conflicts.map(([h]) => `"${channelName(h)}"`).join(", ")}. Continue and unassign the other channel?`, "Continue")) return false;
+    const none = (): ChannelInfo => ({ backend: "none", name: crypto.randomUUID() });
+    const assignments: [number, ChannelInfo][] = [[handle, target ?? none()], ...conflicts.map(([h]): [number, ChannelInfo] => [h, none()])];
+    try {
+        const available = await invoke<boolean[]>("assign_channels", { assignments });
+        const ids = new Map(assignments.map(([h, info]) => [handleToId(h), `${info.backend}:${info.name}`]));
+        for (const [index, [h, info]] of assignments.entries()) {
+            const channel = channels.get(h)!;
+            channel.info = info;
+            channel.config.name = info.name;
+            channel.config.backend = info.backend;
+            channel.available = available[index];
+            channel.error = null;
+        }
+        for (const signals of pendingPaneSignals) for (const signal of signals) signal.channel = ids.get(signal.channel) ?? signal.channel;
+        for (const entry of pendingSimMessages) entry.channel = ids.get(entry.channel) ?? entry.channel;
+        for (const entry of simEntries.values()) if (entry.kind === "raw" && entry.pendingChannelId) entry.pendingChannelId = ids.get(entry.pendingChannelId) ?? entry.pendingChannelId;
+        return true;
+    } catch (e) {
+        log("error", `Failed to change hardware channel: ${e}`);
+        return false;
+    }
+}
+
+let applyingChannelDialog = false;
 async function applyChannelDialog() {
+    if (applyingChannelDialog) return;
+    applyingChannelDialog = true;
+    try { await saveChannelDialog(); }
+    finally { applyingChannelDialog = false; }
+}
+
+async function saveChannelDialog() {
     const dialog = document.getElementById("dialog-channel") as HTMLDialogElement;
     const bitrate = getBitrateFromDialog();
     const protocol = getProtocolFromDialog();
@@ -2125,13 +2170,15 @@ async function applyChannelDialog() {
         // Update config in place and reparse the DBC so the signal tree reflects
         // the change immediately (a fresh copy is also loaded on the next open).
         if (ch) {
+            const selection = (document.getElementById("select-iface") as HTMLSelectElement).value;
+            if (!await changeChannelAssignment(h, selection === "" ? null : availableIfaces[Number(selection)])) return;
             ch.config.display_name = customName;
             ch.config.dbc_path = dialogPendingDbc;
             ch.config.bitrate = bitrate;
             ch.config.protocol = protocol;
             ch.config.listen_only = listenOnly;
             // Sync (or clear) the custom name backend-side so CSV exports match.
-            await invoke("set_channel_display_name", { channelHandle: h, displayName: customName })
+            await invoke("set_channel_display_name", { channelHandle: h, displayName: ch.config.display_name })
                 .catch(e => log("error", `Failed to set channel name: ${e}`));
             await loadChannelDbc(h);
             await restoreProjectEntries();
@@ -2405,9 +2452,15 @@ async function renderChannelList() {
     for (const [h, ch] of channels) {
         const dbcPath = ch.config.dbc_path;
         const bitrate = ch.config.bitrate ?? undefined;
-        const name = ch.config.display_name || ch.info.name;
-        const hwName = ch.info.name;
-        const backend = ch.info.backend;
+        const name = channelName(h);
+        const hwName = ch.info.backend === "none" ? "Unassigned" : ch.info.name;
+        const unassigned = ch.info.backend === "none";
+        const backend = unassigned ? "" : ch.info.backend;
+        const channelLabel = unassigned ? (ch.config.display_name ? `${ch.config.display_name}: no hardware channel assigned` : "No hardware channel assigned")
+            : name === hwName ? name : `${name} (${hwName})`;
+        const nameMarkup = unassigned
+            ? `${ch.config.display_name ? `${escapeHtml(ch.config.display_name)} ` : ""}<span class="ch-unassigned">Unassigned</span>`
+            : `${escapeHtml(name)}<span class="ch-backend label-muted"> ${escapeHtml(backend)}</span>`;
         const isSelected = h === selectedChannel;
         const bitrateLabel = hwName.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
         const protoLabel = ch.config.protocol === "j1939" ? " · J1939" : "";
@@ -2416,8 +2469,8 @@ async function renderChannelList() {
         item.className = `channel-item${isSelected ? " selected" : ""}`;
         item.dataset.channelHandle = String(h);
         item.innerHTML = `
-      <span class="dot${ch.open ? "" : ch.error || !ch.available ? " error" : " closed"}"${ch.error ? ` title="${escapeHtml(ch.error)}"` : !ch.available ? ` title="Disconnected"` : ""}></span>
-      <button type="button" class="ch-name" aria-pressed="${isSelected}" title="${escapeHtml(name === hwName ? name : `${name} (${hwName})`)}" aria-label="${escapeHtml(name === hwName ? name : `${name} (${hwName})`)}">${escapeHtml(name)}<span class="ch-backend label-muted"> ${backend}</span></button>
+      <span class="dot${ch.open ? "" : ch.error || (!ch.available && ch.info.backend !== "none") ? " error" : " closed"}"${ch.error ? ` title="${escapeHtml(ch.error)}"` : !ch.available ? ` title="${ch.info.backend === "none" ? "No hardware channel assigned" : "Disconnected"}"` : ""}></span>
+      <button type="button" class="ch-name" aria-pressed="${isSelected}" title="${escapeHtml(channelLabel)}" aria-label="${escapeHtml(channelLabel)}">${nameMarkup}</button>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
       <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}${listenOnlyLabel}</span>
       <button class="btn-edit-ch btn btn-sm" type="button" aria-label="Configure ${escapeHtml(name)}">Edit</button>
@@ -2872,7 +2925,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         <span class="sim-kind-badge kind-raw">RAW</span>
         <select class="sim-channel-sel" aria-label="CAN channel">
           ${pendingChannelOption}
-          ${[...channels].map(([h, ch]) => `<option value="${h}"${h === entry.channel ? " selected" : ""}>${escapeHtml(ch.config.display_name || ch.info.name)}</option>`).join("")}
+          ${[...channels].map(([h, ch]) => `<option value="${h}"${h === entry.channel ? " selected" : ""}>${escapeHtml(ch.config.display_name || (ch.info.backend === "none" ? "Unassigned" : ch.info.name))}</option>`).join("")}
         </select>
         <span class="label-muted">Period</span>
         <input type="number" class="sim-period small-input" aria-label="Transmission period in milliseconds" value="${entry.periodMs}" min="10">
@@ -3744,6 +3797,7 @@ async function openConfiguredChannels(reportMissing: boolean): Promise<boolean> 
     }
     let opened = false;
     for (const [handle, ch] of channels) {
+        if (ch.info.backend === "none") continue;
         if (!ch.available) {
             if (reportMissing) log("error", `Cannot start channel ${ch.config.display_name || ch.info.name}: interface not found`);
             continue;

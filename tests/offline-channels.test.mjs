@@ -45,7 +45,7 @@ test("Start reports missing interfaces and continues past failures to open other
     const attempted = [], errors = [];
     const ctx = harness(["openConfiguredChannels"], {
         channels: new Map([[1, { available: false, config: {}, info: { name: "Missing" } }],
-            [2, { available: true }], [3, { available: true }]]),
+            [2, { available: true, info: {} }], [3, { available: true, info: {} }], [4, { available: false, info: { backend: "none" } }]]),
         ghostChannels: [], refreshHardware: async () => true, renderChannelList: () => {},
         openChannelByHandle: async handle => { attempted.push(handle); return handle === 3; },
         log: (level, message) => errors.push({ level, message }),
@@ -406,4 +406,59 @@ test("raw simulation keeps a ghost channel id and reconnects when hardware appea
     assert.equal(raw.channel, 8);
     assert.equal(raw.pendingChannelId, undefined);
     assert.equal(rendered, 1);
+});
+
+function assignmentHarness(confirmed = true, fail = false) {
+    const channel = name => ({ info: { backend: "kvaser", name }, config: { ...config(), name }, available: true, dbc: { messages: {} } });
+    const calls = [];
+    const ctx = harness(["changeChannelAssignment", "handleToId", "channelName"], {
+        channels: new Map([[1, channel("CAN A")], [2, channel("CAN B")]]),
+        simEntries: new Map(), crypto: { randomUUID: () => "unassigned-id" },
+        showConfirm: async () => confirmed, log() {},
+        invoke: async (command, args) => { calls.push({ command, args }); if (fail) throw Error("failed"); return args.assignments.map(([, i]) => i.backend !== "none"); },
+    });
+    return { ctx, calls };
+}
+
+test("hardware reassignment requires confirmation and preserves channels when cancelled", async () => {
+    const { ctx, calls } = assignmentHarness(false);
+    assert.equal(await ctx.changeChannelAssignment(1, { backend: "kvaser", name: "CAN B" }), false);
+    assert.equal(calls.length, 0);
+    assert.equal(ctx.channels.get(1).info.name, "CAN A");
+    assert.equal(ctx.channels.get(2).info.name, "CAN B");
+});
+
+test("confirmed reassignment detaches the previous owner and preserves data and pending references", async () => {
+    const { ctx, calls } = assignmentHarness();
+    const oldDbc = ctx.channels.get(2).dbc;
+    ctx.pendingPaneSignals = [[{ channel: "kvaser:CAN A" }, { channel: "kvaser:CAN B" }]];
+    assert.equal(await ctx.changeChannelAssignment(1, { backend: "kvaser", name: "CAN B" }), true);
+    assert.equal(calls.length, 1);
+    assert.equal(ctx.channels.get(1).info.name, "CAN B");
+    assert.equal(ctx.channels.get(2).info.backend, "none");
+    assert.equal(ctx.channels.get(2).available, false);
+    assert.equal(ctx.channels.get(2).config.display_name, undefined);
+    assert.equal(ctx.channelName(2), "Unassigned");
+    assert.equal(ctx.channels.get(2).dbc, oldDbc);
+    assert.equal(ctx.pendingPaneSignals[0][0].channel, "kvaser:CAN B");
+    assert.equal(ctx.pendingPaneSignals[0][1].channel, "none:unassigned-id");
+});
+
+test("Unassigned persists a distinct identity and can be reassigned to hardware", async () => {
+    const { ctx } = assignmentHarness();
+    assert.equal(await ctx.changeChannelAssignment(1, null), true);
+    assert.equal(ctx.handleToId(1), "none:unassigned-id");
+    assert.equal(ctx.channels.get(1).config.backend, "none");
+    assert.equal(ctx.channels.get(1).config.display_name, undefined);
+    assert.equal(ctx.channelName(1), "Unassigned");
+    assert.equal(await ctx.changeChannelAssignment(1, { backend: "pcan", name: "CAN C" }), true);
+    assert.equal(ctx.handleToId(1), "pcan:CAN C");
+    assert.equal(ctx.channels.get(1).available, true);
+});
+
+test("failed assignment leaves both channel configurations intact", async () => {
+    const { ctx } = assignmentHarness(true, true);
+    assert.equal(await ctx.changeChannelAssignment(1, { backend: "kvaser", name: "CAN B" }), false);
+    assert.equal(ctx.channels.get(1).info.name, "CAN A");
+    assert.equal(ctx.channels.get(2).info.name, "CAN B");
 });

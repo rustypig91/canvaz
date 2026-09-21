@@ -1528,3 +1528,15 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   text-align: left;
   cursor: pointer;
 }
+
+/* Hardware assignment status, visually distinct from a user-chosen name. */
+.channel-item .ch-unassigned {
+  display: inline-block;
+  padding: 1px 5px;
+  border: 1px dashed var(--text-muted);
+  border-radius: 4px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-style: italic;
+  font-weight: normal;
+}
