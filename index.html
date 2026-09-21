@@ -36,6 +36,8 @@
           <div class="menu-dropdown">
             <button class="menu-action" data-action="export-csv">Export Signal Values as CSV…</button>
             <button class="menu-action" data-action="export-trace-csv">Export Trace as CSV…</button>
+            <div class="menu-separator"></div>
+            <button class="menu-action" data-action="log-to-disk" title="Save all CAN frames, independent of filters and data retention">Log to disk&#8230;</button>
           </div>
         </div>
 
@@ -64,6 +66,7 @@
         <input id="input-window-custom" aria-label="Window duration in seconds" type="number" min="1" placeholder="sec" />
       </div>
       <span id="status-bar"><span id="status-text"></span></span>
+      <button id="recording-status" hidden type="button" aria-label="Stop logging to disk"></button>
       <button id="btn-show-log" title="View message log">Log</button>
     </header>
 

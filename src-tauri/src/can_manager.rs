@@ -1,3 +1,6 @@
+mod recording;
+pub use recording::RecordingStatus;
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::{
     atomic::{AtomicU32, Ordering},
@@ -338,6 +341,7 @@ struct ManagerShared {
     /// and a flusher thread drains it every FLUSH_INTERVAL_MS as one batched
     /// "can-frame-batch" event — one IPC message per tick instead of per frame.
     pending_events: Vec<CanFrameEvent>,
+    recorder: recording::Recorder,
 }
 
 /// How often the pending frame-event buffer is flushed to the webview. 33 ms
@@ -423,6 +427,7 @@ impl CanManager {
             index_to_handle: HashMap::new(),
             handle_to_index: HashMap::new(),
             pending_events: Vec::new(),
+            recorder: recording::Recorder::default(),
         }));
 
         // Flusher: drain buffered frame events into one batched webview event per
@@ -444,6 +449,20 @@ impl CanManager {
 
         let cans = build_cans(&shared);
         Self { app_state, shared, cans }
+    }
+
+    pub fn start_recording(&self, path: String, start_ms: u64) -> Result<RecordingStatus, String> {
+        let mut shared = self.shared.lock().map_err(|e| e.to_string())?;
+        shared.recorder.start(path, start_ms)?;
+        Ok(shared.recorder.status())
+    }
+
+    pub fn stop_recording(&self) -> RecordingStatus {
+        self.shared.lock().unwrap().recorder.stop()
+    }
+
+    pub fn recording_status(&self) -> RecordingStatus {
+        self.shared.lock().unwrap().recorder.status()
     }
 
     // ── Channel lifecycle ─────────────────────────────────────────────────────
@@ -1033,42 +1052,9 @@ impl CanManager {
         let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
         let mut writer = BufWriter::new(file);
 
-        writeln!(
-            writer,
-            "timestamp_ms,elapsed_s,channel,can_id,direction,dlc,data,message,pgn,src,dst,prio,reassembled"
-        )
-        .map_err(|e| e.to_string())?;
-
-        for (ts, ch_name, f) in &frames {
-            let elapsed = (*ts as f64 - start_ms as f64) / 1000.0;
-            let id_str = if f.is_extended {
-                format!("{:08X}", f.can_id)
-            } else {
-                format!("{:03X}", f.can_id)
-            };
-            let data_str = f.data.iter().map(|b| format!("{:02X}", b)).collect::<Vec<_>>().join(" ");
-            // Error rows have no DBC message; export the error description in
-            // the message column instead.
-            let msg_str = f.message_name.as_deref().or(f.error.as_deref()).unwrap_or("").replace('"', "\"\"");
-            let j1939_str = f
-                .j1939
-                .map(|j| format!("{:X},{:02X},{:02X},{}", j.pgn, j.sa, j.da, j.priority))
-                .unwrap_or_else(|| ",,,".to_string());
-            writeln!(
-                writer,
-                "{},{:.3},{},{},{},{},\"{}\",\"{}\",{},{}",
-                ts,
-                elapsed,
-                ch_name,
-                id_str,
-                f.direction,
-                f.data.len(),
-                data_str,
-                msg_str,
-                j1939_str,
-                f.reassembled as u8
-            )
-            .map_err(|e| e.to_string())?;
+        writer.write_all(recording::HEADER.as_bytes()).map_err(|e| e.to_string())?;
+        for (_, ch_name, frame) in &frames {
+            recording::write_frame(&mut writer, ch_name, frame, start_ms).map_err(|e| e.to_string())?;
         }
 
         writer.flush().map_err(|e| e.to_string())?;
@@ -1334,6 +1320,10 @@ fn ingest_frame(
         signals: sig_data,
     };
 
+    if lock.recorder.enabled() {
+        let name = lock.channels.get(&handle).map(|ch| ch.display_name().to_owned()).unwrap_or_default();
+        lock.recorder.record(&name, &stored);
+    }
     if let Some(ch) = lock.channels.get_mut(&handle) {
         ch.push(stored, window_ms);
     }

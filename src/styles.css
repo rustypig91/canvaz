@@ -1540,3 +1540,16 @@ input:focus-visible, select:focus-visible, textarea:focus-visible {
   font-style: italic;
   font-weight: normal;
 }
+
+/* Only visible during an explicitly started disk recording. */
+#recording-status {
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: transparent;
+  padding: 3px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+#recording-status::first-letter { color: #e45454; }
+#recording-status[hidden] { display: none; }
