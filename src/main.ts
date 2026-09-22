@@ -4541,6 +4541,7 @@ function handleMenuAction(action: string) {
             break;
         case "system-resources": openSysResDialog(); break;
         case "check-updates": checkForUpdates(true); break;
+        case "support-developer": openUrl("https://buymeacoffee.com/rustypig91g"); break;
     }
 }
 
