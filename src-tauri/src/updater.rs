@@ -46,7 +46,13 @@ pub fn update_support() -> Result<(), String> {
 }
 
 fn select_asset(json: &serde_json::Value, version: &str, nsis: bool) -> Result<Asset, String> {
-    let suffix = match (std::env::consts::OS, std::env::consts::ARCH) {
+    select_asset_for_platform(json, version, nsis, std::env::consts::OS, std::env::consts::ARCH)
+}
+
+fn select_asset_for_platform(json: &serde_json::Value, version: &str, nsis: bool, os: &str, arch: &str) -> Result<Asset, String> {
+    // Published filenames may change their prefix; retain these suffixes so
+    // already-installed versions can also discover newly named releases.
+    let suffix = match (os, arch) {
         ("windows", "x86_64") if nsis => "_x64-setup.exe",
         ("windows", "x86_64") => "_x64_en-US.msi",
         ("linux", "x86_64") => "_amd64.AppImage",
@@ -436,6 +442,37 @@ function Remove-Item { param($LiteralPath, [switch]$Recurse, [switch]$Force, $Er
         asset.size += 1;
         asset.digest = "0".repeat(64);
         assert!(copy_verified(&data[..], Vec::new(), &asset, |_| {}).is_err());
+    }
+
+    #[test]
+    fn renamed_release_assets_remain_compatible_with_all_updaters() {
+        for prefix in ["Rusty's Canvaz - CAN Analyzer", "canvaz"] {
+            let names = [
+                format!("{prefix}_0.6.2_x64-setup.exe"),
+                format!("{prefix}_0.6.2_x64_en-US.msi"),
+                format!("{prefix}_0.6.2_amd64.AppImage"),
+                format!("{prefix}_0.6.2_amd64.deb"),
+                format!("{prefix}_0.6.2-1.x86_64.rpm"),
+            ];
+            let assets: Vec<_> = names.iter().map(|name| serde_json::json!({
+                "name": name,
+                "size": 100,
+                "digest": format!("sha256:{}", "a".repeat(64)),
+                "browser_download_url": format!("https://github.com/{REPO}/releases/download/v0.6.2/{}", name.replace(' ', "%20").replace('\'', "%27")),
+            })).collect();
+            let json = serde_json::json!({ "assets": assets });
+            for (os, nsis, index) in [("windows", true, 0), ("windows", false, 1), ("linux", false, 2)] {
+                let asset = select_asset_for_platform(&json, "v0.6.2", nsis, os, "x86_64").unwrap();
+                assert_eq!(asset.url, json["assets"][index]["browser_download_url"].as_str().unwrap());
+                assert_eq!(asset.digest, "a".repeat(64));
+
+                // A renamed asset must use the matching renamed download URL.
+                let mut stale = json.clone();
+                stale["assets"][index]["browser_download_url"] =
+                    format!("https://github.com/{REPO}/releases/download/v0.6.2/old-name").into();
+                assert!(select_asset_for_platform(&stale, "v0.6.2", nsis, os, "x86_64").is_err());
+            }
+        }
     }
 
     #[test]
