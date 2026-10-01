@@ -224,7 +224,6 @@ On Linux, install `xvfb xauth xdotool imagemagick`, then capture the native wind
 bash scripts/capture-screenshot.sh src-tauri/target/release/canvaz /tmp/canvaz-screenshot.png
 ```
 
-The release workflow builds the demo in a separate job after uploading the normal
-packages, waits for the scene to render, and uploads the 1600×900 PNG as both a
-workflow artifact and a release asset. Screenshot failures do not block APT
-publishing. The demo binary is never packaged.
+The release workflow builds the demo after uploading the normal packages, waits
+for the scene to render, and uploads the 1600×900 PNG as both a workflow artifact
+and a release asset. The demo binary is never packaged.
