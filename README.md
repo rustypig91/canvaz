@@ -209,3 +209,21 @@ sudo apt update
 
 Release maintainers: configure `APT_PUBLISH_TOKEN` with Actions write access
 only to `rustypig91/rusty-apt`; see its README for signing and Pages setup.
+
+### Screenshot demo
+
+Build a hardware-free demo with `npm run tauri -- build --no-bundle --features demo`.
+Run `src-tauri/target/release/canvaz` to open a fixed Powertrain CAN trace with
+`demo/powertrain.dbc` active, decoded enum labels, and expanded RPM and throttle
+plots covering 30 seconds. The demo uses a temporary data directory, skips hardware
+discovery and session restore, and disables updates.
+
+On Linux, install `xvfb xauth xdotool imagemagick`, then capture the native window:
+
+```sh
+bash scripts/capture-screenshot.sh src-tauri/target/release/canvaz /tmp/canvaz-screenshot.png
+```
+
+The release workflow builds the demo after uploading the normal packages, waits
+for the scene to render, and uploads the 1600×900 PNG as both a workflow artifact
+and a release asset. The demo binary is never packaged.

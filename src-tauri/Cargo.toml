@@ -44,6 +44,8 @@ socketcan = { version = "3" }
 
 [features]
 default = ["kvaser", "pcan"]
+# Hardware-free screenshot scene; never enabled for distributed bundles.
+demo = []
 kvaser = ["dep:libloading"]
 pcan = ["dep:libloading"]
 linux-can = ["dep:socketcan"]
