@@ -9,7 +9,7 @@ impl CanManager {
 
 fn demo_channel(dbc: ParsedDbc, start_ms: u64) -> ChannelData {
     let mut channel = ChannelData::new(ChannelInfo {
-        backend: "demo".into(),
+        backend: "CAN".into(),
         name: "Powertrain CAN".into(),
     });
     channel.bitrate = 500_000;

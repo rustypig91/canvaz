@@ -39,7 +39,7 @@ fn destination() -> Result<PathBuf, String> {
 }
 #[tauri::command]
 pub fn update_support() -> Result<(), String> {
-    if cfg!(feature = "demo") { return Err("Updates are disabled in demo builds.".into()); }
+    if cfg!(feature = "demo") { return Err("Updates are unavailable in this build.".into()); }
     if std::env::consts::ARCH != "x86_64" {
         return Err("Automatic updates are not available for this architecture.".into());
     }
@@ -98,7 +98,7 @@ fn select_asset_for_platform(json: &serde_json::Value, version: &str, nsis: bool
 
 #[tauri::command]
 pub async fn download_update(app: tauri::AppHandle, version: String) -> Result<(), String> {
-    if cfg!(feature = "demo") { return Err("Updates are disabled in demo builds.".into()); }
+    if cfg!(feature = "demo") { return Err("Updates are unavailable in this build.".into()); }
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<UpdateState>();
         let mut pending = state.0.try_lock().map_err(|_| "An update is already in progress")?;
@@ -157,7 +157,7 @@ pub async fn download_update(app: tauri::AppHandle, version: String) -> Result<(
 
 #[tauri::command]
 pub async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
-    if cfg!(feature = "demo") { return Err("Updates are disabled in demo builds.".into()); }
+    if cfg!(feature = "demo") { return Err("Updates are unavailable in this build.".into()); }
     tauri::async_runtime::spawn_blocking(move || {
         let prepared = app
             .state::<UpdateState>()

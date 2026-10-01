@@ -36,8 +36,12 @@ for ((attempt = 0; attempt < 200; attempt++)); do
     echo "Demo application exited before capture" >&2
     exit 1
   fi
+  if ! grep -q '^CANVAZ_SCENE_READY$' "$work_dir/app.log"; then
+    sleep 0.2
+    continue
+  fi
   window_id=$(xdotool search --all --onlyvisible --pid "$app_pid" \
-    --name "^Rusty's Canvaz - CAN Analyzer — Demo ready$" 2>/dev/null | head -n 1 || true)
+    --name "^Rusty's Canvaz - CAN Analyzer$" 2>/dev/null | head -n 1 || true)
   if [[ -n $window_id ]]; then break; fi
   sleep 0.2
 done

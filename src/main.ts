@@ -6882,11 +6882,15 @@ async function showDemoScene(scene: { dbc: ParsedDbc; start_ms: number; duration
     windowSizeSec = scene.duration_ms / 1000;
     reflectWindowSize();
     channels.set(1, {
-        info: { backend: "demo", name: "Powertrain CAN" },
-        config: { name: "Powertrain CAN", backend: "demo", dbc_path: scene.dbc.path, bitrate: 500000, protocol: null, listen_only: true },
+        info: { backend: "CAN", name: "Powertrain CAN" },
+        config: { name: "Powertrain CAN", backend: "CAN", dbc_path: scene.dbc.path, bitrate: 500000, protocol: null, listen_only: true },
         dbc: scene.dbc, open: true, available: true,
     });
     appRunning = true;
+    const runButton = document.getElementById("btn-app-run")!;
+    runButton.textContent = "■ Stop";
+    runButton.classList.add("running");
+    runButton.title = "Pause live capture";
     renderChannelList();
     selectChannel(1);
     document.querySelector<HTMLButtonElement>('[data-tab="trace"]')!.click();
@@ -6905,7 +6909,7 @@ async function showDemoScene(scene: { dbc: ParsedDbc; start_ms: number; duration
         await toggleTracePlot(row, 1, 256, sig);
     }
     for (const tp of tracePlots.values()) {
-        if (tp.data.length === 0) throw new Error("Demo signal history is empty");
+        if (tp.data.length === 0) throw new Error("Signal history is empty");
         const axis = tp.chart.options.scales!.x!;
         axis.min = 0;
         axis.max = windowSizeSec;
@@ -6915,9 +6919,7 @@ async function showDemoScene(scene: { dbc: ParsedDbc; start_ms: number; duration
     for (const id of ["btn-app-run", "btn-pause-view", "btn-add-channel", "btn-reload-backends"]) {
         const button = document.getElementById(id) as HTMLButtonElement;
         button.disabled = true;
-        button.title = "Fixed demo scene";
     }
-    document.getElementById("btn-app-run")!.textContent = "Demo";
     await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
     await invoke("demo_ready");
 }
