@@ -548,9 +548,9 @@ fn demo_scene(state: State<'_, TauriState>) -> Result<Option<serde_json::Value>,
 fn demo_ready(state: State<'_, TauriState>) -> Result<(), String> {
     #[cfg(feature = "demo")]
     {
-        if let Some(window) = state.app_state.app.get_webview_window("main") {
-            window.set_title("Rusty's Canvaz - CAN Analyzer — Demo ready").map_err(|e| e.to_string())?;
-        }
+        // Keep capture readiness out of the visible window title.
+        let _ = state;
+        println!("CANVAZ_SCENE_READY");
     }
     #[cfg(not(feature = "demo"))]
     let _ = state;

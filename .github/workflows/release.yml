@@ -182,13 +182,13 @@ jobs:
               headers: { 'content-type': 'image/png' },
             });
 
-  publish-apt:
-    needs: release-tauri
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-22.04
-    permissions: {}
-    steps:
-      - name: Request shared APT reconciliation
-        env:
-          GH_TOKEN: ${{ secrets.APT_PUBLISH_TOKEN }}
-        run: gh api --method POST repos/rustypig91/rusty-apt/actions/workflows/publish-apt.yml/dispatches -f ref=main
+  # publish-apt:
+  #   needs: release-tauri
+  #   if: startsWith(github.ref, 'refs/tags/v')
+  #   runs-on: ubuntu-22.04
+  #   permissions: {}
+  #   steps:
+  #     - name: Request shared APT reconciliation
+  #       env:
+  #         GH_TOKEN: ${{ secrets.APT_PUBLISH_TOKEN }}
+  #       run: gh api --method POST repos/rustypig91/rusty-apt/actions/workflows/publish-apt.yml/dispatches -f ref=main
