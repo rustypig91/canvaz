@@ -328,6 +328,7 @@ function markPaneDirty(pane: PlotPane, force = false) {
 
 let appRunning = false;
 let appStartTime = Date.now();
+let demoMode = false;
 let plotTabActive = false; // trace tab is the default active tab (see index.html)
 
 // Saved entries restored after project channels and their DBCs are loaded.
@@ -4259,6 +4260,7 @@ function openSysResDialog() {
 // always reports a result and ignores the skip preference) from the silent
 // startup check (which only surfaces a brand-new, non-skipped release).
 async function checkForUpdates(manual: boolean) {
+    if (demoMode) return;
     if (updateBusy || updateChecking) return;
     updateChecking = true;
     try { await performUpdateCheck(manual); }
@@ -4311,7 +4313,7 @@ let windowSizeSec = DEFAULT_WINDOW_SEC;
 function pruneOldData() {
     // Prune even while the view is paused — the frozen display uses its own
     // snapshot, so the live arrays must not grow unbounded during long pauses.
-    if (!appRunning) return; // leave a stopped chart untouched
+    if (!appRunning || demoMode) return; // leave a stopped or demo chart untouched
     const cutoff = Date.now() - windowSizeSec * 1000;
     for (const pane of plotPanes) {
         for (const s of pane.series.values()) {
@@ -6782,6 +6784,9 @@ window.addEventListener("DOMContentLoaded", async () => {
     // Menu bar
     setupMenuBar();
 
+    const demo = await invoke<{ dbc: ParsedDbc; start_ms: number; duration_ms: number } | null>("demo_scene").catch(() => null);
+    demoMode = demo !== null;
+
     // Preferences (per-user, persisted across restarts)
     await loadPreferences();
     if (preferences.logPinned) {
@@ -6818,6 +6823,11 @@ window.addEventListener("DOMContentLoaded", async () => {
         const pw = await promptSudoPassword();
         await invoke("provide_admin_password", { password: pw ?? null }).catch(() => { });
     });
+
+    if (demo) {
+        await showDemoScene(demo);
+        return;
+    }
 
     // Resolve paths
     const dir = await invoke<string>("get_app_data_dir");
@@ -6862,3 +6872,52 @@ window.addEventListener("DOMContentLoaded", async () => {
     }
     // Otherwise the app stays in stopped state; user adds channels then presses Start.
 });
+
+// Build the screenshot scene through the same decoded-frame and expansion paths
+// used during capture. No session is restored or saved for a demo.
+async function showDemoScene(scene: { dbc: ParsedDbc; start_ms: number; duration_ms: number }) {
+    preferences.sidebarWidth = 440;
+    applySidebarWidth();
+    appStartTime = scene.start_ms;
+    windowSizeSec = scene.duration_ms / 1000;
+    reflectWindowSize();
+    channels.set(1, {
+        info: { backend: "demo", name: "Powertrain CAN" },
+        config: { name: "Powertrain CAN", backend: "demo", dbc_path: scene.dbc.path, bitrate: 500000, protocol: null, listen_only: true },
+        dbc: scene.dbc, open: true, available: true,
+    });
+    appRunning = true;
+    renderChannelList();
+    selectChannel(1);
+    document.querySelector<HTMLButtonElement>('[data-tab="trace"]')!.click();
+    const frames = await invoke<FrameInfo[]>("get_frames", { handle: 1, limit: 10000 });
+    onCanFrameBatch(frames.map(f => ({ ...f, signals: interleaveFrameSignals(f) })));
+    viewPaused = true;
+    snapshotPlotPanes();
+    document.querySelectorAll<HTMLDetailsElement>("#dbc-tree details").forEach(d => { d.open = true; });
+    updatePauseViewBtn();
+    // Freeze at the end of the sample, independent of the capture machine clock.
+    const engineRow = document.querySelector<HTMLTableRowElement>('#trace-tbody tr[data-canid="256"]')!;
+    expandTraceRow(engineRow);
+    for (const name of ["EngineRPM", "ThrottlePercent"]) {
+        const row = engineRow.nextElementSibling!.querySelector<HTMLTableRowElement>(`tr[data-sig="${name}"]`)!;
+        const sig = scene.dbc.messages[256].signals.find(s => s.name === name)!;
+        await toggleTracePlot(row, 1, 256, sig);
+    }
+    for (const tp of tracePlots.values()) {
+        if (tp.data.length === 0) throw new Error("Demo signal history is empty");
+        const axis = tp.chart.options.scales!.x!;
+        axis.min = 0;
+        axis.max = windowSizeSec;
+        tp.chart.update("none");
+    }
+    // This is a fixed demonstration, so capture and hardware controls stay disabled.
+    for (const id of ["btn-app-run", "btn-pause-view", "btn-add-channel", "btn-reload-backends"]) {
+        const button = document.getElementById(id) as HTMLButtonElement;
+        button.disabled = true;
+        button.title = "Fixed demo scene";
+    }
+    document.getElementById("btn-app-run")!.textContent = "Demo";
+    await new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+    await invoke("demo_ready");
+}

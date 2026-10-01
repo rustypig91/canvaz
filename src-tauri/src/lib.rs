@@ -31,6 +31,8 @@ use log::{debug, error, info};
 // ── Tauri managed state ───────────────────────────────────────────────────────
 
 struct TauriState {
+    #[cfg(feature = "demo")]
+    demo_dir: tempfile::TempDir,
     app_state: Arc<AppState>,
     can_manager: ManagerState,
     sys: Mutex<System>,
@@ -399,6 +401,9 @@ fn get_version() -> &'static str {
 
 #[tauri::command]
 fn get_app_data_dir(state: State<'_, TauriState>) -> Result<String, String> {
+    #[cfg(feature = "demo")]
+    { Ok(state.demo_dir.path().to_string_lossy().into_owned()) }
+    #[cfg(not(feature = "demo"))]
     state
         .app_state
         .app
@@ -522,6 +527,36 @@ fn system_resources(state: State<'_, TauriState>) -> Result<SystemResources, Str
     })
 }
 
+// Demo metadata is absent in normal builds. The scene is seeded after the
+// frontend resets the backend, and uses the regular frame/history queries.
+#[tauri::command]
+fn demo_scene(state: State<'_, TauriState>) -> Result<Option<serde_json::Value>, String> {
+    #[cfg(feature = "demo")]
+    {
+        let path = state.demo_dir.path().join("powertrain.dbc");
+        std::fs::write(&path, include_str!("../../demo/powertrain.dbc")).map_err(|e| e.to_string())?;
+        let dbc = ParsedDbc::new(&path.to_string_lossy())?;
+        let start_ms = 1_700_000_000_000u64;
+        state.can_manager.lock().map_err(|e| e.to_string())?.seed_demo(dbc.clone(), start_ms);
+        Ok(Some(serde_json::json!({ "dbc": dbc, "start_ms": start_ms, "duration_ms": 30_000 })))
+    }
+    #[cfg(not(feature = "demo"))]
+    { let _ = state; Ok(None) }
+}
+
+#[tauri::command]
+fn demo_ready(state: State<'_, TauriState>) -> Result<(), String> {
+    #[cfg(feature = "demo")]
+    {
+        if let Some(window) = state.app_state.app.get_webview_window("main") {
+            window.set_title("Rusty's Canvaz - CAN Analyzer — Demo ready").map_err(|e| e.to_string())?;
+        }
+    }
+    #[cfg(not(feature = "demo"))]
+    let _ = state;
+    Ok(())
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -537,10 +572,17 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .setup(|app| {
+            #[cfg(feature = "demo")]
+            if let Some(window) = app.get_webview_window("main") {
+                window.set_decorations(false)?;
+                window.set_size(tauri::LogicalSize::new(1600.0, 900.0))?;
+            }
             logger::set_app(app.handle().clone());
             let app_state = AppState::new(app.handle().clone());
             let manager = CanManager::new(Arc::clone(&app_state));
             app.manage(TauriState {
+                #[cfg(feature = "demo")]
+                demo_dir: tempfile::tempdir()?,
                 app_state,
                 can_manager: Arc::new(Mutex::new(manager)),
                 sys: Mutex::new(System::new()),
@@ -552,6 +594,8 @@ pub fn run() {
             updater::update_support,
             updater::download_update,
             updater::install_update,
+            demo_scene,
+            demo_ready,
             get_version,
             get_app_data_dir,
             write_text_file,

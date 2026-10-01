@@ -1,3 +1,5 @@
+#[cfg(feature = "demo")]
+mod demo;
 mod recording;
 pub use recording::RecordingStatus;
 
@@ -355,6 +357,8 @@ const FLUSH_INTERVAL_MS: u64 = 33;
 // deterministic (alphabetical) order when a channel name exists in several.
 fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
     let mut cans: BTreeMap<String, Can> = BTreeMap::new();
+    // Demo builds never load vendor libraries or discover hardware.
+    if cfg!(feature = "demo") { return cans; }
 
     #[cfg(feature = "kvaser")]
     match KvaserBackend::new() {
