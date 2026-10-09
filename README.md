@@ -175,7 +175,11 @@ replace the AppImage in its existing folder (which must be writable) and restart
 Update `.deb` and `.rpm` installations through your package manager instead.
 The downloads page remains available as a manual fallback.
 
-The existing GitHub release workflow supplies the installers and AppImage.
+The GitHub release workflow publishes the installers, AppImage, Debian package,
+and screenshot only after both Linux and Windows builds succeed on a `v*` tag.
+Manual branch builds upload workflow artifacts without creating a release.
+Rerunning a failed platform retains successful platforms' artifacts from earlier
+attempts of the same run.
 Automatic installation requires GitHub's SHA-256 asset digest and a completed
 upload; releases without a digest can still be downloaded manually.
 
@@ -224,6 +228,6 @@ On Linux, install `xvfb xauth xdotool imagemagick`, then capture the native wind
 bash scripts/capture-screenshot.sh src-tauri/target/release/canvaz /tmp/canvaz-screenshot.png
 ```
 
-The release workflow builds the demo after uploading the normal packages, waits
-for the scene to render, and uploads the 1600×900 PNG as both a workflow artifact
-and a release asset. The demo binary is never packaged.
+The release workflow builds the demo after staging the normal packages, waits
+for the scene to render, and includes the 1600×900 PNG in the Linux workflow
+artifact and the release assets. The demo binary is never packaged.
