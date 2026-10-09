@@ -177,6 +177,7 @@ The downloads page remains available as a manual fallback.
 
 The GitHub release workflow publishes the installers, AppImage, Debian package,
 and screenshot only after both Linux and Windows builds succeed on a `v*` tag.
+After the release succeeds, it requests an update of the shared Rusty APT repository.
 Manual branch builds upload workflow artifacts without creating a release.
 For PR builds, add `build-linux` for Linux packages and the screenshot,
 `build-windows` for Windows installers, or `build` (or both platform labels) for

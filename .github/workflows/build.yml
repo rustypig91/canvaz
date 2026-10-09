@@ -199,13 +199,13 @@ jobs:
           fail_on_unmatched_files: true
           files: release-assets/**/*
 
-  # publish-apt:
-  #   needs: release
-  #   if: startsWith(github.ref, 'refs/tags/v')
-  #   runs-on: ubuntu-22.04
-  #   permissions: {}
-  #   steps:
-  #     - name: Request shared APT reconciliation
-  #       env:
-  #         GH_TOKEN: ${{ secrets.APT_PUBLISH_TOKEN }}
-  #       run: gh api --method POST repos/rustypig91/rusty-apt/actions/workflows/publish-apt.yml/dispatches -f ref=main
+  publish-apt:
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+      - name: Request shared APT reconciliation
+        env:
+          GH_TOKEN: ${{ secrets.APT_PUBLISH_TOKEN }}
+        run: gh api --method POST repos/rustypig91/rusty-apt/actions/workflows/publish-apt.yml/dispatches -f ref=main
