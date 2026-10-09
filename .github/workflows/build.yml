@@ -1,0 +1,211 @@
+name: "build"
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  verify-version:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'build') ||
+      contains(github.event.pull_request.labels.*.name, 'build-linux') ||
+      contains(github.event.pull_request.labels.*.name, 'build-windows')
+    permissions:
+      contents: read
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.platforms.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Select build platforms
+        id: platforms
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          labels = json.loads(os.environ["PR_LABELS"]) or []
+          all_platforms = os.environ["EVENT_NAME"] != "pull_request" or "build" in labels
+          platforms = []
+          if all_platforms or "build-linux" in labels:
+              platforms.append({"platform": "ubuntu-22.04", "args": ""})
+          if all_platforms or "build-windows" in labels:
+              platforms.append({"platform": "windows-latest", "args": ""})
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("matrix=" + json.dumps({"include": platforms}) + "\n")
+          PY
+      - name: Verify tag matches Cargo.toml version
+        # Only meaningful on tag builds; manual/branch runs have no version to check.
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          CARGO_VERSION="$(grep -m1 '^version *= *"' src-tauri/Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "Cargo.toml version: $CARGO_VERSION"
+          echo "Tag version:        $TAG_VERSION"
+          if [ "$CARGO_VERSION" != "$TAG_VERSION" ]; then
+            echo "::error::Release tag '$GITHUB_REF_NAME' does not match Cargo.toml version '$CARGO_VERSION'"
+            exit 1
+          fi
+
+  build:
+    needs: verify-version
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.verify-version.outputs.matrix) }}
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: install dependencies (ubuntu only)
+        if: matrix.platform == 'ubuntu-22.04' || matrix.platform == 'ubuntu-22.04-arm' # This must match the platform value defined above.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf xvfb xauth xdotool imagemagick
+
+      - name: setup node
+        uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: "npm" # Set this to npm, yarn or pnpm.
+
+      - name: install Rust stable
+        uses: dtolnay/rust-toolchain@stable # Set this to dtolnay/rust-toolchain@nightly
+        with:
+          # Those targets are only used on macos runners so it's in an `if` to slightly speed up windows and linux builds.
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "./src-tauri -> target"
+
+      - name: install frontend dependencies
+        # If you don't have `beforeBuildCommand` configured you may want to build your frontend here too.
+        run: npm install # change this to npm or pnpm depending on which one you use.
+
+      - uses: tauri-apps/tauri-action@v0
+        id: tauri
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # On a tag build, pin the in-app version to the tag so it isn't marked
+          # "-modified" when the CI build step dirties the working tree. Empty on
+          # non-tag builds, where build.rs falls back to `git describe`.
+          CANVAZ_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+        with:
+          args: ${{ matrix.args }}
+
+      - name: Stage release bundles with canonical filenames
+        shell: bash
+        env:
+          ARTIFACT_PATHS: ${{ steps.tauri.outputs.artifactPaths }}
+        run: |
+          set -euo pipefail
+          node <<'JS'
+          const fs = require('fs');
+          const path = require('path');
+          const artifacts = JSON.parse(process.env.ARTIFACT_PATHS);
+          if (!artifacts.length) throw new Error('No release bundles were produced');
+          fs.mkdirSync('release-assets', { recursive: true });
+          for (const artifact of artifacts) {
+            const original = path.basename(artifact);
+            // Preserve suffixes used by already-installed versions' updater.
+            const version = original.match(/\d+\.\d+\.\d+.*$/);
+            if (!version) throw new Error(`Missing version in bundle: ${original}`);
+            const name = original.startsWith('canvaz_') ? original : `canvaz_${version[0]}`;
+            console.log(`${original} -> ${name}`);
+            fs.copyFileSync(artifact, path.join('release-assets', name), fs.constants.COPYFILE_EXCL);
+          }
+          JS
+
+      - name: Prepare canonical Debian package
+        if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t packages < <(find src-tauri/target/release/bundle/deb -maxdepth 1 -name '*.deb')
+          test "${#packages[@]}" = 1
+          bash packaging/debian.sh "${packages[0]}"
+
+      - name: Stage canonical Debian package
+        if: startsWith(matrix.platform, 'ubuntu')
+        shell: bash
+        run: cp apt-assets/*.deb release-assets/
+
+      # Stage all installable packages before compiling the demo variant.
+      # Never bundle or distribute the demo binary.
+      - name: Build screenshot demo (ubuntu only)
+        if: matrix.platform == 'ubuntu-22.04'
+        env:
+          CANVAZ_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+        run: npm run tauri -- build --no-bundle --features demo
+
+      - name: Capture screenshot (ubuntu only)
+        if: matrix.platform == 'ubuntu-22.04'
+        run: bash scripts/capture-screenshot.sh src-tauri/target/release/canvaz screenshot/canvaz-screenshot.png
+
+      - name: Stage screenshot (ubuntu only)
+        if: matrix.platform == 'ubuntu-22.04'
+        shell: bash
+        run: cp screenshot/canvaz-screenshot.png release-assets/
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: canvaz-${{ matrix.platform }}-build-${{ github.run_id }}
+          # Retain successful platforms' artifacts when rerunning a failed job.
+          overwrite: true
+          if-no-files-found: error
+          path: release-assets/*
+
+  # Wait for both platform builds before creating or updating a release.
+  release:
+    needs: [verify-version, build]
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download Linux release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: canvaz-ubuntu-22.04-build-${{ github.run_id }}
+          path: release-assets
+
+      - name: Download Windows release assets
+        uses: actions/download-artifact@v8
+        with:
+          name: canvaz-windows-latest-build-${{ github.run_id }}
+          path: release-assets
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Rusty's Canvaz - CAN Analyzer ${{ github.ref_name }}"
+          body: "See the assets to download this version and install."
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: release-assets/**/*
+
+  publish-apt:
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions: {}
+    steps:
+      - name: Request shared APT reconciliation
+        env:
+          GH_TOKEN: ${{ secrets.APT_PUBLISH_TOKEN }}
+        run: gh api --method POST repos/rustypig91/rusty-apt/actions/workflows/publish-apt.yml/dispatches -f ref=main
