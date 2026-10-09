@@ -2,17 +2,46 @@ name: "release"
 
 on:
   workflow_dispatch:
+  pull_request:
+    types: [opened, reopened, synchronize, labeled, unlabeled]
   push:
     tags:
       - "v*"
 
 jobs:
   verify-version:
+    if: >-
+      github.event_name != 'pull_request' ||
+      contains(github.event.pull_request.labels.*.name, 'build') ||
+      contains(github.event.pull_request.labels.*.name, 'build-linux') ||
+      contains(github.event.pull_request.labels.*.name, 'build-windows')
     permissions:
       contents: read
     runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.platforms.outputs.matrix }}
     steps:
       - uses: actions/checkout@v7
+      - name: Select build platforms
+        id: platforms
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+
+          labels = json.loads(os.environ["PR_LABELS"]) or []
+          all_platforms = os.environ["EVENT_NAME"] != "pull_request" or "build" in labels
+          platforms = []
+          if all_platforms or "build-linux" in labels:
+              platforms.append({"platform": "ubuntu-22.04", "args": ""})
+          if all_platforms or "build-windows" in labels:
+              platforms.append({"platform": "windows-latest", "args": ""})
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("matrix=" + json.dumps({"include": platforms}) + "\n")
+          PY
       - name: Verify tag matches Cargo.toml version
         # Only meaningful on tag builds; manual/branch runs have no version to check.
         if: startsWith(github.ref, 'refs/tags/v')
@@ -32,18 +61,7 @@ jobs:
       contents: read
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          # - platform: 'macos-latest' # for Arm based macs (M1 and above).
-          #   args: '--target aarch64-apple-darwin'
-          # - platform: 'macos-latest' # for Intel based macs.
-          #   args: '--target x86_64-apple-darwin'
-          - platform: 'ubuntu-22.04'
-            args: ''
-          # - platform: 'ubuntu-22.04-arm' # Only available in public repos.
-          #   args: ''
-          - platform: "windows-latest"
-            args: ""
+      matrix: ${{ fromJSON(needs.verify-version.outputs.matrix) }}
 
     runs-on: ${{ matrix.platform }}
     steps:

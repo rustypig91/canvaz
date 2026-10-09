@@ -178,6 +178,10 @@ The downloads page remains available as a manual fallback.
 The GitHub release workflow publishes the installers, AppImage, Debian package,
 and screenshot only after both Linux and Windows builds succeed on a `v*` tag.
 Manual branch builds upload workflow artifacts without creating a release.
+For PR builds, add `build-linux` for Linux packages and the screenshot,
+`build-windows` for Windows installers, or `build` (or both platform labels) for
+both. Updating a labeled PR rebuilds the selected platforms; unlabeled PRs skip
+builds. Download the results from the workflow run's artifacts.
 Rerunning a failed platform retains successful platforms' artifacts from earlier
 attempts of the same run.
 Automatic installation requires GitHub's SHA-256 asset digest and a completed
