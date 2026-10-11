@@ -178,11 +178,12 @@ The downloads page remains available as a manual fallback.
 The GitHub release workflow publishes the installers, AppImage, Debian package,
 and screenshot only after both Linux and Windows builds succeed on a `v*` tag.
 After the release succeeds, it requests an update of the shared Rusty APT repository.
-Manual branch builds upload workflow artifacts without creating a release.
-For PR builds, add `build-linux` for Linux packages and the screenshot,
-`build-windows` for Windows installers, or `build` (or both platform labels) for
-both. Updating a labeled PR rebuilds the selected platforms; unlabeled PRs skip
-builds. Download the results from the workflow run's artifacts.
+Every pull request and push to `main` builds both Linux and Windows without
+build labels. Feature-branch pushes build through the pull-request event, avoiding
+duplicate builds. New PR commits cancel older runs for that PR; every `main` push,
+version-tag build, and manual run builds independently. Manual branch builds upload
+workflow artifacts without creating a release. Download the results from the
+workflow run's artifacts.
 Rerunning a failed platform retains successful platforms' artifacts from earlier
 attempts of the same run.
 Automatic installation requires GitHub's SHA-256 asset digest and a completed
