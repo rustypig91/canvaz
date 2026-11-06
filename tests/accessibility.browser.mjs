@@ -36,6 +36,7 @@ try {
                 if (command === "parse_dbc") return { nodes: ["ECU"], messages: { 123: { id: 123, key: 123, name: "Engine", transmitter: "ECU", length: 8, signals: [signal] } } };
                 if (["get_logs", "get_signal_history", "get_frames", "get_bus_stats"].includes(command)) return [];
                 if (command === "get_version") return "dev";
+                if (command === "update_channel") return "github";
                 if (command === "get_app_data_dir") return "/mock";
                 if (command === "read_text_file" || command === "load_project") throw new Error("No saved data");
                 return null;

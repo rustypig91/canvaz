@@ -9,6 +9,48 @@ use std::{
 use tauri::{Emitter, Manager};
 const REPO: &str = "rustypig91/canvaz";
 const MAX_DOWNLOAD: u64 = 512 * 1024 * 1024;
+const STORE_UPDATES_MESSAGE: &str = "Microsoft Store manages updates for this edition. Use Microsoft Store to check for updates.";
+
+#[tauri::command]
+pub fn update_channel() -> &'static str {
+    if cfg!(feature = "demo") {
+        "disabled"
+    } else if cfg!(feature = "microsoft-store") {
+        "microsoft-store"
+    } else {
+        "github"
+    }
+}
+
+fn require_github_updates() -> Result<(), String> {
+    if cfg!(feature = "microsoft-store") {
+        return Err(STORE_UPDATES_MESSAGE.into());
+    }
+    if cfg!(feature = "demo") {
+        return Err("Updates are unavailable in this build.".into());
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn open_store_updates<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
+    if update_channel() != "microsoft-store" {
+        return Err("Microsoft Store updates are only available in the Store edition.".into());
+    }
+    #[cfg(windows)]
+    {
+        use tauri_plugin_opener::OpenerExt;
+        // Fixed destination: no frontend URL or broad custom-protocol permission.
+        app.opener()
+            .open_url("ms-windows-store://downloadsandupdates", None::<&str>)
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = app;
+        Err("Open Microsoft Store on Windows to check for updates.".into())
+    }
+}
 #[derive(Default)]
 pub struct UpdateState(Mutex<Option<Prepared>>);
 struct Prepared {
@@ -39,7 +81,7 @@ fn destination() -> Result<PathBuf, String> {
 }
 #[tauri::command]
 pub fn update_support() -> Result<(), String> {
-    if cfg!(feature = "demo") { return Err("Updates are unavailable in this build.".into()); }
+    require_github_updates()?;
     if std::env::consts::ARCH != "x86_64" {
         return Err("Automatic updates are not available for this architecture.".into());
     }
@@ -97,8 +139,8 @@ fn select_asset_for_platform(json: &serde_json::Value, version: &str, nsis: bool
 }
 
 #[tauri::command]
-pub async fn download_update(app: tauri::AppHandle, version: String) -> Result<(), String> {
-    if cfg!(feature = "demo") { return Err("Updates are unavailable in this build.".into()); }
+pub async fn download_update<R: tauri::Runtime>(app: tauri::AppHandle<R>, version: String) -> Result<(), String> {
+    require_github_updates()?;
     tauri::async_runtime::spawn_blocking(move || {
         let state = app.state::<UpdateState>();
         let mut pending = state.0.try_lock().map_err(|_| "An update is already in progress")?;
@@ -156,8 +198,8 @@ pub async fn download_update(app: tauri::AppHandle, version: String) -> Result<(
 }
 
 #[tauri::command]
-pub async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
-    if cfg!(feature = "demo") { return Err("Updates are unavailable in this build.".into()); }
+pub async fn install_update<R: tauri::Runtime>(app: tauri::AppHandle<R>) -> Result<(), String> {
+    require_github_updates()?;
     tauri::async_runtime::spawn_blocking(move || {
         let prepared = app
             .state::<UpdateState>()
@@ -312,6 +354,37 @@ fn copy_verified(mut reader: impl Read, mut writer: impl Write, asset: &Asset, m
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_channel_follows_the_compiled_edition() {
+        let expected = if cfg!(feature = "demo") {
+            "disabled"
+        } else if cfg!(feature = "microsoft-store") {
+            "microsoft-store"
+        } else {
+            "github"
+        };
+        assert_eq!(update_channel(), expected);
+        assert_eq!(require_github_updates().is_ok(), expected == "github");
+    }
+
+    #[cfg(any(feature = "microsoft-store", feature = "demo"))]
+    #[test]
+    fn blocked_editions_reject_update_commands_before_accessing_installer_state() {
+        // Deliberately omit UpdateState: rejection must precede state access,
+        // HTTP requests, downloads, installer helpers, and application exit.
+        let app = tauri::test::mock_app();
+        let expected = require_github_updates().unwrap_err();
+        assert_eq!(update_support().unwrap_err(), expected);
+        assert_eq!(
+            tauri::async_runtime::block_on(download_update(app.handle().clone(), String::new())).unwrap_err(),
+            expected
+        );
+        assert_eq!(
+            tauri::async_runtime::block_on(install_update(app.handle().clone())).unwrap_err(),
+            expected
+        );
+    }
 
     #[cfg(unix)]
     #[test]

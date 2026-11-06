@@ -6,6 +6,7 @@ mod app_state;
 mod can_communication;
 mod can_manager;
 mod dbc_parser;
+mod distribution;
 mod j1939;
 #[cfg(target_os = "linux")]
 mod linux_environment;
@@ -404,13 +405,13 @@ fn get_app_data_dir(state: State<'_, TauriState>) -> Result<String, String> {
     #[cfg(feature = "demo")]
     { Ok(state.demo_dir.path().to_string_lossy().into_owned()) }
     #[cfg(not(feature = "demo"))]
-    state
-        .app_state
-        .app
-        .path()
-        .app_data_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .map_err(|e| e.to_string())
+    {
+        let path = state.app_state.app.path().app_data_dir().map_err(|e| e.to_string())?;
+        // A fresh edition must be able to save preferences before its first
+        // project/session save creates the directory (notably on Windows).
+        std::fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+        Ok(path.to_string_lossy().into_owned())
+    }
 }
 
 #[tauri::command]
@@ -591,6 +592,8 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            updater::update_channel,
+            updater::open_store_updates,
             updater::update_support,
             updater::download_update,
             updater::install_update,
@@ -636,7 +639,7 @@ pub fn run() {
             load_project,
             system_resources,
         ])
-        .build(tauri::generate_context!())
+        .build(distribution::context())
         .expect("error while building tauri application")
         .run(|app, event| {
             if matches!(event, tauri::RunEvent::Exit) {

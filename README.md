@@ -2,6 +2,10 @@
 
 Rusty's Canvaz is the CAN analyzer in the Rusty's toolchain family, alongside Rusty's Pigtail - Serial Terminal. View, decode, plot, and simulate CAN bus traffic using DBC files.
 
+Read the [privacy policy](docs/site/privacy/index.html). Maintainers can find
+[publication instructions](docs/privacy-policy.md) for the public policy page.
+Store builds use [separate settings and session data](docs/store-data.md).
+
 ## Features
 
 - **Trace** — live frame table with filtering by channel, CAN ID, message name, DLC, direction, cycle time, and data bytes
@@ -57,6 +61,9 @@ npm install
 npm run tauri dev      # development
 npm run tauri build    # production
 ```
+
+For Microsoft Store packages, use the dedicated
+[Windows MSIX builder and workflow](docs/store-packaging.md#dedicated-windows-build).
 
 ### Linux startup from a Snap IDE
 
@@ -158,6 +165,10 @@ package manager.
 - CAN decoding: custom DBC parser + signal codec, J1939 ID decoding and TP reassembly in `src-tauri/src/j1939.rs`
 
 ## Updates
+
+The Microsoft Store edition receives updates through Microsoft Store. Its
+**About → Microsoft Store updates…** action opens an explanation and a button
+to open Microsoft Store. It does not use the GitHub updater described below.
 
 For Windows, use the `-setup.exe` installer and choose **Only me (recommended)**,
 even if you started setup as administrator. **All users** remains available for

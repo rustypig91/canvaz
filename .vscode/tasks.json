@@ -4,6 +4,42 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "tauri:dev (Linux Snap environment)",
+      "detail": "Launch Canvaz using host GNOME settings when VS Code is installed through Snap.",
+      "type": "process",
+      "command": "/bin/bash",
+      "args": [
+        "-c",
+        "env -u GSETTINGS_SCHEMA_DIR XDG_DATA_DIRS=\"${XDG_DATA_DIRS_VSCODE_SNAP_ORIG:-/usr/local/share:/usr/share}\" npm run tauri dev"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "tauri:run (Linux Snap environment)",
+      "detail": "Build and run the release app using host GNOME settings, without creating installers.",
+      "type": "process",
+      "command": "/bin/bash",
+      "args": [
+        "-c",
+        "npm run tauri -- build --no-bundle && exec env -u GSETTINGS_SCHEMA_DIR XDG_DATA_DIRS=\"${XDG_DATA_DIRS_VSCODE_SNAP_ORIG:-/usr/local/share:/usr/share}\" ./src-tauri/target/release/canvaz"
+      ],
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": [],
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
       "label": "ui:dev",
       "type": "shell",
       // `dev` keeps running in the background

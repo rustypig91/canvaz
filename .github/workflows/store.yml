@@ -1,0 +1,100 @@
+name: Microsoft Store MSIX
+
+on:
+  workflow_dispatch:
+    inputs:
+      package_version:
+        description: Optional Store package version override (major.minor.build.0)
+        required: false
+        type: string
+  pull_request:
+    paths:
+      - 'src/**'
+      - 'src-tauri/**'
+      - 'public/**'
+      - 'index.html'
+      - 'package*.json'
+      - 'tsconfig.json'
+      - 'vite.config.ts'
+      - 'packaging/windows/**'
+      - 'scripts/build-msix.py'
+      - 'scripts/prepare-store-manifest.py'
+      - 'scripts/generate-store-images.py'
+      - 'scripts/tests/test_build_msix.py'
+      - 'tests/**'
+      - '.github/workflows/store.yml'
+      - 'LICENSE'
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: store-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  package:
+    runs-on: windows-latest
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/src-tauri/target/store
+      CANVAZ_VERSION: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: lts/*
+          cache: npm
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: './src-tauri -> target/store'
+          key: microsoft-store
+      - uses: actions/cache@v5
+        with:
+          path: src-tauri/target/store-downloads
+          key: webview2-x64-${{ hashFiles('packaging/windows/msix/webview2-runtime.json') }}
+      - name: Install locked frontend dependencies
+        run: npm ci
+      - name: Test frontend update channels and regressions
+        run: npm test
+      - name: Test MSIX build orchestration
+        run: python -m unittest discover -s scripts/tests -p test_build_msix.py -v
+      - name: Verify Store identity
+        run: python scripts/prepare-store-manifest.py --check
+      - name: Verify release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          $metadata = cargo metadata --manifest-path src-tauri/Cargo.toml --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { throw 'cargo metadata failed' }
+          $version = (($metadata | ConvertFrom-Json).packages | Where-Object name -eq 'canvaz').version
+          if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Tag does not match application version $version" }
+      - name: Build unsigned MSIX for Partner Center
+        env:
+          STORE_PACKAGE_VERSION: ${{ inputs.package_version }}
+        run: |
+          $storeBuildArgs = @('--skip-dependency-install')
+          if ($env:STORE_PACKAGE_VERSION) { $storeBuildArgs += @('--package-version', $env:STORE_PACKAGE_VERSION) }
+          python scripts/build-msix.py @storeBuildArgs
+      - name: Test Store edition
+        run: cargo test --manifest-path src-tauri/Cargo.toml --features microsoft-store --locked
+      - name: Upload Store submission artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: canvaz-store-msix-${{ github.run_id }}
+          overwrite: true
+          if-no-files-found: error
+          path: |
+            src-tauri/target/release-assets/store/*.msix
+            src-tauri/target/release-assets/store/*.sha256
+            src-tauri/target/release-assets/store/*.build-info.json
