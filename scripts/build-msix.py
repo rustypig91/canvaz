@@ -27,7 +27,10 @@ RUNTIME_FOLDER = "WebView2"
 def run(arguments, env, capture=False):
     result = subprocess.run(
         [str(arg) for arg in arguments], cwd=ROOT, env=env, check=True,
-        stdout=subprocess.PIPE if capture else None, text=capture,
+        stdout=subprocess.PIPE if capture else None,
+        # Cargo's JSON is UTF-8 even when Windows uses a legacy code page.
+        # Leave inherited console output alone for SDK tools and build logs.
+        encoding="utf-8" if capture else None,
     )
     return result.stdout if capture else None
 

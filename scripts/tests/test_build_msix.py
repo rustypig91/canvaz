@@ -10,6 +10,7 @@ from pathlib import Path
 import shutil
 import struct
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -163,6 +164,17 @@ class PackagingTests(unittest.TestCase):
 
 
 class DependencyTests(unittest.TestCase):
+    def test_captured_cargo_json_uses_utf8_instead_of_the_windows_code_page(self):
+        metadata = {"description": "Metadata with Unicode: \u0101 \u65e5\u672c\u8a9e"}
+        payload = json.dumps(metadata, ensure_ascii=False).encode("utf-8")
+        with patch.object(builder.subprocess, "run", wraps=subprocess.run) as command:
+            captured = builder.run(
+                [sys.executable, "-c", f"import sys; sys.stdout.buffer.write({payload!r})"],
+                dict(os.environ), capture=True,
+            )
+        self.assertEqual(json.loads(captured), metadata)
+        self.assertEqual(command.call_args.kwargs["encoding"], "utf-8")
+
     def test_flags_preserve_encoded_precedence_and_do_not_mutate_environment(self):
         for encoded, plain, expected in [
             (None, "  --cfg=plain \t -C debuginfo=0 ", "--cfg=plain\x1f-C\x1fdebuginfo=0\x1f"),
