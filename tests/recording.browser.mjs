@@ -32,6 +32,7 @@ try {
                 if (command === "plugin:dialog|save") { window.recordingSaveOpened = true; return null; }
                 if (["get_logs", "get_signal_history", "get_frames", "get_bus_stats"].includes(command)) return [];
                 if (command === "get_version") return "dev";
+                if (command === "update_channel") return "github";
                 if (command === "get_app_data_dir") return "/mock";
                 if (command === "read_text_file" || command === "load_project") throw new Error("No saved data");
                 return null;

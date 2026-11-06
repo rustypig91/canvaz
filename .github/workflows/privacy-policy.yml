@@ -1,0 +1,56 @@
+name: Publish privacy policy
+
+on:
+  # Releases created with GITHUB_TOKEN do not trigger another release workflow.
+  # The build workflow calls this explicitly after publishing the release.
+  workflow_call:
+  # Publish the first policy or a policy-only change without releasing the app.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    outputs:
+      artifact_name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Upload policy site
+        uses: actions/upload-pages-artifact@v4
+        with:
+          # Full reruns get a new name; deploy-only retries reuse the build output.
+          name: github-pages-${{ github.run_id }}-${{ github.run_attempt }}
+          path: docs/site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.policy.outputs.url }}
+    steps:
+      - name: Configure GitHub Pages
+        id: pages
+        uses: actions/configure-pages@v5
+      - name: Deploy policy site
+        uses: actions/deploy-pages@v4
+        with:
+          artifact_name: ${{ needs.build.outputs.artifact_name }}
+      - name: Report privacy policy URL
+        id: policy
+        env:
+          PAGE_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          echo "url=${PAGE_URL%/}/privacy/" >> "$GITHUB_OUTPUT"
+          echo "Privacy policy URL — ${PAGE_URL%/}/privacy/" >> "$GITHUB_STEP_SUMMARY"

@@ -31,6 +31,9 @@ tempfile = "3"
 url = "2"
 percent-encoding = "2"
 
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+
 # Platform defaults: on each target these crates are non-optional, and the
 # backend cfg() gates accept target_os = "linux" as well, so a plain build gets
 # Kvaser + PCAN everywhere (default features) and SocketCAN on Linux without
@@ -46,6 +49,8 @@ socketcan = { version = "3" }
 default = ["kvaser", "pcan"]
 # Hardware-free screenshot scene; never enabled for distributed bundles.
 demo = []
+# Isolate Store settings, session restore, and the embedded webview profile.
+microsoft-store = []
 kvaser = ["dep:libloading"]
 pcan = ["dep:libloading"]
 linux-can = ["dep:socketcan"]
