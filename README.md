@@ -189,10 +189,11 @@ The downloads page remains available as a manual fallback.
 The GitHub release workflow (`.github/workflows/release.yml`) publishes the
 installers, AppImage, Debian package, and screenshot on a `v*` tag only after the
 Linux, Windows, and Microsoft Store builds and website deployment all succeed.
-The `store-submission.zip` release asset archives the unsigned MSIX, checksum,
-build metadata, Store listing artwork, package icons, demo screenshot, and
-submission instructions. It is for Partner Center submission; use the EXE/MSI
-assets for direct Windows installation.
+Every successful Store workflow run uploads `store-submission.zip` in the
+`canvaz-store-submission-<run-id>` artifact. The release workflow attaches the
+same ZIP, containing the unsigned MSIX, checksum, build metadata, Store listing
+artwork, package icons, and submission instructions. It is for Partner Center
+submission; use the EXE/MSI assets for direct Windows installation.
 After the release succeeds, it requests an update of the shared Rusty APT repository.
 Every pull request and push to `main` builds both Linux and Windows without
 build labels. Feature-branch pushes build through the pull-request event, avoiding

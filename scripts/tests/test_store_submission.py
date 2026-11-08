@@ -104,6 +104,15 @@ class SubmissionArchiveTests(unittest.TestCase):
             self.create_archive()
         self.assertFalse(self.output.exists())
 
+    def test_store_archive_does_not_require_a_screenshot(self):
+        self.screenshot.unlink()
+        submission.create_archive(self.packages, None, self.output)
+        with zipfile.ZipFile(self.output) as archive:
+            self.assertIsNone(archive.testzip())
+            self.assertIn(f'package/{self.package.name}', archive.namelist())
+            self.assertIn('packaging/windows/store-listing/canvaz-app-tile-300x300.png', archive.namelist())
+            self.assertFalse(any(name.startswith('screenshots/') for name in archive.namelist()))
+
     def test_missing_artwork_fails_without_creating_archive(self):
         with self.assertRaisesRegex(ValueError, 'Missing Store artwork'):
             submission.create_archive(self.packages, self.screenshot, self.output, root=self.root)

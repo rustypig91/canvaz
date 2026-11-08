@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Archive a built Store package and its listing materials for a GitHub release."""
+"""Archive a built Store package and its listing materials for submission."""
 
 import argparse
 import hashlib
@@ -30,9 +30,10 @@ def create_archive(package_directory, screenshot, output, root=ROOT):
         'README.md': root / 'packaging/windows/store-submission-README.md',
         'APPLICATION.md': root / 'README.md',
         'LICENSE': root / 'LICENSE',
-        'screenshots/canvaz-linux-demo.png': screenshot,
         **{f'package/{file.name}': file for file in (package, checksum, metadata)},
     }
+    if screenshot is not None:
+        files['screenshots/canvaz-linux-demo.png'] = screenshot
     for relative in (
         'packaging/windows/README.md',
         'packaging/windows/msix/store-identity.json',
@@ -69,7 +70,7 @@ def create_archive(package_directory, screenshot, output, root=ROOT):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--package-directory', type=Path, required=True)
-    parser.add_argument('--screenshot', type=Path, required=True)
+    parser.add_argument('--screenshot', type=Path, help='Optional Linux demo screenshot for reference')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     print(create_archive(args.package_directory, args.screenshot, args.output))

@@ -90,6 +90,11 @@ jobs:
           python scripts/build-msix.py @storeBuildArgs
       - name: Test Store edition
         run: cargo test --manifest-path src-tauri/Cargo.toml --features microsoft-store --locked
+      - name: Archive Store submission materials
+        run: >-
+          python scripts/package-store-submission.py
+          --package-directory src-tauri/target/release-assets/store
+          --output src-tauri/target/release-assets/store-submission.zip
       - name: Upload Store submission artifacts
         uses: actions/upload-artifact@v7
         with:
@@ -100,3 +105,10 @@ jobs:
             src-tauri/target/release-assets/store/*.msix
             src-tauri/target/release-assets/store/*.sha256
             src-tauri/target/release-assets/store/*.build-info.json
+      - name: Upload Store submission archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: canvaz-store-submission-${{ github.run_id }}
+          overwrite: true
+          if-no-files-found: error
+          path: src-tauri/target/release-assets/store-submission.zip

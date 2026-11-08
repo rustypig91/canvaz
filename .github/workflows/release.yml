@@ -52,17 +52,6 @@ jobs:
       contents: write
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: '3.14'
-
-      - name: Test Store submission archive
-        run: python -m unittest discover -s scripts/tests -p test_store_submission.py -v
-
       - name: Download Linux release assets
         uses: actions/download-artifact@v8
         with:
@@ -75,18 +64,11 @@ jobs:
           name: canvaz-windows-latest-build-${{ github.run_id }}
           path: release-assets
 
-      - name: Download Store submission package
+      - name: Download Store submission archive
         uses: actions/download-artifact@v8
         with:
-          name: canvaz-store-msix-${{ github.run_id }}
-          path: store-package
-
-      - name: Archive Store submission materials
-        run: |
-          python scripts/package-store-submission.py \
-            --package-directory store-package \
-            --screenshot release-assets/canvaz-screenshot.png \
-            --output release-assets/store-submission.zip
+          name: canvaz-store-submission-${{ github.run_id }}
+          path: release-assets
 
       - name: Release
         uses: softprops/action-gh-release@v2

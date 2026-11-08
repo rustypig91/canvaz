@@ -177,14 +177,18 @@ dispatch. The release workflow calls it for `v*` tags. Only superseded PR runs
 are cancelled. It tests the frontend, packaging orchestration, identity, and
 Store-feature Rust code, then
 uploads `canvaz-store-msix-<run-id>` with the MSIX, checksum, and build metadata.
-Artifact replacement supports reruns. Download this artifact for submission.
-The release workflow also packages these files in `store-submission.zip` alongside
-all checked-in listing artwork and package icons, the Linux demo screenshot,
+Every successful Store run also creates `store-submission.zip` and uploads it
+as `canvaz-store-submission-<run-id>`, including PR, `main`, and manual runs.
+Artifact replacement supports reruns. The ZIP contains the package files,
+all checked-in listing artwork and package icons,
 identity/manifest references, license, privacy policy, and submission instructions.
 It verifies that the MSIX matches its checksum and build metadata before creating
-the archive. Missing package files, artwork directories, or screenshot block
-release creation. The archive is a maintainer bundle; upload the contained MSIX
-to Partner Center. CI does not submit to Partner Center automatically.
+the archive. Missing package files or artwork directories fail the Store job and
+block releases. The release workflow downloads this finished archive and attaches
+it without repackaging. The Linux demo screenshot remains a separate release
+asset; prepare Windows Store edition screenshots for submission. The archive
+is a maintainer bundle; upload the contained MSIX to Partner Center. CI does not
+submit to Partner Center automatically.
 
 Tag builds require the tag to match the Cargo application version. The separate
 Store package version still comes from `store-identity.json`; manual dispatch

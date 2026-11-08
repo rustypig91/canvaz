@@ -1,6 +1,7 @@
 # Canvaz Microsoft Store submission materials
 
 This archive is for the maintainer submitting Canvaz in Partner Center.
+Every successful Store workflow run produces it, including PR and manual builds.
 The MSIX is unsigned; Microsoft signs it during Store publication. Use the
 EXE/MSI release assets for direct installation.
 
@@ -13,14 +14,17 @@ EXE/MSI release assets for direct installation.
 - `packaging/windows/msix/Assets/`: all six package icons, including 200% scale
   variants. These are already embedded in the MSIX; separate listing images
   belong in the Store listing fields.
-- `screenshots/canvaz-linux-demo.png`: the automated 1600 x 900 Linux demo
-  screenshot from the same release build. Review it as a reference and capture
-  Windows Store edition screenshots for the final listing.
 - `packaging/windows/msix/store-identity.json` and `AppxManifest.xml.in`:
   package identity and manifest template for reference.
 - `APPLICATION.md`, `docs/`, `packaging/windows/README.md`, and `LICENSE`:
   application overview, Store packaging/data behavior, privacy policy, artwork
   dimensions, and license.
+
+The Store workflow does not capture screenshots. Prepare Windows Store edition
+screenshots for the final listing. The Linux demo screenshot is a separate
+GitHub release asset; local archives made with the helper's optional
+`--screenshot` argument include it as `screenshots/canvaz-linux-demo.png` for
+reference.
 
 ## Submit in Partner Center
 
