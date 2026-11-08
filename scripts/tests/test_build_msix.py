@@ -11,6 +11,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from unittest.mock import patch
 
@@ -37,11 +38,9 @@ class PackagingTests(unittest.TestCase):
         (self.root / "scripts").mkdir()
         shutil.copy2(ROOT / "scripts/prepare-store-manifest.py", self.root / "scripts")
         shutil.copytree(ROOT / "packaging/windows/msix", self.root / "packaging/windows/msix")
-        # Keep the fixture version stable when the real Store version advances.
-        identity_path = self.root / "packaging/windows/msix/store-identity.json"
-        identity = json.loads(identity_path.read_text())
-        identity["packageVersion"] = "1.0.0.0"
-        identity_path.write_text(json.dumps(identity))
+        # Keep the fixture version stable when the real application advances.
+        (self.root / "src-tauri").mkdir()
+        self.set_application_version("1.0.0")
         (self.root / "LICENSE").write_text("license fixture")
         # Deliberately leave a stale direct-download executable outside Store.
         pe_file(self.root / "src-tauri/target/release/canvaz.exe", 0x14C)
@@ -49,7 +48,10 @@ class PackagingTests(unittest.TestCase):
         self.fail = None
         self.demo = False
         self.custom_protocol = True
-        self.package_args = argparse.Namespace(package_version=None, output_directory="output with spaces", skip_dependency_install=False)
+        self.package_args = argparse.Namespace(output_directory="output with spaces", skip_dependency_install=False)
+
+    def set_application_version(self, version):
+        (self.root / "src-tauri/Cargo.toml").write_text(f'[package]\nname = "canvaz"\nversion = "{version}"\n')
 
     def tearDown(self):
         self.temp.cleanup()
@@ -68,7 +70,7 @@ class PackagingTests(unittest.TestCase):
         elif args[:2] == ["cargo", "metadata"]:
             self.assertTrue(capture)
             return json.dumps({
-                "packages": [{"id": "app", "name": "canvaz", "version": "0.6.4"}, {"id": "tauri", "name": "tauri"}],
+                "packages": [{"id": "app", "name": "canvaz", "version": tomllib.loads((self.root / "src-tauri/Cargo.toml").read_text())["package"]["version"]}, {"id": "tauri", "name": "tauri"}],
                 "resolve": {"root": "app", "nodes": [
                     {"id": "app", "features": ["microsoft-store", "kvaser", "pcan"] + (["demo"] if self.demo else [])},
                     {"id": "tauri", "features": ["custom-protocol"] if self.custom_protocol else []},
@@ -88,6 +90,9 @@ class PackagingTests(unittest.TestCase):
             })
             self.assertTrue((stage / "Assets/Square44x44Logo.scale-200.png").is_file())
             self.assertTrue((stage / "resources.pri").is_file())
+            manifest = builder.ET.parse(stage / "AppxManifest.xml")
+            version = tomllib.loads((self.root / "src-tauri/Cargo.toml").read_text())["package"]["version"]
+            self.assertEqual(manifest.getroot().find("{*}Identity").get("Version"), f"{version}.0")
             self.assertNotIn("/nv", args)  # Never disable MakeAppx validation.
             if self.fail:
                 raise subprocess.CalledProcessError(1, args)
@@ -107,7 +112,7 @@ class PackagingTests(unittest.TestCase):
         package = output / "canvaz-store-1.0.0.0-x64.msix"
         self.assertEqual(package.read_bytes(), b"MSIX fixture")
         info = json.loads((output / f"{package.name}.build-info.json").read_text())
-        self.assertEqual(info["applicationVersion"], "0.6.4")
+        self.assertEqual(info["applicationVersion"], "1.0.0")
         self.assertEqual(info["packageVersion"], "1.0.0.0")
         self.assertEqual(info["storeId"], "9P3PGB2ZZ67L")
         self.assertEqual(info["webview2"], {"mode": "evergreen"})
@@ -142,13 +147,24 @@ class PackagingTests(unittest.TestCase):
         self.assertFalse(any(call[:2] == ["MakeAppx.exe", "pack"] for call in self.calls))
         self.assertFalse((self.root / self.package_args.output_directory).exists())
 
-    def test_explicit_version_and_dependency_install_skip(self):
-        self.package_args.package_version = "1.0.2.0"
+    def test_dependency_install_skip(self):
         self.package_args.skip_dependency_install = True
         self.build()
         self.assertNotIn(["npm.cmd", "ci"], self.calls)
         self.assertIn(["npm.cmd", "run", "build"], self.calls)
-        self.assertTrue((self.root / self.package_args.output_directory / "canvaz-store-1.0.2.0-x64.msix").is_file())
+        self.assertTrue((self.root / self.package_args.output_directory / "canvaz-store-1.0.0.0-x64.msix").is_file())
+
+    def test_store_version_follows_application_version(self):
+        for version in ("1.1.0", "1.1.2", "2.0.0", "65535.65535.65535"):
+            with self.subTest(version=version):
+                self.set_application_version(version)
+                self.build()
+                output = self.root / self.package_args.output_directory
+                package = output / f"canvaz-store-{version}.0-x64.msix"
+                self.assertTrue(package.is_file())
+                info = json.loads((output / f"{package.name}.build-info.json").read_text())
+                self.assertEqual(info["applicationVersion"], version)
+                self.assertEqual(info["packageVersion"], f"{version}.0")
 
     def test_windows_utf8_bom_metadata_is_supported(self):
         # Windows PowerShell's Set-Content -Encoding UTF8 writes a BOM. The
@@ -164,9 +180,11 @@ class PackagingTests(unittest.TestCase):
         self.assertFalse(any(call[:2] == ["MakeAppx.exe", "pack"] for call in self.calls))
 
     def test_invalid_version_stops_before_external_tools(self):
-        self.package_args.package_version = "0.6.4.0"
-        with self.assertRaisesRegex(ValueError, "nonzero major"):
-            self.build()
+        for version in ("0.6.5", "65536.0.0", "1.65536.0", "1.0.65536", "1.0.0-beta.1", "1.0.0+build", "1.0", "1.0.0.0", "01.0.0"):
+            with self.subTest(version=version):
+                self.set_application_version(version)
+                with self.assertRaises(ValueError):
+                    self.build()
         self.assertFalse(self.calls)
 
 

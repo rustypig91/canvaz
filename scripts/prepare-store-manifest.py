@@ -5,6 +5,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+import tomllib
 import xml.etree.ElementTree as ET
 
 
@@ -34,23 +35,25 @@ def required_text(identity, key):
 
 
 def package_version(value):
-    if not isinstance(value, str) or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+\.0", value):
-        raise ValueError("Package version must be numeric major.minor.build.0 (fourth component reserved for Store).")
+    if not isinstance(value, str) or not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", value):
+        raise ValueError("Application version must be numeric major.minor.patch for Store packaging.")
     parts = [int(part) for part in value.split(".")]
     if parts[0] == 0 or any(part > 65535 for part in parts):
         raise ValueError("Package version requires a nonzero major and components at most 65535.")
-    return value
+    return f"{value}.0"
 
 
-def prepare(identity, version_override=None):
+def prepare(identity):
     if not isinstance(identity, dict):
         raise ValueError("Store identity must be a JSON object.")
+    with (ROOT / "src-tauri/Cargo.toml").open("rb") as source:
+        version = tomllib.load(source)["package"]["version"]
     replacements = {
         "@IDENTITY_NAME@": required_text(identity, "name"),
         "@PUBLISHER@": required_text(identity, "publisher"),
         "@PUBLISHER_DISPLAY_NAME@": required_text(identity, "publisherDisplayName"),
         "@DISPLAY_NAME@": required_text(identity, "displayName"),
-        "@VERSION@": package_version(version_override if version_override is not None else identity.get("packageVersion")),
+        "@VERSION@": package_version(version),
     }
     tree = ET.parse(MSIX / "AppxManifest.xml.in")
     # Assign XML values rather than interpolating strings: reserved names and
@@ -69,14 +72,13 @@ def prepare(identity, version_override=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--identity", type=Path, default=MSIX / "store-identity.json")
-    parser.add_argument("--package-version", help="Override the explicit Store package version")
     operation = parser.add_mutually_exclusive_group(required=True)
     operation.add_argument("--check", action="store_true", help="Validate inputs without writing a manifest")
     operation.add_argument("--output", type=Path, help="Write AppxManifest.xml to a package staging directory")
     args = parser.parse_args()
     try:
         identity = json.loads(args.identity.read_text(encoding="utf-8-sig"))
-        tree = prepare(identity, args.package_version)
+        tree = prepare(identity)
         if args.output:
             for prefix, namespace in NAMESPACES.items():
                 ET.register_namespace(prefix, namespace)
@@ -85,7 +87,7 @@ def main():
             print(args.output)
         else:
             print("Identity fields and package version are populated; manifest XML parses.")
-    except (OSError, ValueError, ET.ParseError) as error:
+    except (OSError, ValueError, KeyError, ET.ParseError) as error:
         parser.error(str(error))
 
 

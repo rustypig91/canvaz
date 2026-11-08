@@ -71,17 +71,18 @@ doing so would change [the Store edition's existing data locations](store-data.m
 
 ## Package version
 
-Start the Store package at **1.0.0.0**, maintained explicitly as `packageVersion`
-in the identity JSON. The application remains version **0.6.5**; this work does
-not bump the app or rename its release tag. Store package versioning is separate
-because the first component cannot be zero and the fourth is reserved for Store
-use and must be zero. Each component is at most 65535.
+The application version in `src-tauri/Cargo.toml` is the single source for all
+release versions. The Store manifest and package filename use that version with
+an appended `.0`: **1.0.0 → 1.0.0.0**, **1.1.0 → 1.1.0.0**, and
+**1.1.2 → 1.1.2.0**. The current application version is **1.0.0**.
+There is no separate version in the identity JSON or command-line override.
 
-Increase the package version for each new Store package intended to upgrade
-installed copies, including packaging-only revisions. Do not derive it blindly
-from the current `0.x` Cargo version. A command-line override is available when
-preparing a new packaging revision; it does not change the app's displayed
-version. Keep a record of the version submitted to Partner Center.
+Store packaging requires a numeric `major.minor.patch` application version with
+a nonzero major and each component at most 65535. Prerelease and build suffixes
+are rejected. The fourth component is reserved for Store use and remains zero.
+Increase the application version for every Store update, including packaging-only
+revisions, so installed copies can upgrade. Use the matching `v<version>` release
+tag and keep a record of the version submitted to Partner Center.
 
 ## Validate and prepare the manifest
 
@@ -90,11 +91,9 @@ With the supplied identity configured, run from the repository root:
 ```sh
 python3 scripts/prepare-store-manifest.py --check
 python3 scripts/prepare-store-manifest.py --output src-tauri/target/store/layout/AppxManifest.xml
-# Example packaging-only revision:
-python3 scripts/prepare-store-manifest.py --package-version 1.0.1.0 --output src-tauri/target/store/layout/AppxManifest.xml
 ```
 
-The script uses only Python's standard library and works from any working
+The script requires Python 3.11+, uses only its standard library, and works from any working
 directory. It checks required identity values, rejects template placeholders,
 enforces the Store version format, and escapes XML values. It cannot verify
 name availability, account ownership, or whether the values match Partner Center.
@@ -111,8 +110,8 @@ From the repository root in PowerShell:
 py -3 scripts/build-msix.py
 # Reuse node_modules, but always rebuild the frontend and Rust executable:
 py -3 scripts/build-msix.py --skip-dependency-install
-# Packaging-only revision or alternate output directory:
-py -3 scripts/build-msix.py --package-version 1.0.1.0 --output-directory release-assets/store
+# Alternate output directory:
+py -3 scripts/build-msix.py --output-directory release-assets/store
 ```
 
 The script uses `src-tauri/target/store` independently of direct-download/demo
@@ -190,9 +189,9 @@ asset; prepare Windows Store edition screenshots for submission. The archive
 is a maintainer bundle; upload the contained MSIX to Partner Center. CI does not
 submit to Partner Center automatically.
 
-Tag builds require the tag to match the Cargo application version. The separate
-Store package version still comes from `store-identity.json`; manual dispatch
-offers an optional override for a packaging-only revision. No signing secrets
+Tag builds require the tag to match the Cargo application version. Every Store
+build, including manual dispatch, derives the package version from that same
+Cargo version with an appended `.0`. No signing secrets
 or Partner Center credentials are required. The release workflow runs the
 direct-download and Store builds in parallel, then deploys the website. All must
 succeed before it creates the GitHub release.
@@ -201,7 +200,8 @@ succeed before it creates the GitHub release.
 
 Run `python3 -m unittest discover -s scripts/tests -p test_build_msix.py -v`
 for SDK-free orchestration checks: production-only staging without a private
-runtime, feature rejection, version overrides, numeric SDK discovery, failure cleanup,
+runtime, feature rejection, automatic version mapping, invalid application versions,
+numeric SDK discovery, failure cleanup,
 and preservation of existing outputs and caller state. Store-feature Rust
 tests also check its storage/profile selection, updater rejection, and native
 missing-runtime recovery decisions.
@@ -229,7 +229,7 @@ builds do in CI. Dirty local version strings skip startup update checks, so
 the smoke test requires a release version to cover that path:
 
 ```powershell
-$env:CANVAZ_VERSION = 'v0.6.5'
+$env:CANVAZ_VERSION = 'v1.0.0'
 py -3 scripts/build-msix.py
 npm install --no-save playwright
 MakeAppx.exe unpack /p src-tauri/target/release-assets/store/canvaz-store-1.0.0.0-x64.msix /d src-tauri/target/store-smoke /o

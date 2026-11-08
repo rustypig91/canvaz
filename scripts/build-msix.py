@@ -95,7 +95,7 @@ def build(args):
     helper = manifest_module()
     # Accept Windows PowerShell's UTF-8 BOM, as the manifest checker does.
     identity = json.loads((ROOT / "packaging/windows/msix/store-identity.json").read_text(encoding="utf-8-sig"))
-    manifest = helper.prepare(identity, args.package_version)
+    manifest = helper.prepare(identity)
     version = manifest.getroot().find(f"{{{helper.NAMESPACES['']}}}Identity").get("Version")
     makeappx, makepri = sdk_tool("MakeAppx.exe"), sdk_tool("MakePri.exe")
     output = Path(args.output_directory)
@@ -183,7 +183,6 @@ def build(args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--package-version", help="Override the explicit Store package version")
     parser.add_argument("--output-directory", default="src-tauri/target/release-assets/store")
     parser.add_argument("--skip-dependency-install", action="store_true", help="Reuse an existing npm dependency installation")
     args = parser.parse_args()

@@ -3,11 +3,6 @@ name: Microsoft Store MSIX
 on:
   workflow_call:
   workflow_dispatch:
-    inputs:
-      package_version:
-        description: Optional Store package version override (major.minor.build.0)
-        required: false
-        type: string
   pull_request:
     paths:
       - 'src/**'
@@ -82,12 +77,7 @@ jobs:
           $version = (($metadata | ConvertFrom-Json).packages | Where-Object name -eq 'canvaz').version
           if ($env:GITHUB_REF_NAME -ne "v$version") { throw "Tag does not match application version $version" }
       - name: Build unsigned MSIX for Partner Center
-        env:
-          STORE_PACKAGE_VERSION: ${{ inputs.package_version }}
-        run: |
-          $storeBuildArgs = @('--skip-dependency-install')
-          if ($env:STORE_PACKAGE_VERSION) { $storeBuildArgs += @('--package-version', $env:STORE_PACKAGE_VERSION) }
-          python scripts/build-msix.py @storeBuildArgs
+        run: python scripts/build-msix.py --skip-dependency-install
       - name: Test Store edition
         run: cargo test --manifest-path src-tauri/Cargo.toml --features microsoft-store --locked
       - name: Archive Store submission materials
