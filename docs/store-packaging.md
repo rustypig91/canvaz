@@ -72,7 +72,7 @@ doing so would change [the Store edition's existing data locations](store-data.m
 ## Package version
 
 Start the Store package at **1.0.0.0**, maintained explicitly as `packageVersion`
-in the identity JSON. The application remains version **0.6.4**; this work does
+in the identity JSON. The application remains version **0.6.5**; this work does
 not bump the app or rename its release tag. Store package versioning is separate
 because the first component cannot be zero and the fourth is reserved for Store
 use and must be zero. Each component is at most 65535.
@@ -206,7 +206,7 @@ builds do in CI. Dirty local version strings skip startup update checks, so
 the smoke test requires a release version to cover that path:
 
 ```powershell
-$env:CANVAZ_VERSION = 'v0.6.4'
+$env:CANVAZ_VERSION = 'v0.6.5'
 py -3 scripts/build-msix.py
 npm install --no-save playwright
 MakeAppx.exe unpack /p src-tauri/target/release-assets/store/canvaz-store-1.0.0.0-x64.msix /d src-tauri/target/store-smoke /o
