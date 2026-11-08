@@ -23,3 +23,6 @@ dist-ssr
 
 *.csv
 .claude
+
+# Python build helpers and regression checks
+__pycache__/

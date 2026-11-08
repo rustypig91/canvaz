@@ -44,7 +44,7 @@
         <div class="menu-item" id="menu-about">
           <button class="menu-trigger">About</button>
           <div class="menu-dropdown">
-            <button class="menu-action" data-action="check-updates">Check for Updates…</button>
+            <button class="menu-action" data-action="check-updates" disabled>Check for Updates…</button>
             <button class="menu-action" data-action="system-resources">System Resources…</button>
             <div class="menu-separator"></div>
             <button class="menu-action" data-action="support-developer">Support developer</button>
@@ -280,6 +280,7 @@
         <h2>Rusty's Canvaz - CAN Analyzer</h2>
         <p class="about-version">Version <span id="about-version">…</span></p>
         <p>View and simulate CAN bus traffic using DBC files.</p>
+        <p id="about-update-channel" hidden></p>
         <div class="about-footer">
           <button id="btn-github" class="btn btn-sm about-github">GitHub ↗</button>
           <button id="btn-about-close" class="btn btn-primary">Close</button>

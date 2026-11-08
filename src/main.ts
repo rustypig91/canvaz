@@ -4111,6 +4111,26 @@ interface LatestRelease {
 let currentVersion = "";
 let updateBusy = false;
 let updateChecking = false;
+type UpdateChannel = "github" | "microsoft-store" | "disabled";
+// Fail closed until the compiled backend identifies the edition.
+let updateChannel: UpdateChannel = "disabled";
+
+async function initializeUpdates() {
+    try {
+        const channel = await invoke<UpdateChannel>("update_channel");
+        updateChannel = channel === "github" || channel === "microsoft-store" ? channel : "disabled";
+    } catch {
+        updateChannel = "disabled";
+    }
+    const action = document.querySelector<HTMLButtonElement>('[data-action="check-updates"]')!;
+    action.disabled = updateChannel === "disabled";
+    action.textContent = updateChannel === "microsoft-store" ? "Microsoft Store updates…"
+        : updateChannel === "github" ? "Check for Updates…" : "Updates unavailable";
+    action.title = updateChannel === "microsoft-store" ? "Microsoft Store manages updates for this edition." : "";
+    const about = document.getElementById("about-update-channel")!;
+    about.hidden = updateChannel !== "microsoft-store";
+    about.textContent = "Microsoft Store manages updates for this edition.";
+}
 
 // The in-app version build.rs bakes in. Release builds are a clean "X.Y.Z";
 // dev builds carry a git-describe suffix ("0.1.0-5-gabc", "-modified") or are
@@ -4133,6 +4153,7 @@ function isNewerVersion(current: string, latest: string): boolean {
 }
 
 async function fetchLatestRelease(): Promise<LatestRelease> {
+    if (updateChannel !== "github") throw new Error("GitHub updates are unavailable in this edition.");
     const resp = await fetch(RELEASES_LATEST_API, {
         headers: { Accept: "application/vnd.github+json" },
         signal: AbortSignal.timeout(15000),
@@ -4152,7 +4173,16 @@ function openUpdateDialog(opts: {
     skipVersion: string | null;
     installError?: string;
 }) {
-    if (updateBusy) return;
+    if (updateBusy || updateChannel === "disabled") return;
+    const storeManaged = updateChannel === "microsoft-store";
+    if (storeManaged) {
+        opts = {
+            title: "Microsoft Store updates",
+            message: "Microsoft Store manages updates for this edition. Open Microsoft Store to check for updates. Update timing depends on your Store settings and system policies.",
+            downloadUrl: null,
+            skipVersion: null,
+        };
+    }
     document.getElementById("update-title")!.textContent = opts.title;
     document.getElementById("update-message")!.textContent = opts.message;
 
@@ -4164,8 +4194,16 @@ function openUpdateDialog(opts: {
     const manualBtn = document.getElementById("btn-update-manual") as HTMLButtonElement;
     const progress = document.getElementById("update-progress") as HTMLProgressElement;
     progress.hidden = true;
-    manualBtn.style.display = opts.downloadUrl ? "" : "none";
-    manualBtn.onclick = () => { if (opts.downloadUrl) void openUrl(opts.downloadUrl); };
+    manualBtn.style.display = storeManaged || opts.downloadUrl ? "" : "none";
+    manualBtn.textContent = storeManaged ? "Open Microsoft Store" : "Downloads page";
+    manualBtn.onclick = async () => {
+        if (storeManaged) {
+            try { await invoke("open_store_updates"); }
+            catch (e) { document.getElementById("update-message")!.textContent = `Could not open Microsoft Store: ${e}. Open Microsoft Store manually to check for updates.`; }
+        } else if (opts.downloadUrl) {
+            await openUrl(opts.downloadUrl);
+        }
+    };
     downloadBtn.style.display = opts.skipVersion && !opts.installError ? "" : "none";
     downloadBtn.textContent = "Update and restart";
     if (opts.installError) document.getElementById("update-message")!.textContent += ` ${opts.installError}`;
@@ -4176,7 +4214,7 @@ function openUpdateDialog(opts: {
 
     dialog.oncancel = event => { if (updateBusy) event.preventDefault(); };
     downloadBtn.onclick = async () => {
-        if (!opts.skipVersion || updateBusy) return;
+        if (updateChannel !== "github" || !opts.skipVersion || updateBusy) return;
         updateBusy = true;
         const buttons = [downloadBtn, manualBtn, skipBtn, closeBtn];
         buttons.forEach(button => button.disabled = true);
@@ -4207,7 +4245,7 @@ function openUpdateDialog(opts: {
         }
     };
     skipBtn.onclick = () => {
-        if (opts.skipVersion) { preferences.skippedVersion = opts.skipVersion; savePreferences(); }
+        if (updateChannel === "github" && opts.skipVersion) { preferences.skippedVersion = opts.skipVersion; savePreferences(); }
         dialog.close();
     };
 
@@ -4260,7 +4298,11 @@ function openSysResDialog() {
 // always reports a result and ignores the skip preference) from the silent
 // startup check (which only surfaces a brand-new, non-skipped release).
 async function checkForUpdates(manual: boolean) {
-    if (demoMode) return;
+    if (demoMode || updateChannel === "disabled") return;
+    if (updateChannel === "microsoft-store") {
+        if (manual) openUpdateDialog({ title: "", message: "", downloadUrl: null, skipVersion: null });
+        return;
+    }
     if (updateBusy || updateChecking) return;
     updateChecking = true;
     try { await performUpdateCheck(manual); }
@@ -4268,6 +4310,7 @@ async function checkForUpdates(manual: boolean) {
 }
 
 async function performUpdateCheck(manual: boolean) {
+    if (updateChannel !== "github") return;
     if (manual) log("info", "Checking for updates…");
 
     let latest: LatestRelease;
@@ -4451,7 +4494,7 @@ function setupMenuBar() {
         dropdown.id = `${item.id}-actions`;
         trigger.setAttribute("aria-controls", dropdown.id);
         item.addEventListener("keydown", e => {
-            const actions = Array.from(item.querySelectorAll<HTMLButtonElement>(".menu-action"));
+            const actions = Array.from(item.querySelectorAll<HTMLButtonElement>(".menu-action:not(:disabled)"));
             if (e.key === "Escape") { e.preventDefault(); closeAllMenus(); trigger.focus(); }
             else if (["ArrowDown", "ArrowUp", "Home", "End"].includes(e.key)) {
                 e.preventDefault();
@@ -6786,6 +6829,7 @@ window.addEventListener("DOMContentLoaded", async () => {
 
     const demo = await invoke<{ dbc: ParsedDbc; start_ms: number; duration_ms: number } | null>("demo_scene").catch(() => null);
     demoMode = demo !== null;
+    await initializeUpdates();
 
     // Preferences (per-user, persisted across restarts)
     await loadPreferences();

@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="How Rusty's Canvaz handles CAN traffic, local files, diagnostics, and network requests.">
+    <meta name="color-scheme" content="light dark">
+    <title>Privacy policy — Rusty's Canvaz</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        font-family: system-ui, sans-serif;
+        line-height: 1.65;
+        background: #f7f8fa;
+        color: #202630;
+      }
+      * { box-sizing: border-box; }
+      body { max-width: 48rem; margin: 0 auto; padding: 3rem 1.25rem; }
+      h1, h2 { line-height: 1.25; }
+      h1 { margin: 0.5rem 0; font-size: clamp(2rem, 6vw, 2.75rem); }
+      h2 { margin-top: 2rem; font-size: 1.25rem; }
+      a { color: #17569b; overflow-wrap: anywhere; }
+      a:focus-visible { outline: 3px solid currentColor; outline-offset: 3px; }
+      li + li { margin-top: 0.6rem; }
+      .product, .updated { color: #536070; }
+      .product { margin: 0; font-weight: 600; }
+      .summary {
+        padding: 1rem 1.25rem;
+        margin-top: 2rem;
+        border-left: 4px solid #32844d;
+        background: #eaf3ec;
+      }
+      code { font-size: 0.9em; overflow-wrap: anywhere; }
+      footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid #c5cdd6; }
+      @media (prefers-color-scheme: dark) {
+        :root { background: #14181f; color: #e3e8ef; }
+        a { color: #94c6ff; }
+        .product, .updated { color: #acb9c8; }
+        .summary { background: #1b2b23; border-color: #70c28c; }
+        footer { border-color: #3c4755; }
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <p class="product">Rusty's Canvaz – CAN Analyzer</p>
+      <h1>Privacy policy</h1>
+      <p class="updated">Last updated: <time datetime="2026-11-06">6 November 2026</time></p>
+    </header>
+    <main>
+      <p>This policy describes how Rusty's Canvaz – CAN Analyzer, developed by
+        Christoffer Zakrisson (rustypig91), handles information. It also covers
+        this policy page.</p>
+      <p class="summary">Canvaz processes CAN traffic and DBC files on your
+        computer. The app does not upload your CAN traffic, recordings, projects,
+        DBC files, or diagnostic logs to the developer. It includes no advertising,
+        usage analytics, or automatic crash-report uploads. No Canvaz account is
+        required.</p>
+
+      <h2>Data the app uses</h2>
+      <ul>
+        <li><strong>CAN communication:</strong> Canvaz receives frames from the
+          interfaces you select and decodes them locally. This includes frame
+          identifiers, payload bytes, timestamps, channel information, and decoded
+          signal values, including J1939 information where enabled. When you start
+          transmission or simulation, the app sends the configured frames to the
+          selected CAN interface. Traffic may contain personal, vehicle, or other
+          sensitive information.</li>
+        <li><strong>Devices and configuration:</strong> Interface names, backend
+          types, channel assignments, bitrates, protocol settings, and user-chosen
+          channel names are used to connect to devices and restore your workspace.</li>
+        <li><strong>Files and saved work:</strong> The app reads the DBC and
+          project files you select. Projects and automatic session saves contain
+          channel settings, DBC file paths, plots, filters, and simulation settings,
+          including configured signal values and raw frame payloads. Preferences
+          and the last project path are also saved locally.</li>
+        <li><strong>Recordings and exports:</strong> Choosing
+          <strong>Data → Log to disk…</strong> saves incoming and transmitted CAN
+          frames to the CSV file you select. Recording is independent of display
+          filters, pausing the view, and the in-memory retention window. CSV and
+          plot-image exports are written to destinations you choose.</li>
+        <li><strong>Diagnostics:</strong> The local message log and console output
+          can contain the app version, device names, file paths, and error details.
+          The System resources dialog reads process names and identifiers, CPU
+          usage, and memory use to display Canvaz's resource consumption. This
+          information is not automatically sent to the developer.</li>
+      </ul>
+
+      <h2>Storage, retention, and deletion</h2>
+      <p>Live trace and plot data are held in memory, subject to the selected
+        retention window and display limits. Automatic session saving preserves
+        workspace configuration, not a recording of received traffic. Simulation
+        payloads can be saved as part of that configuration.</p>
+      <p>Preferences and session files are stored in Canvaz's application-data
+        folder in your user profile. Direct-download builds normally use
+        <code>%APPDATA%\com.christoffer.canvaz</code> on Windows and
+        <code>$XDG_DATA_HOME/com.christoffer.canvaz</code> on Linux (defaulting to
+        <code>~/.local/share/com.christoffer.canvaz</code>). The Microsoft Store
+        edition uses the separate identifier
+        <code>com.christoffer.canvaz.store</code> for its data folders and embedded
+        webview profile. It does not automatically import direct-download
+        preferences or sessions. Windows may redirect packaged data locations
+        within per-user package storage. The embedded webview may also keep a
+        local runtime profile or cache.</p>
+      <p>Saved projects, recordings, and exports have no automatic expiry date.
+        Clearing the trace or changing its retention window does not delete those
+        files or stop an active recording. To remove stored data, stop recording,
+        close Canvaz, and delete its application-data files and any projects,
+        recordings, exports, and backups you no longer need. Remove webview
+        profile data separately where applicable. Uninstallation may leave files
+        behind; it should not be relied on to preserve or remove your data.</p>
+      <p>Canvaz does not add encryption to local files or CAN communication.
+        Access is governed by your operating system and filesystem permissions.
+        Synced folders, backups, connected devices, and other bus participants
+        may retain copies outside Canvaz's control. Deleting a file is not secure
+        erasure. The developer cannot access or delete data held only on your
+        computer.</p>
+
+      <h2>Network access and third-party services</h2>
+      <p><strong>Microsoft Store edition:</strong> Canvaz does not use the GitHub
+        updater in this edition. It does not check GitHub for newer releases or
+        download or install GitHub updates, including when preferences have been
+        copied from a direct-download installation. Microsoft Store and Windows
+        manage Store updates. Choosing <strong>Open Microsoft Store</strong>
+        opens the Store's Updates and downloads page; it does not ask Canvaz to
+        install an update or restart.</p>
+      <p>All Windows editions use the shared Microsoft Edge WebView2 Evergreen
+        Runtime, which updates independently of Canvaz according to your system
+        settings. If the runtime is missing, Canvaz offers to open Microsoft's
+        download page in your browser. The direct-download EXE and MSI installers
+        can download and install the runtime when needed.</p>
+      <p><strong>GitHub updates:</strong> Direct-download release builds check
+        GitHub for a newer release at startup. <strong>About → Check for
+        Updates</strong> also contacts GitHub. Skipping a release hides its startup
+        notice but does not disable later checks. Choosing an update downloads
+        release metadata and installation files from GitHub and its download
+        infrastructure. These requests expose your IP address and ordinary request
+        details, such as the requested release and HTTP headers, to those services.
+        They do not include CAN traffic, device configuration, DBC files, projects,
+        recordings, or local logs. See the
+        <a href="https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement">GitHub Privacy Statement</a>.</p>
+      <p><strong>Platform services:</strong> Windows and the Microsoft Edge
+        WebView2 runtime used to display Canvaz on Windows may perform their own
+        update and diagnostic processing according to your system settings. If
+        you obtain Canvaz through Microsoft Store, Microsoft also processes Store
+        distribution, installation, and update information under the
+        <a href="https://www.microsoft.com/en-us/privacy/privacystatement">Microsoft Privacy Statement</a>.
+        Operating-system, runtime, and driver services operate independently of
+        Canvaz's local data handling.</p>
+      <p>Opening project, support, donation, or other external links uses your
+        browser or the corresponding system app. Information you provide to those
+        services is handled under their policies. CAN frames are sent to the
+        interface and bus you select; further processing by connected equipment
+        is outside Canvaz's control.</p>
+
+      <h2>Information you choose to share</h2>
+      <p>If you email the developer or submit an issue, the developer receives
+        the contact information, message, and attachments you provide and uses
+        them to respond and investigate the report. Support correspondence may
+        be retained while needed to resolve and follow up on the request. You can
+        request deletion of correspondence held by the developer using the contact
+        address below, subject to applicable legal obligations.</p>
+      <p>GitHub issues are public. Remove personal information, credentials,
+        confidential DBC definitions, and sensitive CAN data before sharing files
+        or logs. Canvaz does not sell personal information or share local app data
+        with advertisers.</p>
+
+      <h2>This policy page</h2>
+      <p>This page is hosted on GitHub Pages. It contains no analytics, tracking
+        scripts, third-party fonts, or embedded third-party content. GitHub may
+        process your IP address and ordinary web-request information when you
+        visit, as described in its privacy statement linked above.</p>
+
+      <h2>Changes and contact</h2>
+      <p>Policy updates will be published at this address with a revised date.</p>
+      <p>For privacy questions or requests, contact Christoffer Zakrisson
+        (rustypig91) at <a href="mailto:rustypig91@gmail.com">rustypig91@gmail.com</a>.</p>
+    </main>
+    <footer>
+      <a href="https://github.com/rustypig91/canvaz">Project source and support</a>
+    </footer>
+  </body>
+</html>

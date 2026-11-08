@@ -1,6 +1,6 @@
 [package]
 name = "canvaz"
-version = "0.6.4"
+version = "0.6.5"
 description = "Rusty's Canvaz - CAN Analyzer: view, decode, plot, and simulate CAN bus traffic"
 authors = ["Christoffer Zakrisson"]
 edition = "2021"
@@ -31,6 +31,9 @@ tempfile = "3"
 url = "2"
 percent-encoding = "2"
 
+[dev-dependencies]
+tauri = { version = "2", features = ["test"] }
+
 # Platform defaults: on each target these crates are non-optional, and the
 # backend cfg() gates accept target_os = "linux" as well, so a plain build gets
 # Kvaser + PCAN everywhere (default features) and SocketCAN on Linux without
@@ -38,6 +41,8 @@ percent-encoding = "2"
 # other targets.
 [target.'cfg(windows)'.dependencies]
 libloading = { version = "0.8" }
+# Native startup recovery must work before a WebView/Tauri window exists.
+rfd = { version = "0.16", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 socketcan = { version = "3" }
@@ -46,6 +51,8 @@ socketcan = { version = "3" }
 default = ["kvaser", "pcan"]
 # Hardware-free screenshot scene; never enabled for distributed bundles.
 demo = []
+# Isolate Store settings, session restore, and the embedded webview profile.
+microsoft-store = []
 kvaser = ["dep:libloading"]
 pcan = ["dep:libloading"]
 linux-can = ["dep:socketcan"]

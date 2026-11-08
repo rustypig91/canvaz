@@ -33,5 +33,19 @@ fn main() {
         _ => {}
     }
 
-    tauri_build::build()
+    let attributes = tauri_build::Attributes::new();
+    let attributes = if target_os == "windows" && std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        // tauri-build 2.6 links its manifest only into app binaries. Library
+        // tests also import TaskDialogIndirect, which requires Common Controls
+        // v6 at process load time. Embed the same manifest in every MSVC target.
+        // https://github.com/tauri-apps/tauri/issues/13419
+        let manifest = std::path::Path::new(&std::env::var("CARGO_MANIFEST_DIR").unwrap()).join("windows/app.manifest.xml");
+        println!("cargo:rerun-if-changed={}", manifest.display());
+        println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
+        println!("cargo:rustc-link-arg=/MANIFESTINPUT:{}", manifest.display());
+        attributes.windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest())
+    } else {
+        attributes
+    };
+    tauri_build::try_build(attributes).expect("failed to run Tauri build script");
 }

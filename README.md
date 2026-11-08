@@ -2,6 +2,10 @@
 
 Rusty's Canvaz is the CAN analyzer in the Rusty's toolchain family, alongside Rusty's Pigtail - Serial Terminal. View, decode, plot, and simulate CAN bus traffic using DBC files.
 
+Read the [privacy policy](docs/site/privacy/index.html). Maintainers can find
+[publication instructions](docs/privacy-policy.md) for the public policy page.
+Store builds use [separate settings and session data](docs/store-data.md).
+
 ## Features
 
 - **Trace** — live frame table with filtering by channel, CAN ID, message name, DLC, direction, cycle time, and data bytes
@@ -57,6 +61,9 @@ npm install
 npm run tauri dev      # development
 npm run tauri build    # production
 ```
+
+For Microsoft Store packages, use the dedicated
+[Windows MSIX builder and workflow](docs/store-packaging.md#dedicated-windows-build).
 
 ### Linux startup from a Snap IDE
 
@@ -159,6 +166,10 @@ package manager.
 
 ## Updates
 
+The Microsoft Store edition receives updates through Microsoft Store. Its
+**About → Microsoft Store updates…** action opens an explanation and a button
+to open Microsoft Store. It does not use the GitHub updater described below.
+
 For Windows, use the `-setup.exe` installer and choose **Only me (recommended)**,
 even if you started setup as administrator. **All users** remains available for
 shared installations. Automatic updates preserve the existing installation scope.
@@ -175,8 +186,14 @@ replace the AppImage in its existing folder (which must be writable) and restart
 Update `.deb` and `.rpm` installations through your package manager instead.
 The downloads page remains available as a manual fallback.
 
-The GitHub release workflow publishes the installers, AppImage, Debian package,
-and screenshot only after both Linux and Windows builds succeed on a `v*` tag.
+The GitHub release workflow (`.github/workflows/release.yml`) publishes the
+installers, AppImage, Debian package, and screenshot on a `v*` tag only after the
+Linux, Windows, and Microsoft Store builds and website deployment all succeed.
+Every successful Store workflow run uploads `store-submission.zip` in the
+`canvaz-store-submission-<run-id>` artifact. The release workflow attaches the
+same ZIP, containing the unsigned MSIX, checksum, build metadata, Store listing
+artwork, package icons, and submission instructions. It is for Partner Center
+submission; use the EXE/MSI assets for direct Windows installation.
 After the release succeeds, it requests an update of the shared Rusty APT repository.
 Every pull request and push to `main` builds both Linux and Windows without
 build labels. Feature-branch pushes build through the pull-request event, avoiding
