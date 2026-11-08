@@ -188,8 +188,44 @@ and preservation of existing outputs and caller state. Store-feature Rust
 tests also check its storage/profile selection and updater rejection.
 These checks do not substitute for an actual Windows SDK package build.
 
-- Run the Store workflow to verify the real MakePri/MakeAppx output and inspect
-  native DLL dependencies on Windows.
+The branch was also checked natively on Windows on **2026-11-08**: all 84
+frontend tests, 13 packaging tests, 43 Store-feature Rust tests, and 41
+direct-download Rust tests passed, along with both browser regression checks.
+The production MSIX was built using the Windows SDK's MakePri and MakeAppx
+with validation enabled. The Store executable's imports contain only Windows
+system DLLs, with no VC++ redistributable dependency. The native smoke check
+below also passed against the unpacked package and its pinned WebView2 runtime.
+These results cover one development machine, not the complete supported
+Windows version range or Store certification.
+
+### Native Store smoke check
+
+Run from the repository root in a Windows SDK shell with `MakeAppx.exe` on
+PATH. Set the current Cargo application version for this build, just as tag
+builds do in CI. Dirty local version strings skip startup update checks, so
+the smoke test requires a release version to cover that path:
+
+```powershell
+$env:CANVAZ_VERSION = 'v0.6.4'
+py -3 scripts/build-msix.py
+npm install --no-save playwright
+MakeAppx.exe unpack /p src-tauri/target/release-assets/store/canvaz-store-1.0.0.0-x64.msix /d src-tauri/target/store-smoke /o
+node tests/store.windows.mjs src-tauri/target/store-smoke
+```
+
+The optional Playwright dependency connects to the bundled WebView2; no
+separate Chromium download is needed. Close other Store-edition instances
+before running. The check launches the unpacked executable using the normal
+Store preference/session paths and a temporary webview profile. It observes a
+fresh frontend reload, checks the Store menu and About dialog, exercises the
+real backend's updater rejection, and fails on GitHub requests, script errors,
+or a runtime version different from the pin. It closes its own process and
+removes its temporary webview profile. Port 9227 must be available.
+
+This checks the unpacked executable, not Windows package identity,
+installation, or Store-delivered updates. Remaining release checks:
+
+- Run the Store workflow to confirm the package also builds on CI.
 - Verify Kvaser/PCAN DLL loading and externally installed driver prerequisites
   under package identity. The app package does not install Windows drivers.
 - Run the Windows App Certification Kit and native installation, coexistence,

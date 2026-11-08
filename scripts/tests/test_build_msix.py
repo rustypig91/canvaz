@@ -150,6 +150,19 @@ class PackagingTests(unittest.TestCase):
         self.assertIn(["npm.cmd", "run", "build"], self.calls)
         self.assertTrue((self.root / self.package_args.output_directory / "canvaz-store-1.0.2.0-x64.msix").is_file())
 
+    def test_windows_utf8_bom_metadata_is_supported(self):
+        # Windows PowerShell's Set-Content -Encoding UTF8 writes a BOM. The
+        # manifest checker already accepts it; the package builder must agree.
+        for filename in ["store-identity.json", "webview2-runtime.json"]:
+            with self.subTest(filename=filename):
+                path = self.root / "packaging/windows/msix" / filename
+                original = path.read_bytes()
+                try:
+                    path.write_bytes(b"\xef\xbb\xbf" + original)
+                    self.build()
+                finally:
+                    path.write_bytes(original)
+
     def test_development_server_build_is_rejected_before_packaging(self):
         self.custom_protocol = False
         with self.assertRaisesRegex(ValueError, "Refusing to package"):

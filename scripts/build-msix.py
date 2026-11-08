@@ -129,10 +129,11 @@ def build(args):
         raise ValueError("Run this build on Windows with the x64 MSVC toolchain and Windows SDK.")
     env = build_environment()
     helper = manifest_module()
-    identity = json.loads((ROOT / "packaging/windows/msix/store-identity.json").read_text(encoding="utf-8"))
+    # Accept Windows PowerShell's UTF-8 BOM, as the manifest checker does.
+    identity = json.loads((ROOT / "packaging/windows/msix/store-identity.json").read_text(encoding="utf-8-sig"))
     manifest = helper.prepare(identity, args.package_version)
     version = manifest.getroot().find(f"{{{helper.NAMESPACES['']}}}Identity").get("Version")
-    runtime = json.loads((ROOT / "packaging/windows/msix/webview2-runtime.json").read_text(encoding="utf-8"))
+    runtime = json.loads((ROOT / "packaging/windows/msix/webview2-runtime.json").read_text(encoding="utf-8-sig"))
     makeappx, makepri = sdk_tool("MakeAppx.exe"), sdk_tool("MakePri.exe")
     output = Path(args.output_directory)
     if not output.is_absolute():
