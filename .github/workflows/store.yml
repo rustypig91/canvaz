@@ -1,6 +1,7 @@
 name: Microsoft Store MSIX
 
 on:
+  workflow_call:
   workflow_dispatch:
     inputs:
       package_version:
@@ -26,7 +27,6 @@ on:
       - 'LICENSE'
   push:
     branches: [main]
-    tags: ['v*']
 
 permissions:
   contents: read

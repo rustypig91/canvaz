@@ -186,8 +186,9 @@ replace the AppImage in its existing folder (which must be writable) and restart
 Update `.deb` and `.rpm` installations through your package manager instead.
 The downloads page remains available as a manual fallback.
 
-The GitHub release workflow publishes the installers, AppImage, Debian package,
-and screenshot only after both Linux and Windows builds succeed on a `v*` tag.
+The GitHub release workflow (`.github/workflows/release.yml`) publishes the
+installers, AppImage, Debian package, and screenshot on a `v*` tag only after the
+Linux, Windows, and Microsoft Store builds and website deployment all succeed.
 After the release succeeds, it requests an update of the shared Rusty APT repository.
 Every pull request and push to `main` builds both Linux and Windows without
 build labels. Feature-branch pushes build through the pull-request event, avoiding

@@ -172,9 +172,10 @@ are independent of Canvaz releases. See
 
 ## GitHub Actions
 
-`.github/workflows/store.yml` runs on relevant PRs, all `main` pushes, `v*` tags,
-and manual dispatch. Only superseded PR runs are cancelled. It tests the
-frontend, packaging orchestration, identity, and Store-feature Rust code, then
+`.github/workflows/store.yml` runs on relevant PRs, all `main` pushes, and manual
+dispatch. The release workflow calls it for `v*` tags. Only superseded PR runs
+are cancelled. It tests the frontend, packaging orchestration, identity, and
+Store-feature Rust code, then
 uploads `canvaz-store-msix-<run-id>` with the MSIX, checksum, and build metadata.
 Artifact replacement supports reruns. Download this artifact for submission;
 the workflow does not publish it to GitHub Releases or Partner Center.
@@ -182,8 +183,9 @@ the workflow does not publish it to GitHub Releases or Partner Center.
 Tag builds require the tag to match the Cargo application version. The separate
 Store package version still comes from `store-identity.json`; manual dispatch
 offers an optional override for a packaging-only revision. No signing secrets
-or Partner Center credentials are required. Direct-download release builds
-continue through the existing `build` workflow independently.
+or Partner Center credentials are required. The release workflow runs the
+direct-download and Store builds in parallel, then deploys the website. All must
+succeed before it creates the GitHub release.
 
 ## Validation and remaining native checks
 
