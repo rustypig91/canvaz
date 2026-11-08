@@ -22,10 +22,11 @@ This URL is not live until the site has been successfully deployed.
 5. Open the URL printed in the workflow summary and verify it before entering
    it in Partner Center. A custom domain changes the URL; use the deployed one.
 
-The existing release workflow also calls the reusable privacy workflow after
-its release job succeeds. It publishes the policy from the released commit,
-alongside APT publication. PRs, ordinary pushes, and failed releases do not
-deploy the site. Manual dispatch supports policy-only publication.
+The release workflow calls the reusable privacy workflow after all application
+builds succeed, before creating the GitHub release. It publishes the policy
+from the tagged commit; a failed deployment blocks release creation. PRs and
+ordinary pushes do not deploy the site. Manual dispatch supports policy-only
+publication.
 
 The workflow uploads only `docs/site`, uses the standard GitHub Pages token
 permissions, and requires no custom token or domain. Deployments serialize

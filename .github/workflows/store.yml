@@ -21,7 +21,13 @@ on:
       - 'scripts/build-msix.py'
       - 'scripts/prepare-store-manifest.py'
       - 'scripts/generate-store-images.py'
+      - 'scripts/package-store-submission.py'
       - 'scripts/tests/test_build_msix.py'
+      - 'scripts/tests/test_store_submission.py'
+      - 'docs/store-*.md'
+      - 'docs/privacy-policy.md'
+      - 'docs/site/privacy/**'
+      - 'README.md'
       - 'tests/**'
       - '.github/workflows/store.yml'
       - 'LICENSE'
@@ -64,8 +70,8 @@ jobs:
         run: npm ci
       - name: Test frontend update channels and regressions
         run: npm test
-      - name: Test MSIX build orchestration
-        run: python -m unittest discover -s scripts/tests -p test_build_msix.py -v
+      - name: Test MSIX build orchestration and submission archive
+        run: python -m unittest discover -s scripts/tests -p 'test_*.py' -v
       - name: Verify Store identity
         run: python scripts/prepare-store-manifest.py --check
       - name: Verify release tag
