@@ -30,7 +30,7 @@ CAN devices may also restrict simultaneous access by multiple processes.
 
 ## Building and checking
 
-For a complete Windows Store build with its bundled WebView2 runtime:
+For a complete Windows Store build using shared Evergreen WebView2:
 
 ```powershell
 py -3 scripts/build-msix.py
@@ -38,11 +38,11 @@ py -3 scripts/build-msix.py
 
 The dedicated builder isolates Cargo output and creates an unsigned MSIX.
 See [Store packaging](store-packaging.md) for prerequisites, artifacts, and CI.
-A bare Store-feature executable on Windows needs the pinned runtime directory
-named `WebView2` beside it; use the package layout for native testing.
+A Store-feature executable on Windows uses the installed Evergreen Runtime;
+there is no private `WebView2` directory in the package.
 
 Direct-download release builds must omit `microsoft-store`. The feature also
-disables the GitHub updater and selects the bundled WebView2 runtime. Native
+disables the GitHub updater. All Windows builds use Evergreen WebView2. Native
 installation and certification checks remain required before submission.
 
 ## Updates

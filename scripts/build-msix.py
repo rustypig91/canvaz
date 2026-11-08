@@ -13,15 +13,12 @@ import struct
 import subprocess
 import sys
 import tempfile
-import urllib.parse
-import urllib.request
 import xml.etree.ElementTree as ET
 
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = "x86_64-pc-windows-msvc"
 FEATURES = "microsoft-store,kvaser,pcan,tauri/custom-protocol"
-RUNTIME_FOLDER = "WebView2"
 
 
 def run(arguments, env, capture=False):
@@ -67,39 +64,6 @@ def sha256(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def checked_download(runtime, cache):
-    url = urllib.parse.urlparse(runtime["url"])
-    version = runtime["version"]
-    if (url.scheme != "https" or url.hostname != "msedge.sf.dl.delivery.mp.microsoft.com"
-            or runtime["architecture"] != "x64"
-            or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", version)
-            or not url.path.endswith(f"Microsoft.WebView2.FixedVersionRuntime.{version}.x64.cab")
-            or not re.fullmatch(r"[a-fA-F0-9]{64}", runtime["sha256"])):
-        raise ValueError("Invalid pinned x64 WebView2 runtime metadata.")
-    expected = runtime["sha256"].lower()
-    cache.mkdir(parents=True, exist_ok=True)
-    destination = cache / f"WebView2-{version}-x64.cab"
-    if destination.is_file() and sha256(destination) == expected:
-        return destination
-    with tempfile.NamedTemporaryFile(dir=cache, suffix=".partial", delete=False) as output:
-        temporary = Path(output.name)
-        try:
-            print(f"Downloading Microsoft WebView2 {version} (x64)...", flush=True)
-            with urllib.request.urlopen(runtime["url"], timeout=60) as response:
-                shutil.copyfileobj(response, output)
-        except BaseException:
-            output.close()
-            temporary.unlink(missing_ok=True)
-            raise
-    try:
-        if sha256(temporary) != expected:
-            raise ValueError("WebView2 CAB checksum does not match the pinned SHA-256.")
-        temporary.replace(destination)
-    finally:
-        temporary.unlink(missing_ok=True)
-    return destination
-
-
 def require_x64_exe(path):
     with path.open("rb") as binary:
         header = binary.read(64)
@@ -133,7 +97,6 @@ def build(args):
     identity = json.loads((ROOT / "packaging/windows/msix/store-identity.json").read_text(encoding="utf-8-sig"))
     manifest = helper.prepare(identity, args.package_version)
     version = manifest.getroot().find(f"{{{helper.NAMESPACES['']}}}Identity").get("Version")
-    runtime = json.loads((ROOT / "packaging/windows/msix/webview2-runtime.json").read_text(encoding="utf-8-sig"))
     makeappx, makepri = sdk_tool("MakeAppx.exe"), sdk_tool("MakePri.exe")
     output = Path(args.output_directory)
     if not output.is_absolute():
@@ -165,21 +128,12 @@ def build(args):
 
     binary_dir = target_dir / TARGET / "release"
     require_x64_exe(binary_dir / "canvaz.exe")
-    cab = checked_download(runtime, ROOT / "src-tauri/target/store-downloads")
     # Temporary staging is removed after successful packaging and every failure.
     # Existing target/release or demo files never enter this package.
     with tempfile.TemporaryDirectory(prefix="staging-", dir=target_dir) as work:
         work = Path(work)
         stage = work / "layout"
         stage.mkdir()
-        extracted = work / "runtime"
-        extracted.mkdir()
-        run(["expand.exe", str(cab), "-F:*", str(extracted)], env)
-        runtimes = list(extracted.rglob("msedgewebview2.exe"))
-        if len(runtimes) != 1:
-            raise ValueError("Expected exactly one WebView2 runtime executable in the pinned CAB.")
-        require_x64_exe(runtimes[0])
-        shutil.copytree(runtimes[0].parent, stage / RUNTIME_FOLDER)
         shutil.copy2(binary_dir / "canvaz.exe", stage / "canvaz.exe")
         # Some WebView2 loader configurations use a companion DLL; copy it if
         # emitted. The usual Rust WebView2 loader is statically linked.
@@ -219,7 +173,7 @@ def build(args):
         info = {
             "applicationVersion": app["version"], "packageVersion": version,
             "identity": identity["name"], "storeId": identity.get("storeId"),
-            "target": TARGET, "features": sorted(active), "webview2": runtime,
+            "target": TARGET, "features": sorted(active), "webview2": {"mode": "evergreen"},
             "msixSha256": digest,
         }
         (output / f"{package_name}.build-info.json").write_text(json.dumps(info, indent=2) + "\n", encoding="utf-8")

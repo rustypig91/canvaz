@@ -3,7 +3,6 @@
 import argparse
 import hashlib
 import importlib.util
-import io
 import json
 import os
 from pathlib import Path
@@ -64,6 +63,8 @@ class PackagingTests(unittest.TestCase):
             self.assertIn("--no-default-features", args)
             self.assertIn(builder.FEATURES, args)
             pe_file(Path(env["CARGO_TARGET_DIR"]) / builder.TARGET / "release/canvaz.exe")
+            # A previous build's private runtime must never enter the package.
+            pe_file(Path(env["CARGO_TARGET_DIR"]) / builder.TARGET / "release/WebView2/msedgewebview2.exe")
         elif args[:2] == ["cargo", "metadata"]:
             self.assertTrue(capture)
             return json.dumps({
@@ -73,10 +74,6 @@ class PackagingTests(unittest.TestCase):
                     {"id": "tauri", "features": ["custom-protocol"] if self.custom_protocol else []},
                 ]},
             })
-        elif args[0] == "expand.exe":
-            runtime = Path(args[-1]) / "Microsoft.WebView2.FixedVersionRuntime.fixture.x64"
-            pe_file(runtime / "msedgewebview2.exe")
-            (runtime / "runtime-license.txt").write_text("runtime license fixture")
         elif args[:2] == ["MakePri.exe", "createconfig"]:
             Path(args[args.index("/cf") + 1]).write_text("<resources><packaging><autoResourcePackage/></packaging></resources>")
         elif args[:2] == ["MakePri.exe", "new"]:
@@ -86,8 +83,9 @@ class PackagingTests(unittest.TestCase):
         elif args[:2] == ["MakeAppx.exe", "pack"]:
             stage = Path(args[args.index("/d") + 1])
             builder.require_x64_exe(stage / "canvaz.exe")
-            builder.require_x64_exe(stage / "WebView2/msedgewebview2.exe")
-            self.assertTrue((stage / "WebView2/runtime-license.txt").is_file())
+            self.assertEqual({path.name for path in stage.iterdir()}, {
+                "canvaz.exe", "LICENSE", "Assets", "resources.pri", "AppxManifest.xml",
+            })
             self.assertTrue((stage / "Assets/Square44x44Logo.scale-200.png").is_file())
             self.assertTrue((stage / "resources.pri").is_file())
             self.assertNotIn("/nv", args)  # Never disable MakeAppx validation.
@@ -99,11 +97,10 @@ class PackagingTests(unittest.TestCase):
     def build(self):
         with patch.object(builder, "ROOT", self.root), patch.object(builder.sys, "platform", "win32"), \
                 patch.object(builder, "sdk_tool", side_effect=lambda name: name), \
-                patch.object(builder, "checked_download", return_value=self.root / "runtime.cab"), \
                 patch.object(builder, "run", side_effect=self.fake_run):
             return builder.build(self.package_args)
 
-    def test_success_stages_only_store_outputs_with_runtime_and_metadata(self):
+    def test_success_stages_only_store_outputs_with_evergreen_and_metadata(self):
         before_env, before_cwd = dict(os.environ), Path.cwd()
         self.build()
         output = self.root / self.package_args.output_directory
@@ -113,6 +110,7 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(info["applicationVersion"], "0.6.4")
         self.assertEqual(info["packageVersion"], "1.0.0.0")
         self.assertEqual(info["storeId"], "9P3PGB2ZZ67L")
+        self.assertEqual(info["webview2"], {"mode": "evergreen"})
         self.assertEqual(info["msixSha256"], hashlib.sha256(b"MSIX fixture").hexdigest())
         self.assertTrue((output / f"{package.name}.sha256").read_text().startswith(info["msixSha256"]))
         self.assertFalse(list((self.root / "src-tauri/target/store").glob("staging-*")))
@@ -120,6 +118,8 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(Path.cwd(), before_cwd)
         self.assertIn(["npm.cmd", "ci"], self.calls)
         self.assertIn(["npm.cmd", "run", "build"], self.calls)
+        self.assertFalse(any(call[0] == "expand.exe" for call in self.calls))
+        self.assertFalse((self.root / "src-tauri/target/store-downloads").exists())
 
     def test_failure_cleans_staging_and_preserves_existing_artifact_and_environment(self):
         self.fail = True
@@ -153,15 +153,9 @@ class PackagingTests(unittest.TestCase):
     def test_windows_utf8_bom_metadata_is_supported(self):
         # Windows PowerShell's Set-Content -Encoding UTF8 writes a BOM. The
         # manifest checker already accepts it; the package builder must agree.
-        for filename in ["store-identity.json", "webview2-runtime.json"]:
-            with self.subTest(filename=filename):
-                path = self.root / "packaging/windows/msix" / filename
-                original = path.read_bytes()
-                try:
-                    path.write_bytes(b"\xef\xbb\xbf" + original)
-                    self.build()
-                finally:
-                    path.write_bytes(original)
+        path = self.root / "packaging/windows/msix/store-identity.json"
+        path.write_bytes(b"\xef\xbb\xbf" + path.read_bytes())
+        self.build()
 
     def test_development_server_build_is_rejected_before_packaging(self):
         self.custom_protocol = False
@@ -223,28 +217,6 @@ class DependencyTests(unittest.TestCase):
             path.write_bytes(b"not windows")
             with self.assertRaisesRegex(ValueError, "Not a Windows"):
                 builder.require_x64_exe(path)
-
-    def test_download_rejects_tampering_and_reuses_only_verified_cache(self):
-        data = b"fixture runtime CAB"
-        runtime = json.loads((ROOT / "packaging/windows/msix/webview2-runtime.json").read_text())
-        runtime["sha256"] = hashlib.sha256(data).hexdigest()
-        with tempfile.TemporaryDirectory() as temp:
-            cache = Path(temp)
-            with patch.object(builder.urllib.request, "urlopen", return_value=io.BytesIO(b"tampered")):
-                with self.assertRaisesRegex(ValueError, "checksum"):
-                    builder.checked_download(runtime, cache)
-            self.assertEqual(list(cache.iterdir()), [])
-            with patch.object(builder.urllib.request, "urlopen", return_value=io.BytesIO(data)) as request:
-                downloaded = builder.checked_download(runtime, cache)
-                self.assertEqual(downloaded.read_bytes(), data)
-                builder.checked_download(runtime, cache)
-                self.assertEqual(request.call_count, 1)
-
-    def test_runtime_descriptor_rejects_untrusted_or_wrong_architecture_sources(self):
-        runtime = json.loads((ROOT / "packaging/windows/msix/webview2-runtime.json").read_text())
-        for invalid in [dict(runtime, architecture="x86"), dict(runtime, url="http://example.com/runtime.cab"), dict(runtime, sha256="invalid")]:
-            with self.subTest(invalid=invalid), tempfile.TemporaryDirectory() as temp, self.assertRaisesRegex(ValueError, "Invalid pinned"):
-                builder.checked_download(invalid, Path(temp))
 
 
 if __name__ == "__main__":

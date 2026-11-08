@@ -5,8 +5,8 @@
 Use an **x64 MSIX** containing the production Tauri/Win32 application. Register
 it in Partner Center as an **MSIX or PWA app**. The existing NSIS/MSI installers
 remain the direct-download route. `scripts/build-msix.py` builds the production
-frontend and Store-feature executable, stages the package and bundled WebView2,
-indexes scaled icons with MakePri, and runs MakeAppx with validation enabled.
+frontend and Store-feature executable, stages the package using shared Evergreen
+WebView2, indexes scaled icons with MakePri, and runs MakeAppx with validation enabled.
 
 The manifest template is `packaging/windows/msix/AppxManifest.xml.in`. It uses
 `packagedClassicApp`, medium integrity, and `runFullTrust` for native CAN driver
@@ -104,7 +104,7 @@ publish anything. The template is not a submission-ready manifest on its own.
 ## Dedicated Windows build
 
 Install Python 3.11+, Node.js, Rust's Windows x64 MSVC toolchain, Visual Studio
-C++ Build Tools, and the Windows 10/11 SDK (MakePri, MakeAppx, and expand.exe).
+C++ Build Tools, and the Windows 10/11 SDK (MakePri and MakeAppx).
 From the repository root in PowerShell:
 
 ```powershell
@@ -138,30 +138,36 @@ src-tauri/target/release-assets/store/canvaz-store-1.0.0.0-x64.msix
 ```
 
 The adjacent `.sha256` and `.build-info.json` files record the checksum,
-application/package versions, active features, Store identity, and bundled
-runtime version/source/hash. The MSIX is unsigned for Partner Center ingestion;
+application/package versions, active features, Store identity, and the
+Evergreen runtime mode. The MSIX is unsigned for Partner Center ingestion;
 it is not a public unsigned sideload installer. This script does not install,
 upload, or publish the package.
 
-## Bundled WebView2
+## Evergreen WebView2 on Windows
 
-`packaging/windows/msix/webview2-runtime.json` pins Microsoft's x64 Fixed Version
-runtime, currently **157.0.4341.42**, with its official download URL and SHA-256.
-The builder verifies cached and downloaded CABs, extracts them with expand.exe,
-checks the runtime is an x64 PE executable, and includes its full directory as
-`WebView2/` beside `canvaz.exe`. The Store context selects that directory before
-Tauri creates its webview; it does not depend on a machine-wide Evergreen
-installation. Microsoft runtime license/resource files remain in the bundle.
+All Windows editions use the shared Evergreen WebView2 Runtime. The MSIX does
+not contain a private browser runtime or runtime installer. Build metadata
+records `"webview2": {"mode": "evergreen"}`; no runtime CAB is downloaded or cached.
+Evergreen receives Microsoft's runtime updates independently of Canvaz's Store
+updates, subject to the machine's update policies.
 
-The CAB is about 311 MB and the extracted runtime is larger, so expect a larger
-Store package than the standalone executable. Verified CABs are cached under
-`src-tauri/target/store-downloads` for later builds. Corrupt cache entries are
-not trusted or reused.
+The EXE and MSI installers explicitly use Tauri's `downloadBootstrapper` mode:
+they reuse the installed runtime and download/install Evergreen if it is missing.
+The bootstrapper needs internet access when the runtime is missing. For offline
+deployment, install Microsoft's Evergreen Standalone Installer beforehand.
 
-Fixed Version runtimes do not update themselves. Before Store releases, review
-[Microsoft's runtime downloads](https://developer.microsoft.com/en-us/microsoft-edge/webview2/),
-update the pinned version/URL/hash when needed, and increase the Store package
-version. Customers receive runtime updates in the next Store package. See
+The custom Store MSIX builder does not run Tauri's installer hooks, and this
+package does not declare a Store-installed runtime dependency. Before creating
+any webview, all Windows builds check for WebView2. If detection fails, a native
+dialog offers to open Microsoft's download page. Users install the Evergreen
+Runtime and relaunch Canvaz; declining exits cleanly, and a browser-launch failure
+shows the download URL. The check never downloads or runs an installer itself.
+This also covers a runtime removed after an EXE/MSI installation.
+
+Windows 11 includes Evergreen, and most Windows 10 machines already have it.
+Keep the missing-runtime recovery path for managed/custom installations. Test
+the app regularly against current and upcoming runtimes, since their updates
+are independent of Canvaz releases. See
 [Microsoft's distribution guidance](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution).
 
 ## GitHub Actions
@@ -182,21 +188,26 @@ continue through the existing `build` workflow independently.
 ## Validation and remaining native checks
 
 Run `python3 -m unittest discover -s scripts/tests -p test_build_msix.py -v`
-for SDK-free orchestration checks: production-only staging, runtime integrity,
-feature rejection, version overrides, numeric SDK discovery, failure cleanup,
+for SDK-free orchestration checks: production-only staging without a private
+runtime, feature rejection, version overrides, numeric SDK discovery, failure cleanup,
 and preservation of existing outputs and caller state. Store-feature Rust
-tests also check its storage/profile selection and updater rejection.
+tests also check its storage/profile selection, updater rejection, and native
+missing-runtime recovery decisions.
 These checks do not substitute for an actual Windows SDK package build.
 
-The branch was also checked natively on Windows on **2026-11-08**: all 84
-frontend tests, 13 packaging tests, 43 Store-feature Rust tests, and 41
-direct-download Rust tests passed, along with both browser regression checks.
-The production MSIX was built using the Windows SDK's MakePri and MakeAppx
-with validation enabled. The Store executable's imports contain only Windows
-system DLLs, with no VC++ redistributable dependency. The native smoke check
-below also passed against the unpacked package and its pinned WebView2 runtime.
-These results cover one development machine, not the complete supported
-Windows version range or Store certification.
+The Evergreen package was checked natively on Windows on **2026-11-08**: all 84
+frontend tests, 11 packaging tests, 47 Store-feature Rust tests, and 45
+direct-download Rust tests passed. MakePri and MakeAppx built a validated MSIX
+of **2,942,399 bytes**, down from the earlier fixed-runtime package's
+322,584,901 bytes. The native smoke check below passed using installed Evergreen
+157.0.4341.42, including the frontend, Store update UI, isolated data path,
+backend updater rejection, and no GitHub requests or script errors.
+
+Missing-runtime acceptance, cancellation, and browser-launch failure decisions
+are covered by Rust tests. Visual verification of the native recovery dialogs
+was unavailable because the Windows UI automation helper could not connect.
+Local checks cover one development machine, not the complete supported Windows
+version range, installed-package behavior, or Store certification.
 
 ### Native Store smoke check
 
@@ -213,19 +224,23 @@ MakeAppx.exe unpack /p src-tauri/target/release-assets/store/canvaz-store-1.0.0.
 node tests/store.windows.mjs src-tauri/target/store-smoke
 ```
 
-The optional Playwright dependency connects to the bundled WebView2; no
-separate Chromium download is needed. Close other Store-edition instances
+The optional Playwright dependency connects to installed Evergreen WebView2;
+no separate Chromium download is needed. Close other Store-edition instances
 before running. The check launches the unpacked executable using the normal
 Store preference/session paths and a temporary webview profile. It observes a
 fresh frontend reload, checks the Store menu and About dialog, exercises the
 real backend's updater rejection, and fails on GitHub requests, script errors,
-or a runtime version different from the pin. It closes its own process and
-removes its temporary webview profile. Port 9227 must be available.
+or a private runtime directory in the unpacked layout. It closes its own process
+and removes its temporary webview profile. Port 9227 must be available.
 
 This checks the unpacked executable, not Windows package identity,
 installation, or Store-delivered updates. Remaining release checks:
 
 - Run the Store workflow to confirm the package also builds on CI.
+- Verify an installed Store package launches with Evergreen on a clean machine.
+  In a test VM without WebView2, verify the native download prompt, cancellation,
+  browser-open failure instructions, and successful launch after installing the
+  Evergreen Runtime. Do not uninstall the runtime on a normal development machine.
 - Verify Kvaser/PCAN DLL loading and externally installed driver prerequisites
   under package identity. The app package does not install Windows drivers.
 - Run the Windows App Certification Kit and native installation, coexistence,

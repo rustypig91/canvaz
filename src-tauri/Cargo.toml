@@ -41,6 +41,8 @@ tauri = { version = "2", features = ["test"] }
 # other targets.
 [target.'cfg(windows)'.dependencies]
 libloading = { version = "0.8" }
+# Native startup recovery must work before a WebView/Tauri window exists.
+rfd = { version = "0.16", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 socketcan = { version = "3" }

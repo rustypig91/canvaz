@@ -124,9 +124,11 @@
         manage Store updates. Choosing <strong>Open Microsoft Store</strong>
         opens the Store's Updates and downloads page; it does not ask Canvaz to
         install an update or restart.</p>
-      <p>The Store edition includes a fixed version of the WebView2 runtime.
-        Updates to that bundled runtime are delivered with Canvaz's Store
-        packages rather than through the runtime's own automatic updater.</p>
+      <p>All Windows editions use the shared Microsoft Edge WebView2 Evergreen
+        Runtime, which updates independently of Canvaz according to your system
+        settings. If the runtime is missing, Canvaz offers to open Microsoft's
+        download page in your browser. The direct-download EXE and MSI installers
+        can download and install the runtime when needed.</p>
       <p><strong>GitHub updates:</strong> Direct-download release builds check
         GitHub for a newer release at startup. <strong>About → Check for
         Updates</strong> also contacts GitHub. Skipping a release hides its startup

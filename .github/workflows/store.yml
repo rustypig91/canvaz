@@ -60,10 +60,6 @@ jobs:
         with:
           workspaces: './src-tauri -> target/store'
           key: microsoft-store
-      - uses: actions/cache@v5
-        with:
-          path: src-tauri/target/store-downloads
-          key: webview2-x64-${{ hashFiles('packaging/windows/msix/webview2-runtime.json') }}
       - name: Install locked frontend dependencies
         run: npm ci
       - name: Test frontend update channels and regressions

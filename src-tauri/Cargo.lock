@@ -414,6 +414,7 @@ dependencies = [
  "libloading 0.8.9",
  "log",
  "percent-encoding",
+ "rfd",
  "serde",
  "serde_json",
  "sha2",

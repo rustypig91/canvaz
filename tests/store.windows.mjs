@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
@@ -12,9 +12,8 @@ import { chromium } from "playwright";
 assert.equal(process.platform, "win32", "This check requires native Windows WebView2.");
 assert.ok(process.argv[2], "Pass the unpacked MSIX directory.");
 const layout = resolve(process.argv[2]);
-const runtime = JSON.parse(readFileSync(new URL("../packaging/windows/msix/webview2-runtime.json", import.meta.url), "utf8").replace(/^\uFEFF/, ""));
 assert.ok(existsSync(join(layout, "canvaz.exe")), "Missing Store executable.");
-assert.ok(existsSync(join(layout, "WebView2/msedgewebview2.exe")), "Missing bundled runtime.");
+assert.equal(existsSync(join(layout, "WebView2")), false, "Store package must use shared Evergreen WebView2.");
 const endpoint = "http://127.0.0.1:9227";
 assert.equal(await fetch(`${endpoint}/json/version`).then(() => true, () => false), false,
     "Test debugging port 9227 must be unused.");
@@ -25,6 +24,8 @@ const app = spawn(join(layout, "canvaz.exe"), [], {
     cwd: layout, windowsHide: true,
     env: {
         ...process.env,
+        // An inherited development override must not select a private runtime.
+        WEBVIEW2_BROWSER_EXECUTABLE_FOLDER: "",
         WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS: "--remote-debugging-port=9227",
         WEBVIEW2_USER_DATA_FOLDER: profile,
     },
@@ -91,7 +92,7 @@ try {
     await delay(1000);
     assert.deepEqual(requests, [], "Store startup and manual updates must not contact GitHub.");
     assert.deepEqual(errors, [], "No script errors in the real WebView2 runtime.");
-    assert.equal(await browser.version(), runtime.version, "Use the pinned bundled WebView2 runtime.");
+    assert.match(await browser.version(), /^\d+\.\d+\.\d+\.\d+$/, "Evergreen WebView2 must report its version.");
     result = { nativeStoreSmoke: "passed", appVersion, url: page.url(), dataPath,
         browserVersion: await browser.version(), githubRequests: requests, errors };
 } finally {

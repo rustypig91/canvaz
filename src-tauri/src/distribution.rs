@@ -8,11 +8,6 @@ pub fn context<R: tauri::Runtime>() -> tauri::Context<R> {
         // Tauri uses it for every app path and its default Windows/Linux webview
         // data directory, so plugins and browser storage follow the same edition.
         context.config_mut().identifier = "com.christoffer.canvaz.store".into();
-        // The MSIX contains this pinned runtime beside canvaz.exe. Set it here
-        // before Tauri creates WebView2, independently of the host's Evergreen
-        // installation. The build script stages the matching directory.
-        context.config_mut().bundle.windows.webview_install_mode =
-            tauri::utils::config::WebviewInstallMode::FixedRuntime { path: "WebView2".into() };
     }
     context
 }
@@ -34,11 +29,10 @@ mod tests {
         let direct = app(tauri::generate_context!());
         let edition = app(super::context());
         assert_eq!(direct.config().identifier, "com.christoffer.canvaz");
-        if cfg!(feature = "microsoft-store") {
+        for app in [&direct, &edition] {
             assert!(matches!(
-                &edition.config().bundle.windows.webview_install_mode,
-                tauri::utils::config::WebviewInstallMode::FixedRuntime { path }
-                    if path == std::path::Path::new("WebView2")
+                &app.config().bundle.windows.webview_install_mode,
+                tauri::utils::config::WebviewInstallMode::DownloadBootstrapper { silent: true }
             ));
         }
 

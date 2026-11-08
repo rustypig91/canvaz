@@ -14,6 +14,8 @@ mod logger;
 mod project;
 mod sim_generator;
 mod updater;
+#[cfg(windows)]
+mod windows_runtime;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -565,6 +567,11 @@ pub fn run() {
     #[cfg(target_os = "linux")]
     linux_environment::prepare();
     logger::init();
+
+    #[cfg(windows)]
+    if !windows_runtime::prepare() {
+        return;
+    }
 
     debug!("Starting can-signals-tauri version {}", env!("GIT_VERSION"));
     tauri::Builder::default()
