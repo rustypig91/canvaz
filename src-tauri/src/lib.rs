@@ -113,6 +113,7 @@ async fn open_channel(
     dbc_path: Option<String>,
     protocol: Option<String>,
     resume_capture: Option<bool>,
+    socketcand_attempt: Option<u32>,
     state: State<'_, TauriState>,
 ) -> Result<Option<ParsedDbc>, String> {
     let can_manager = Arc::clone(&state.can_manager);
@@ -121,7 +122,7 @@ async fn open_channel(
     let result = tauri::async_runtime::spawn_blocking(move || {
         CanManager::open_channel(
             &can_manager, channel_handle, bitrate, listen_only, dbc_path.as_deref(), proto,
-            resume_capture.unwrap_or(false),
+            resume_capture.unwrap_or(false), socketcand_attempt,
         )
     })
     .await
@@ -129,6 +130,7 @@ async fn open_channel(
 
     match &result {
         Ok(_) => info!("Opened channel {channel_handle}"),
+        Err(e) if e == can_manager::SOCKETCAND_OPEN_CANCELLED => debug!("{e}: {channel_handle}"),
         // The frontend reports the first failure and keeps background retries quiet.
         Err(e) if resume_capture.unwrap_or(false) => debug!("Failed to reopen channel {channel_handle}: {e}"),
         Err(e) => error!("Failed to open channel {channel_handle}: {e}"),
@@ -137,9 +139,9 @@ async fn open_channel(
 }
 
 #[tauri::command]
-fn close_channel(channel_handle: u32, state: State<'_, TauriState>) -> Result<(), String> {
+fn close_channel(channel_handle: u32, socketcand_attempt: Option<u32>, state: State<'_, TauriState>) -> Result<(), String> {
     debug!("Close channel request: handle={channel_handle}");
-    state.can_manager.lock().map_err(|e| e.to_string())?.close_channel(channel_handle)
+    state.can_manager.lock().map_err(|e| e.to_string())?.close_channel(channel_handle, socketcand_attempt)
 }
 
 /// Full Rust log history (ring-buffered). The frontend fetches this on every

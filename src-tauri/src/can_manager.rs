@@ -441,7 +441,10 @@ pub struct CanManager {
     shared: Arc<Mutex<ManagerShared>>,
     cans: BTreeMap<String, Can>,
     opening_socketcand: HashMap<u32, Arc<()>>,
+    cancelled_socketcand: HashMap<u32, u32>,
 }
+
+pub(crate) const SOCKETCAND_OPEN_CANCELLED: &str = "Socketcand connection was cancelled";
 
 impl CanManager {
     pub fn new(app_state: Arc<AppState>) -> Self {
@@ -473,7 +476,10 @@ impl CanManager {
         });
 
         let cans = build_cans(&shared);
-        Self { app_state, shared, cans, opening_socketcand: HashMap::new() }
+        Self {
+            app_state, shared, cans,
+            opening_socketcand: HashMap::new(), cancelled_socketcand: HashMap::new(),
+        }
     }
 
     pub fn start_recording(&self, path: String, start_ms: u64) -> Result<RecordingStatus, String> {
@@ -537,6 +543,14 @@ impl CanManager {
 
         let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
 
+        if let Some((backend, index)) = &found {
+            if backend == "socketcand" {
+                if let Some(&handle) = lock.index_to_handle.get(&(backend.clone(), *index)) {
+                    return Ok(CreatedChannel { handle, backend: backend.clone(), available: true });
+                }
+            }
+        }
+
         // Data and identity exist independently of the physical interface.
         let handle = lock
             .channels
@@ -582,7 +596,10 @@ impl CanManager {
             }
             for (&other, channel) in &lock.channels {
                 let target = assignments.iter().find(|(h, _)| *h == other).map(|(_, i)| i).unwrap_or(&channel.info);
-                if other != *handle && target.backend == info.backend && target.name == info.name {
+                if other != *handle && target.backend == info.backend
+                    && (target.name == info.name || (info.backend == "socketcand"
+                        && crate::can_communication::SocketcandBackend::same_endpoint(&target.name, &info.name)))
+                {
                     return Err("Interface already assigned".into());
                 }
             }
@@ -629,6 +646,7 @@ impl CanManager {
             lock.channels
                 .remove(&handle)
                 .ok_or_else(|| format!("channel handle {handle} not found"))?;
+            self.cancelled_socketcand.remove(&handle);
             return Ok(());
         }
 
@@ -657,6 +675,7 @@ impl CanManager {
         lock.handle_to_index.remove(&handle);
         lock.channels.remove(&handle);
         self.opening_socketcand.remove(&handle);
+        self.cancelled_socketcand.remove(&handle);
         can.unregister_channel(hw_index);
 
         info!("Removed {backend_name} channel {hw_index} (handle: {handle})");
@@ -688,10 +707,16 @@ impl CanManager {
         dbc_path: Option<&str>,
         protocol: Protocol,
         resume_capture: bool,
+        socketcand_attempt: Option<u32>,
     ) -> Result<Option<ParsedDbc>, String> {
         let mut guard = manager.lock().map_err(|e| e.to_string())?;
         let (backend_name, hw_index) = guard.backend_index(handle)?;
         let remote = backend_name == "socketcand";
+        if let Some(attempt) = socketcand_attempt {
+            if !remote || guard.cancelled_socketcand.get(&handle).is_some_and(|&cancelled| attempt <= cancelled) {
+                return Err(SOCKETCAND_OPEN_CANCELLED.into());
+            }
+        }
         guard.cans.get(&backend_name).ok_or("Backend not found")?
             .ensure_closed(hw_index).map_err(|e| e.to_string())?;
         if guard.opening_socketcand.contains_key(&handle) {
@@ -721,7 +746,7 @@ impl CanManager {
             let connection = crate::can_communication::SocketcandBackend::connect(&endpoint, listen_only);
             let mut guard = manager.lock().map_err(|e| e.to_string())?;
             if !guard.opening_socketcand.get(&handle).is_some_and(|current| Arc::ptr_eq(current, &attempt)) {
-                return Err("Socketcand connection was cancelled".into());
+                return Err(SOCKETCAND_OPEN_CANCELLED.into());
             }
             guard.opening_socketcand.remove(&handle);
             let (tx, rx) = connection.map_err(|e| e.to_string())?;
@@ -747,17 +772,32 @@ impl CanManager {
 
     /// Close the hardware but keep the channel registered, so it can be reopened
     /// on the next Start. Unregistering the handle is `remove_channel`'s job.
-    pub fn close_channel(&mut self, handle: u32) -> Result<(), String> {
+    pub fn close_channel(&mut self, handle: u32, socketcand_attempt: Option<u32>) -> Result<(), String> {
+        let (backend_name, hw_index) = self.backend_index(handle)?;
+        if let Some(attempt) = socketcand_attempt {
+            // Stop can reach the manager before the open worker starts. Keep
+            // the cancelled attempt number so that worker also declines to open.
+            let cancelled = self.cancelled_socketcand.entry(handle).or_default();
+            *cancelled = (*cancelled).max(attempt);
+        }
         if self.opening_socketcand.remove(&handle).is_some() {
             return Ok(());
         }
-        let (backend_name, hw_index) = self.backend_index(handle)?;
-        self.cans.get_mut(&backend_name).ok_or("Backend not found")?.close(hw_index)
+        let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
+        if socketcand_attempt.is_some() && !can.is_open(hw_index) {
+            return Ok(());
+        }
+        can.close(hw_index)
     }
 
     /// Close all open hardware and drop every channel registration/data store.
     /// Used to give a reloading frontend a clean backend to rebuild from.
     pub fn reset(&mut self) {
+        self.cancelled_socketcand.clear();
+        self.reset_registrations();
+    }
+
+    fn reset_registrations(&mut self) {
         self.opening_socketcand.clear();
         let indices: Vec<(String, u8)> = match self.shared.lock() {
             Ok(lock) => lock.handle_to_index.values().cloned().collect(),
@@ -799,7 +839,7 @@ impl CanManager {
             .lock()
             .map(|mut lock| std::mem::take(&mut lock.channels))
             .unwrap_or_default();
-        self.reset();
+        self.reset_registrations();
         if let Ok(mut lock) = self.shared.lock() {
             lock.channels = channels;
         }

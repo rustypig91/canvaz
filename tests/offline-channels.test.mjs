@@ -282,7 +282,7 @@ test("Start preserves duplicate offline channels, dependent entries and saved ID
         let reconnected = false;
         const opened = [];
         const element = { value: "", querySelector: () => null, classList: { add: () => {} } };
-        const ctx = harness(["refreshHardware", "registerChannel", "handleToId", "idToHandle", "openConfiguredChannels", "startApp", "finishStartingCapture"], {
+        const ctx = harness(["refreshHardware", "registerChannel", "handleToId", "idToHandle", "openConfiguredChannels", "startApp", "finishStartingCapture", "reconcileSimMessages"], {
             channels: new Map(reverse ? entries.reverse() : entries), ghostChannels: [], renderChannelList: () => {},
             simEntries: new Map([["message", simulated], ["raw", raw]]), plotPanes: [pane],
             document: { getElementById: () => element },

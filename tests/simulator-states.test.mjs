@@ -8,7 +8,7 @@ const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.
 const names = ["simEntryStatus", "updateSimEntryStatus", "updateSimTxStatus", "queueSimOperation",
     "startSim", "stopSim", "openConfiguredChannels", "startApp", "finishStartingCapture", "stopApp", "finishStoppingCapture",
     "onChannelError", "closeFailedChannel", "openChannelByHandle",
-    "scheduleChannelRecovery", "recoverChannel"];
+    "scheduleChannelRecovery", "attemptChannelRecovery", "recoverChannel", "reconcileSimMessages"];
 const code = ts.transpileModule(source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text)).map(n => n.getText(source)).join("\n"), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
@@ -28,7 +28,7 @@ function harness(kind = "raw", invoke = async () => 42) {
     const row = { querySelector: selector => controls[selector] };
     const ctx = vm.createContext({
         channels: new Map([[1, ch]]), simEntries: new Map([["entry", entry]]), appRunning: true,
-        startingCapture: null, stoppingCapture: null,
+        startingCapture: null, stoppingCapture: null, nextSocketcandAttempt: 0,
         document: { querySelector: () => row, getElementById: id => id === "sim-tx-status" ? footer : count },
         invoke, scheduleAutoSave() {}, log() {}, channelName: () => "CAN 1", simSignalValues: () => ({}), simGenerators: () => [],
         viewPaused: false, updatePauseViewBtn() {}, stopBusStatsPoll() {}, renderChannelList() {},
@@ -211,17 +211,19 @@ test("stopping capture disables Send while channel closure is pending", async ()
     await stopping;
 });
 
-test("Stop cancels queued recovery and closes a Socketcand reconnect already in progress", async () => {
+test("Stop cancels a Socketcand reconnect and lets capture restart before its response", async () => {
     const open = deferred(), entered = deferred();
     const calls = [];
     const h = harness("raw", async (command, args) => {
         calls.push(command);
         if (command === "open_channel") {
             assert.equal(args.resumeCapture, true);
+            assert.equal(args.socketcandAttempt, 1);
             entered.resolve();
             return open.promise;
         }
         assert.equal(command, "close_channel");
+        assert.equal(args.socketcandAttempt, 1);
     });
     h.ch.open = false;
     h.entry.running = true;
@@ -237,10 +239,10 @@ test("Stop cancels queued recovery and closes a Socketcand reconnect already in 
     h.ctx.openConfiguredChannels = async () => { calls.push("start"); return false; };
     const starting = h.ctx.startApp();
     assert.equal(h.timers.size, 0);
-    assert.deepEqual(calls, ["open_channel"]);
-    open.resolve(null);
-    await Promise.all([retry, stopping, starting]);
+    await Promise.all([stopping, starting]);
     assert.deepEqual(calls, ["open_channel", "close_channel", "start"]);
+    open.resolve(null);
+    await retry;
     assert.equal(h.ch.open, false);
     assert.equal(h.entry.periodicHandle, null);
 });
@@ -264,6 +266,7 @@ test("capture retries when the only Socketcand server is initially offline", asy
     });
 
     await h.ctx.startApp();
+    await h.ctx.channelRecoveryTasks.get(1);
     assert.equal(h.ctx.appRunning, true);
     assert.equal(h.ch.open, false);
     assert.match(h.ch.error, /Connection refused/);
@@ -276,6 +279,62 @@ test("capture retries when the only Socketcand server is initially offline", asy
     assert.equal(h.ch.open, true);
     assert.equal(h.ch.error, null);
     assert.equal(h.timers.size, 0);
+});
+
+test("Socketcand startup waits for the capture view, then leaves a slow handshake in the background", async () => {
+    const handshake = deferred(), entered = deferred();
+    const opened = [];
+    let traceReady = false;
+    const h = harness("raw", async (command, args) => {
+        assert.equal(command, "open_channel");
+        opened.push(args.channelHandle);
+        if (args.channelHandle === 2) return null;
+        assert.equal(traceReady, true);
+        assert.equal(h.ctx.appRunning, true);
+        entered.resolve();
+        return handshake.promise;
+    });
+    h.ch.open = false;
+    const local = { info: { backend: "socketcan", name: "vcan0" }, config: {}, available: true, open: false };
+    h.ctx.channels.set(2, local);
+    Object.assign(h.ctx, {
+        appRunning: false, appStartTime: 0, sidebarSnapshot: null,
+        ghostChannels: [], refreshHardware: async () => true,
+        traceFilterMsgNames: null, signalLastValues: new Map(), signalLastRaw: new Map(),
+        signalMinValues: new Map(), signalMaxValues: new Map(), renderDbcTree() {},
+        plotPanes: [], restoreProjectEntries: async () => {}, clearTrace() { traceReady = true; },
+        startScrollLoop() {}, startBusStatsPoll() {},
+    });
+    await Promise.all([h.ctx.startApp(), entered.promise]);
+    assert.deepEqual(opened, [2, 1]);
+    assert.equal(local.open, true);
+    assert.equal(h.ch.open, false);
+    assert.equal(h.count.textContent, "■ Stop");
+    handshake.resolve(null);
+    await h.ctx.channelRecoveryTasks.get(1);
+    assert.equal(h.ch.open, true);
+});
+
+test("Socketcand reconnect refreshes DBC definitions before rearming simulated messages", async () => {
+    const signal = { name: "Value", factor: 2 };
+    const dbc = { messages: { 123: { name: "Updated", dlc: 2, signals: [signal] } } };
+    const h = harness("message", async command => {
+        if (command === "open_channel") return dbc;
+        assert.equal(command, "add_periodic_message");
+        assert.equal(h.entry.signals[0].def, signal);
+        assert.equal(h.entry.signals[0].value, 12);
+        return 42;
+    });
+    h.ch.open = false;
+    h.entry.running = true;
+    h.entry.signals = [{ def: { name: "Value", factor: 1 }, value: 12, gen: null }];
+    const getElement = h.ctx.document.getElementById;
+    h.ctx.document.getElementById = id => id === "sim-entries" ? { querySelector: () => null } : getElement(id);
+    h.ctx.renderDbcTree = () => {};
+    h.ctx.restoreProjectEntries = async () => {};
+    await h.ctx.attemptChannelRecovery(1, true);
+    assert.equal(h.entry.periodicHandle, 42);
+    assert.equal(h.entry.dlc, 2);
 });
 
 test("a Socketcand disconnect before the open response leaves the channel disconnected", async () => {

@@ -2,18 +2,27 @@
 use super::{CanBackend, CanFrame, CanOpenError, RxHandle, TxHandle};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpStream, ToSocketAddrs};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Default)]
 pub struct SocketcandBackend {
     // An open channel keeps its index even when another channel is removed.
-    channels: Vec<Option<String>>,
+    channels: Vec<Option<Registration>>,
+}
+
+#[derive(Clone)]
+struct Registration {
+    name: String,
+    endpoint: (String, u16, String),
 }
 
 const MAX_MESSAGE_BYTES: usize = 4096;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_EARLY_FRAMES: usize = 1024;
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn endpoint(name: &str) -> Result<(String, u16, String), String> {
     let (address, bus) = if let Some((label, address)) = name.split_once(" (") {
@@ -35,7 +44,7 @@ fn endpoint(name: &str) -> Result<(String, u16, String), String> {
         Some(url::Host::Ipv6(host)) => host.to_string(),
         Some(url::Host::Ipv4(host)) => host.to_string(),
         Some(url::Host::Domain(host)) if !host.is_empty()
-            && host.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) => host.to_owned(),
+            && host.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) => host.to_ascii_lowercase(),
         _ => return Err("Socketcand requires a valid host name or IP address".into()),
     };
     let port = url.port().unwrap_or(29536);
@@ -47,17 +56,18 @@ fn endpoint(name: &str) -> Result<(String, u16, String), String> {
 
 impl CanBackend for SocketcandBackend {
     fn register_channel(&mut self, name: &str) -> Result<(), String> {
-        endpoint(name)?;
-        if self.channel_index(name).is_some() {
+        let endpoint = endpoint(name)?;
+        if self.index_of(&endpoint).is_some() {
             return Ok(());
         }
+        let registration = Some(Registration { name: name.into(), endpoint });
         if let Some(slot) = self.channels.iter_mut().find(|slot| slot.is_none()) {
-            *slot = Some(name.into());
+            *slot = registration;
         } else {
             if self.channels.len() > usize::from(u8::MAX) {
                 return Err("Too many socketcand channels".into());
             }
-            self.channels.push(Some(name.into()));
+            self.channels.push(registration);
         }
         Ok(())
     }
@@ -81,34 +91,59 @@ impl CanBackend for SocketcandBackend {
     }
 
     fn list_channels(&self) -> Vec<String> {
-        self.channels.iter().flatten().cloned().collect()
+        self.channels.iter().flatten().map(|channel| channel.name.clone()).collect()
     }
 
     fn channel_index(&self, name: &str) -> Option<u8> {
-        let index = self.channels.iter().position(|slot| slot.as_deref() == Some(name))?;
-        u8::try_from(index).ok()
+        self.index_of(&endpoint(name).ok()?)
     }
 
     fn open_channel(&mut self, index: u8, _: u32, listen_only: bool, _: Option<&str>) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
-        let name = self.channels.get(usize::from(index)).and_then(Option::as_deref)
+        let channel = self.channels.get(usize::from(index)).and_then(Option::as_ref)
             .ok_or("Unknown socketcand channel")?;
-        Self::connect(name, listen_only)
+        Self::connect(&channel.name, listen_only)
     }
 }
 
 impl SocketcandBackend {
+    fn index_of(&self, endpoint: &(String, u16, String)) -> Option<u8> {
+        let index = self.channels.iter().position(|slot| {
+            slot.as_ref().is_some_and(|channel| &channel.endpoint == endpoint)
+        })?;
+        u8::try_from(index).ok()
+    }
+
+    pub(crate) fn same_endpoint(first: &str, second: &str) -> bool {
+        endpoint(first).is_ok_and(|key| endpoint(second).is_ok_and(|other| key == other))
+    }
+
     pub(crate) fn connect(name: &str, listen_only: bool) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
         let (host, port, bus) = endpoint(name)?;
         let addresses = (host.as_str(), port).to_socket_addrs().map_err(|e| e.to_string())?;
-        let mut stream = None;
+        let mut rx = Self::connect_addresses(addresses, &bus)?;
+        // Keep reads independent of writes. Serialize writes so an echo
+        // cannot interleave with a send command.
+        let writer = Arc::new(Mutex::new(rx.stream.try_clone().map_err(|e| e.to_string())?));
+        let tx = SocketcandTx { writer: Arc::clone(&writer), listen_only };
+        rx.heartbeat = Some(Heartbeat { writer, due: Instant::now() + HEARTBEAT_INTERVAL, awaiting_echo: false });
+        Ok((Box::new(tx), Box::new(rx)))
+    }
+
+    fn connect_addresses(addresses: impl IntoIterator<Item = SocketAddr>, bus: &str) -> Result<SocketcandRx, String> {
         let mut last_error = "Socketcand host has no addresses".to_string();
         for address in addresses {
-            match TcpStream::connect_timeout(&address, OPEN_TIMEOUT) {
-                Ok(s) => { stream = Some(s); break; }
-                Err(e) => last_error = e.to_string(),
+            let result = TcpStream::connect_timeout(&address, OPEN_TIMEOUT)
+                .map_err(|e| e.to_string())
+                .and_then(|stream| Self::negotiate(stream, bus));
+            match result {
+                Ok(rx) => return Ok(rx),
+                Err(e) => last_error = format!("Socketcand {address}: {e}"),
             }
         }
-        let stream = stream.ok_or(last_error)?;
+        Err(last_error)
+    }
+
+    fn negotiate(stream: TcpStream, bus: &str) -> Result<SocketcandRx, String> {
         stream.set_nodelay(true).map_err(|e| e.to_string())?;
         stream.set_write_timeout(Some(OPEN_TIMEOUT)).map_err(|e| e.to_string())?;
         let mut rx = SocketcandRx::new(stream);
@@ -122,13 +157,20 @@ impl SocketcandBackend {
         // An echo in RAW mode confirms the bind succeeded, even on a quiet bus.
         rx.stream.write_all(b"< echo >").map_err(|e| e.to_string())?;
         rx.wait_for_raw_echo(deadline)?;
-        // The TX worker is the only writer after the handshake. Cloning the
-        // socket lets RX block independently without locking out transmission.
-        let tx = SocketcandTx { stream: rx.stream.try_clone().map_err(|e| e.to_string())?, listen_only };
-        Ok((Box::new(tx), Box::new(rx)))
+        Ok(rx)
     }
 }
-struct SocketcandTx { stream: TcpStream, listen_only: bool }
+fn write_command(writer: &Mutex<TcpStream>, command: &[u8]) -> Result<(), String> {
+    let mut stream = writer.lock().map_err(|e| e.to_string())?;
+    stream.write_all(command).map_err(|error| {
+        // A failed write may leave a partial command. Close both halves so
+        // RX reports a fatal failure and the channel can reconnect.
+        let _ = stream.shutdown(Shutdown::Both);
+        error.to_string()
+    })
+}
+
+struct SocketcandTx { writer: Arc<Mutex<TcpStream>>, listen_only: bool }
 impl TxHandle for SocketcandTx {
     fn send(&mut self, frame: &mut CanFrame) -> Result<(), String> {
         if self.listen_only { return Err("Socketcand channel is receive-only".into()); }
@@ -142,12 +184,7 @@ impl TxHandle for SocketcandTx {
             write!(command, " {byte:x}").unwrap();
         }
         command.push_str(" >");
-        if let Err(error) = self.stream.write_all(command.as_bytes()) {
-            // A failed write may have left half a command on the wire. Close
-            // both halves so RX reports a fatal failure and recovery reconnects.
-            let _ = self.stream.shutdown(Shutdown::Both);
-            return Err(error.to_string());
-        }
+        write_command(&self.writer, command.as_bytes())?;
         // RAW mode has no positive send acknowledgement: this is the time the
         // command was written, not confirmation of delivery on the remote bus.
         frame.timestamp_ms = Some(now_ms());
@@ -162,10 +199,34 @@ struct SocketcandRx {
     pending: Vec<u8>,
     early_frames: VecDeque<CanFrame>,
     clock_anchor: Option<(u64, u64)>,
+    heartbeat: Option<Heartbeat>,
 }
+
+struct Heartbeat {
+    writer: Arc<Mutex<TcpStream>>,
+    due: Instant,
+    awaiting_echo: bool,
+}
+
+impl Heartbeat {
+    fn poll(&mut self) -> Result<(), String> {
+        if Instant::now() < self.due { return Ok(()); }
+        if self.awaiting_echo { return Err("Socketcand heartbeat timed out".into()); }
+        write_command(&self.writer, b"< echo >")?;
+        self.awaiting_echo = true;
+        self.due = Instant::now() + HEARTBEAT_TIMEOUT;
+        Ok(())
+    }
+
+    fn echoed(&mut self) {
+        self.awaiting_echo = false;
+        self.due = Instant::now() + HEARTBEAT_INTERVAL;
+    }
+}
+
 impl SocketcandRx {
     fn new(stream: TcpStream) -> Self {
-        Self { stream, pending: Vec::new(), early_frames: VecDeque::new(), clock_anchor: None }
+        Self { stream, pending: Vec::new(), early_frames: VecDeque::new(), clock_anchor: None, heartbeat: None }
     }
     fn local_timestamp(&mut self, server_ms: u64, local_ms: u64) -> u64 {
         // Match the hardware backends: anchor the first sample to this host's
@@ -236,7 +297,16 @@ impl RxHandle for SocketcandRx {
         if let Some(frame) = self.early_frames.pop_front() { return Ok(Some(frame)); }
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
-            let Some(message) = self.message(deadline)? else { return Ok(None); };
+            let read_deadline = if let Some(heartbeat) = &mut self.heartbeat {
+                heartbeat.poll()?;
+                deadline.min(heartbeat.due)
+            } else {
+                deadline
+            };
+            let Some(message) = self.message(read_deadline)? else { return Ok(None); };
+            if let Some(heartbeat) = self.heartbeat.as_mut().filter(|_| message == "echo") {
+                heartbeat.echoed();
+            }
             if let Some(frame) = self.decode_message(&message)? { return Ok(Some(frame)); }
             // Unsupported FD traffic must not keep the RX worker from stopping.
             if Instant::now() >= deadline { return Ok(None); }
@@ -296,6 +366,19 @@ mod tests {
         assert_eq!(f.timestamp_ms, Some(1700000000123));
         assert!(parse_frame("frame 123 1.000000").unwrap().data.is_empty());
         for bad in ["frame 800 1.000000 FF", "frame 123 1.000000 F", "frame 123 NaN FF", "error denied"] { assert!(parse_frame(bad).is_err()); }
+    }
+
+    #[test]
+    fn equivalent_addresses_share_an_index_without_changing_the_saved_name() {
+        let mut backend = SocketcandBackend::default();
+        let saved = "vcan0@SIL (can://LOCALHOST:29536)";
+        let equivalent = "can://localhost/vcan0";
+        backend.register_channel(saved).unwrap();
+        backend.register_channel(equivalent).unwrap();
+        assert_eq!(backend.channel_index(equivalent), backend.channel_index(saved));
+        assert_eq!(backend.list_channels(), [saved]);
+        assert!(!SocketcandBackend::same_endpoint(saved, "can://localhost/VCAN0"));
+        assert!(!SocketcandBackend::same_endpoint(saved, "can://localhost:30000/vcan0"));
     }
 
     #[test]
@@ -406,6 +489,52 @@ mod tests {
     }
 
     #[test]
+    fn address_fallback_continues_after_a_successful_tcp_connect_with_a_failed_handshake() {
+        let rejected = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let working = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addresses = [rejected.local_addr().unwrap(), working.local_addr().unwrap()];
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = rejected.accept().unwrap();
+            stream.write_all(b"< different protocol >").unwrap();
+            let (stream, _) = working.accept().unwrap();
+            let mut peer = SocketcandRx::new(stream);
+            peer.stream.write_all(b"< hi >").unwrap();
+            peer.expect("open vcan0").unwrap();
+            peer.stream.write_all(b"< ok >").unwrap();
+            peer.expect("rawmode").unwrap();
+            peer.stream.write_all(b"< ok >").unwrap();
+            peer.expect("echo").unwrap();
+            peer.stream.write_all(b"< echo >").unwrap();
+        });
+        let rx = SocketcandBackend::connect_addresses(addresses, "vcan0").unwrap();
+        assert_eq!(rx.stream.peer_addr().unwrap(), addresses[1]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn raw_heartbeat_keeps_frames_and_detects_a_silent_peer() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let mut peer = SocketcandRx::new(peer);
+        let writer = Arc::new(Mutex::new(stream.try_clone().unwrap()));
+        let mut rx = SocketcandRx::new(stream);
+        rx.heartbeat = Some(Heartbeat { writer, due: Instant::now(), awaiting_echo: false });
+
+        assert!(rx.receive(0).unwrap().is_none());
+        peer.expect("echo").unwrap();
+        peer.stream.write_all(b"< echo >< frame 123 1.000000 AA >").unwrap();
+        assert_eq!(rx.receive(1000).unwrap().unwrap().data, [0xAA]);
+        assert!(!rx.heartbeat.as_ref().unwrap().awaiting_echo);
+
+        rx.heartbeat.as_mut().unwrap().due = Instant::now();
+        assert!(rx.receive(0).unwrap().is_none());
+        peer.expect("echo").unwrap();
+        rx.heartbeat.as_mut().unwrap().due = Instant::now();
+        assert_eq!(rx.receive(50).unwrap_err(), "Socketcand heartbeat timed out");
+    }
+
+    #[test]
     fn mixed_fd_traffic_keeps_classic_frames_and_errors_on_the_local_timeline() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
@@ -491,14 +620,14 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (peer, _) = listener.accept().unwrap();
-        let mut tx = SocketcandTx { stream, listen_only: true };
+        let mut tx = SocketcandTx { writer: Arc::new(Mutex::new(stream)), listen_only: true };
         let mut f = frame(0x123, false, vec![1]);
         assert!(tx.send(&mut f).unwrap_err().contains("receive-only"));
         assert!(f.timestamp_ms.is_none());
         let mut peer = SocketcandRx::new(peer);
         assert!(peer.message(Instant::now() + Duration::from_millis(20)).unwrap().is_none());
         tx.listen_only = false;
-        tx.stream.shutdown(Shutdown::Both).unwrap();
+        tx.writer.lock().unwrap().shutdown(Shutdown::Both).unwrap();
         assert!(tx.send(&mut f).is_err());
         assert!(f.timestamp_ms.is_none());
     }

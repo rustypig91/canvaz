@@ -145,7 +145,7 @@ interface CreatedChannel { handle: number; backend: string; available: boolean; 
 interface ChannelConfig { name: string; display_name?: string | null; backend: string; dbc_path: string | null; bitrate: number | null; protocol: string | null; listen_only: boolean; }
 // Everything the app tracks about one channel, keyed by its u32 handle in `channels`.
 interface Channel {
-    opening?: { failed: boolean };
+    opening?: { failed: boolean; socketcandAttempt?: number };
     info: ChannelInfo;       // backend + hardware name (immutable identity)
     config: ChannelConfig;   // user settings: DBC path + bitrate
     dbc: ParsedDbc | null;   // DBC tree, parsed by open_channel; null until opened
@@ -330,6 +330,7 @@ function markPaneDirty(pane: PlotPane, force = false) {
 let appRunning = false;
 let startingCapture: Promise<void> | null = null;
 let stoppingCapture: Promise<void> | null = null;
+let nextSocketcandAttempt = 0;
 let appStartTime = Date.now();
 let demoMode = false;
 let plotTabActive = false; // trace tab is the default active tab (see index.html)
@@ -2021,7 +2022,10 @@ async function registerChannel(config: ChannelConfig): Promise<RegisterResult> {
 async function openChannelByHandle(handle: number, resumeCapture = false): Promise<boolean> {
     const ch = channels.get(handle);
     if (!ch || ch.opening) return false;
-    const opening = { failed: false };
+    const opening = {
+        failed: false,
+        socketcandAttempt: ch.info.backend === "socketcand" ? ++nextSocketcandAttempt : undefined,
+    };
     ch.opening = opening;
     try {
         // open_channel opens the hardware (using the channel's configured bitrate
@@ -2033,7 +2037,9 @@ async function openChannelByHandle(handle: number, resumeCapture = false): Promi
             dbcPath: ch.config.dbc_path ?? null,
             protocol: ch.config.protocol ?? null,
             resumeCapture,
+            socketcandAttempt: opening.socketcandAttempt,
         });
+        if (ch.opening !== opening) return false;
         if (opening.failed) {
             await failedChannelCloses.get(handle);
             return false;
@@ -2045,6 +2051,7 @@ async function openChannelByHandle(handle: number, resumeCapture = false): Promi
         ch.error = null;
         return true;
     } catch (e) {
+        if (ch.opening !== opening) return false;
         const msg = String(e);
         if (msg === "Sudo authentication cancelled") {
             log("warn", "Cancelled — sudo password required.");
@@ -2054,7 +2061,7 @@ async function openChannelByHandle(handle: number, resumeCapture = false): Promi
         }
         return false;
     } finally {
-        delete ch.opening;
+        if (ch.opening === opening) delete ch.opening;
     }
 }
 
@@ -2122,27 +2129,40 @@ async function closeFailedChannel(handle: number) {
 
 function scheduleChannelRecovery(handle: number) {
     if (channelRecoveryTimers.has(handle) || channelRecoveryTasks.has(handle)) return;
-    channelRecoveryTimers.set(handle, setTimeout(async () => {
+    channelRecoveryTimers.set(handle, setTimeout(() => {
         channelRecoveryTimers.delete(handle);
-        const task = recoverChannel(handle);
-        channelRecoveryTasks.set(handle, task);
-        try {
-            await task;
-        } finally {
-            channelRecoveryTasks.delete(handle);
-        }
-        const ch = channels.get(handle);
-        if (appRunning && ch && !ch.open) scheduleChannelRecovery(handle);
+        return attemptChannelRecovery(handle, true);
     }, CHANNEL_RECOVERY_INTERVAL_MS));
 }
 
-async function recoverChannel(handle: number) {
+async function attemptChannelRecovery(handle: number, resumeCapture: boolean) {
+    const task = recoverChannel(handle, resumeCapture);
+    channelRecoveryTasks.set(handle, task);
+    try {
+        await task;
+    } catch (e) {
+        log("error", `Channel ${channelName(handle)} recovery failed: ${e}`);
+    } finally {
+        if (channelRecoveryTasks.get(handle) === task) {
+            channelRecoveryTasks.delete(handle);
+            const ch = channels.get(handle);
+            if (appRunning && ch && !ch.open) scheduleChannelRecovery(handle);
+        }
+    }
+}
+
+async function recoverChannel(handle: number, resumeCapture: boolean) {
     await failedChannelCloses.get(handle);
     const ch = channels.get(handle);
     if (!appRunning || !ch || ch.open) return;
-    if (!await openChannelByHandle(handle, true) || !appRunning) return;
-    log("info", `Channel ${channelName(handle)} recovered`);
+    if (!await openChannelByHandle(handle, resumeCapture) || !appRunning) return;
+    if (resumeCapture) log("info", `Channel ${channelName(handle)} recovered`);
     renderChannelList();
+    if (ch.info.backend === "socketcand" && ch.dbc) {
+        reconcileSimMessages(handle);
+        renderDbcTree((document.getElementById("signal-search") as HTMLInputElement).value);
+        await restoreProjectEntries();
+    }
     // Re-register simulations the user kept armed while disconnected.
     for (const [key, entry] of simEntries) {
         if (entry.channel === handle && entry.running) await startSim(key);
@@ -3868,21 +3888,20 @@ async function openConfiguredChannels(reportMissing: boolean): Promise<boolean> 
         }
     }
     let opened = false;
-    const remoteOpens: Promise<boolean>[] = [];
     for (const [handle, ch] of channels) {
         if (ch.info.backend === "none") continue;
         if (!ch.available) {
             if (reportMissing) log("error", `Cannot start channel ${ch.config.display_name || ch.info.name}: interface not found`);
             continue;
         }
-        if (ch.info.backend === "socketcand") remoteOpens.push(openChannelByHandle(handle));
-        else if (await openChannelByHandle(handle)) opened = true;
+        // Remote channels connect once the capture view is ready so a slow
+        // server cannot delay local capture or swallow early remote frames.
+        if (ch.info.backend === "socketcand" || await openChannelByHandle(handle)) opened = true;
     }
-    await Promise.all(remoteOpens);
     renderChannelList();
     // Remote servers can come online after capture starts, even when there is
     // no other channel open to keep capture running.
-    return opened || remoteOpens.length > 0;
+    return opened;
 }
 
 async function startApp(reportMissing = true) {
@@ -3897,31 +3916,34 @@ async function startApp(reportMissing = true) {
     }
 }
 
+// Simulation entries cache their DBC definitions. Refresh them using the DBC
+// parsed at open, preserving the values and generators of surviving signals.
+function reconcileSimMessages(handle: number) {
+    const dbc = channels.get(handle)?.dbc;
+    if (!dbc) return;
+    const simContainer = document.getElementById("sim-entries")!;
+    for (const [key, entry] of simEntries) {
+        if (entry.kind !== "message" || entry.channel !== handle) continue;
+        const msg = dbc.messages[entry.messageId];
+        if (!msg) {
+            simEntries.delete(key);
+            simContainer.querySelector(`[data-sim-key="${key}"]`)?.remove();
+            continue;
+        }
+        const prevValues = new Map(entry.signals.map(s => [s.def.name, s.value]));
+        const prevGens = new Map(entry.signals.map(s => [s.def.name, s.gen]));
+        entry.messageName = msg.name;
+        entry.dlc = msg.dlc;
+        entry.signals = msg.signals.map(s => ({ def: s, value: prevValues.get(s.name) ?? simDefaultValue(s), gen: prevGens.get(s.name) ?? null }));
+        simContainer.querySelector(`[data-sim-key="${key}"]`)?.replaceWith(createSimEntryEl(key, entry));
+    }
+}
+
 async function finishStartingCapture(reportMissing: boolean) {
     if (!await openConfiguredChannels(reportMissing)) return;
 
-    // Reconcile simulated message entries with the reloaded DBC. Entries hold a
-    // snapshot of each signal's definition, so after the DBC changes on disk we
-    // prune entries whose message is gone and, for survivors, swap in the fresh
-    // signal defs (preserving prior values by name), update the DLC, and re-render
-    // so added/removed signals and changed scaling take effect.
-    {
-        const simContainer = document.getElementById("sim-entries")!;
-        for (const [key, entry] of [...simEntries]) {
-            if (entry.kind !== "message") continue;
-            const msg = channels.get(entry.channel)?.dbc?.messages[entry.messageId];
-            if (!msg) {
-                simEntries.delete(key);
-                simContainer.querySelector(`[data-sim-key="${key}"]`)?.remove();
-                continue;
-            }
-            const prevValues = new Map(entry.signals.map(s => [s.def.name, s.value]));
-            const prevGens = new Map(entry.signals.map(s => [s.def.name, s.gen]));
-            entry.messageName = msg.name;
-            entry.dlc = msg.dlc;
-            entry.signals = msg.signals.map(s => ({ def: s, value: prevValues.get(s.name) ?? simDefaultValue(s), gen: prevGens.get(s.name) ?? null }));
-            simContainer.querySelector(`[data-sim-key="${key}"]`)?.replaceWith(createSimEntryEl(key, entry));
-        }
+    for (const [handle, ch] of channels) {
+        if (ch.info.backend !== "socketcand") reconcileSimMessages(handle);
     }
 
     // Prune message names from filter that no longer exist in any DBC
@@ -3974,7 +3996,7 @@ async function finishStartingCapture(reportMissing: boolean) {
     startScrollLoop();
     startBusStatsPoll();
     for (const [handle, ch] of channels) {
-        if (ch.info.backend === "socketcand" && ch.available && !ch.open) scheduleChannelRecovery(handle);
+        if (ch.info.backend === "socketcand" && ch.available && !ch.open) void attemptChannelRecovery(handle, false);
     }
 
     const btn = document.getElementById("btn-app-run")!;
@@ -4009,7 +4031,16 @@ async function finishStoppingCapture() {
     stopBusStatsPoll();
     for (const timer of channelRecoveryTimers.values()) clearTimeout(timer);
     channelRecoveryTimers.clear();
-    // An open already in progress can complete after Stop is pressed.
+    const cancelledOpens = [];
+    for (const [handle, ch] of channels) {
+        const opening = ch.opening;
+        if (!opening?.socketcandAttempt || opening.failed) continue;
+        delete ch.opening;
+        channelRecoveryTasks.delete(handle);
+        cancelledOpens.push(invoke("close_channel", { channelHandle: handle, socketcandAttempt: opening.socketcandAttempt })
+            .catch(e => log("debug", `Failed to cancel connection for ${ch.info.name}: ${e}`)));
+    }
+    await Promise.all(cancelledOpens);
     await Promise.allSettled(channelRecoveryTasks.values());
     await Promise.allSettled(failedChannelCloses.values());
     await Promise.all([...simEntries.values()].map(entry => entry.operation?.catch(() => {})));
