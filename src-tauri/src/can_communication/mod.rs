@@ -156,6 +156,7 @@ pub trait RxHandle: Send + 'static {
 pub trait CanBackend: Send + 'static {
     fn register_channel(&mut self, _name: &str) -> Result<(), String> { Ok(()) }
     fn unregister_channel(&mut self, _index: u8) {}
+    fn replace_registrations(&mut self, _removed: &[u8], _names: &[&str]) -> Result<(), String> { Ok(()) }
     fn list_channels(&self) -> Vec<String>;
     fn channel_index(&self, name: &str) -> Option<u8> {
         let index = self.list_channels().iter().position(|channel| channel == name)?;
@@ -259,6 +260,10 @@ impl Can {
         self.backend.unregister_channel(index);
     }
 
+    pub fn replace_registrations(&mut self, removed: &[u8], names: &[&str]) -> Result<(), String> {
+        self.backend.replace_registrations(removed, names)
+    }
+
     pub fn channel_index(&self, name: &str) -> Option<u8> {
         self.backend.channel_index(name)
     }
@@ -271,18 +276,28 @@ impl Can {
         self.backend.reinitialize();
     }
 
-    pub fn open(&mut self, channel: u8, bitrate: u32, listen_only: bool, admin_password: Option<&str>) -> Result<(), CanOpenError> {
+    pub(crate) fn ensure_closed(&self, channel: u8) -> Result<(), CanOpenError> {
         if self.is_open(channel) {
-            error!("Attempted to open channel {channel} which is already open");
             return Err(CanOpenError::AlreadyOpen(format!("Channel {channel} is already open")));
         }
+        Ok(())
+    }
+
+    pub fn open(&mut self, channel: u8, bitrate: u32, listen_only: bool, admin_password: Option<&str>) -> Result<(), CanOpenError> {
+        self.ensure_closed(channel)?;
 
         if self.admin_password.is_none() && admin_password.is_some() {
             self.admin_password = Some(admin_password.unwrap().to_string());
         }
 
         let (tx_handle, rx_handle) = self.backend.open_channel(channel, bitrate, listen_only, self.admin_password.as_deref())?;
+        self.start_channel(channel, tx_handle, rx_handle);
+        info!("Opened channel {channel} with baudrate {bitrate}");
+        Ok(())
+    }
 
+    pub(crate) fn start_channel(&mut self, channel: u8, tx_handle: Box<dyn TxHandle>, rx_handle: Box<dyn RxHandle>) {
+        debug_assert!(!self.is_open(channel));
         let queue: SendQueue = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -311,8 +326,6 @@ impl Can {
                 tx_thread,
             },
         );
-        info!("Opened channel {channel} with baudrate {bitrate}");
-        Ok(())
     }
 
     pub fn close(&mut self, channel: u8) -> Result<(), String> {

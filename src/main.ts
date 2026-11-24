@@ -1844,12 +1844,13 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
     const sel = document.getElementById("select-iface") as HTMLSelectElement;
 
     const nameInput = document.getElementById("input-channel-name") as HTMLInputElement;
+    const socketcandInput = document.getElementById("input-socketcand") as HTMLInputElement;
+    socketcandInput.value = "";
+    socketcandInput.oninput = () => setSocketcandAddressError("");
 
     document.getElementById("row-socketcand")!.style.display = "none";
     setSocketcandAddressError("");
     if (mode === "add") {
-        const socketcandInput = document.getElementById("input-socketcand") as HTMLInputElement;
-        socketcandInput.oninput = () => setSocketcandAddressError("");
         title.textContent = "Add CAN Channel";
         applyBtn.textContent = "Add";
         ifaceRow.style.display = "";
@@ -1901,17 +1902,23 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         if (ch && ch.info.backend !== "none" && !availableIfaces.some(i => i.backend === ch.info.backend && i.name === ch.info.name)) availableIfaces.push(ch.info);
         sel.innerHTML = '<option value="">No hardware channel</option>' + availableIfaces.map((i, index) =>
             `<option value="${index}">${escapeHtml(i.name)} (${escapeHtml(i.backend)})</option>`).join("");
+        sel.insertAdjacentHTML("beforeend", '<option value="__socketcand__">Socketcand (TCP)...</option>');
         sel.value = ch?.info.backend === "none" ? "" : String(availableIfaces.findIndex(i => i.backend === ch?.info.backend && i.name === ch?.info.name));
-        sel.onchange = () => {
-            const iface = sel.value === "" ? null : availableIfaces[Number(sel.value)];
-            updateChannelInterfaceInDialog(iface?.backend ?? "none", iface?.name ?? "");
+        const updateAssignment = () => {
+            const iface = sel.value === "" ? undefined : availableIfaces[Number(sel.value)];
+            const backend = sel.value === "__socketcand__" ? "socketcand" : iface?.backend ?? "none";
+            document.getElementById("row-socketcand")!.style.display = backend === "socketcand" ? "" : "none";
+            socketcandInput.value = backend === "socketcand" ? iface?.name ?? "" : "";
+            setSocketcandAddressError("");
+            updateChannelInterfaceInDialog(backend, iface?.name ?? "");
         };
+        sel.onchange = updateAssignment;
         dialogPendingDbc = ch?.config.dbc_path ?? null;
         setDbcLabel(dialogPendingDbc);
         setBitrateInDialog(ch?.config.bitrate ?? null, hwName.startsWith("vcan"));
         setProtocolInDialog(ch?.config.protocol ?? null);
         setListenOnlyInDialog(ch?.config.listen_only ?? false);
-        updateChannelInterfaceInDialog(ch?.info.backend ?? "none", hwName);
+        updateAssignment();
         nameInput.value = ch?.config.display_name ?? "";
         nameInput.placeholder = hwName;
         selectChannel(handle!);
@@ -2143,7 +2150,7 @@ async function recoverChannel(handle: number) {
 }
 
 // Unique persisted identities keep unassigned channels distinct across project reloads.
-async function changeChannelAssignment(handle: number, target: ChannelInfo | null): Promise<boolean> {
+async function changeChannelAssignment(handle: number, target: ChannelInfo | null, onError?: (message: string) => void): Promise<boolean> {
     const ch = channels.get(handle)!;
     if ((!target && ch.info.backend === "none") || (target?.backend === ch.info.backend && target?.name === ch.info.name)) return true;
     const conflicts = target ? [...channels].filter(([h, c]) => h !== handle && c.info.backend === target.backend && c.info.name === target.name) : [];
@@ -2167,7 +2174,8 @@ async function changeChannelAssignment(handle: number, target: ChannelInfo | nul
         for (const entry of simEntries.values()) if (entry.kind === "raw" && entry.pendingChannelId) entry.pendingChannelId = ids.get(entry.pendingChannelId) ?? entry.pendingChannelId;
         return true;
     } catch (e) {
-        log("error", `Failed to change hardware channel: ${e}`);
+        if (onError) onError(String(e));
+        else log("error", `Failed to change hardware channel: ${e}`);
         return false;
     }
 }
@@ -2244,7 +2252,18 @@ async function saveChannelDialog() {
         // the change immediately (a fresh copy is also loaded on the next open).
         if (ch) {
             const selection = (document.getElementById("select-iface") as HTMLSelectElement).value;
-            if (!await changeChannelAssignment(h, selection === "" ? null : availableIfaces[Number(selection)])) return;
+            let target = selection === "" ? null : availableIfaces[Number(selection)];
+            const remote = selection === "__socketcand__" || target?.backend === "socketcand";
+            if (remote) {
+                const input = document.getElementById("input-socketcand") as HTMLInputElement;
+                const name = input.value.trim();
+                if (!name) {
+                    setSocketcandAddressError("Enter a Socketcand address.");
+                    return;
+                }
+                target = { backend: "socketcand", name };
+            }
+            if (!await changeChannelAssignment(h, target, remote ? setSocketcandAddressError : undefined)) return;
             ch.config.display_name = customName;
             ch.config.dbc_path = dialogPendingDbc;
             ch.config.bitrate = ch.info.backend === "socketcand" ? null : bitrate;
@@ -3849,16 +3868,21 @@ async function openConfiguredChannels(reportMissing: boolean): Promise<boolean> 
         }
     }
     let opened = false;
+    const remoteOpens: Promise<boolean>[] = [];
     for (const [handle, ch] of channels) {
         if (ch.info.backend === "none") continue;
         if (!ch.available) {
             if (reportMissing) log("error", `Cannot start channel ${ch.config.display_name || ch.info.name}: interface not found`);
             continue;
         }
-        if (await openChannelByHandle(handle)) opened = true;
+        if (ch.info.backend === "socketcand") remoteOpens.push(openChannelByHandle(handle));
+        else if (await openChannelByHandle(handle)) opened = true;
     }
+    await Promise.all(remoteOpens);
     renderChannelList();
-    return opened;
+    // Remote servers can come online after capture starts, even when there is
+    // no other channel open to keep capture running.
+    return opened || remoteOpens.length > 0;
 }
 
 async function startApp(reportMissing = true) {
@@ -4890,8 +4914,12 @@ function updateTraceEmptyState() {
         action = "Add channel"; target = "btn-add-channel";
     } else if (!configured.some(ch => ch.open) && (details.length > 0 || appRunning)) {
         title = "Channels disconnected or unable to start";
-        description = "Check the hardware connection and channel settings, then reload hardware and start capture.";
-        action = "Reload hardware"; target = "btn-reload-backends";
+        if (appRunning && configured.some(ch => ch.info?.backend === "socketcand" && ch.available)) {
+            description = "Capture is retrying the Socketcand connection.";
+        } else {
+            description = "Check the hardware connection and channel settings, then reload hardware and start capture.";
+            action = "Reload hardware"; target = "btn-reload-backends";
+        }
     } else if (!appRunning) {
         title = "Capture stopped";
         description = "Start capture to display CAN traffic.";

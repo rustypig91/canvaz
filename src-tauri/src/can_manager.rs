@@ -440,6 +440,7 @@ pub struct CanManager {
     app_state: Arc<AppState>,
     shared: Arc<Mutex<ManagerShared>>,
     cans: BTreeMap<String, Can>,
+    opening_socketcand: HashMap<u32, Arc<()>>,
 }
 
 impl CanManager {
@@ -472,7 +473,7 @@ impl CanManager {
         });
 
         let cans = build_cans(&shared);
-        Self { app_state, shared, cans }
+        Self { app_state, shared, cans, opening_socketcand: HashMap::new() }
     }
 
     pub fn start_recording(&self, path: String, start_ms: u64) -> Result<RecordingStatus, String> {
@@ -572,7 +573,6 @@ impl CanManager {
     pub fn assign_channels(&mut self, assignments: Vec<(u32, ChannelInfo)>) -> Result<Vec<bool>, String> {
         validate_assignment_handles(&assignments)?;
         let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
-        let mut resolved = Vec::new();
         for (handle, info) in &assignments {
             if !lock.channels.contains_key(handle) { return Err("Channel not found".into()); }
             if let Some((backend, index)) = lock.handle_to_index.get(handle) {
@@ -580,22 +580,34 @@ impl CanManager {
                     return Err("Stop capture before changing channels".into());
                 }
             }
-            let index = if info.backend == "none" { None } else {
-                self.cans.get(&info.backend).and_then(|can| can.channel_index(&info.name))
-            };
             for (&other, channel) in &lock.channels {
                 let target = assignments.iter().find(|(h, _)| *h == other).map(|(_, i)| i).unwrap_or(&channel.info);
                 if other != *handle && target.backend == info.backend && target.name == info.name {
                     return Err("Interface already assigned".into());
                 }
             }
-            resolved.push(index);
         }
-        let mut previous_indices = Vec::new();
+
+        let remote_targets: Vec<&str> = assignments.iter().filter_map(|(_, info)| {
+            (info.backend == "socketcand").then_some(info.name.as_str())
+        }).collect();
+        let removed_remote_indices: Vec<u8> = assignments.iter().filter_map(|(handle, _)| {
+            let (backend, index) = lock.handle_to_index.get(handle)?;
+            let current_name = lock.channels.get(handle)?.info.name.as_str();
+            (backend == "socketcand" && !remote_targets.contains(&current_name)).then_some(*index)
+        }).collect();
+        if !remote_targets.is_empty() || !removed_remote_indices.is_empty() {
+            self.cans.get_mut("socketcand").ok_or("Socketcand backend not found")?
+                .replace_registrations(&removed_remote_indices, &remote_targets)?;
+        }
+
+        let resolved: Vec<_> = assignments.iter().map(|(_, info)| {
+            self.cans.get(&info.backend).and_then(|can| can.channel_index(&info.name))
+        }).collect();
         for (handle, _) in &assignments {
+            self.opening_socketcand.remove(handle);
             if let Some(key) = lock.handle_to_index.remove(handle) {
                 lock.index_to_handle.remove(&key);
-                previous_indices.push(key);
             }
         }
         for ((handle, info), index) in assignments.into_iter().zip(&resolved) {
@@ -606,13 +618,6 @@ impl CanManager {
             }
             let channel = lock.channels.get_mut(&handle).unwrap();
             channel.info = info;
-        }
-        for (backend, index) in previous_indices {
-            if !lock.index_to_handle.contains_key(&(backend.clone(), index)) {
-                if let Some(can) = self.cans.get_mut(&backend) {
-                    can.unregister_channel(index);
-                }
-            }
         }
         Ok(resolved.iter().map(Option::is_some).collect())
     }
@@ -651,6 +656,7 @@ impl CanManager {
         lock.index_to_handle.remove(&(backend_name.clone(), hw_index));
         lock.handle_to_index.remove(&handle);
         lock.channels.remove(&handle);
+        self.opening_socketcand.remove(&handle);
         can.unregister_channel(hw_index);
 
         info!("Removed {backend_name} channel {hw_index} (handle: {handle})");
@@ -675,7 +681,7 @@ impl CanManager {
     /// the given DBC (parsed fresh from disk) for decode/encode. Returns the
     /// parsed DBC so the frontend can populate its signal tree.
     pub fn open_channel(
-        &mut self,
+        manager: &Mutex<Self>,
         handle: u32,
         bitrate: u32,
         listen_only: bool,
@@ -683,29 +689,54 @@ impl CanManager {
         protocol: Protocol,
         resume_capture: bool,
     ) -> Result<Option<ParsedDbc>, String> {
-        let (backend_name, hw_index) = self.backend_index(handle)?;
+        let mut guard = manager.lock().map_err(|e| e.to_string())?;
+        let (backend_name, hw_index) = guard.backend_index(handle)?;
+        let remote = backend_name == "socketcand";
+        guard.cans.get(&backend_name).ok_or("Backend not found")?
+            .ensure_closed(hw_index).map_err(|e| e.to_string())?;
+        if guard.opening_socketcand.contains_key(&handle) {
+            return Err("Socketcand channel is already connecting".into());
+        }
 
         // Parse the DBC before touching hardware so a bad path fails fast.
         let dbc = dbc_path.map(|p| ParsedDbc::new(p).map(Arc::new)).transpose()?;
 
-        {
-            let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
-            if let Some(ch) = lock.channels.get_mut(&handle) {
-                ch.prepare_capture(resume_capture);
-                ch.dbc = dbc.clone();
-                ch.protocol = protocol;
-                ch.listen_only = listen_only;
-                // Socketcand uses the server's bitrate, which RAW mode does not report.
-                ch.bitrate = if backend_name == "socketcand" { 0 } else { bitrate };
+        let endpoint = {
+            let mut lock = guard.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
+            let ch = lock.channels.get_mut(&handle).ok_or("Channel not found")?;
+            ch.prepare_capture(resume_capture);
+            ch.dbc = dbc.clone();
+            ch.protocol = protocol;
+            ch.listen_only = listen_only;
+            // Socketcand uses the server's bitrate, which RAW mode does not report.
+            ch.bitrate = if remote { 0 } else { bitrate };
+            remote.then(|| ch.info.name.clone())
+        };
+
+        if let Some(endpoint) = endpoint {
+            // Resolve and negotiate without blocking IPC or TX on other channels.
+            let attempt = Arc::new(());
+            guard.opening_socketcand.insert(handle, Arc::clone(&attempt));
+            drop(guard);
+            let connection = crate::can_communication::SocketcandBackend::connect(&endpoint, listen_only);
+            let mut guard = manager.lock().map_err(|e| e.to_string())?;
+            if !guard.opening_socketcand.get(&handle).is_some_and(|current| Arc::ptr_eq(current, &attempt)) {
+                return Err("Socketcand connection was cancelled".into());
             }
+            guard.opening_socketcand.remove(&handle);
+            let (tx, rx) = connection.map_err(|e| e.to_string())?;
+            let can = guard.cans.get_mut(&backend_name).ok_or("Backend not found")?;
+            can.start_channel(hw_index, tx, rx);
+            return Ok(dbc.map(|d| (*d).clone()));
         }
 
-        let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
+        let manager = &mut *guard;
+        let can = manager.cans.get_mut(&backend_name).ok_or("Backend not found")?;
         match can.open(hw_index, bitrate, listen_only, None) {
             Ok(()) => {}
             Err(crate::can_communication::CanOpenError::PasswordRequired) => {
                 info!("Backend '{backend_name}' requires admin password to open channel {handle}");
-                let pw = self.app_state.get_admin_password()?;
+                let pw = manager.app_state.get_admin_password()?;
                 can.open(hw_index, bitrate, listen_only, Some(&pw)).map_err(|e| e.to_string())?;
             }
             Err(e) => return Err(e.to_string()),
@@ -717,6 +748,9 @@ impl CanManager {
     /// Close the hardware but keep the channel registered, so it can be reopened
     /// on the next Start. Unregistering the handle is `remove_channel`'s job.
     pub fn close_channel(&mut self, handle: u32) -> Result<(), String> {
+        if self.opening_socketcand.remove(&handle).is_some() {
+            return Ok(());
+        }
         let (backend_name, hw_index) = self.backend_index(handle)?;
         self.cans.get_mut(&backend_name).ok_or("Backend not found")?.close(hw_index)
     }
@@ -724,6 +758,7 @@ impl CanManager {
     /// Close all open hardware and drop every channel registration/data store.
     /// Used to give a reloading frontend a clean backend to rebuild from.
     pub fn reset(&mut self) {
+        self.opening_socketcand.clear();
         let indices: Vec<(String, u8)> = match self.shared.lock() {
             Ok(lock) => lock.handle_to_index.values().cloned().collect(),
             Err(_) => return,

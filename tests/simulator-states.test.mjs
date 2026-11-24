@@ -6,7 +6,7 @@ import ts from "typescript";
 
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 const names = ["simEntryStatus", "updateSimEntryStatus", "updateSimTxStatus", "queueSimOperation",
-    "startSim", "stopSim", "startApp", "finishStartingCapture", "stopApp", "finishStoppingCapture",
+    "startSim", "stopSim", "openConfiguredChannels", "startApp", "finishStartingCapture", "stopApp", "finishStoppingCapture",
     "onChannelError", "closeFailedChannel", "openChannelByHandle",
     "scheduleChannelRecovery", "recoverChannel"];
 const code = ts.transpileModule(source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text)).map(n => n.getText(source)).join("\n"), {
@@ -15,7 +15,7 @@ const code = ts.transpileModule(source.statements.filter(n => ts.isFunctionDecla
 function element() {
     const classes = new Set();
     return { textContent: "", disabled: false, title: "", dataset: {}, style: {},
-        classList: { toggle: (name, on) => on ? classes.add(name) : classes.delete(name), remove: name => classes.delete(name) } };
+        classList: { add: name => classes.add(name), toggle: (name, on) => on ? classes.add(name) : classes.delete(name), remove: name => classes.delete(name) } };
 }
 function harness(kind = "raw", invoke = async () => 42) {
     const entry = { kind, channel: 1, canId: 123, messageId: 123, messageName: "Engine", signals: [], data: [0], dlc: 1, periodMs: 100, running: false, periodicHandle: null };
@@ -243,6 +243,39 @@ test("Stop cancels queued recovery and closes a Socketcand reconnect already in 
     assert.deepEqual(calls, ["open_channel", "close_channel", "start"]);
     assert.equal(h.ch.open, false);
     assert.equal(h.entry.periodicHandle, null);
+});
+
+test("capture retries when the only Socketcand server is initially offline", async () => {
+    const attempts = [];
+    const h = harness("raw", async (command, args) => {
+        assert.equal(command, "open_channel");
+        attempts.push(args.resumeCapture);
+        if (attempts.length < 3) throw new Error("Connection refused");
+        return null;
+    });
+    h.ch.open = false;
+    Object.assign(h.ctx, {
+        appRunning: false, appStartTime: 0, sidebarSnapshot: null,
+        ghostChannels: [], refreshHardware: async () => true,
+        traceFilterMsgNames: null, signalLastValues: new Map(), signalLastRaw: new Map(),
+        signalMinValues: new Map(), signalMaxValues: new Map(), renderDbcTree() {},
+        plotPanes: [], restoreProjectEntries: async () => {}, clearTrace() {},
+        startScrollLoop() {}, startBusStatsPoll() {},
+    });
+
+    await h.ctx.startApp();
+    assert.equal(h.ctx.appRunning, true);
+    assert.equal(h.ch.open, false);
+    assert.match(h.ch.error, /Connection refused/);
+    for (const id of [1, 2]) {
+        const retry = h.timers.get(id);
+        h.timers.delete(id);
+        await retry();
+    }
+    assert.deepEqual(attempts, [false, true, true]);
+    assert.equal(h.ch.open, true);
+    assert.equal(h.ch.error, null);
+    assert.equal(h.timers.size, 0);
 });
 
 test("a Socketcand disconnect before the open response leaves the channel disconnected", async () => {

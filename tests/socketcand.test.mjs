@@ -177,6 +177,44 @@ test("editing a saved monitoring channel preserves receive-only until explicitly
     assert.equal(channel.config.bitrate, null);
 });
 
+test("editing a Socketcand address keeps the channel and reports invalid replacements inline", async () => {
+    const name = "can://localhost/vcan0";
+    const h = harness([{ backend: "socketcand", name }]);
+    const channel = { info: { backend: "socketcand", name }, config: {
+        backend: "socketcand", name, bitrate: null, listen_only: true, dbc_path: null, protocol: null,
+    } };
+    h.context.channels.set(7, channel);
+    h.context.changeChannelAssignment = async (handle, target, reportError) => {
+        assert.equal(handle, 7);
+        assert.equal(target.backend, "socketcand");
+        if (target.name === "can://localhost/") {
+            reportError("Socketcand requires an interface");
+            return false;
+        }
+        channel.info = target;
+        channel.config.name = target.name;
+        return true;
+    };
+
+    await h.context.openChannelDialog("edit", 7);
+    const input = h.element("input-socketcand");
+    assert.equal(input.value, name);
+    assert.equal(h.element("row-socketcand").style.display, "");
+    input.value = "can://localhost/";
+    await h.context.saveChannelDialog();
+    assert.equal(h.element("error-socketcand").textContent, "Socketcand requires an interface");
+    assert.equal(h.element("dialog-channel").open, true);
+    assert.equal(channel.info.name, name);
+
+    input.value = " can://server:30000/can1 ";
+    input.oninput();
+    await h.context.saveChannelDialog();
+    assert.equal(h.context.channels.get(7), channel);
+    assert.equal(channel.config.name, "can://server:30000/can1");
+    assert.equal(channel.config.listen_only, true);
+    assert.equal(h.element("dialog-channel").open, false);
+});
+
 test("local virtual interfaces still use the virtual bitrate selection", async () => {
     const h = harness([{ backend: "socketcan", name: "vcan0" }]);
     await h.context.openChannelDialog("add");

@@ -119,19 +119,18 @@ async fn open_channel(
     let proto = can_manager::Protocol::from_config(protocol.as_deref());
     let listen_only = listen_only.unwrap_or(false);
     let result = tauri::async_runtime::spawn_blocking(move || {
-        can_manager
-            .lock()
-            .map_err(|e| e.to_string())?
-            .open_channel(
-                channel_handle, bitrate, listen_only, dbc_path.as_deref(), proto,
-                resume_capture.unwrap_or(false),
-            )
+        CanManager::open_channel(
+            &can_manager, channel_handle, bitrate, listen_only, dbc_path.as_deref(), proto,
+            resume_capture.unwrap_or(false),
+        )
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));
 
     match &result {
-        Ok(_) => info!("Opened channel (handle {}) with baudrate {}", channel_handle, bitrate),
+        Ok(_) => info!("Opened channel {channel_handle}"),
+        // The frontend reports the first failure and keeps background retries quiet.
+        Err(e) if resume_capture.unwrap_or(false) => debug!("Failed to reopen channel {channel_handle}: {e}"),
         Err(e) => error!("Failed to open channel {channel_handle}: {e}"),
     }
     result

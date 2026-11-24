@@ -1,16 +1,19 @@
 //! Classic CAN over socketcand RAW mode. Bus configuration stays on the server.
 use super::{CanBackend, CanFrame, CanOpenError, RxHandle, TxHandle};
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SocketcandBackend {
     // An open channel keeps its index even when another channel is removed.
     channels: Vec<Option<String>>,
 }
 
 const MAX_MESSAGE_BYTES: usize = 4096;
+const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
+const MAX_EARLY_FRAMES: usize = 1024;
 
 fn endpoint(name: &str) -> Result<(String, u16, String), String> {
     let (address, bus) = if let Some((label, address)) = name.split_once(" (") {
@@ -65,6 +68,18 @@ impl CanBackend for SocketcandBackend {
         }
     }
 
+    fn replace_registrations(&mut self, removed: &[u8], names: &[&str]) -> Result<(), String> {
+        let mut updated = self.clone();
+        for &index in removed {
+            updated.unregister_channel(index);
+        }
+        for name in names {
+            updated.register_channel(name)?;
+        }
+        *self = updated;
+        Ok(())
+    }
+
     fn list_channels(&self) -> Vec<String> {
         self.channels.iter().flatten().cloned().collect()
     }
@@ -77,24 +92,39 @@ impl CanBackend for SocketcandBackend {
     fn open_channel(&mut self, index: u8, _: u32, listen_only: bool, _: Option<&str>) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
         let name = self.channels.get(usize::from(index)).and_then(Option::as_deref)
             .ok_or("Unknown socketcand channel")?;
+        Self::connect(name, listen_only)
+    }
+}
+
+impl SocketcandBackend {
+    pub(crate) fn connect(name: &str, listen_only: bool) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
         let (host, port, bus) = endpoint(name)?;
+        let addresses = (host.as_str(), port).to_socket_addrs().map_err(|e| e.to_string())?;
+        let connect_deadline = Instant::now() + OPEN_TIMEOUT;
         let mut stream = None;
         let mut last_error = "Socketcand host has no addresses".to_string();
-        for address in (host.as_str(), port).to_socket_addrs().map_err(|e| e.to_string())? {
-            match TcpStream::connect_timeout(&address, Duration::from_secs(3)) {
+        for address in addresses {
+            let remaining = connect_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { break; }
+            match TcpStream::connect_timeout(&address, remaining) {
                 Ok(s) => { stream = Some(s); break; }
                 Err(e) => last_error = e.to_string(),
             }
         }
         let stream = stream.ok_or(last_error)?;
         stream.set_nodelay(true).map_err(|e| e.to_string())?;
-        stream.set_write_timeout(Some(Duration::from_secs(3))).map_err(|e| e.to_string())?;
+        stream.set_write_timeout(Some(OPEN_TIMEOUT)).map_err(|e| e.to_string())?;
         let mut rx = SocketcandRx::new(stream);
-        rx.expect("hi")?;
+        let deadline = Instant::now() + OPEN_TIMEOUT;
+        rx.expect_before("hi", deadline)?;
         rx.stream.write_all(format!("< open {bus} >").as_bytes()).map_err(|e| e.to_string())?;
-        rx.expect("ok")?;
+        rx.expect_before("ok", deadline)?;
         rx.stream.write_all(b"< rawmode >").map_err(|e| e.to_string())?;
-        rx.expect("ok")?;
+        rx.expect_before("ok", deadline)?;
+        // The daemon acknowledges the mode switch before binding the RAW socket.
+        // An echo in RAW mode confirms the bind succeeded, even on a quiet bus.
+        rx.stream.write_all(b"< echo >").map_err(|e| e.to_string())?;
+        rx.wait_for_raw_echo(deadline)?;
         // The TX worker is the only writer after the handshake. Cloning the
         // socket lets RX block independently without locking out transmission.
         let tx = SocketcandTx { stream: rx.stream.try_clone().map_err(|e| e.to_string())?, listen_only };
@@ -133,11 +163,12 @@ impl TxHandle for SocketcandTx {
 struct SocketcandRx {
     stream: TcpStream,
     pending: Vec<u8>,
+    early_frames: VecDeque<CanFrame>,
     clock_anchor: Option<(u64, u64)>,
 }
 impl SocketcandRx {
     fn new(stream: TcpStream) -> Self {
-        Self { stream, pending: Vec::new(), clock_anchor: None }
+        Self { stream, pending: Vec::new(), early_frames: VecDeque::new(), clock_anchor: None }
     }
     fn local_timestamp(&mut self, server_ms: u64, local_ms: u64) -> u64 {
         // Match the hardware backends: anchor the first sample to this host's
@@ -174,26 +205,44 @@ impl SocketcandRx {
             }
         }
     }
-    fn expect(&mut self, expected: &str) -> Result<(), String> {
-        let response = self.message(Instant::now() + Duration::from_secs(3))?.ok_or("Socketcand handshake timed out")?;
+    fn expect_before(&mut self, expected: &str, deadline: Instant) -> Result<(), String> {
+        let response = self.message(deadline)?.ok_or("Socketcand handshake timed out")?;
         if response != expected { return Err(format!("Socketcand expected '{expected}', received '{response}'")); }
         Ok(())
+    }
+
+    fn wait_for_raw_echo(&mut self, deadline: Instant) -> Result<(), String> {
+        while Instant::now() < deadline {
+            let Some(message) = self.message(deadline)? else { break; };
+            if message == "echo" { return Ok(()); }
+            if let Some(frame) = self.decode_message(&message)? {
+                if self.early_frames.len() == MAX_EARLY_FRAMES {
+                    return Err("Socketcand sent too many frames before confirming RAW mode".into());
+                }
+                self.early_frames.push_back(frame);
+            }
+        }
+        Err("Socketcand RAW mode confirmation timed out".into())
+    }
+
+    fn decode_message(&mut self, message: &str) -> Result<Option<CanFrame>, String> {
+        if matches!(message.split_whitespace().next(), Some("ok" | "echo" | "fdframe")) {
+            return Ok(None);
+        }
+        let mut frame = parse_frame(message)?;
+        frame.timestamp_ms = frame.timestamp_ms.map(|ts| self.local_timestamp(ts, now_ms()));
+        Ok(Some(frame))
     }
 }
 impl RxHandle for SocketcandRx {
     fn receive(&mut self, timeout_ms: u64) -> Result<Option<CanFrame>, String> {
+        if let Some(frame) = self.early_frames.pop_front() { return Ok(Some(frame)); }
         let deadline = Instant::now() + Duration::from_millis(timeout_ms);
         loop {
             let Some(message) = self.message(deadline)? else { return Ok(None); };
-            if message == "ok" || message == "echo" || message.split_whitespace().next() == Some("fdframe") {
-                // FD traffic can share the bus with classic CAN. Consume it
-                // without killing capture, but still honor the RX deadline.
-                if Instant::now() >= deadline { return Ok(None); }
-                continue;
-            }
-            let mut frame = parse_frame(&message)?;
-            frame.timestamp_ms = frame.timestamp_ms.map(|ts| self.local_timestamp(ts, now_ms()));
-            return Ok(Some(frame));
+            if let Some(frame) = self.decode_message(&message)? { return Ok(Some(frame)); }
+            // Unsupported FD traffic must not keep the RX worker from stopping.
+            if Instant::now() >= deadline { return Ok(None); }
         }
     }
     fn close(&mut self) { let _ = self.stream.shutdown(Shutdown::Both); }
@@ -228,6 +277,12 @@ fn parse_frame(message: &str) -> Result<CanFrame, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl SocketcandRx {
+        fn expect(&mut self, expected: &str) -> Result<(), String> {
+            self.expect_before(expected, Instant::now() + OPEN_TIMEOUT)
+        }
+    }
     #[test]
     fn addresses_and_frames() {
         assert_eq!(endpoint("vcan0@SIL (can://127.0.0.1:29537)").unwrap(), endpoint("can://127.0.0.1:29537/vcan0").unwrap());
@@ -261,6 +316,23 @@ mod tests {
         backend.register_channel(replacement).unwrap();
         assert_eq!(backend.channel_index(replacement), Some(0));
         assert_eq!(backend.list_channels().len(), 256);
+    }
+
+    #[test]
+    fn replacing_endpoints_is_atomic_and_can_reuse_a_slot_at_capacity() {
+        let mut backend = SocketcandBackend::default();
+        for index in 0..=u8::MAX {
+            backend.register_channel(&format!("can://localhost/can{index}")).unwrap();
+        }
+        let previous = "can://localhost/can0";
+        let replacement = "can://localhost/vcan0";
+        assert!(backend.replace_registrations(&[0], &[replacement, "can://localhost/"]).is_err());
+        assert_eq!(backend.channel_index(previous), Some(0));
+        assert_eq!(backend.channel_index(replacement), None);
+        backend.replace_registrations(&[0], &[replacement]).unwrap();
+        assert_eq!(backend.channel_index(previous), None);
+        assert_eq!(backend.channel_index(replacement), Some(0));
+        assert_eq!(backend.channel_index("can://localhost/can1"), Some(1));
     }
 
     #[test]
@@ -302,6 +374,8 @@ mod tests {
             peer.stream.write_all(b"< ok >").unwrap();
             peer.expect("rawmode").unwrap();
             peer.stream.write_all(b"< ok >< frame 123 1.000000 AA >< frame 00000123 2.000000 >").unwrap();
+            peer.expect("echo").unwrap();
+            peer.stream.write_all(b"< echo >").unwrap();
         });
         let mut backend = SocketcandBackend::default();
         backend.register_channel(&format!("can://{address}/vcan0")).unwrap();
@@ -311,6 +385,26 @@ mod tests {
         assert!(rx.receive(100).unwrap().unwrap().is_extended);
         assert!(rx.receive(100).is_err());
         rx.close();
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn mode_switch_acknowledgement_alone_does_not_open_a_channel() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut peer = SocketcandRx::new(stream);
+            peer.stream.write_all(b"< hi >").unwrap();
+            peer.expect("open vcan0").unwrap();
+            peer.stream.write_all(b"< ok >").unwrap();
+            peer.expect("rawmode").unwrap();
+            peer.stream.write_all(b"< ok >").unwrap();
+            peer.expect("echo").unwrap();
+            // The daemon can disconnect here if the RAW socket could not bind.
+        });
+        let result = SocketcandBackend::connect(&format!("can://{address}/vcan0"), false);
+        assert!(result.is_err());
         server.join().unwrap();
     }
 
@@ -368,6 +462,8 @@ mod tests {
             peer.stream.write_all(b"< ok >").unwrap();
             peer.expect("rawmode").unwrap();
             peer.stream.write_all(b"< ok >< frame 123 1.000000 AA >").unwrap();
+            peer.expect("echo").unwrap();
+            peer.stream.write_all(b"< echo >").unwrap();
             peer.expect("send 123 2 1 ff").unwrap();
             peer.expect("send 00000123 0").unwrap();
             peer.expect("send 1FFFFFFF 8 0 1 2 3 4 5 6 ff").unwrap();
@@ -424,6 +520,8 @@ mod tests {
             peer.stream.write_all(b"< ok >").unwrap();
             peer.expect("rawmode").unwrap();
             peer.stream.write_all(b"< ok >< frame 321 1.000000 FF >").unwrap();
+            peer.expect("echo").unwrap();
+            peer.stream.write_all(b"< echo >").unwrap();
             let mut once = 0;
             let mut periodic = 0;
             while once < 1 || periodic < 2 {
