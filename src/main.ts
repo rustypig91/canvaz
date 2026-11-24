@@ -1813,6 +1813,7 @@ function setBitrateInDialog(bitrate: number | null, isVcan: boolean) {
 function updateChannelInterfaceInDialog(backend: string, name: string) {
     const remote = backend === "socketcand";
     document.getElementById("row-bitrate")!.style.display = remote ? "none" : "";
+    (document.getElementById("input-bitrate-custom") as HTMLInputElement).disabled = remote;
     document.getElementById("label-listen-only")!.textContent = remote
         ? "Receive only — send & simulate disabled; server ACK settings unchanged"
         : "Silent — no ACKs, no error flags, send & simulate disabled";
@@ -3324,7 +3325,7 @@ function idToHandle(id: string): number | undefined {
 
 function buildProject(): Project {
     return {
-        version: 1,
+        version: 2,
         channels: [
             ...[...channels.values()].map(ch => ({
                 name: ch.info.name,
@@ -6475,7 +6476,7 @@ interface BusStats {
     channel_handle: number;
     rx_fps: number;
     tx_fps: number;
-    bus_load: number;
+    bus_load: number | null;
     error_frames: number;
     status?: BusStatus | null;
 }
@@ -6534,9 +6535,10 @@ function renderBusStats(stats: BusStats[]) {
 
         const st = s.status;
         const state = st?.bus_state ?? null;
+        const load = s.bus_load?.toFixed(1);
         const tipLines = [
             channelName(s.channel_handle),
-            `Bus load: ${s.bus_load.toFixed(1)} % (estimated)`,
+            load == null ? "Bus load unavailable (bitrate unknown)" : `Bus load: ${load} % (estimated)`,
             `RX: ${s.rx_fps.toFixed(0)} f/s · TX: ${s.tx_fps.toFixed(0)} f/s`,
             `Error frames: ${s.error_frames}`,
         ];
@@ -6549,7 +6551,7 @@ function renderBusStats(stats: BusStats[]) {
         chip.querySelector<HTMLElement>(".bus-state")!.className =
             `bus-state${state && state !== "active" ? ` ${state}` : ""}`;
         chip.querySelector<HTMLElement>(".bus-chip-name")!.textContent = channelName(s.channel_handle);
-        chip.querySelector<HTMLElement>(".bus-load")!.textContent = `${s.bus_load.toFixed(1)}%`;
+        chip.querySelector<HTMLElement>(".bus-load")!.textContent = load == null ? "—" : `${load}%`;
         chip.querySelector<HTMLElement>(".bus-fps")!.textContent = `${(s.rx_fps + s.tx_fps).toFixed(0)}/s`;
         const errEl = chip.querySelector<HTMLElement>(".bus-err-count")!;
         errEl.textContent = s.error_frames > 0 ? `${s.error_frames}⚠` : "";

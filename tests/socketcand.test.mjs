@@ -77,11 +77,13 @@ test("switching to Socketcand and back preserves the chosen physical bitrate and
         h.element("select-iface").value = "__socketcand__";
         h.element("select-iface").onchange();
         assert.equal(h.element("row-bitrate").style.display, "none");
+        assert.equal(h.element("input-bitrate-custom").disabled, true);
         h.element("select-iface").value = "USB";
         h.element("select-iface").onchange();
         assert.equal(h.element("row-socketcand").style.display, "none");
         assert.equal(h.element("row-bitrate").style.display, "");
         assert.equal(h.context.getBitrateFromDialog(), 250000);
+        assert.equal(h.element("input-bitrate-custom").disabled, false);
         assert.equal(h.element("input-listen-only").checked, listenOnly);
         assert.match(h.element("label-listen-only").textContent, /no ACKs/);
     }

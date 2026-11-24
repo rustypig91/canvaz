@@ -159,8 +159,8 @@ pub struct BusStats {
     /// Transmitted frames per second.
     pub tx_fps: f64,
     /// Estimated bus load in percent (0–100), from frame sizes with an
-    /// average stuff-bit allowance against the configured bitrate.
-    pub bus_load: f64,
+    /// average stuff-bit allowance against the configured bitrate, when known.
+    pub bus_load: Option<f64>,
     /// Total bus error frames seen since the channel was opened.
     pub error_frames: u64,
     /// Latest controller status from the backend; `None` until first report.
@@ -241,7 +241,7 @@ struct ChannelData {
     /// getting dropped by the hardware's silent/listen-only mode.
     listen_only: bool,
     /// Bitrate from the last `open_channel` call; denominator of the bus-load
-    /// estimate. 0 until first opened.
+    /// estimate. 0 before opening or when the bitrate is unknown.
     bitrate: u32,
     stats: ChannelStats,
 }
@@ -671,7 +671,8 @@ impl CanManager {
                 ch.protocol = protocol;
                 ch.tp = TpReassembler::default();
                 ch.listen_only = listen_only;
-                ch.bitrate = bitrate;
+                // Socketcand uses the server's bitrate, which RAW mode does not report.
+                ch.bitrate = if backend_name == "socketcand" { 0 } else { bitrate };
                 ch.stats = ChannelStats::default();
             }
         }
@@ -1007,22 +1008,22 @@ impl CanManager {
         for handle in open_handles {
             let Some(ch) = lock.channels.get_mut(&handle) else { continue };
             let s = &mut ch.stats;
-            let (rx_fps, tx_fps, bus_load) = match s.last_query {
+            let (rx_fps, tx_fps, bits_per_sec) = match s.last_query {
                 Some((t, rx, tx, bits)) => {
                     let dt = now.duration_since(t).as_secs_f64();
                     if dt > 0.0 {
-                        let load = if ch.bitrate > 0 {
-                            ((s.wire_bits - bits) as f64 / dt / ch.bitrate as f64 * 100.0).min(100.0)
-                        } else {
-                            0.0
-                        };
-                        ((s.rx_frames - rx) as f64 / dt, (s.tx_frames - tx) as f64 / dt, load)
+                        (
+                            (s.rx_frames - rx) as f64 / dt,
+                            (s.tx_frames - tx) as f64 / dt,
+                            (s.wire_bits - bits) as f64 / dt,
+                        )
                     } else {
                         (0.0, 0.0, 0.0)
                     }
                 }
                 None => (0.0, 0.0, 0.0),
             };
+            let bus_load = (ch.bitrate > 0).then(|| (bits_per_sec / ch.bitrate as f64 * 100.0).min(100.0));
             s.last_query = Some((now, s.rx_frames, s.tx_frames, s.wire_bits));
             out.push(BusStats {
                 channel_handle: handle,

@@ -453,6 +453,7 @@ fn rx_loop(
             Ok(Some(frame)) => on_rx(channel, frame),
             Ok(None) => {}
             Err(e) => {
+                if stop.load(Ordering::Relaxed) { break; }
                 error!("RX error on channel {channel}: {e}");
                 // Fatal: this loop is the channel's only receive path, so the
                 // channel is dead from here on — let the app surface it.
@@ -490,7 +491,7 @@ fn tx_loop(
             last_tx_err = None;
             on_tx(channel, f);
         }
-        Err(e) => {
+        Err(e) if !stop.load(Ordering::Relaxed) => {
             // Debug, not error: TX failures are continuously visible in the
             // bus-stats footer (bus state, error counters), and a failing bus
             // would otherwise flood the user-facing log via periodic sends.
@@ -500,6 +501,7 @@ fn tx_loop(
                 last_tx_err = Some(e);
             }
         }
+        Err(_) => {}
     };
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -514,7 +516,7 @@ fn tx_loop(
             Err(_) => break,
         };
         let mut i = 0;
-        while i < q.len() {
+        while i < q.len() && !stop.load(Ordering::Relaxed) {
             match &mut q[i] {
                 SendEntry::OneShot(_) => {
                     if let SendEntry::OneShot(mut f) = q.remove(i) {
@@ -546,6 +548,8 @@ fn tx_loop(
                 }
             }
         }
+
+        if stop.load(Ordering::Relaxed) { break; }
 
         // Sleep until the next periodic deadline, or up to 1 s if there are
         // none. notify_one() in send_once/add_periodic/close wakes us early

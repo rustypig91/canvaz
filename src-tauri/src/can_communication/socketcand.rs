@@ -17,7 +17,7 @@ fn endpoint(name: &str) -> Result<(String, u16, String), String> {
     }
     let bus = bus.unwrap_or(url.path().trim_start_matches('/'));
     if bus.is_empty() || bus.len() > 15 || !bus.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b)) {
-        return Err("Socketcand requires an interface, for example can://127.0.0.1:29537/vcan0".into());
+        return Err("Socketcand requires an interface, for example can://127.0.0.1:29536/vcan0".into());
     }
     let host = url.host_str().ok_or("Socketcand host missing")?.trim_matches(['[', ']']).to_owned();
     Ok((host, url.port().unwrap_or(29536), bus.to_owned()))
@@ -70,7 +70,7 @@ impl TxHandle for SocketcandTx {
         let mut command = format!("< send {id} {}", frame.data.len());
         for byte in &frame.data {
             use std::fmt::Write;
-            write!(command, " {byte:02x}").unwrap();
+            write!(command, " {byte:x}").unwrap();
         }
         command.push_str(" >");
         if let Err(error) = self.stream.write_all(command.as_bytes()) {
@@ -101,7 +101,11 @@ impl SocketcandRx {
         // Match the hardware backends: anchor the first sample to this host's
         // clock, retaining server-relative timing for plots and cycle times.
         let (server_base, local_base) = *self.clock_anchor.get_or_insert((server_ms, local_ms));
-        local_base.saturating_add(server_ms.saturating_sub(server_base))
+        if server_ms >= server_base {
+            local_base.saturating_add(server_ms - server_base)
+        } else {
+            local_base.saturating_sub(server_base - server_ms)
+        }
     }
     fn message(&mut self, deadline: Instant) -> Result<Option<String>, String> {
         loop {
@@ -262,6 +266,7 @@ mod tests {
             assert_eq!(rx.local_timestamp(server_base, 1_700_000_000_000), 1_700_000_000_000);
             // Network jitter does not change the interval between samples.
             assert_eq!(rx.local_timestamp(server_base + 125, 1_700_000_005_000), 1_700_000_000_125);
+            assert_eq!(rx.local_timestamp(server_base - 125, 1_700_000_005_100), 1_699_999_999_875);
         }
     }
 
@@ -281,9 +286,9 @@ mod tests {
             peer.stream.write_all(b"< ok >").unwrap();
             peer.expect("rawmode").unwrap();
             peer.stream.write_all(b"< ok >< frame 123 1.000000 AA >").unwrap();
-            peer.expect("send 123 2 01 ff").unwrap();
+            peer.expect("send 123 2 1 ff").unwrap();
             peer.expect("send 00000123 0").unwrap();
-            peer.expect("send 1FFFFFFF 8 00 01 02 03 04 05 06 ff").unwrap();
+            peer.expect("send 1FFFFFFF 8 0 1 2 3 4 5 6 ff").unwrap();
             peer.stream.write_all(b"< frame 124 1.100000 BB >").unwrap();
         });
         let mut backend = SocketcandBackend::default();
@@ -341,8 +346,8 @@ mod tests {
             let mut periodic = 0;
             while once < 1 || periodic < 2 {
                 match peer.message(Instant::now() + Duration::from_secs(3)).unwrap().as_deref() {
-                    Some("send 123 1 01") => once += 1,
-                    Some("send 00000123 1 02") => periodic += 1,
+                    Some("send 123 1 1") => once += 1,
+                    Some("send 00000123 1 2") => periodic += 1,
                     other => panic!("unexpected command: {other:?}"),
                 }
             }

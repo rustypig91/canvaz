@@ -258,8 +258,8 @@ artifact and the release assets. The demo binary is never packaged.
 ### Socketcand connections
 
 Choose **Add CAN Channel → Socketcand (TCP)** and enter
-`can://127.0.0.1:29537/vcan0`. You can also paste the advertised label
-`vcan0@SIL (can://127.0.0.1:29537)`. Add the channel, then start capture.
+`can://127.0.0.1:29536/vcan0`. You can also paste the advertised label
+`vcan0@SIL (can://127.0.0.1:29536)`. Add the channel, then start capture.
 The connection is saved with the project and can be reopened after stopping.
 
 Socketcand works over TCP on all platforms and sends and receives classic CAN
@@ -267,13 +267,12 @@ standard and extended frames, plus reported bus errors. Send and Simulate use
 the same connection as capture. Received timestamps are anchored to the local
 clock on the first frame, preserving server-relative timing even when the
 server clock is not synchronized with this computer.
-The server must already expose and configure the requested interface; the bitrate
-control is hidden for remote channels. Selecting **Listen-only** prevents this
-client from sending; it does not change the server's physical listen-only/ACK
-settings. Previously saved monitoring channels retain that setting: stop capture,
-clear it, and restart to enable Send and Simulate. A transmitted frame is recorded
-when its command is written to TCP; socketcand does not acknowledge successful
-delivery on the CAN bus. CAN FD is not supported; incoming FD messages are skipped so classic CAN
-capture continues on mixed buses.
+The server configures the bitrate, so the remote channel has no bitrate control
+or bus load estimate. **Listen-only** blocks sending from this client and leaves
+the server's physical listen-only and ACK settings alone. Socketcand channels
+from older projects open in Listen-only mode. To enable Send and Simulate, stop
+capture, clear **Listen-only**, and restart. TX timestamps indicate when the
+client wrote the command to TCP. Incoming CAN FD messages are skipped so that
+classic CAN capture continues on mixed buses.
 
 Protocol reference: [socketcand protocol](https://github.com/linux-can/socketcand/blob/master/doc/protocol.md).
