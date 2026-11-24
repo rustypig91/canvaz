@@ -34,8 +34,9 @@ pub struct ChannelConfig {
     #[serde(default = "default_backend")]
     pub backend: String,
     pub dbc_path: Option<String>,
+    /// Unspecified for virtual interfaces and server-configured socketcand buses.
     #[serde(default = "default_bitrate")]
-    pub bitrate: u32,
+    pub bitrate: Option<u32>,
     /// Protocol interpretation for received frames ("j1939"); None = raw CAN.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
@@ -45,8 +46,8 @@ pub struct ChannelConfig {
     pub listen_only: bool,
 }
 
-fn default_bitrate() -> u32 {
-    500_000
+fn default_bitrate() -> Option<u32> {
+    Some(500_000)
 }
 
 fn default_backend() -> String {
@@ -207,5 +208,35 @@ impl Project {
         info!("Loading project from '{}'", path);
         let json = std::fs::read_to_string(path).map_err(|e| format!("Read error: {e}"))?;
         serde_json::from_str(&json).map_err(|e| format!("Parse error: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn project_round_trip_accepts_unknown_virtual_and_physical_bitrates() {
+        let project: Project = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "channels": [
+                { "backend": "socketcand", "name": "can://localhost/vcan0", "bitrate": null },
+                { "backend": "socketcan", "name": "vcan0", "bitrate": null },
+                { "backend": "pcan", "name": "USB", "bitrate": 250000 },
+                { "name": "can0" }
+            ],
+            "plot_panes": []
+        })).unwrap();
+        assert_eq!(project.channels.iter().map(|ch| ch.bitrate).collect::<Vec<_>>(), [None, None, Some(250000), Some(500000)]);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("socketcand.canvaz");
+        project.save(path.to_str().unwrap()).unwrap();
+        let loaded = Project::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&loaded).unwrap(), serde_json::to_value(&project).unwrap());
+        for invalid in [serde_json::json!(-1), serde_json::json!(1.5), serde_json::json!(4294967296u64)] {
+            let mut value = serde_json::to_value(&project.channels[0]).unwrap();
+            value["bitrate"] = invalid;
+            assert!(serde_json::from_value::<ChannelConfig>(value).is_err());
+        }
     }
 }

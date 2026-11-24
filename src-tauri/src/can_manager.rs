@@ -670,7 +670,7 @@ impl CanManager {
                 ch.dbc = dbc.clone();
                 ch.protocol = protocol;
                 ch.tp = TpReassembler::default();
-                ch.listen_only = listen_only || backend_name == "socketcand";
+                ch.listen_only = listen_only;
                 ch.bitrate = bitrate;
                 ch.stats = ChannelStats::default();
             }

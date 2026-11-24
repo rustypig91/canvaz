@@ -255,17 +255,25 @@ The release workflow builds the demo after staging the normal packages, waits
 for the scene to render, and includes the 1600×900 PNG in the Linux workflow
 artifact and the release assets. The demo binary is never packaged.
 
-### Socketcand monitoring
+### Socketcand connections
 
 Choose **Add CAN Channel → Socketcand (TCP)** and enter
 `can://127.0.0.1:29537/vcan0`. You can also paste the advertised label
 `vcan0@SIL (can://127.0.0.1:29537)`. Add the channel, then start capture.
 The connection is saved with the project and can be reopened after stopping.
 
-Socketcand monitoring works over TCP on all platforms and receives classic CAN
-standard and extended frames with server timestamps, plus reported bus errors.
+Socketcand works over TCP on all platforms and sends and receives classic CAN
+standard and extended frames, plus reported bus errors. Send and Simulate use
+the same connection as capture. Received timestamps are anchored to the local
+clock on the first frame, preserving server-relative timing even when the
+server clock is not synchronized with this computer.
 The server must already expose and configure the requested interface; the bitrate
-selection does not reconfigure it. This backend is receive-only and does not
-change the server's physical listen-only/ACK settings. CAN FD is not supported.
+control is hidden for remote channels. Selecting **Listen-only** prevents this
+client from sending; it does not change the server's physical listen-only/ACK
+settings. Previously saved monitoring channels retain that setting: stop capture,
+clear it, and restart to enable Send and Simulate. A transmitted frame is recorded
+when its command is written to TCP; socketcand does not acknowledge successful
+delivery on the CAN bus. CAN FD is not supported; incoming FD messages are skipped so classic CAN
+capture continues on mixed buses.
 
 Protocol reference: [socketcand protocol](https://github.com/linux-can/socketcand/blob/master/doc/protocol.md).

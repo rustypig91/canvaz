@@ -1810,6 +1810,17 @@ function setBitrateInDialog(bitrate: number | null, isVcan: boolean) {
     }
 }
 
+function updateChannelInterfaceInDialog(backend: string, name: string) {
+    const remote = backend === "socketcand";
+    document.getElementById("row-bitrate")!.style.display = remote ? "none" : "";
+    document.getElementById("label-listen-only")!.textContent = remote
+        ? "Receive only — send & simulate disabled; server ACK settings unchanged"
+        : "Silent — no ACKs, no error flags, send & simulate disabled";
+    // Remote channels leave local hardware settings intact, so switching back
+    // restores the chosen bitrate and does not silently enable listen-only.
+    if (!remote) setBitrateInDialog(getBitrateFromDialog(), name.startsWith("vcan"));
+}
+
 async function openChannelDialog(mode: DialogMode, handle?: number) {
     const opener = document.activeElement as HTMLElement | null;
     dialogMode = mode;
@@ -1860,13 +1871,11 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         const updateSocketcand = () => {
             const remote = sel.value === "__socketcand__";
             document.getElementById("row-socketcand")!.style.display = remote ? "" : "none";
-            if (remote) { setBitrateInDialog(null, true); setListenOnlyInDialog(true); }
+            const iface = available.find(i => i.name === sel.value);
+            updateChannelInterfaceInDialog(remote ? "socketcand" : iface?.backend ?? "", sel.value);
         };
         sel.onchange = updateSocketcand;
         updateSocketcand();
-
-        // Auto-detect vcan from first available item
-        if (available[0]?.name.startsWith("vcan")) setBitrateInDialog(null, true);
     } else {
         const ch = channels.get(handle!);
         const hwName = ch?.info.backend === "none" ? "Unassigned" : ch?.info.name ?? String(handle!);
@@ -1878,12 +1887,16 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         sel.innerHTML = '<option value="">No hardware channel</option>' + availableIfaces.map((i, index) =>
             `<option value="${index}">${escapeHtml(i.name)} (${escapeHtml(i.backend)})</option>`).join("");
         sel.value = ch?.info.backend === "none" ? "" : String(availableIfaces.findIndex(i => i.backend === ch?.info.backend && i.name === ch?.info.name));
-        sel.onchange = () => setBitrateInDialog(getBitrateFromDialog(), sel.value !== "" && availableIfaces[Number(sel.value)].name.startsWith("vcan"));
+        sel.onchange = () => {
+            const iface = sel.value === "" ? null : availableIfaces[Number(sel.value)];
+            updateChannelInterfaceInDialog(iface?.backend ?? "none", iface?.name ?? "");
+        };
         dialogPendingDbc = ch?.config.dbc_path ?? null;
         setDbcLabel(dialogPendingDbc);
         setBitrateInDialog(ch?.config.bitrate ?? null, hwName.startsWith("vcan"));
         setProtocolInDialog(ch?.config.protocol ?? null);
         setListenOnlyInDialog(ch?.config.listen_only ?? false);
+        updateChannelInterfaceInDialog(ch?.info.backend ?? "none", hwName);
         nameInput.value = ch?.config.display_name ?? "";
         nameInput.placeholder = hwName;
         selectChannel(handle!);
@@ -2143,7 +2156,7 @@ async function saveChannelDialog() {
             return;
         }
         const backend = selected === "__socketcand__" ? "socketcand" : availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
-        const config: ChannelConfig = { name, display_name: customName, backend, dbc_path: dialogPendingDbc, bitrate, protocol, listen_only: listenOnly };
+        const config: ChannelConfig = { name, display_name: customName, backend, dbc_path: dialogPendingDbc, bitrate: backend === "socketcand" ? null : bitrate, protocol, listen_only: listenOnly };
         // Register channel with backend (allocates handle); hardware opens (and
         // the DBC is loaded) on Start. If the name exists in no backend the
         // channel is still added, as a ghost — same as a project channel whose
@@ -2181,7 +2194,7 @@ async function saveChannelDialog() {
             if (!await changeChannelAssignment(h, selection === "" ? null : availableIfaces[Number(selection)])) return;
             ch.config.display_name = customName;
             ch.config.dbc_path = dialogPendingDbc;
-            ch.config.bitrate = bitrate;
+            ch.config.bitrate = ch.info.backend === "socketcand" ? null : bitrate;
             ch.config.protocol = protocol;
             ch.config.listen_only = listenOnly;
             // Sync (or clear) the custom name backend-side so CSV exports match.
@@ -2471,7 +2484,7 @@ async function renderChannelList() {
         const isSelected = h === selectedChannel;
         const bitrateLabel = hwName.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
         const protoLabel = ch.config.protocol === "j1939" ? " · J1939" : "";
-        const listenOnlyLabel = ch.config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">silent</span>` : "";
+        const listenOnlyLabel = ch.config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">${backend === "socketcand" ? "receive-only" : "silent"}</span>` : "";
         const item = document.createElement("div");
         item.className = `channel-item${isSelected ? " selected" : ""}`;
         item.dataset.channelHandle = String(h);
@@ -2539,7 +2552,7 @@ async function renderChannelList() {
         const ghostName = config.display_name || config.name;
         const bitrateLabel = config.name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
         const protoLabel = config.protocol === "j1939" ? " · J1939" : "";
-        const listenOnlyLabel = config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">silent</span>` : "";
+        const listenOnlyLabel = config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">${config.backend === "socketcand" ? "receive-only" : "silent"}</span>` : "";
         const item = document.createElement("div");
         item.className = "channel-item";
         item.innerHTML = `

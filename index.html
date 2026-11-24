@@ -205,7 +205,7 @@
         <div class="form-row" id="row-socketcand" style="display:none">
           <label for="input-socketcand">Socketcand address</label>
           <input id="input-socketcand" type="text" placeholder="can://127.0.0.1:29537/vcan0" />
-          <small>Uses the server’s bus configuration. Monitoring only.</small>
+          <small>Uses the server’s bus configuration. Supports classic CAN send and receive.</small>
         </div>
 
         <div class="form-row">
@@ -213,7 +213,7 @@
           <input id="input-channel-name" type="text" maxlength="64" placeholder="Optional — defaults to interface name" />
         </div>
 
-        <div class="form-row">
+        <div class="form-row" id="row-bitrate">
           <label for="select-bitrate">Bitrate</label>
           <select id="select-bitrate">
             <option value="125000">125 kbps</option>
@@ -236,7 +236,7 @@
 
         <div class="form-row">
           <label for="input-listen-only">Listen-only</label>
-          <label class="checkbox-label"><input type="checkbox" id="input-listen-only"> Silent — no ACKs, no error flags, send &amp; simulate disabled</label>
+          <label class="checkbox-label"><input type="checkbox" id="input-listen-only"> <span id="label-listen-only">Silent — no ACKs, no error flags, send &amp; simulate disabled</span></label>
         </div>
 
         <div class="form-row">
