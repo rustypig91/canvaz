@@ -100,13 +100,10 @@ impl SocketcandBackend {
     pub(crate) fn connect(name: &str, listen_only: bool) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
         let (host, port, bus) = endpoint(name)?;
         let addresses = (host.as_str(), port).to_socket_addrs().map_err(|e| e.to_string())?;
-        let connect_deadline = Instant::now() + OPEN_TIMEOUT;
         let mut stream = None;
         let mut last_error = "Socketcand host has no addresses".to_string();
         for address in addresses {
-            let remaining = connect_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() { break; }
-            match TcpStream::connect_timeout(&address, remaining) {
+            match TcpStream::connect_timeout(&address, OPEN_TIMEOUT) {
                 Ok(s) => { stream = Some(s); break; }
                 Err(e) => last_error = e.to_string(),
             }
