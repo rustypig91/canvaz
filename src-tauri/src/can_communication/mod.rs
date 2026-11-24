@@ -308,8 +308,14 @@ impl Can {
             format!("Channel {channel} is not open")
         })?;
         state.stop.store(true, Ordering::Relaxed);
-        state.queue.1.notify_one();
         let _ = state.rx_thread.join();
+        // Synchronize with the TX worker's stop check and entry into the
+        // condition wait. RX closes the shared socket before we take the lock.
+        {
+            let (lock, cvar) = state.queue.as_ref();
+            let _queue = lock.lock();
+            cvar.notify_one();
+        }
         let _ = state.tx_thread.join();
         info!("Closed channel {channel}");
         Ok(())

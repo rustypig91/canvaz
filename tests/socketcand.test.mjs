@@ -97,6 +97,31 @@ test("blank Socketcand addresses show an inline error and block registration unt
     assert.equal(h.element("dialog-channel").open, false);
 });
 
+test("Socketcand registration errors appear beside the address and clear on editing", async () => {
+    const h = harness();
+    const register = h.context.registerChannel;
+    const error = "Socketcand requires an interface, for example can://127.0.0.1:29536/vcan0";
+    h.context.registerChannel = async config => config.name === "can://localhost/"
+        ? { error } : register(config);
+    await h.context.openChannelDialog("add");
+
+    const input = h.element("input-socketcand");
+    input.value = "can://localhost/";
+    await h.context.saveChannelDialog();
+    assert.equal(h.element("error-socketcand").textContent, error);
+    assert.equal(input.attributes.get("aria-invalid"), "true");
+    assert.equal(input.focused, true);
+    assert.equal(h.element("dialog-channel").open, true);
+
+    input.value = "can://localhost/vcan0";
+    input.oninput();
+    assert.equal(h.element("error-socketcand").textContent, "");
+    assert.equal(input.attributes.get("aria-invalid"), "false");
+    await h.context.saveChannelDialog();
+    assert.equal(h.saved[0].name, input.value);
+    assert.equal(h.element("dialog-channel").open, false);
+});
+
 test("switching to Socketcand and back preserves the chosen physical bitrate and listen-only flag", async () => {
     const h = harness([{ backend: "pcan", name: "USB" }]);
     await h.context.openChannelDialog("add");
