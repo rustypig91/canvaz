@@ -1822,6 +1822,13 @@ function updateChannelInterfaceInDialog(backend: string, name: string) {
     if (!remote) setBitrateInDialog(getBitrateFromDialog(), name.startsWith("vcan"));
 }
 
+function setSocketcandAddressError(invalid: boolean) {
+    const input = document.getElementById("input-socketcand") as HTMLInputElement;
+    input.setAttribute("aria-invalid", String(invalid));
+    document.getElementById("error-socketcand")!.textContent = invalid ? "Enter a Socketcand address." : "";
+    if (invalid) input.focus();
+}
+
 async function openChannelDialog(mode: DialogMode, handle?: number) {
     const opener = document.activeElement as HTMLElement | null;
     dialogMode = mode;
@@ -1836,7 +1843,12 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
     const nameInput = document.getElementById("input-channel-name") as HTMLInputElement;
 
     document.getElementById("row-socketcand")!.style.display = "none";
+    setSocketcandAddressError(false);
     if (mode === "add") {
+        const socketcandInput = document.getElementById("input-socketcand") as HTMLInputElement;
+        socketcandInput.oninput = () => {
+            if (socketcandInput.value.trim()) setSocketcandAddressError(false);
+        };
         title.textContent = "Add CAN Channel";
         applyBtn.textContent = "Add";
         ifaceRow.style.display = "";
@@ -1872,6 +1884,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         const updateSocketcand = () => {
             const remote = sel.value === "__socketcand__";
             document.getElementById("row-socketcand")!.style.display = remote ? "" : "none";
+            if (!remote) setSocketcandAddressError(false);
             const iface = available.find(i => i.name === sel.value);
             updateChannelInterfaceInDialog(remote ? "socketcand" : iface?.backend ?? "", sel.value);
         };
@@ -2146,17 +2159,19 @@ async function saveChannelDialog() {
 
     if (dialogMode === "add") {
         const selected = (document.getElementById("select-iface") as HTMLSelectElement).value;
-        const name = selected === "__socketcand__"
+        const newSocketcand = selected === "__socketcand__";
+        const name = newSocketcand
             ? (document.getElementById("input-socketcand") as HTMLInputElement).value.trim() : selected;
         if (!name) {
-            log("error", "Channel name not set");
+            if (newSocketcand) setSocketcandAddressError(true);
+            else log("error", "Channel name not set");
             return;
         };
         if (ghostChannels.some(g => g.config.name === name)) {
             log("error", `Channel '${name}' is already added (hardware not available)`);
             return;
         }
-        const backend = selected === "__socketcand__" ? "socketcand" : availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
+        const backend = newSocketcand ? "socketcand" : availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
         const config: ChannelConfig = { name, display_name: customName, backend, dbc_path: dialogPendingDbc, bitrate: backend === "socketcand" ? null : bitrate, protocol, listen_only: listenOnly };
         // Register channel with backend (allocates handle); hardware opens (and
         // the DBC is loaded) on Start. If the name exists in no backend the

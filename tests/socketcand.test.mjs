@@ -7,7 +7,7 @@ import ts from "typescript";
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 const names = ["openChannelDialog", "saveChannelDialog", "updateChannelInterfaceInDialog",
     "setBitrateInDialog", "getBitrateFromDialog", "setListenOnlyInDialog", "getListenOnlyFromDialog",
-    "setProtocolInDialog", "getProtocolFromDialog", "setDbcLabel"];
+    "setProtocolInDialog", "getProtocolFromDialog", "setDbcLabel", "setSocketcandAddressError"];
 const code = ts.transpileModule(source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text))
     .map(n => n.getText(source)).join("\n"), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
@@ -27,6 +27,9 @@ function harness(ifaces = []) {
                 if (!this.value) this.value = html.match(/<option value="([^"]*)"/)?.[1] ?? "";
             },
             addEventListener() {}, contains() { return false; },
+            attributes: new Map(),
+            setAttribute(name, value) { this.attributes.set(name, value); },
+            focus() { this.focused = true; },
             showModal() { this.open = true; }, close() { this.open = false; },
         });
         return elements.get(id);
@@ -65,6 +68,32 @@ test("adding Socketcand without hardware enables sending and saves an unspecifie
     assert.equal(h.saved[0].backend, "socketcand");
     assert.equal(h.saved[0].bitrate, null);
     assert.equal(h.saved[0].listen_only, false);
+    assert.equal(h.element("dialog-channel").open, false);
+});
+
+test("blank Socketcand addresses show an inline error and block registration until corrected", async () => {
+    const h = harness();
+    await h.context.openChannelDialog("add");
+    const input = h.element("input-socketcand");
+    const error = h.element("error-socketcand");
+
+    for (const blank of ["", "   "]) {
+        input.value = blank;
+        await h.context.saveChannelDialog();
+        assert.equal(h.saved.length, 0);
+        assert.equal(h.element("dialog-channel").open, true);
+        assert.equal(error.textContent, "Enter a Socketcand address.");
+        assert.equal(input.attributes.get("aria-invalid"), "true");
+        assert.equal(input.focused, true);
+    }
+
+    input.value = " can://127.0.0.1:29536/vcan0 ";
+    input.oninput();
+    assert.equal(error.textContent, "");
+    assert.equal(input.attributes.get("aria-invalid"), "false");
+    await h.context.saveChannelDialog();
+    assert.equal(h.saved.length, 1);
+    assert.equal(h.saved[0].name, "can://127.0.0.1:29536/vcan0");
     assert.equal(h.element("dialog-channel").open, false);
 });
 

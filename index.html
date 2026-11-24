@@ -204,8 +204,9 @@
 
         <div class="form-row" id="row-socketcand" style="display:none">
           <label for="input-socketcand">Socketcand address</label>
-          <input id="input-socketcand" type="text" placeholder="can://127.0.0.1:29536/vcan0" />
-          <small>Uses the server’s bus configuration. Supports classic CAN send and receive.</small>
+          <input id="input-socketcand" type="text" placeholder="can://127.0.0.1:29536/vcan0" aria-required="true" aria-describedby="hint-socketcand error-socketcand" />
+          <small id="hint-socketcand">Uses the server’s bus configuration. Supports classic CAN send and receive.</small>
+          <small id="error-socketcand" class="form-error" role="alert"></small>
         </div>
 
         <div class="form-row">
