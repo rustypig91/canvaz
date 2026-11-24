@@ -158,6 +158,7 @@ test("New Project keeps session saving and dirty tracking active for subsequent 
     const writes = [], timers = new Map();
     let nextTimer = 0, value = 0;
     const ctx = harness(["newProject", "scheduleAutoSave"], {
+        startingCapture: null, stoppingCapture: null,
         sessionFilePath: "session.canvaz", projectPath: "old.canvaz", projectDirty: false, projectRevision: 0, restoringProject: false,
         autoSaveTimer: null, appRunning: false, channels: new Map(), ghostChannels: [], plotPanes: [], pendingPaneSignals: [], pendingSimMessages: [], simEntries: new Map(),
         signalLastValues: new Map(), signalLastRaw: new Map(), signalMinValues: new Map(), signalMaxValues: new Map(),

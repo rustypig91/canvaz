@@ -14,7 +14,7 @@ function harness(names, globals) {
     const code = ts.transpileModule(functions.map(n => n.getText(source)).join("\n"), {
         compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
     }).outputText;
-    const context = vm.createContext({ pendingPaneSignals: [], pendingSimMessages: [], ...globals });
+    const context = vm.createContext({ pendingPaneSignals: [], pendingSimMessages: [], startingCapture: null, stoppingCapture: null, ...globals });
     vm.runInContext(code, context);
     return context;
 }
@@ -59,7 +59,7 @@ test("Start reports missing interfaces and continues past failures to open other
 
 test("all missing channels keep capture stopped, with errors only on explicit Start", async () => {
     const errors = [];
-    const ctx = harness(["openConfiguredChannels", "startApp"], {
+    const ctx = harness(["openConfiguredChannels", "startApp", "finishStartingCapture"], {
         channels: new Map([[1, { available: false, config: {}, info: { name: "Missing" } }]]),
         ghostChannels: [], appRunning: false,
         refreshHardware: async () => true, renderChannelList: () => {},
@@ -282,7 +282,7 @@ test("Start preserves duplicate offline channels, dependent entries and saved ID
         let reconnected = false;
         const opened = [];
         const element = { value: "", querySelector: () => null, classList: { add: () => {} } };
-        const ctx = harness(["refreshHardware", "registerChannel", "handleToId", "idToHandle", "openConfiguredChannels", "startApp"], {
+        const ctx = harness(["refreshHardware", "registerChannel", "handleToId", "idToHandle", "openConfiguredChannels", "startApp", "finishStartingCapture"], {
             channels: new Map(reverse ? entries.reverse() : entries), ghostChannels: [], renderChannelList: () => {},
             simEntries: new Map([["message", simulated], ["raw", raw]]), plotPanes: [pane],
             document: { getElementById: () => element },

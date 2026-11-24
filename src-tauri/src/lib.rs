@@ -112,6 +112,7 @@ async fn open_channel(
     listen_only: Option<bool>,
     dbc_path: Option<String>,
     protocol: Option<String>,
+    resume_capture: Option<bool>,
     state: State<'_, TauriState>,
 ) -> Result<Option<ParsedDbc>, String> {
     let can_manager = Arc::clone(&state.can_manager);
@@ -121,7 +122,10 @@ async fn open_channel(
         can_manager
             .lock()
             .map_err(|e| e.to_string())?
-            .open_channel(channel_handle, bitrate, listen_only, dbc_path.as_deref(), proto)
+            .open_channel(
+                channel_handle, bitrate, listen_only, dbc_path.as_deref(), proto,
+                resume_capture.unwrap_or(false),
+            )
     })
     .await
     .unwrap_or_else(|e| Err(e.to_string()));

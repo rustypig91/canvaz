@@ -161,7 +161,7 @@ pub struct BusStats {
     /// Estimated bus load in percent (0–100), from frame sizes with an
     /// average stuff-bit allowance against the configured bitrate, when known.
     pub bus_load: Option<f64>,
-    /// Total bus error frames seen since the channel was opened.
+    /// Total bus error frames seen during the current capture.
     pub error_frames: u64,
     /// Latest controller status from the backend; `None` until first report.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -247,6 +247,19 @@ struct ChannelData {
 }
 
 impl ChannelData {
+    fn prepare_capture(&mut self, resume_capture: bool) {
+        self.tp = TpReassembler::default();
+        if resume_capture {
+            // Keep history and cumulative counts, but restart rate sampling
+            // and discard the last known controller status.
+            self.stats.last_query = None;
+            self.stats.bus_status = None;
+        } else {
+            self.frames.clear();
+            self.stats = ChannelStats::default();
+        }
+    }
+
     fn new(info: ChannelInfo) -> Self {
         Self {
             frames: VecDeque::new(),
@@ -506,16 +519,15 @@ impl CanManager {
     /// existing handle.
     pub fn create_channel(&mut self, backend_name: &str, channel_name: &str) -> Result<CreatedChannel, String> {
         if let Some(can) = self.cans.get_mut(backend_name) { can.register_channel(channel_name)?; }
-        let find = |can: &Can| can.list_channels().iter().position(|n| n == channel_name).map(|i| i as u8);
         let found = if backend_name == "none" { None } else { self
             .cans
             .get(backend_name)
-            .and_then(|can| find(can).map(|i| (backend_name.to_string(), i)))
+            .and_then(|can| can.channel_index(channel_name).map(|i| (backend_name.to_string(), i)))
             .or_else(|| {
                 self.cans
                     .iter()
                     .filter(|(name, _)| name.as_str() != backend_name)
-                    .find_map(|(name, can)| find(can).map(|i| (name.clone(), i)))
+                    .find_map(|(name, can)| can.channel_index(channel_name).map(|i| (name.clone(), i)))
             })
         };
         let available = found.is_some();
@@ -569,7 +581,7 @@ impl CanManager {
                 }
             }
             let index = if info.backend == "none" { None } else {
-                self.cans.get(&info.backend).and_then(|can| can.list_channels().iter().position(|name| name == &info.name)).map(|i| i as u8)
+                self.cans.get(&info.backend).and_then(|can| can.channel_index(&info.name))
             };
             for (&other, channel) in &lock.channels {
                 let target = assignments.iter().find(|(h, _)| *h == other).map(|(_, i)| i).unwrap_or(&channel.info);
@@ -579,8 +591,12 @@ impl CanManager {
             }
             resolved.push(index);
         }
+        let mut previous_indices = Vec::new();
         for (handle, _) in &assignments {
-            if let Some(key) = lock.handle_to_index.remove(handle) { lock.index_to_handle.remove(&key); }
+            if let Some(key) = lock.handle_to_index.remove(handle) {
+                lock.index_to_handle.remove(&key);
+                previous_indices.push(key);
+            }
         }
         for ((handle, info), index) in assignments.into_iter().zip(&resolved) {
             if let Some(index) = index {
@@ -590,6 +606,13 @@ impl CanManager {
             }
             let channel = lock.channels.get_mut(&handle).unwrap();
             channel.info = info;
+        }
+        for (backend, index) in previous_indices {
+            if !lock.index_to_handle.contains_key(&(backend.clone(), index)) {
+                if let Some(can) = self.cans.get_mut(&backend) {
+                    can.unregister_channel(index);
+                }
+            }
         }
         Ok(resolved.iter().map(Option::is_some).collect())
     }
@@ -628,6 +651,7 @@ impl CanManager {
         lock.index_to_handle.remove(&(backend_name.clone(), hw_index));
         lock.handle_to_index.remove(&handle);
         lock.channels.remove(&handle);
+        can.unregister_channel(hw_index);
 
         info!("Removed {backend_name} channel {hw_index} (handle: {handle})");
 
@@ -657,6 +681,7 @@ impl CanManager {
         listen_only: bool,
         dbc_path: Option<&str>,
         protocol: Protocol,
+        resume_capture: bool,
     ) -> Result<Option<ParsedDbc>, String> {
         let (backend_name, hw_index) = self.backend_index(handle)?;
 
@@ -666,14 +691,12 @@ impl CanManager {
         {
             let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
             if let Some(ch) = lock.channels.get_mut(&handle) {
-                ch.frames.clear();
+                ch.prepare_capture(resume_capture);
                 ch.dbc = dbc.clone();
                 ch.protocol = protocol;
-                ch.tp = TpReassembler::default();
                 ch.listen_only = listen_only;
                 // Socketcand uses the server's bitrate, which RAW mode does not report.
                 ch.bitrate = if backend_name == "socketcand" { 0 } else { bitrate };
-                ch.stats = ChannelStats::default();
             }
         }
 
@@ -710,6 +733,7 @@ impl CanManager {
                 if can.is_open(hw_index) {
                     let _ = can.close(hw_index);
                 }
+                can.unregister_channel(hw_index);
             }
         }
         if let Ok(mut lock) = self.shared.lock() {
@@ -1398,6 +1422,17 @@ mod tests {
             assert_eq!(samples.len(), 1);
             assert_eq!(samples[0].value, expected);
         }
+
+        channel.stats.error_frames = 2;
+        channel.stats.last_query = Some((std::time::Instant::now(), 3, 0, 0));
+        channel.prepare_capture(true);
+        assert_eq!(channel.get_signal_history(0x123, "Value", 0).len(), 1);
+        assert_eq!(channel.stats.error_frames, 2);
+        assert!(channel.stats.last_query.is_none());
+
+        channel.prepare_capture(false);
+        assert!(channel.get_signal_history(0x123, "Value", 0).is_empty());
+        assert_eq!(channel.stats.error_frames, 0);
     }
 
     #[test]

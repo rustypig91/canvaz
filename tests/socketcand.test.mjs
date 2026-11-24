@@ -7,7 +7,7 @@ import ts from "typescript";
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 const names = ["openChannelDialog", "saveChannelDialog", "updateChannelInterfaceInDialog",
     "setBitrateInDialog", "getBitrateFromDialog", "setListenOnlyInDialog", "getListenOnlyFromDialog",
-    "setProtocolInDialog", "getProtocolFromDialog", "setDbcLabel", "setSocketcandAddressError"];
+    "setProtocolInDialog", "getProtocolFromDialog", "setDbcLabel", "setSocketcandAddressError", "removeChannel"];
 const code = ts.transpileModule(source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text))
     .map(n => n.getText(source)).join("\n"), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
@@ -185,4 +185,25 @@ test("local virtual interfaces still use the virtual bitrate selection", async (
     await h.context.saveChannelDialog();
     assert.equal(h.saved[0].backend, "socketcan");
     assert.equal(h.saved[0].bitrate, null);
+});
+
+test("removing a Socketcand channel keeps it configured until backend removal succeeds", async () => {
+    const h = harness();
+    const name = "can://localhost/vcan0";
+    h.context.channels.set(7, { info: { backend: "socketcand", name } });
+    h.context.confirmAndStop = async () => true;
+    h.context.log = () => {};
+    h.context.renderChannelList = () => {};
+    let fail = true;
+    h.context.invoke = async (command, args) => {
+        assert.equal(command, "remove_channel");
+        assert.equal(args.channelHandle, 7);
+        assert.equal(h.context.channels.has(7), true);
+        if (fail) throw new Error("Channel is open");
+    };
+    await h.context.removeChannel(7, name);
+    assert.equal(h.context.channels.has(7), true);
+    fail = false;
+    await h.context.removeChannel(7, name);
+    assert.equal(h.context.channels.has(7), false);
 });

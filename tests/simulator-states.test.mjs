@@ -5,7 +5,10 @@ import vm from "node:vm";
 import ts from "typescript";
 
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
-const names = ["simEntryStatus", "updateSimEntryStatus", "updateSimTxStatus", "queueSimOperation", "startSim", "stopSim", "stopApp", "onChannelError"];
+const names = ["simEntryStatus", "updateSimEntryStatus", "updateSimTxStatus", "queueSimOperation",
+    "startSim", "stopSim", "startApp", "finishStartingCapture", "stopApp", "finishStoppingCapture",
+    "onChannelError", "closeFailedChannel", "openChannelByHandle",
+    "scheduleChannelRecovery", "recoverChannel"];
 const code = ts.transpileModule(source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text)).map(n => n.getText(source)).join("\n"), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
@@ -16,20 +19,29 @@ function element() {
 }
 function harness(kind = "raw", invoke = async () => 42) {
     const entry = { kind, channel: 1, canId: 123, messageId: 123, messageName: "Engine", signals: [], data: [0], dlc: 1, periodMs: 100, running: false, periodicHandle: null };
-    const ch = { config: { listen_only: false }, open: true, available: true };
+    const ch = { info: { name: "can://localhost/vcan0", backend: "socketcand" },
+        config: { listen_only: false }, open: true, available: true };
+    const timers = new Map();
+    let timerId = 0;
     const controls = Object.fromEntries([".sim-state", ".sim-toggle", ".sim-send-once", ".sim-remove"].map(key => [key, element()]));
     const footer = element(), count = element();
     const row = { querySelector: selector => controls[selector] };
     const ctx = vm.createContext({
         channels: new Map([[1, ch]]), simEntries: new Map([["entry", entry]]), appRunning: true,
+        startingCapture: null, stoppingCapture: null,
         document: { querySelector: () => row, getElementById: id => id === "sim-tx-status" ? footer : count },
         invoke, scheduleAutoSave() {}, log() {}, channelName: () => "CAN 1", simSignalValues: () => ({}), simGenerators: () => [],
-        viewPaused: false, updatePauseViewBtn() {}, stopBusStatsPoll() {}, renderChannelList() {}, scheduleChannelRecovery() {},
+        viewPaused: false, updatePauseViewBtn() {}, stopBusStatsPoll() {}, renderChannelList() {},
+        sigKeyCache: new Map(), pgnMapCache: new Map(),
+        channelRecoveryTimers: new Map(), channelRecoveryTasks: new Map(), failedChannelCloses: new Map(),
+        CHANNEL_RECOVERY_INTERVAL_MS: 5000,
+        setTimeout: callback => { timers.set(++timerId, callback); return timerId; },
+        clearTimeout: id => timers.delete(id),
     });
     vm.runInContext(code, ctx);
     const refresh = () => ctx.updateSimTxStatus();
     const state = () => controls[".sim-state"].textContent;
-    return { ctx, entry, ch, controls, footer, count, refresh, state };
+    return { ctx, entry, ch, controls, footer, count, refresh, state, timers };
 }
 function deferred() {
     let resolve;
@@ -197,6 +209,65 @@ test("stopping capture disables Send while channel closure is pending", async ()
     assert.equal(h.controls[".sim-send-once"].disabled, true);
     closing.resolve();
     await stopping;
+});
+
+test("Stop cancels queued recovery and closes a Socketcand reconnect already in progress", async () => {
+    const open = deferred(), entered = deferred();
+    const calls = [];
+    const h = harness("raw", async (command, args) => {
+        calls.push(command);
+        if (command === "open_channel") {
+            assert.equal(args.resumeCapture, true);
+            entered.resolve();
+            return open.promise;
+        }
+        assert.equal(command, "close_channel");
+    });
+    h.ch.open = false;
+    h.entry.running = true;
+    h.ctx.scheduleChannelRecovery(1);
+    const retry = h.timers.get(1)();
+    h.timers.delete(1);
+    await entered.promise;
+    h.ctx.scheduleChannelRecovery(1);
+    assert.equal(h.timers.size, 0);
+    h.ctx.scheduleChannelRecovery(2);
+    assert.equal(h.timers.size, 1);
+    const stopping = h.ctx.stopApp();
+    h.ctx.openConfiguredChannels = async () => { calls.push("start"); return false; };
+    const starting = h.ctx.startApp();
+    assert.equal(h.timers.size, 0);
+    assert.deepEqual(calls, ["open_channel"]);
+    open.resolve(null);
+    await Promise.all([retry, stopping, starting]);
+    assert.deepEqual(calls, ["open_channel", "close_channel", "start"]);
+    assert.equal(h.ch.open, false);
+    assert.equal(h.entry.periodicHandle, null);
+});
+
+test("a Socketcand disconnect before the open response leaves the channel disconnected", async () => {
+    const open = deferred(), close = deferred(), closing = deferred();
+    const h = harness("raw", async (command, args) => {
+        if (command === "open_channel") {
+            assert.equal(args.resumeCapture, false);
+            return open.promise;
+        }
+        assert.equal(command, "close_channel");
+        closing.resolve();
+        return close.promise;
+    });
+    h.ch.open = false;
+    const opening = h.ctx.openChannelByHandle(1);
+    const error = h.ctx.onChannelError({ channel_handle: 1, fatal: true, error: "Socketcand disconnected" });
+    await closing.promise;
+    open.resolve(null);
+    await Promise.resolve();
+    assert.equal(h.ch.open, false);
+    assert.equal(h.ch.error, "Socketcand disconnected");
+    close.resolve();
+    assert.equal(await opening, false);
+    await error;
+    assert.equal(h.timers.size, 1);
 });
 
 test("channel failure replaces a stale removal error with Disconnected", async () => {

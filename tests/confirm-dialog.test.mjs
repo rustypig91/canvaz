@@ -23,6 +23,7 @@ function harness() {
     const context = vm.createContext({
         document, appRunning: true, projectDirty: true, projectRevision: 7,
         projectPath: "original.canvaz", restoringProject: false,
+        startingCapture: null, stoppingCapture: null,
         stopApp: async () => { context.appRunning = false; },
         dialogOpen: async () => { dialogOpenCalls++; return "another.canvaz"; },
         invoke: async command => { assert.equal(command, "load_project"); return {}; },

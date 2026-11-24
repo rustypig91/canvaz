@@ -5,7 +5,12 @@ use std::net::{Shutdown, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Default)]
-pub struct SocketcandBackend { channels: Vec<String> }
+pub struct SocketcandBackend {
+    // An open channel keeps its index even when another channel is removed.
+    channels: Vec<Option<String>>,
+}
+
+const MAX_MESSAGE_BYTES: usize = 4096;
 
 fn endpoint(name: &str) -> Result<(String, u16, String), String> {
     let (address, bus) = if let Some((label, address)) = name.split_once(" (") {
@@ -15,26 +20,63 @@ fn endpoint(name: &str) -> Result<(String, u16, String), String> {
     if url.scheme() != "can" || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
         return Err("Use can://host:port/interface for socketcand".into());
     }
-    let bus = bus.unwrap_or(url.path().trim_start_matches('/'));
+    let path_bus = url.path().strip_prefix('/').unwrap_or(url.path());
+    if bus.is_some_and(|label_bus| !path_bus.is_empty() && label_bus != path_bus) {
+        return Err("Socketcand label and address specify different interfaces".into());
+    }
+    let bus = bus.unwrap_or(path_bus);
     if bus.is_empty() || bus.len() > 15 || !bus.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b)) {
         return Err("Socketcand requires an interface, for example can://127.0.0.1:29536/vcan0".into());
     }
-    let host = url.host_str().ok_or("Socketcand host missing")?.trim_matches(['[', ']']).to_owned();
-    Ok((host, url.port().unwrap_or(29536), bus.to_owned()))
+    let host = match url.host() {
+        Some(url::Host::Ipv6(host)) => host.to_string(),
+        Some(url::Host::Ipv4(host)) => host.to_string(),
+        Some(url::Host::Domain(host)) if !host.is_empty()
+            && host.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b)) => host.to_owned(),
+        _ => return Err("Socketcand requires a valid host name or IP address".into()),
+    };
+    let port = url.port().unwrap_or(29536);
+    if port == 0 {
+        return Err("Socketcand port must be between 1 and 65535".into());
+    }
+    Ok((host, port, bus.to_owned()))
 }
 
 impl CanBackend for SocketcandBackend {
     fn register_channel(&mut self, name: &str) -> Result<(), String> {
         endpoint(name)?;
-        if !self.channels.iter().any(|n| n == name) {
-            if self.channels.len() >= 256 { return Err("Too many socketcand channels".into()); }
-            self.channels.push(name.into());
+        if self.channel_index(name).is_some() {
+            return Ok(());
+        }
+        if let Some(slot) = self.channels.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(name.into());
+        } else {
+            if self.channels.len() > usize::from(u8::MAX) {
+                return Err("Too many socketcand channels".into());
+            }
+            self.channels.push(Some(name.into()));
         }
         Ok(())
     }
-    fn list_channels(&self) -> Vec<String> { self.channels.clone() }
+
+    fn unregister_channel(&mut self, index: u8) {
+        if let Some(slot) = self.channels.get_mut(usize::from(index)) {
+            *slot = None;
+        }
+    }
+
+    fn list_channels(&self) -> Vec<String> {
+        self.channels.iter().flatten().cloned().collect()
+    }
+
+    fn channel_index(&self, name: &str) -> Option<u8> {
+        let index = self.channels.iter().position(|slot| slot.as_deref() == Some(name))?;
+        u8::try_from(index).ok()
+    }
+
     fn open_channel(&mut self, index: u8, _: u32, listen_only: bool, _: Option<&str>) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
-        let name = self.channels.get(index as usize).ok_or("Unknown socketcand channel")?;
+        let name = self.channels.get(usize::from(index)).and_then(Option::as_deref)
+            .ok_or("Unknown socketcand channel")?;
         let (host, port, bus) = endpoint(name)?;
         let mut stream = None;
         let mut last_error = "Socketcand host has no addresses".to_string();
@@ -109,13 +151,16 @@ impl SocketcandRx {
     }
     fn message(&mut self, deadline: Instant) -> Result<Option<String>, String> {
         loop {
-            if let Some(end) = self.pending.iter().position(|&b| b == b'>') {
+            // Bound the complete message as well as an unfinished one.
+            // Bytes after the first terminator belong to later messages.
+            let message_window = &self.pending[..self.pending.len().min(MAX_MESSAGE_BYTES)];
+            if let Some(end) = message_window.iter().position(|&b| b == b'>') {
                 let bytes: Vec<_> = self.pending.drain(..=end).collect();
                 let text = std::str::from_utf8(&bytes).map_err(|_| "Non-ASCII socketcand response")?.trim();
                 let text = text.strip_prefix('<').and_then(|s| s.strip_suffix('>')).ok_or("Malformed socketcand response")?;
                 return Ok(Some(text.trim().to_owned()));
             }
-            if self.pending.len() > 4096 { return Err("Socketcand response too large".into()); }
+            if self.pending.len() >= MAX_MESSAGE_BYTES { return Err("Socketcand response too large".into()); }
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() { return Ok(None); }
             self.stream.set_read_timeout(Some(remaining)).map_err(|e| e.to_string())?;
@@ -186,14 +231,51 @@ mod tests {
     #[test]
     fn addresses_and_frames() {
         assert_eq!(endpoint("vcan0@SIL (can://127.0.0.1:29537)").unwrap(), endpoint("can://127.0.0.1:29537/vcan0").unwrap());
+        assert_eq!(endpoint("can://[::1]/vcan0").unwrap(), ("::1".into(), 29536, "vcan0".into()));
         assert!(endpoint("can://localhost/").is_err());
         assert!(endpoint("can://localhost/can0%20>").is_err());
+        assert!(endpoint("can:///can0").is_err());
+        assert!(endpoint("can://local%20host/can0").is_err());
+        assert!(endpoint("can://localhost:0/can0").is_err());
+        assert!(endpoint("vcan0@SIL (can://localhost/can1)").is_err());
         let f = parse_frame("frame 00000123 1700000000.123456 01FF").unwrap();
         assert!(f.is_extended);
         assert_eq!(f.data, [1,255]);
         assert_eq!(f.timestamp_ms, Some(1700000000123));
         assert!(parse_frame("frame 123 1.000000").unwrap().data.is_empty());
         for bad in ["frame 800 1.000000 FF", "frame 123 1.000000 F", "frame 123 NaN FF", "error denied"] { assert!(parse_frame(bad).is_err()); }
+    }
+
+    #[test]
+    fn removed_endpoints_free_slots_without_renumbering_other_channels() {
+        let mut backend = SocketcandBackend::default();
+        for index in 0..=u8::MAX {
+            backend.register_channel(&format!("can://localhost/can{index}")).unwrap();
+        }
+        let replacement = "can://localhost/vcan0";
+        assert!(backend.register_channel(replacement).is_err());
+        backend.unregister_channel(0);
+        assert_eq!(backend.channel_index("can://localhost/can0"), None);
+        assert_eq!(backend.list_channels()[0], "can://localhost/can1");
+        assert_eq!(backend.channel_index("can://localhost/can1"), Some(1));
+        backend.register_channel(replacement).unwrap();
+        assert_eq!(backend.channel_index(replacement), Some(0));
+        assert_eq!(backend.list_channels().len(), 256);
+    }
+
+    #[test]
+    fn oversized_messages_are_rejected_even_with_a_terminator() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let mut rx = SocketcandRx::new(stream);
+        let mut message = format!("<{}>", " ".repeat(MAX_MESSAGE_BYTES - 2)).into_bytes();
+        message.extend_from_slice(b"< ok >");
+        rx.pending = message;
+        assert_eq!(rx.message(Instant::now()).unwrap().as_deref(), Some(""));
+        assert_eq!(rx.message(Instant::now()).unwrap().as_deref(), Some("ok"));
+        rx.pending = format!("<{}>", " ".repeat(MAX_MESSAGE_BYTES - 1)).into_bytes();
+        assert_eq!(rx.message(Instant::now()).unwrap_err(), "Socketcand response too large");
     }
     #[test]
     fn partial_messages_survive_timeouts() {

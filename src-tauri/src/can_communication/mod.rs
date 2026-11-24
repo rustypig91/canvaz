@@ -155,7 +155,12 @@ pub trait RxHandle: Send + 'static {
 
 pub trait CanBackend: Send + 'static {
     fn register_channel(&mut self, _name: &str) -> Result<(), String> { Ok(()) }
+    fn unregister_channel(&mut self, _index: u8) {}
     fn list_channels(&self) -> Vec<String>;
+    fn channel_index(&self, name: &str) -> Option<u8> {
+        let index = self.list_channels().iter().position(|channel| channel == name)?;
+        u8::try_from(index).ok()
+    }
     /// `listen_only`: open the channel silent (no ACKs, no error flags injected)
     /// so the tool cannot disturb the bus. Backends that cannot honor it should
     /// still open normally rather than fail.
@@ -248,6 +253,14 @@ impl Can {
 
     pub fn register_channel(&mut self, name: &str) -> Result<(), String> {
         self.backend.register_channel(name)
+    }
+
+    pub fn unregister_channel(&mut self, index: u8) {
+        self.backend.unregister_channel(index);
+    }
+
+    pub fn channel_index(&self, name: &str) -> Option<u8> {
+        self.backend.channel_index(name)
     }
 
     pub fn list_channels(&self) -> Vec<String> {

@@ -145,6 +145,7 @@ interface CreatedChannel { handle: number; backend: string; available: boolean; 
 interface ChannelConfig { name: string; display_name?: string | null; backend: string; dbc_path: string | null; bitrate: number | null; protocol: string | null; listen_only: boolean; }
 // Everything the app tracks about one channel, keyed by its u32 handle in `channels`.
 interface Channel {
+    opening?: { failed: boolean };
     info: ChannelInfo;       // backend + hardware name (immutable identity)
     config: ChannelConfig;   // user settings: DBC path + bitrate
     dbc: ParsedDbc | null;   // DBC tree, parsed by open_channel; null until opened
@@ -327,6 +328,8 @@ function markPaneDirty(pane: PlotPane, force = false) {
 }
 
 let appRunning = false;
+let startingCapture: Promise<void> | null = null;
+let stoppingCapture: Promise<void> | null = null;
 let appStartTime = Date.now();
 let demoMode = false;
 let plotTabActive = false; // trace tab is the default active tab (see index.html)
@@ -2006,11 +2009,13 @@ async function registerChannel(config: ChannelConfig): Promise<RegisterResult> {
 
 // Open a channel by its u32 handle. If root is required the Rust side emits
 // "request-admin-password", the global listener shows the dialog, and open_channel
-// unblocks automatically. `quiet` demotes failure logs to debug — used by the
-// automatic recovery retries so a persistently absent device doesn't spam the log.
-async function openChannelByHandle(handle: number, quiet = false): Promise<boolean> {
+// unblocks automatically. Reopening during capture keeps retained frames and
+// demotes retry failures to debug.
+async function openChannelByHandle(handle: number, resumeCapture = false): Promise<boolean> {
     const ch = channels.get(handle);
-    if (!ch) return false;
+    if (!ch || ch.opening) return false;
+    const opening = { failed: false };
+    ch.opening = opening;
     try {
         // open_channel opens the hardware (using the channel's configured bitrate
         // and DBC path) and returns the DBC it parsed fresh from disk.
@@ -2020,7 +2025,12 @@ async function openChannelByHandle(handle: number, quiet = false): Promise<boole
             listenOnly: ch.config.listen_only ?? false,
             dbcPath: ch.config.dbc_path ?? null,
             protocol: ch.config.protocol ?? null,
+            resumeCapture,
         });
+        if (opening.failed) {
+            await failedChannelCloses.get(handle);
+            return false;
+        }
         ch.dbc = dbc ?? null;
         sigKeyCache.delete(handle); // key tables are derived from the DBC just replaced
         pgnMapCache.delete(handle);
@@ -2032,10 +2042,12 @@ async function openChannelByHandle(handle: number, quiet = false): Promise<boole
         if (msg === "Sudo authentication cancelled") {
             log("warn", "Cancelled — sudo password required.");
         } else {
-            log(quiet ? "debug" : "error", `Channel error: ${msg}`);
-            if (!quiet) { ch.error = msg; renderChannelList(); }
+            log(resumeCapture ? "debug" : "error", `Channel error: ${msg}`);
+            if (!resumeCapture) { ch.error = msg; renderChannelList(); }
         }
         return false;
+    } finally {
+        delete ch.opening;
     }
 }
 
@@ -2046,6 +2058,8 @@ async function openChannelByHandle(handle: number, quiet = false): Promise<boole
 // background so replugging the device recovers without a manual restart.
 
 const channelRecoveryTimers = new Map<number, ReturnType<typeof setTimeout>>();
+const channelRecoveryTasks = new Map<number, Promise<void>>();
+const failedChannelCloses = new Map<number, Promise<void>>();
 const CHANNEL_RECOVERY_INTERVAL_MS = 5000;
 
 async function onChannelError(ev: ChannelErrorEvent) {
@@ -2059,55 +2073,73 @@ async function onChannelError(ev: ChannelErrorEvent) {
         log("debug", `TX error on ${name}: ${ev.error}`);
         return;
     }
+    if ((!ch.open && !ch.opening) || failedChannelCloses.has(ev.channel_handle)) return;
+    if (ch.opening) ch.opening.failed = true;
     log("error", `Channel ${name} stopped receiving: ${ev.error}`);
     ch.error = ev.error;
     // Block new transmissions immediately and drain pending registrations before
     // closing, so a late IPC response cannot restore a dead periodic handle.
     ch.open = false;
     updateSimTxStatus();
+    const closing = closeFailedChannel(ev.channel_handle);
+    failedChannelCloses.set(ev.channel_handle, closing);
+    try {
+        await closing;
+    } finally {
+        failedChannelCloses.delete(ev.channel_handle);
+    }
+    if (appRunning) scheduleChannelRecovery(ev.channel_handle);
+}
+
+async function closeFailedChannel(handle: number) {
     await Promise.all([...simEntries.values()]
-        .filter(entry => entry.channel === ev.channel_handle)
+        .filter(entry => entry.channel === handle)
         .map(entry => entry.operation?.catch(() => {})));
     // The RX thread is gone but the hardware handle is still registered as
     // open; close it so the next open starts from a clean state.
-    try { await invoke("close_channel", { channelHandle: ev.channel_handle }); }
+    try { await invoke("close_channel", { channelHandle: handle }); }
     catch (e) { log("debug", `Close after channel error failed: ${e}`); }
-    ch.open = false;
     // The channel's backend periodics died with the hardware handle; clear the
     // stale registrations, otherwise recovery's startSim() bails on its
     // "already registered" guard and the entries never resume sending (and the
     // footer TX indicator would keep counting them).
     for (const entry of simEntries.values()) {
-        if (entry.channel === ev.channel_handle) {
+        if (entry.channel === handle) {
             entry.periodicHandle = null;
             delete entry.txError;
         }
     }
     updateSimTxStatus();
     renderChannelList();
-    if (appRunning) scheduleChannelRecovery(ev.channel_handle);
 }
 
 function scheduleChannelRecovery(handle: number) {
-    if (channelRecoveryTimers.has(handle)) return;
+    if (channelRecoveryTimers.has(handle) || channelRecoveryTasks.has(handle)) return;
     channelRecoveryTimers.set(handle, setTimeout(async () => {
         channelRecoveryTimers.delete(handle);
-        const ch = channels.get(handle);
-        // Stop retrying once capture stops, the channel was removed, or
-        // something else (Start, Reload backends) already reopened it.
-        if (!ch || !appRunning || ch.open) return;
-        if (await openChannelByHandle(handle, true)) {
-            log("info", `Channel ${channelName(handle)} recovered`);
-            renderChannelList();
-            // Backend periodics died with the hardware handle; re-register the
-            // sim entries the user still has marked as running on this channel.
-            for (const [key, entry] of simEntries) {
-                if (entry.channel === handle && entry.running) await startSim(key);
-            }
-        } else {
-            scheduleChannelRecovery(handle);
+        const task = recoverChannel(handle);
+        channelRecoveryTasks.set(handle, task);
+        try {
+            await task;
+        } finally {
+            channelRecoveryTasks.delete(handle);
         }
+        const ch = channels.get(handle);
+        if (appRunning && ch && !ch.open) scheduleChannelRecovery(handle);
     }, CHANNEL_RECOVERY_INTERVAL_MS));
+}
+
+async function recoverChannel(handle: number) {
+    await failedChannelCloses.get(handle);
+    const ch = channels.get(handle);
+    if (!appRunning || !ch || ch.open) return;
+    if (!await openChannelByHandle(handle, true) || !appRunning) return;
+    log("info", `Channel ${channelName(handle)} recovered`);
+    renderChannelList();
+    // Re-register simulations the user kept armed while disconnected.
+    for (const [key, entry] of simEntries) {
+        if (entry.channel === handle && entry.running) await startSim(key);
+    }
 }
 
 // Unique persisted identities keep unassigned channels distinct across project reloads.
@@ -2503,7 +2535,7 @@ async function renderChannelList() {
             ? `${ch.config.display_name ? `${escapeHtml(ch.config.display_name)} ` : ""}<span class="ch-unassigned">Unassigned</span>`
             : `${escapeHtml(name)}<span class="ch-backend label-muted"> ${escapeHtml(backend)}</span>`;
         const isSelected = h === selectedChannel;
-        const bitrateLabel = hwName.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
+        const bitrateLabel = backend === "socketcand" ? "—" : hwName.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
         const protoLabel = ch.config.protocol === "j1939" ? " · J1939" : "";
         const listenOnlyLabel = ch.config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">${backend === "socketcand" ? "receive-only" : "silent"}</span>` : "";
         const item = document.createElement("div");
@@ -2535,33 +2567,13 @@ async function renderChannelList() {
                     }
                 },
                 {
-                    label: "Remove Channel", danger: true, action: async () => {
-                        if (!await confirmAndStop(`Stop live capture and remove "${name}"?`, "Stop & remove channel")) return;
-                        channels.delete(h);
-                        if (selectedChannel === h) selectChannel(null);
-                        renderChannelList();
-                        rebuildTraceColumns();
-                        scheduleAutoSave("channel removed");
-                    }
+                    label: "Remove Channel", danger: true, action: () => removeChannel(h, name)
                 },
             ]);
         });
         item.querySelector(".btn-close-ch")!.addEventListener("click", async (e) => {
             e.stopPropagation();
-            if (!await confirmAndStop(`Stop live capture and remove "${name}"?`, "Stop & remove channel")) return;
-
-            try { await invoke("remove_channel", { channelHandle: h }); }
-            catch (e) {
-                log("error", `Remove channel error: ${e}`);
-                return;
-            }
-            channels.delete(h);
-
-            if (selectedChannel === h) selectChannel(null);
-
-            renderChannelList();
-            rebuildTraceColumns();
-            scheduleAutoSave("channel closed");
+            await removeChannel(h, name);
         });
         list.appendChild(item);
     }
@@ -2571,7 +2583,7 @@ async function renderChannelList() {
         const dbcPath = config.dbc_path;
         const bitrate = config.bitrate;
         const ghostName = config.display_name || config.name;
-        const bitrateLabel = config.name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
+        const bitrateLabel = config.backend === "socketcand" ? "—" : config.name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
         const protoLabel = config.protocol === "j1939" ? " · J1939" : "";
         const listenOnlyLabel = config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">${config.backend === "socketcand" ? "receive-only" : "silent"}</span>` : "";
         const item = document.createElement("div");
@@ -3419,7 +3431,7 @@ async function newProject() {
     ++projectRevision;
     if (autoSaveTimer) clearTimeout(autoSaveTimer);
     try {
-        if (appRunning) await stopApp();
+        if (appRunning || startingCapture || stoppingCapture) await stopApp();
 
         for (const h of [...channels.keys()]) {
             try { await invoke("remove_channel", { channelHandle: h }); } catch { }
@@ -3521,7 +3533,7 @@ async function openProject() {
 
 async function applyProject(project: Project) {
     // Stop any active capture before applying a new project.
-    if (appRunning) await stopApp();
+    if (appRunning || startingCapture || stoppingCapture) await stopApp();
     // Remove old hardware registrations before reusing any channel identities.
     await invoke("reset_backend");
     clearTrace();
@@ -3850,6 +3862,18 @@ async function openConfiguredChannels(reportMissing: boolean): Promise<boolean> 
 }
 
 async function startApp(reportMissing = true) {
+    if (stoppingCapture) await stoppingCapture;
+    if (startingCapture) return startingCapture;
+    if (appRunning) return;
+    startingCapture = finishStartingCapture(reportMissing);
+    try {
+        await startingCapture;
+    } finally {
+        startingCapture = null;
+    }
+}
+
+async function finishStartingCapture(reportMissing: boolean) {
     if (!await openConfiguredChannels(reportMissing)) return;
 
     // Reconcile simulated message entries with the reloaded DBC. Entries hold a
@@ -3925,6 +3949,9 @@ async function startApp(reportMissing = true) {
     clearTrace();
     startScrollLoop();
     startBusStatsPoll();
+    for (const [handle, ch] of channels) {
+        if (ch.info.backend === "socketcand" && ch.available && !ch.open) scheduleChannelRecovery(handle);
+    }
 
     const btn = document.getElementById("btn-app-run")!;
     btn.textContent = "■ Stop";
@@ -3934,6 +3961,18 @@ async function startApp(reportMissing = true) {
 }
 
 async function stopApp() {
+    if (startingCapture) await startingCapture;
+    if (stoppingCapture) return stoppingCapture;
+    if (!appRunning) return;
+    stoppingCapture = finishStoppingCapture();
+    try {
+        await stoppingCapture;
+    } finally {
+        stoppingCapture = null;
+    }
+}
+
+async function finishStoppingCapture() {
     // If the view is paused, resume it first so pending trace/plot/sidebar
     // updates are flushed and the final live state is shown before stopping.
     if (viewPaused) {
@@ -3944,6 +3983,11 @@ async function stopApp() {
     updateSimTxStatus();
     updatePauseViewBtn();
     stopBusStatsPoll();
+    for (const timer of channelRecoveryTimers.values()) clearTimeout(timer);
+    channelRecoveryTimers.clear();
+    // An open already in progress can complete after Stop is pressed.
+    await Promise.allSettled(channelRecoveryTasks.values());
+    await Promise.allSettled(failedChannelCloses.values());
     await Promise.all([...simEntries.values()].map(entry => entry.operation?.catch(() => {})));
     // Close hardware connections; they will reopen on the next Start.
     for (const [handle, ch] of channels) {
@@ -3951,9 +3995,9 @@ async function stopApp() {
         // the next Start reports fresh errors if the problem persists.
         ch.error = null;
         if (!ch.open) continue;
+        ch.open = false;
         try { await invoke("close_channel", { channelHandle: handle }); }
         catch (e) { log("debug", `Failed to close channel ${ch.info.name}: ${e}`); }
-        ch.open = false;
     }
     // Channels are closed so backend periodics are gone; preserve running intent so
     // entries auto-restart on next Start and the UI shows "Armed".
@@ -4008,10 +4052,27 @@ function showConfirm(message: string, actionLabel: string): Promise<boolean> {
 
 // Shows a confirm dialog if running, stops capture, then returns true so the caller can proceed.
 async function confirmAndStop(prompt: string, actionLabel: string): Promise<boolean> {
+    if (startingCapture) await startingCapture;
+    if (stoppingCapture) await stoppingCapture;
     if (!appRunning) return true;
     if (!await showConfirm(prompt, actionLabel)) return false;
     await stopApp();
     return true;
+}
+
+async function removeChannel(handle: number, name: string) {
+    if (!await confirmAndStop(`Stop live capture and remove "${name}"?`, "Stop & remove channel")) return;
+    try {
+        await invoke("remove_channel", { channelHandle: handle });
+    } catch (e) {
+        log("error", `Remove channel error: ${e}`);
+        return;
+    }
+    channels.delete(handle);
+    if (selectedChannel === handle) selectChannel(null);
+    renderChannelList();
+    rebuildTraceColumns();
+    scheduleAutoSave("channel removed");
 }
 
 async function exportCsv() {
@@ -6555,6 +6616,7 @@ function renderBusStats(stats: BusStats[]) {
 
         const st = s.status;
         const state = st?.bus_state ?? null;
+        const remote = channels.get(s.channel_handle)?.info.backend === "socketcand";
         const load = s.bus_load?.toFixed(1);
         const tipLines = [
             channelName(s.channel_handle),
@@ -6563,13 +6625,16 @@ function renderBusStats(stats: BusStats[]) {
             `Error frames: ${s.error_frames}`,
         ];
         if (state) tipLines.push(`Bus state: ${BUS_STATE_LABEL[state] ?? state}`);
+        else if (remote) tipLines.push("Bus state unavailable");
         if (st?.tx_err != null && st?.rx_err != null) tipLines.push(`Error counters: TX ${st.tx_err} · RX ${st.rx_err}`);
         if (st?.overrun != null && st.overrun > 0) tipLines.push(`Overruns: ${st.overrun}`);
 
         chip.className = `bus-chip${s.error_frames > 0 ? " has-errors" : ""}`;
         chip.dataset.tip = tipLines.join("\n");
-        chip.querySelector<HTMLElement>(".bus-state")!.className =
-            `bus-state${state && state !== "active" ? ` ${state}` : ""}`;
+        const dot = chip.querySelector<HTMLElement>(".bus-state")!;
+        dot.className = "bus-state";
+        if (state && state !== "active") dot.classList.add(state);
+        else if (!state && remote) dot.classList.add("unknown");
         chip.querySelector<HTMLElement>(".bus-chip-name")!.textContent = channelName(s.channel_handle);
         chip.querySelector<HTMLElement>(".bus-load")!.textContent = load == null ? "—" : `${load}%`;
         chip.querySelector<HTMLElement>(".bus-fps")!.textContent = `${(s.rx_fps + s.tx_fps).toFixed(0)}/s`;
@@ -6807,8 +6872,15 @@ window.addEventListener("DOMContentLoaded", async () => {
     document.getElementById("btn-add-raw-frame")!.addEventListener("click", addRawFrame);
 
     // Play / Stop
-    document.getElementById("btn-app-run")!.addEventListener("click", async () => {
-        if (appRunning) await stopApp(); else await startApp();
+    const runButton = document.getElementById("btn-app-run") as HTMLButtonElement;
+    runButton.addEventListener("click", async () => {
+        runButton.disabled = true;
+        try {
+            if (appRunning) await stopApp();
+            else await startApp();
+        } finally {
+            runButton.disabled = false;
+        }
     });
 
     document.getElementById("btn-pause-view")!.addEventListener("click", () => {

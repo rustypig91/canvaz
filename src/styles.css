@@ -194,6 +194,7 @@ kbd {
 .bus-chip .bus-state.warning { background: var(--warning); }
 .bus-chip .bus-state.passive { background: #fb923c; }
 .bus-chip .bus-state.busoff  { background: var(--danger); }
+.bus-chip .bus-state.unknown { background: var(--text-muted); }
 .bus-chip.has-errors { border-color: var(--danger); }
 .bus-chip.has-errors .bus-err-count { color: var(--danger); }
 
