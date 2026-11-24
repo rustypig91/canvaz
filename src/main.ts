@@ -107,6 +107,7 @@ interface FrameInfo {
 
 interface CanFrameEvent {
     channel_handle: number;
+    socketcand_attempt?: number;
     can_id: number;
     is_extended: boolean;
     dlc: number;
@@ -145,7 +146,8 @@ interface CreatedChannel { handle: number; backend: string; available: boolean; 
 interface ChannelConfig { name: string; display_name?: string | null; backend: string; dbc_path: string | null; bitrate: number | null; protocol: string | null; listen_only: boolean; }
 // Everything the app tracks about one channel, keyed by its u32 handle in `channels`.
 interface Channel {
-    opening?: { failed: boolean; socketcandAttempt?: number };
+    opening?: { failed: boolean; socketcandAttempt?: number; frames: CanFrameEvent[] };
+    socketcandAttempt?: number;
     info: ChannelInfo;       // backend + hardware name (immutable identity)
     config: ChannelConfig;   // user settings: DBC path + bitrate
     dbc: ParsedDbc | null;   // DBC tree, parsed by open_channel; null until opened
@@ -156,7 +158,7 @@ interface Channel {
 
 // Backend "channel-error" event: fatal means the RX loop died and the channel
 // no longer receives; non-fatal is a TX send failure on a live channel.
-interface ChannelErrorEvent { channel_handle: number; error: string; fatal: boolean; }
+interface ChannelErrorEvent { channel_handle: number; socketcand_attempt?: number; error: string; fatal: boolean; }
 // One simulated message instance; the same message can appear multiple times.
 interface SimMessageConfig {
     channel: string; message_id: number; period_ms: number; running?: boolean;
@@ -2022,9 +2024,10 @@ async function registerChannel(config: ChannelConfig): Promise<RegisterResult> {
 async function openChannelByHandle(handle: number, resumeCapture = false): Promise<boolean> {
     const ch = channels.get(handle);
     if (!ch || ch.opening) return false;
-    const opening = {
+    const opening: NonNullable<Channel["opening"]> = {
         failed: false,
         socketcandAttempt: ch.info.backend === "socketcand" ? ++nextSocketcandAttempt : undefined,
+        frames: [],
     };
     ch.opening = opening;
     try {
@@ -2040,13 +2043,17 @@ async function openChannelByHandle(handle: number, resumeCapture = false): Promi
             socketcandAttempt: opening.socketcandAttempt,
         });
         if (ch.opening !== opening) return false;
+        ch.dbc = dbc ?? null;
+        sigKeyCache.delete(handle); // key tables are derived from the DBC just replaced
+        pgnMapCache.delete(handle);
+        ch.socketcandAttempt = opening.socketcandAttempt;
+        // RX can emit frames before the open response reaches the webview.
+        // Apply them only after installing the DBC that decoded their signals.
+        if (opening.frames.length) onCanFrameBatch(opening.frames);
         if (opening.failed) {
             await failedChannelCloses.get(handle);
             return false;
         }
-        ch.dbc = dbc ?? null;
-        sigKeyCache.delete(handle); // key tables are derived from the DBC just replaced
-        pgnMapCache.delete(handle);
         ch.open = true;
         ch.error = null;
         return true;
@@ -2079,6 +2086,8 @@ const CHANNEL_RECOVERY_INTERVAL_MS = 5000;
 async function onChannelError(ev: ChannelErrorEvent) {
     const ch = channels.get(ev.channel_handle);
     if (!ch) return;
+    if (ev.socketcand_attempt !== undefined &&
+        ev.socketcand_attempt !== (ch.opening?.socketcandAttempt ?? ch.socketcandAttempt)) return;
     const name = channelName(ev.channel_handle);
     if (!ev.fatal) {
         // Debug only: bus trouble is continuously visible in the footer's
@@ -2095,7 +2104,7 @@ async function onChannelError(ev: ChannelErrorEvent) {
     // closing, so a late IPC response cannot restore a dead periodic handle.
     ch.open = false;
     updateSimTxStatus();
-    const closing = closeFailedChannel(ev.channel_handle);
+    const closing = closeFailedChannel(ev.channel_handle, ev.socketcand_attempt);
     failedChannelCloses.set(ev.channel_handle, closing);
     try {
         await closing;
@@ -2105,13 +2114,13 @@ async function onChannelError(ev: ChannelErrorEvent) {
     if (appRunning) scheduleChannelRecovery(ev.channel_handle);
 }
 
-async function closeFailedChannel(handle: number) {
+async function closeFailedChannel(handle: number, socketcandAttempt?: number) {
     await Promise.all([...simEntries.values()]
         .filter(entry => entry.channel === handle)
         .map(entry => entry.operation?.catch(() => {})));
     // The RX thread is gone but the hardware handle is still registered as
     // open; close it so the next open starts from a clean state.
-    try { await invoke("close_channel", { channelHandle: handle }); }
+    try { await invoke("close_channel", { channelHandle: handle, socketcandAttempt }); }
     catch (e) { log("debug", `Close after channel error failed: ${e}`); }
     // The channel's backend periodics died with the hardware handle; clear the
     // stale registrations, otherwise recovery's startSim() bails on its
@@ -3811,10 +3820,10 @@ async function restoreProjectEntries() {
 
 }
 
-async function refreshHardware(): Promise<boolean> {
+async function refreshHardware(startCapture = false): Promise<boolean> {
     let remapped: { old_handle: number; new_handle: number; backend: string; available: boolean }[];
     try {
-        remapped = await invoke<{ old_handle: number; new_handle: number; backend: string; available: boolean }[]>("reload_backends");
+        remapped = await invoke<{ old_handle: number; new_handle: number; backend: string; available: boolean }[]>("reload_backends", { startCapture });
     } catch (e) {
         log("error", `Backend reload failed: ${e}`);
         return false;
@@ -3833,12 +3842,12 @@ async function refreshHardware(): Promise<boolean> {
         if (remap !== undefined && remap.new_handle === oldHandle) {
             renamedIds.set(`${ch.info.backend}:${ch.info.name}`, `${remap.backend}:${ch.info.name}`);
             ch.config.backend = remap.backend;
-            channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend }, open: false, available: remap.available, error: null });
+            channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend }, open: false, socketcandAttempt: undefined, available: remap.available, error: null });
         } else {
             // The destination owns the hardware mapping. The original offline
             // registration still exists and can reconnect under its own backend
             // later, so preserve its DBC and every reference to its handle.
-            channels.set(oldHandle, { ...ch, open: false, available: false, error: remap
+            channels.set(oldHandle, { ...ch, open: false, socketcandAttempt: undefined, available: false, error: remap
                 ? "Resolves to an already-configured channel"
                 : "Not found after backend reload" });
         }
@@ -3881,7 +3890,7 @@ async function refreshHardware(): Promise<boolean> {
 
 // Explicit Start reports missing interfaces; automatic startup stays quiet.
 async function openConfiguredChannels(reportMissing: boolean): Promise<boolean> {
-    if (!await refreshHardware()) return false;
+    if (!await refreshHardware(true)) return false;
     if (reportMissing) {
         for (const ghost of ghostChannels) {
             log("error", `Cannot start channel ${ghost.config.name}: ${ghost.error}`);
@@ -4034,6 +4043,7 @@ async function finishStoppingCapture() {
     const cancelledOpens = [];
     for (const [handle, ch] of channels) {
         const opening = ch.opening;
+        delete ch.socketcandAttempt;
         if (!opening?.socketcandAttempt || opening.failed) continue;
         delete ch.opening;
         channelRecoveryTasks.delete(handle);
@@ -5233,6 +5243,13 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
     const appendEntries: TraceEntry[] = [];
 
     for (const ev of events) {
+        if (ev.socketcand_attempt !== undefined) {
+            const channel = channels.get(ev.channel_handle);
+            if (channel?.socketcandAttempt !== ev.socketcand_attempt) {
+                if (channel?.opening?.socketcandAttempt === ev.socketcand_attempt) channel.opening.frames.push(ev);
+                continue;
+            }
+        }
         const isError = ev.error != null;
         // Message identity comes from the frontend's copy of the DBC (the event
         // carries no strings); both sides parsed the same file at open. On J1939
@@ -5395,7 +5412,7 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
 // live-event layout.
 function interleaveFrameSignals(f: FrameInfo): (number | null)[] {
     const msg = dbcMessageFor(f.channel_handle, f.can_id, f.is_extended);
-    if (!msg || msg.signals.length === f.signals.length) {
+    if (!msg || (msg.signals.length === f.signals.length && msg.signals.every((sig, i) => sig.name === f.signals[i].name))) {
         return f.signals.flatMap(s => [s.value, s.raw]);
     }
     const byName = new Map(f.signals.map(s => [s.name, s]));

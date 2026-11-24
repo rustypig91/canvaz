@@ -24,6 +24,53 @@ const MAX_EARLY_FRAMES: usize = 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
 
+pub(crate) const SOCKETCAND_OPEN_CANCELLED: &str = "Socketcand connection was cancelled";
+
+#[derive(Default)]
+pub(crate) struct SocketcandConnect(Mutex<ConnectState>);
+
+#[derive(Default)]
+enum ConnectState {
+    #[default]
+    Pending,
+    Handshaking(TcpStream),
+    Cancelled,
+}
+
+impl SocketcandConnect {
+    pub(crate) fn cancel(&self) {
+        let mut state = self.0.lock().unwrap();
+        if let ConnectState::Handshaking(stream) = std::mem::replace(&mut *state, ConnectState::Cancelled) {
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    fn check_cancelled(&self) -> Result<(), String> {
+        if matches!(*self.0.lock().unwrap(), ConnectState::Cancelled) {
+            return Err(SOCKETCAND_OPEN_CANCELLED.into());
+        }
+        Ok(())
+    }
+
+    fn track(&self, stream: &TcpStream) -> Result<(), String> {
+        let mut state = self.0.lock().unwrap();
+        if matches!(*state, ConnectState::Cancelled) {
+            return Err(SOCKETCAND_OPEN_CANCELLED.into());
+        }
+        *state = ConnectState::Handshaking(stream.try_clone().map_err(|e| e.to_string())?);
+        Ok(())
+    }
+
+    fn finish_handshake(&self) -> Result<(), String> {
+        let mut state = self.0.lock().unwrap();
+        if matches!(*state, ConnectState::Cancelled) {
+            return Err(SOCKETCAND_OPEN_CANCELLED.into());
+        }
+        *state = ConnectState::Pending;
+        Ok(())
+    }
+}
+
 fn endpoint(name: &str) -> Result<(String, u16, String), String> {
     let (address, bus) = if let Some((label, address)) = name.split_once(" (") {
         (address.strip_suffix(')').ok_or("Invalid socketcand label")?, Some(label.split('@').next().unwrap_or(label)))
@@ -101,7 +148,7 @@ impl CanBackend for SocketcandBackend {
     fn open_channel(&mut self, index: u8, _: u32, listen_only: bool, _: Option<&str>) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
         let channel = self.channels.get(usize::from(index)).and_then(Option::as_ref)
             .ok_or("Unknown socketcand channel")?;
-        Self::connect(&channel.name, listen_only)
+        Self::connect(&channel.name, listen_only, &SocketcandConnect::default())
     }
 }
 
@@ -117,10 +164,13 @@ impl SocketcandBackend {
         endpoint(first).is_ok_and(|key| endpoint(second).is_ok_and(|other| key == other))
     }
 
-    pub(crate) fn connect(name: &str, listen_only: bool) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
+    pub(crate) fn connect(
+        name: &str, listen_only: bool, opening: &SocketcandConnect,
+    ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
+        opening.check_cancelled()?;
         let (host, port, bus) = endpoint(name)?;
         let addresses = (host.as_str(), port).to_socket_addrs().map_err(|e| e.to_string())?;
-        let mut rx = Self::connect_addresses(addresses, &bus)?;
+        let mut rx = Self::connect_addresses(addresses, &bus, opening)?;
         // Keep reads independent of writes. Serialize writes so an echo
         // cannot interleave with a send command.
         let writer = Arc::new(Mutex::new(rx.stream.try_clone().map_err(|e| e.to_string())?));
@@ -129,12 +179,19 @@ impl SocketcandBackend {
         Ok((Box::new(tx), Box::new(rx)))
     }
 
-    fn connect_addresses(addresses: impl IntoIterator<Item = SocketAddr>, bus: &str) -> Result<SocketcandRx, String> {
+    fn connect_addresses(
+        addresses: impl IntoIterator<Item = SocketAddr>, bus: &str, opening: &SocketcandConnect,
+    ) -> Result<SocketcandRx, String> {
         let mut last_error = "Socketcand host has no addresses".to_string();
         for address in addresses {
+            opening.check_cancelled()?;
             let result = TcpStream::connect_timeout(&address, OPEN_TIMEOUT)
                 .map_err(|e| e.to_string())
-                .and_then(|stream| Self::negotiate(stream, bus));
+                .and_then(|stream| {
+                    opening.track(&stream)?;
+                    Self::negotiate(stream, bus)
+                });
+            opening.finish_handshake()?;
             match result {
                 Ok(rx) => return Ok(rx),
                 Err(e) => last_error = format!("Socketcand {address}: {e}"),
@@ -275,7 +332,9 @@ impl SocketcandRx {
             if message == "echo" { return Ok(()); }
             if let Some(frame) = self.decode_message(&message)? {
                 if self.early_frames.len() == MAX_EARLY_FRAMES {
-                    return Err("Socketcand sent too many frames before confirming RAW mode".into());
+                    // A busy bus can fill the buffer while the echo makes a
+                    // round trip. Keep recent traffic and finish opening.
+                    self.early_frames.pop_front();
                 }
                 self.early_frames.push_back(frame);
             }
@@ -320,25 +379,35 @@ fn now_ms() -> u64 {
 fn parse_frame(message: &str) -> Result<CanFrame, String> {
     let invalid = || format!("Invalid socketcand frame: {message}");
     let parts: Vec<_> = message.split_whitespace().collect();
-    if parts.len() == 3 && parts[0] == "error" {
-        let mut frame = parse_frame(&format!("frame 00000000 {}", parts[2]))?;
-        let class = u32::from_str_radix(parts[1], 16).map_err(|_| invalid())?;
-        frame.is_extended = false;
-        frame.error = Some(format!("SocketCAN bus error 0x{class:X}"));
-        return Ok(frame);
+    if parts.first() == Some(&"error") {
+        if let ["error", class, timestamp @ ..] = parts.as_slice() {
+            if timestamp.len() <= 1 && class.bytes().all(|b| b.is_ascii_hexdigit()) {
+                let class = u32::from_str_radix(class, 16).map_err(|_| invalid())?;
+                let timestamp_ms = timestamp.first().map(|ts| parse_timestamp(ts).ok_or_else(invalid)).transpose()?;
+                return Ok(CanFrame {
+                    can_id: 0, is_extended: false, data: Vec::new(), timestamp_ms,
+                    error: Some(format!("SocketCAN bus error 0x{class:X}")),
+                });
+            }
+        }
+        return Err(format!("Socketcand server reported: {message}"));
     }
     if !(3..=4).contains(&parts.len()) || parts[0] != "frame" { return Err(invalid()); }
     let id = parts[1];
     let can_id = u32::from_str_radix(id, 16).map_err(|_| invalid())?;
     let is_extended = id.len() == 8;
     if !(id.len() == 3 || is_extended) || can_id > if is_extended { 0x1fffffff } else { 0x7ff } { return Err(invalid()); }
-    let (seconds, micros) = parts[2].split_once('.').ok_or_else(invalid)?;
-    if micros.len() != 6 || !micros.bytes().all(|b| b.is_ascii_digit()) { return Err(invalid()); }
-    let timestamp_ms = seconds.parse::<u64>().ok().and_then(|s| s.checked_mul(1000)).and_then(|s| s.checked_add(micros.parse::<u64>().ok()? / 1000)).ok_or_else(invalid)?;
+    let timestamp_ms = parse_timestamp(parts[2]).ok_or_else(invalid)?;
     let payload = parts.get(3).copied().unwrap_or("");
     if payload.len() > 16 || payload.len() % 2 != 0 || !payload.bytes().all(|b| b.is_ascii_hexdigit()) { return Err(invalid()); }
     let data = (0..payload.len()).step_by(2).map(|i| u8::from_str_radix(&payload[i..i+2], 16).map_err(|_| invalid())).collect::<Result<_, _>>()?;
     Ok(CanFrame { can_id, is_extended, data, timestamp_ms: Some(timestamp_ms), error: None })
+}
+
+fn parse_timestamp(timestamp: &str) -> Option<u64> {
+    let (seconds, micros) = timestamp.split_once('.')?;
+    if micros.len() != 6 || !micros.bytes().all(|b| b.is_ascii_digit()) { return None; }
+    seconds.parse::<u64>().ok()?.checked_mul(1000)?.checked_add(micros.parse::<u64>().ok()? / 1000)
 }
 
 #[cfg(test)]
@@ -483,7 +552,7 @@ mod tests {
             peer.expect("echo").unwrap();
             // The daemon can disconnect here if the RAW socket could not bind.
         });
-        let result = SocketcandBackend::connect(&format!("can://{address}/vcan0"), false);
+        let result = SocketcandBackend::connect(&format!("can://{address}/vcan0"), false, &SocketcandConnect::default());
         assert!(result.is_err());
         server.join().unwrap();
     }
@@ -506,8 +575,67 @@ mod tests {
             peer.expect("echo").unwrap();
             peer.stream.write_all(b"< echo >").unwrap();
         });
-        let rx = SocketcandBackend::connect_addresses(addresses, "vcan0").unwrap();
+        let rx = SocketcandBackend::connect_addresses(addresses, "vcan0", &SocketcandConnect::default()).unwrap();
         assert_eq!(rx.stream.peer_addr().unwrap(), addresses[1]);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn cancellation_disconnects_the_handshaking_peer_and_skips_fallback() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let fallback = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addresses = [listener.local_addr().unwrap(), fallback.local_addr().unwrap()];
+        let opening = Arc::new(SocketcandConnect::default());
+        let in_flight = Arc::clone(&opening);
+        let client = std::thread::spawn(move || {
+            SocketcandBackend::connect_addresses(addresses, "vcan0", &in_flight)
+                .err().unwrap()
+        });
+
+        let (stream, _) = listener.accept().unwrap();
+        let mut peer = SocketcandRx::new(stream);
+        peer.stream.write_all(b"< hi >").unwrap();
+        peer.expect("open vcan0").unwrap();
+        opening.cancel();
+
+        peer.stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        assert_eq!(peer.stream.read(&mut [0; 1]).unwrap(), 0);
+        assert_eq!(client.join().unwrap(), SOCKETCAND_OPEN_CANCELLED);
+        fallback.set_nonblocking(true).unwrap();
+        assert_eq!(fallback.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn documented_bus_error_without_a_timestamp_is_still_a_frame() {
+        let frame = parse_frame("error 004").unwrap();
+        assert_eq!(frame.error.as_deref(), Some("SocketCAN bus error 0x4"));
+        assert!(frame.timestamp_ms.is_none());
+        assert_eq!(parse_frame("error unknown command").unwrap_err(), "Socketcand server reported: error unknown command");
+    }
+
+    #[test]
+    fn a_busy_bus_during_the_raw_handshake_keeps_the_latest_frames() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut batch = String::new();
+            for n in 0..=MAX_EARLY_FRAMES {
+                use std::fmt::Write;
+                write!(batch, "< frame {n:03X} 1.000000 >").unwrap();
+            }
+            batch.push_str("< echo >");
+            sender.write_all(batch.as_bytes()).unwrap();
+        });
+        let mut rx = SocketcandRx::new(stream);
+        rx.wait_for_raw_echo(Instant::now() + OPEN_TIMEOUT).unwrap();
+        assert_eq!(rx.early_frames.len(), MAX_EARLY_FRAMES);
+        assert_eq!(rx.early_frames.front().unwrap().can_id, 1);
+        assert_eq!(rx.early_frames.back().unwrap().can_id, MAX_EARLY_FRAMES as u32);
         server.join().unwrap();
     }
 

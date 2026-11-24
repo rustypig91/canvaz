@@ -262,8 +262,10 @@ Choose **Add CAN Channel → Socketcand (TCP)** and enter
 `vcan0@SIL (can://127.0.0.1:29536)`. Add the channel, then start capture.
 The connection is saved with the project. Stop capture and use **Edit** to
 change the address while keeping the channel's plots and simulations. While
-capture is running, Canvaz retries unavailable or unresponsive Socketcand servers, including
-when the configured server is the only channel.
+capture is running, Canvaz retries unavailable or unresponsive Socketcand
+servers, including when the configured server is the only channel. During
+connection setup, Canvaz retains up to the latest 1,024 classic frames and bus
+errors while waiting for the server to confirm RAW mode.
 
 Socketcand works over TCP on all platforms and sends and receives classic CAN
 standard and extended frames, plus reported bus errors. Send and Simulate use

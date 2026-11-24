@@ -1,5 +1,6 @@
 mod socketcand;
 pub use socketcand::SocketcandBackend;
+pub(crate) use socketcand::{SocketcandConnect, SOCKETCAND_OPEN_CANCELLED};
 #[cfg(feature = "kvaser")]
 mod kvaser;
 #[cfg(feature = "pcan")]

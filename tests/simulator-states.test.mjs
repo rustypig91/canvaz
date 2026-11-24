@@ -299,7 +299,10 @@ test("Socketcand startup waits for the capture view, then leaves a slow handshak
     h.ctx.channels.set(2, local);
     Object.assign(h.ctx, {
         appRunning: false, appStartTime: 0, sidebarSnapshot: null,
-        ghostChannels: [], refreshHardware: async () => true,
+        ghostChannels: [], refreshHardware: async startCapture => {
+            assert.equal(startCapture, true);
+            return true;
+        },
         traceFilterMsgNames: null, signalLastValues: new Map(), signalLastRaw: new Map(),
         signalMinValues: new Map(), signalMaxValues: new Map(), renderDbcTree() {},
         plotPanes: [], restoreProjectEntries: async () => {}, clearTrace() { traceReady = true; },
@@ -345,12 +348,13 @@ test("a Socketcand disconnect before the open response leaves the channel discon
             return open.promise;
         }
         assert.equal(command, "close_channel");
+        assert.equal(args.socketcandAttempt, 1);
         closing.resolve();
         return close.promise;
     });
     h.ch.open = false;
     const opening = h.ctx.openChannelByHandle(1);
-    const error = h.ctx.onChannelError({ channel_handle: 1, fatal: true, error: "Socketcand disconnected" });
+    const error = h.ctx.onChannelError({ channel_handle: 1, socketcand_attempt: 1, fatal: true, error: "Socketcand disconnected" });
     await closing.promise;
     open.resolve(null);
     await Promise.resolve();
@@ -360,6 +364,26 @@ test("a Socketcand disconnect before the open response leaves the channel discon
     assert.equal(await opening, false);
     await error;
     assert.equal(h.timers.size, 1);
+});
+
+test("a stale Socketcand error cannot close a replacement connection", async () => {
+    const calls = [];
+    const h = harness("raw", async (command, args) => {
+        calls.push([command, args.socketcandAttempt]);
+        return null;
+    });
+    h.ch.open = false;
+    h.ctx.nextSocketcandAttempt = 1;
+    const opening = h.ctx.openChannelByHandle(1);
+    const oldError = { channel_handle: 1, socketcand_attempt: 1, fatal: true, error: "Socketcand disconnected" };
+    await h.ctx.onChannelError(oldError);
+    assert.equal(await opening, true);
+    await h.ctx.onChannelError(oldError);
+    assert.equal(h.ch.open, true);
+    assert.deepEqual(calls, [["open_channel", 2]]);
+    await h.ctx.onChannelError({ ...oldError, socketcand_attempt: 2 });
+    assert.equal(h.ch.open, false);
+    assert.deepEqual(calls, [["open_channel", 2], ["close_channel", 2]]);
 });
 
 test("channel failure replaces a stale removal error with Disconnected", async () => {

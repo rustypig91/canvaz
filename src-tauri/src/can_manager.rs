@@ -56,6 +56,8 @@ impl Protocol {
 #[derive(Debug, Clone, Serialize)]
 struct CanFrameEvent {
     channel_handle: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    socketcand_attempt: Option<u32>,
     can_id: u32,
     is_extended: bool,
     /// u16: reassembled J1939 transport messages carry up to 1785 data bytes.
@@ -94,6 +96,8 @@ fn is_false(b: &bool) -> bool {
 #[derive(Debug, Clone, Serialize)]
 struct ChannelErrorEvent {
     channel_handle: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    socketcand_attempt: Option<u32>,
     error: String,
     fatal: bool,
 }
@@ -235,6 +239,7 @@ struct ChannelData {
     /// hardware identity used for lookup.
     display_name: Option<String>,
     protocol: Protocol,
+    socketcand_attempt: Option<u32>,
     tp: TpReassembler,
     /// Set by the last `open_channel` call. When true, TX entry points refuse
     /// to send so the bus stays undisturbed rather than the frame silently
@@ -267,6 +272,7 @@ impl ChannelData {
             info,
             display_name: None,
             protocol: Protocol::None,
+            socketcand_attempt: None,
             tp: TpReassembler::default(),
             listen_only: false,
             bitrate: 0,
@@ -440,11 +446,14 @@ pub struct CanManager {
     app_state: Arc<AppState>,
     shared: Arc<Mutex<ManagerShared>>,
     cans: BTreeMap<String, Can>,
-    opening_socketcand: HashMap<u32, Arc<()>>,
+    opening_socketcand: HashMap<u32, OpeningSocketcand>,
     cancelled_socketcand: HashMap<u32, u32>,
 }
 
-pub(crate) const SOCKETCAND_OPEN_CANCELLED: &str = "Socketcand connection was cancelled";
+struct OpeningSocketcand {
+    attempt: Option<u32>,
+    connection: Arc<crate::can_communication::SocketcandConnect>,
+}
 
 impl CanManager {
     pub fn new(app_state: Arc<AppState>) -> Self {
@@ -586,7 +595,8 @@ impl CanManager {
     /// Atomically reassign hardware without replacing logical channel data.
     pub fn assign_channels(&mut self, assignments: Vec<(u32, ChannelInfo)>) -> Result<Vec<bool>, String> {
         validate_assignment_handles(&assignments)?;
-        let mut lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
+        let shared = Arc::clone(&self.shared);
+        let mut lock = shared.lock().map_err(|_| "Lock poisoned".to_string())?;
         for (handle, info) in &assignments {
             if !lock.channels.contains_key(handle) { return Err("Channel not found".into()); }
             if let Some((backend, index)) = lock.handle_to_index.get(handle) {
@@ -622,7 +632,7 @@ impl CanManager {
             self.cans.get(&info.backend).and_then(|can| can.channel_index(&info.name))
         }).collect();
         for (handle, _) in &assignments {
-            self.opening_socketcand.remove(handle);
+            self.cancel_socketcand_open(*handle);
             if let Some(key) = lock.handle_to_index.remove(handle) {
                 lock.index_to_handle.remove(&key);
             }
@@ -635,6 +645,7 @@ impl CanManager {
             }
             let channel = lock.channels.get_mut(&handle).unwrap();
             channel.info = info;
+            channel.socketcand_attempt = None;
         }
         Ok(resolved.iter().map(Option::is_some).collect())
     }
@@ -674,7 +685,9 @@ impl CanManager {
         lock.index_to_handle.remove(&(backend_name.clone(), hw_index));
         lock.handle_to_index.remove(&handle);
         lock.channels.remove(&handle);
-        self.opening_socketcand.remove(&handle);
+        if let Some(opening) = self.opening_socketcand.remove(&handle) {
+            opening.connection.cancel();
+        }
         self.cancelled_socketcand.remove(&handle);
         can.unregister_channel(hw_index);
 
@@ -709,6 +722,8 @@ impl CanManager {
         resume_capture: bool,
         socketcand_attempt: Option<u32>,
     ) -> Result<Option<ParsedDbc>, String> {
+        use crate::can_communication::{SocketcandBackend, SocketcandConnect, SOCKETCAND_OPEN_CANCELLED};
+
         let mut guard = manager.lock().map_err(|e| e.to_string())?;
         let (backend_name, hw_index) = guard.backend_index(handle)?;
         let remote = backend_name == "socketcand";
@@ -740,16 +755,22 @@ impl CanManager {
 
         if let Some(endpoint) = endpoint {
             // Resolve and negotiate without blocking IPC or TX on other channels.
-            let attempt = Arc::new(());
-            guard.opening_socketcand.insert(handle, Arc::clone(&attempt));
+            let opening = Arc::new(SocketcandConnect::default());
+            guard.opening_socketcand.insert(handle, OpeningSocketcand {
+                attempt: socketcand_attempt,
+                connection: Arc::clone(&opening),
+            });
             drop(guard);
-            let connection = crate::can_communication::SocketcandBackend::connect(&endpoint, listen_only);
+            let connection = SocketcandBackend::connect(&endpoint, listen_only, &opening);
             let mut guard = manager.lock().map_err(|e| e.to_string())?;
-            if !guard.opening_socketcand.get(&handle).is_some_and(|current| Arc::ptr_eq(current, &attempt)) {
+            if !guard.opening_socketcand.get(&handle).is_some_and(|current| Arc::ptr_eq(&current.connection, &opening)) {
                 return Err(SOCKETCAND_OPEN_CANCELLED.into());
             }
             guard.opening_socketcand.remove(&handle);
             let (tx, rx) = connection.map_err(|e| e.to_string())?;
+            guard.shared.lock().map_err(|_| "Lock poisoned".to_string())?
+                .channels.get_mut(&handle).ok_or("Channel not found")?
+                .socketcand_attempt = socketcand_attempt;
             let can = guard.cans.get_mut(&backend_name).ok_or("Backend not found")?;
             can.start_channel(hw_index, tx, rx);
             return Ok(dbc.map(|d| (*d).clone()));
@@ -775,12 +796,21 @@ impl CanManager {
     pub fn close_channel(&mut self, handle: u32, socketcand_attempt: Option<u32>) -> Result<(), String> {
         let (backend_name, hw_index) = self.backend_index(handle)?;
         if let Some(attempt) = socketcand_attempt {
+            if backend_name != "socketcand" { return Ok(()); }
             // Stop can reach the manager before the open worker starts. Keep
             // the cancelled attempt number so that worker also declines to open.
             let cancelled = self.cancelled_socketcand.entry(handle).or_default();
             *cancelled = (*cancelled).max(attempt);
+            if let Some(opening) = self.opening_socketcand.get(&handle) {
+                if opening.attempt == Some(attempt) { self.cancel_socketcand_open(handle); }
+                return Ok(());
+            }
+            let shared = self.shared.lock().map_err(|e| e.to_string())?;
+            if shared.channels.get(&handle).and_then(|ch| ch.socketcand_attempt) != Some(attempt) {
+                return Ok(());
+            }
         }
-        if self.opening_socketcand.remove(&handle).is_some() {
+        if self.cancel_socketcand_open(handle) {
             return Ok(());
         }
         let can = self.cans.get_mut(&backend_name).ok_or("Backend not found")?;
@@ -788,6 +818,14 @@ impl CanManager {
             return Ok(());
         }
         can.close(hw_index)
+    }
+
+    fn cancel_socketcand_open(&mut self, handle: u32) -> bool {
+        if let Some(opening) = self.opening_socketcand.remove(&handle) {
+            opening.connection.cancel();
+            return true;
+        }
+        false
     }
 
     /// Close all open hardware and drop every channel registration/data store.
@@ -798,7 +836,9 @@ impl CanManager {
     }
 
     fn reset_registrations(&mut self) {
-        self.opening_socketcand.clear();
+        for (_, opening) in self.opening_socketcand.drain() {
+            opening.connection.cancel();
+        }
         let indices: Vec<(String, u8)> = match self.shared.lock() {
             Ok(lock) => lock.handle_to_index.values().cloned().collect(),
             Err(_) => return,
@@ -824,7 +864,7 @@ impl CanManager {
     /// the original when the channel name moved backends across the reload.
     /// On Kvaser this calls canUnloadLibrary()+canInitializeLibrary() which is the
     /// documented way to detect hardware connected after the initial library init.
-    pub fn reload_backends(&mut self) -> Vec<(u32, CreatedChannel)> {
+    pub fn reload_backends(&mut self, start_capture: bool) -> Vec<(u32, CreatedChannel)> {
         let previous: Vec<(u32, ChannelInfo)> = self
             .shared
             .lock()
@@ -842,6 +882,12 @@ impl CanManager {
         self.reset_registrations();
         if let Ok(mut lock) = self.shared.lock() {
             lock.channels = channels;
+            if start_capture {
+                // Socketcand opens asynchronously once the new capture starts.
+                // Discard the previous capture before history can be queried.
+                lock.channels.values_mut().filter(|ch| ch.info.backend == "socketcand")
+                    .for_each(|ch| ch.prepare_capture(false));
+            }
         }
 
         // canUnloadLibrary() resets the "already initialised" flag inside CANlib
@@ -1319,13 +1365,17 @@ fn make_error_callback(backend: String, shared: Arc<Mutex<ManagerShared>>) -> im
             let Ok(lock) = shared.lock() else { return };
             lock.index_to_handle
                 .get(&(backend.clone(), hw_index))
-                .map(|&handle| (handle, lock.app.clone()))
+                .map(|&handle| {
+                    let attempt = lock.channels.get(&handle).and_then(|ch| ch.socketcand_attempt);
+                    (handle, attempt, lock.app.clone())
+                })
         };
-        let Some((handle, app)) = resolved else { return };
+        let Some((handle, socketcand_attempt, app)) = resolved else { return };
         let _ = app.emit(
             "channel-error",
             &ChannelErrorEvent {
                 channel_handle: handle,
+                socketcand_attempt,
                 error,
                 fatal,
             },
@@ -1420,6 +1470,7 @@ fn ingest_frame(
 
     let event = CanFrameEvent {
         channel_handle: handle,
+        socketcand_attempt: lock.channels.get(&handle).and_then(|ch| ch.socketcand_attempt),
         can_id: raw.can_id,
         is_extended: raw.is_extended,
         dlc: raw.data.len() as u16,

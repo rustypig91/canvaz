@@ -130,7 +130,7 @@ async fn open_channel(
 
     match &result {
         Ok(_) => info!("Opened channel {channel_handle}"),
-        Err(e) if e == can_manager::SOCKETCAND_OPEN_CANCELLED => debug!("{e}: {channel_handle}"),
+        Err(e) if e == can_communication::SOCKETCAND_OPEN_CANCELLED => debug!("{e}: {channel_handle}"),
         // The frontend reports the first failure and keeps background retries quiet.
         Err(e) if resume_capture.unwrap_or(false) => debug!("Failed to reopen channel {channel_handle}: {e}"),
         Err(e) => error!("Failed to open channel {channel_handle}: {e}"),
@@ -170,8 +170,8 @@ struct RemappedChannel {
 }
 
 #[tauri::command]
-fn reload_backends(state: State<'_, TauriState>) -> Result<Vec<RemappedChannel>, String> {
-    let remapped = state.can_manager.lock().map_err(|e| e.to_string())?.reload_backends();
+fn reload_backends(start_capture: Option<bool>, state: State<'_, TauriState>) -> Result<Vec<RemappedChannel>, String> {
+    let remapped = state.can_manager.lock().map_err(|e| e.to_string())?.reload_backends(start_capture.unwrap_or(false));
     Ok(remapped
         .into_iter()
         .map(|(old_handle, created)| RemappedChannel {
