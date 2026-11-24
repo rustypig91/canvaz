@@ -202,6 +202,12 @@
           <select id="select-iface"></select>
         </div>
 
+        <div class="form-row" id="row-socketcand" style="display:none">
+          <label for="input-socketcand">Socketcand address</label>
+          <input id="input-socketcand" type="text" placeholder="can://127.0.0.1:29537/vcan0" />
+          <small>Uses the server’s bus configuration. Monitoring only.</small>
+        </div>
+
         <div class="form-row">
           <label for="input-channel-name">Display Name</label>
           <input id="input-channel-name" type="text" maxlength="64" placeholder="Optional — defaults to interface name" />

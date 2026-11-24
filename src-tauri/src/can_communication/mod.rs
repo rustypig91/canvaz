@@ -1,3 +1,5 @@
+mod socketcand;
+pub use socketcand::SocketcandBackend;
 #[cfg(feature = "kvaser")]
 mod kvaser;
 #[cfg(feature = "pcan")]
@@ -152,6 +154,7 @@ pub trait RxHandle: Send + 'static {
 }
 
 pub trait CanBackend: Send + 'static {
+    fn register_channel(&mut self, _name: &str) -> Result<(), String> { Ok(()) }
     fn list_channels(&self) -> Vec<String>;
     /// `listen_only`: open the channel silent (no ACKs, no error flags injected)
     /// so the tool cannot disturb the bus. Backends that cannot honor it should
@@ -241,6 +244,10 @@ impl Can {
             on_status: Arc::new(on_status),
             admin_password: None,
         }
+    }
+
+    pub fn register_channel(&mut self, name: &str) -> Result<(), String> {
+        self.backend.register_channel(name)
     }
 
     pub fn list_channels(&self) -> Vec<String> {

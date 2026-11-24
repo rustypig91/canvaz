@@ -254,3 +254,18 @@ bash scripts/capture-screenshot.sh src-tauri/target/release/canvaz /tmp/canvaz-s
 The release workflow builds the demo after staging the normal packages, waits
 for the scene to render, and includes the 1600×900 PNG in the Linux workflow
 artifact and the release assets. The demo binary is never packaged.
+
+### Socketcand monitoring
+
+Choose **Add CAN Channel → Socketcand (TCP)** and enter
+`can://127.0.0.1:29537/vcan0`. You can also paste the advertised label
+`vcan0@SIL (can://127.0.0.1:29537)`. Add the channel, then start capture.
+The connection is saved with the project and can be reopened after stopping.
+
+Socketcand monitoring works over TCP on all platforms and receives classic CAN
+standard and extended frames with server timestamps, plus reported bus errors.
+The server must already expose and configure the requested interface; the bitrate
+selection does not reconfigure it. This backend is receive-only and does not
+change the server's physical listen-only/ACK settings. CAN FD is not supported.
+
+Protocol reference: [socketcand protocol](https://github.com/linux-can/socketcand/blob/master/doc/protocol.md).

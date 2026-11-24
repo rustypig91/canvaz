@@ -413,6 +413,13 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
         info!("SocketCAN backend initialized successfully");
     }
 
+    cans.insert("socketcand".into(), Can::new(
+        crate::can_communication::SocketcandBackend::default(),
+        make_frame_callback("socketcand".into(), Arc::clone(shared), "rx"),
+        make_frame_callback("socketcand".into(), Arc::clone(shared), "tx"),
+        make_error_callback("socketcand".into(), Arc::clone(shared)),
+        make_status_callback("socketcand".into(), Arc::clone(shared)),
+    ));
     cans
 }
 
@@ -498,6 +505,7 @@ impl CanManager {
     /// Calling `create_channel` again for the same channel returns the
     /// existing handle.
     pub fn create_channel(&mut self, backend_name: &str, channel_name: &str) -> Result<CreatedChannel, String> {
+        if let Some(can) = self.cans.get_mut(backend_name) { can.register_channel(channel_name)?; }
         let find = |can: &Can| can.list_channels().iter().position(|n| n == channel_name).map(|i| i as u8);
         let found = if backend_name == "none" { None } else { self
             .cans
@@ -662,7 +670,7 @@ impl CanManager {
                 ch.dbc = dbc.clone();
                 ch.protocol = protocol;
                 ch.tp = TpReassembler::default();
-                ch.listen_only = listen_only;
+                ch.listen_only = listen_only || backend_name == "socketcand";
                 ch.bitrate = bitrate;
                 ch.stats = ChannelStats::default();
             }
