@@ -222,33 +222,9 @@ impl CanBackend for SocketCanBackend {
         }
 
         let was_up = link_is_up(&details);
-        let reconfigure = !virtual_link && !configured_timing_matches(&details, settings);
-        if reconfigure {
-            let nominal = settings.bitrate.to_string();
-            let silent = if settings.listen_only { "on" } else { "off" };
-            let mut args = vec!["link", "set", &name, "type", "can", "bitrate", &nominal, "listen-only", silent];
-            let data;
-            if fd {
-                data = settings.data_bitrate()?.to_string();
-                args.extend(["dbitrate", &data, "fd", "on"]);
-                // The Linux default is ISO. Clear non-ISO mode when active.
-                if controller_flag(&details, "FD-NON-ISO") {
-                    args.extend(["fd-non-iso", "off"]);
-                }
-            } else if controller_flag(&details, "FD") {
-                args.extend(["fd", "off"]);
-            }
-            if was_up {
-                run_ip_auto(&["link", "set", &name, "down"], admin_password)?;
-            }
-            run_ip_auto(&args, admin_password).map_err(|e| match e {
-                CanOpenError::Other(message) if fd => CanOpenError::Other(format!(
-                    "Cannot configure ISO CAN FD on '{name}'. Check adapter and driver support and both bitrates: {message}"
-                )),
-                error => error,
-            })?;
-        }
-        if reconfigure || !was_up {
+        if !virtual_link && !configured_timing_matches(&details, settings) {
+            configure_socketcan(&name, &details, settings, |args| run_ip_auto(args, admin_password))?;
+        } else if !was_up {
             run_ip_auto(&["link", "set", &name, "up"], admin_password)?;
         }
 
@@ -402,17 +378,106 @@ fn link_is_up(details: &str) -> bool {
         .and_then(|(_, rest)| rest.split_once('>')).is_some_and(|(flags, _)| flags.split(',').any(|flag| flag == "UP"))
 }
 
+fn timing_fields<'a>(details: &'a str, key: &str) -> Option<Vec<&'a str>> {
+    details.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        let field = fields.next()?;
+        if field != key {
+            return None;
+        }
+        let value = fields.next()?;
+        value.parse::<u32>().ok()?;
+        Some([field, value].into_iter().chain(fields).collect())
+    })
+}
+
 fn configured_timing_matches(details: &str, settings: ChannelSettings) -> bool {
     let fd = settings.mode == FrameFormat::Fd;
     if controller_flag(details, "LISTEN-ONLY") != settings.listen_only || controller_flag(details, "FD") != fd {
         return false;
     }
-    let bitrate = |key: &str| details.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        (fields.next()? == key).then(|| fields.next()?.parse::<u32>().ok()).flatten()
-    });
+    let bitrate = |key| timing_fields(details, key).and_then(|fields| fields[1].parse::<u32>().ok());
     bitrate("bitrate") == Some(settings.bitrate)
         && (!fd || (!controller_flag(details, "FD-NON-ISO") && bitrate("dbitrate") == settings.data_bitrate))
+}
+
+fn previous_timing<'a>(details: &'a str, rate: &str, quantum: &str) -> Option<Vec<&'a str>> {
+    if let Some(fields) = timing_fields(details, quantum).filter(|fields| fields.len() >= 10 && fields[1] != "0") {
+        // ip prints the five settable timing parameters first, then the computed prescaler.
+        return Some(fields[..10].to_vec());
+    }
+    timing_fields(details, rate).filter(|fields| fields[1] != "0")
+}
+
+fn configure_socketcan(
+    name: &str,
+    details: &str,
+    settings: ChannelSettings,
+    mut run_ip: impl FnMut(&[&str]) -> Result<(), CanOpenError>,
+) -> Result<(), CanOpenError> {
+    let base = ["link", "set", name, "type", "can"];
+    let up = ["link", "set", name, "up"];
+    let fd = settings.mode == FrameFormat::Fd;
+    let was_fd = controller_flag(details, "FD");
+    let was_non_iso = controller_flag(details, "FD-NON-ISO");
+    let on_off = |enabled| if enabled { "on" } else { "off" };
+    let nominal = settings.bitrate.to_string();
+    let mut args = base.to_vec();
+    args.extend(["bitrate", &nominal, "listen-only", on_off(settings.listen_only)]);
+    let data;
+    if fd {
+        data = settings.data_bitrate()?.to_string();
+        args.extend(["dbitrate", &data, "fd", "on"]);
+        if was_non_iso {
+            args.extend(["fd-non-iso", "off"]);
+        }
+    } else if was_fd {
+        args.extend(["fd", "off"]);
+    }
+
+    let mut restore = base.to_vec();
+    let was_up = link_is_up(details);
+    if was_up {
+        // A failed netlink request can apply the new controller mode or nominal
+        // bitrate before rejecting the data timing. Save both phases before going down.
+        let timing_error = || CanOpenError::Other(format!("Cannot read the active CAN timing on '{name}'"));
+        restore.extend(previous_timing(details, "bitrate", "tq").ok_or_else(timing_error)?);
+        restore.extend(["listen-only", on_off(controller_flag(details, "LISTEN-ONLY"))]);
+        if was_fd {
+            restore.extend(previous_timing(details, "dbitrate", "dtq").ok_or_else(timing_error)?);
+            restore.extend(["fd", "on"]);
+            if was_non_iso {
+                restore.extend(["fd-non-iso", "on"]);
+            }
+            let tdc_mode = [("TDC-MANUAL", "manual"), ("TDC-AUTO", "auto")].into_iter()
+                .find_map(|(flag, mode)| controller_flag(details, flag).then_some(mode));
+            if let Some(mode) = tdc_mode {
+                restore.extend(["tdc-mode", mode]);
+                if let Some(fields) = timing_fields(details, if mode == "manual" { "tdcv" } else { "tdco" }) {
+                    restore.extend(fields);
+                }
+            }
+        } else if fd {
+            restore.extend(["fd", "off"]);
+        }
+        run_ip(&["link", "set", name, "down"])?;
+    }
+
+    let result = run_ip(&args).map_err(|error| match error {
+        CanOpenError::Other(message) if fd => CanOpenError::Other(format!(
+            "Cannot configure ISO CAN FD on '{name}'. Check adapter and driver support and both bitrates: {message}"
+        )),
+        error => error,
+    }).and_then(|()| run_ip(&up));
+    if let Err(error) = result {
+        if was_up {
+            if let Err(restore_error) = run_ip(&restore).and_then(|()| run_ip(&up)) {
+                return Err(format!("{error}. Could not restore the previous SocketCAN configuration on '{name}': {restore_error}").into());
+            }
+        }
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -515,6 +580,34 @@ mod tests {
             let non_iso = details.replace("FD>", &format!("FD{separator}FD-NON-ISO>"));
             assert!(controller_flag(&non_iso, "FD-NON-ISO"));
             assert!(!configured_timing_matches(&non_iso, settings));
+        }
+    }
+
+    #[test]
+    fn failed_fd_reconfiguration_restores_the_active_link() {
+        let details = "2: can0: <NOARP,UP,LOWER_UP> mtu 72\n\
+            can <LISTEN-ONLY,FD,FD-NON-ISO> state ERROR-ACTIVE\n\
+            bitrate 500000 sample-point 0.875\n\
+            tq 125 prop-seg 6 phase-seg1 7 phase-seg2 2 sjw 1 brp 10\n\
+            dbitrate 2000000 dsample-point 0.800\n\
+            dtq 50 dprop-seg 3 dphase-seg1 4 dphase-seg2 2 dsjw 1 dbrp 4";
+        let settings = ChannelSettings {
+            mode: FrameFormat::Fd,
+            bitrate: 250_000,
+            data_bitrate: Some(3_000_000),
+            listen_only: false,
+        };
+        for failing_step in [1, 2] {
+            let mut commands = Vec::new();
+            let result = configure_socketcan("can0", details, settings, |args| {
+                commands.push(args.join(" "));
+                if commands.len() - 1 == failing_step { Err("Invalid timing".to_string().into()) } else { Ok(()) }
+            });
+            assert!(result.unwrap_err().to_string().contains("Invalid timing"));
+            assert_eq!(commands[0], "link set can0 down");
+            assert_eq!(commands[1], "link set can0 type can bitrate 250000 listen-only off dbitrate 3000000 fd on fd-non-iso off");
+            assert_eq!(commands[failing_step + 1], "link set can0 type can tq 125 prop-seg 6 phase-seg1 7 phase-seg2 2 sjw 1 listen-only on dtq 50 dprop-seg 3 dphase-seg1 4 dphase-seg2 2 dsjw 1 fd on fd-non-iso on");
+            assert_eq!(commands[failing_step + 2], "link set can0 up");
         }
     }
 }

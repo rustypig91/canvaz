@@ -429,24 +429,25 @@ impl RxHandle for PcanRxHandle {
         let ch = &*self.0;
         // SAFETY: handle is a valid initialized channel.
         let s = unsafe { (ch.lib.get_status)(ch.handle) };
-        // PCAN-Basic exposes no TEC/REC; only the coarse bus state. BUSHEAVY
-        // means an error counter passed 128, which is the error-passive limit.
-        let bus_state = if s & PCAN_ERROR_BUSOFF != 0 {
-            BusState::BusOff
-        } else if s & (PCAN_ERROR_BUSPASSIVE | PCAN_ERROR_BUSHEAVY) != 0 {
-            BusState::Passive
-        } else if s & PCAN_ERROR_BUSLIGHT != 0 {
-            BusState::Warning
-        } else {
-            BusState::Active
-        };
         Some(BusStatus {
-            bus_state: Some(bus_state),
+            bus_state: Some(pcan_bus_state(s)),
             ..BusStatus::default()
         })
     }
 
     fn close(&mut self) {}
+}
+
+fn pcan_bus_state(status: TPCANStatus) -> BusState {
+    if status & PCAN_ERROR_BUSOFF != 0 {
+        BusState::BusOff
+    } else if status & PCAN_ERROR_BUSPASSIVE != 0 {
+        BusState::Passive
+    } else if status & (PCAN_ERROR_BUSLIGHT | PCAN_ERROR_BUSHEAVY) != 0 {
+        BusState::Warning
+    } else {
+        BusState::Active
+    }
 }
 
 // ── Backend ───────────────────────────────────────────────────────────────────
@@ -571,6 +572,13 @@ fn pcan_fd_bitrate(nominal: u32, data: u32) -> Result<std::ffi::CString, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pcan_bus_warning_is_distinct_from_error_passive() {
+        assert_eq!(pcan_bus_state(PCAN_ERROR_BUSHEAVY), BusState::Warning);
+        assert_eq!(pcan_bus_state(PCAN_ERROR_BUSHEAVY | PCAN_ERROR_BUSPASSIVE), BusState::Passive);
+        assert_eq!(pcan_bus_state(PCAN_ERROR_BUSPASSIVE | PCAN_ERROR_BUSOFF), BusState::BusOff);
+    }
 
     #[test]
     fn default_fd_rates_fit_older_peak_controller_limits() {

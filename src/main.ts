@@ -2278,10 +2278,14 @@ async function saveChannelDialog() {
     }
     const dataInput = document.getElementById("input-data-bitrate") as HTMLInputElement;
     const dataBitrate = mode === "fd" && !dialogExternalTiming ? dataInput.valueAsNumber : null;
-    if (dataBitrate !== null && (bitrate === null || !Number.isInteger(dataBitrate) || !Number.isInteger(bitrate) || bitrate <= 0 || dataBitrate < bitrate)) {
-        document.getElementById("error-can-timing")!.textContent = "Enter positive bitrates with the data bitrate at least as high as the nominal bitrate.";
-        dataInput.focus();
-        return;
+    if (dataBitrate !== null) {
+        const validNominal = bitrate !== null && Number.isInteger(bitrate) && bitrate > 0 && bitrate <= 0xFFFFFFFF;
+        if (!validNominal || !Number.isInteger(dataBitrate) || dataBitrate < bitrate || dataBitrate > 0xFFFFFFFF) {
+            document.getElementById("error-can-timing")!.textContent = "Enter whole-number bitrates from 1 to 4,294,967,295, with the data bitrate at least as high as the nominal bitrate.";
+            const invalidInput = validNominal ? dataInput : document.getElementById("input-bitrate-custom")!;
+            invalidInput.focus();
+            return;
+        }
     }
     const protocol = getProtocolFromDialog();
     const listenOnly = getListenOnlyFromDialog();

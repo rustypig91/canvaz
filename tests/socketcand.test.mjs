@@ -323,6 +323,10 @@ test("CAN FD channel settings keep both bitrates and reject invalid data timing"
     await h.context.saveChannelDialog();
     assert.match(h.element("error-can-timing").textContent, /at least as high/);
     assert.equal(h.saved.length, 0);
+    h.element("input-data-bitrate").value = "4294967296";
+    await h.context.saveChannelDialog();
+    assert.match(h.element("error-can-timing").textContent, /4,294,967,295/);
+    assert.equal(h.saved.length, 0);
     h.element("input-data-bitrate").value = "2000000";
     await h.context.saveChannelDialog();
     assert.equal(h.saved[0].mode, "fd");
