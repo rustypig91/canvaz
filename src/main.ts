@@ -3940,6 +3940,15 @@ function reconcileSimMessages(handle: number) {
         if (entry.kind !== "message" || entry.channel !== handle) continue;
         const msg = dbc.messages[entry.messageId];
         if (!msg) {
+            // A reconnect can load an edited DBC that temporarily omits this
+            // message. Preserve the user's values, generators and armed state
+            // with the other unresolved project entries instead of losing them.
+            pendingSimMessages.push({
+                channel: handleToId(handle), message_id: entry.messageId,
+                period_ms: entry.periodMs, running: entry.running,
+                signals: entry.signals.map(s => ({ name: s.def.name, value: s.value, generator: s.gen ?? null })),
+            });
+            log("warn", `${entry.messageName} is missing from the DBC; simulation settings retained until its definition returns`);
             simEntries.delete(key);
             simContainer.querySelector(`[data-sim-key="${key}"]`)?.remove();
             continue;

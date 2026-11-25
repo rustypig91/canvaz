@@ -279,5 +279,7 @@ from older projects open in Listen-only mode. To enable Send and Simulate, stop
 capture, clear **Listen-only**, and restart. TX timestamps indicate when the
 client wrote the command to TCP. Incoming CAN FD messages are skipped so that
 classic CAN capture continues on mixed buses.
+If a reloaded DBC omits a simulated message, its settings and armed state are
+retained and restored when that message definition becomes available again.
 
 Protocol reference: [socketcand protocol](https://github.com/linux-can/socketcand/blob/master/doc/protocol.md).

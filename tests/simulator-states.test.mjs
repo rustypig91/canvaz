@@ -8,7 +8,7 @@ const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.
 const names = ["simEntryStatus", "updateSimEntryStatus", "updateSimTxStatus", "queueSimOperation",
     "startSim", "stopSim", "openConfiguredChannels", "startApp", "finishStartingCapture", "stopApp", "finishStoppingCapture",
     "onChannelError", "closeFailedChannel", "openChannelByHandle",
-    "scheduleChannelRecovery", "attemptChannelRecovery", "recoverChannel", "reconcileSimMessages"];
+    "scheduleChannelRecovery", "attemptChannelRecovery", "recoverChannel", "reconcileSimMessages", "restoreProjectEntries"];
 const code = ts.transpileModule(source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text)).map(n => n.getText(source)).join("\n"), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
@@ -34,6 +34,7 @@ function harness(kind = "raw", invoke = async () => 42) {
         viewPaused: false, updatePauseViewBtn() {}, stopBusStatsPoll() {}, renderChannelList() {},
         sigKeyCache: new Map(), pgnMapCache: new Map(),
         channelRecoveryTimers: new Map(), channelRecoveryTasks: new Map(), failedChannelCloses: new Map(),
+        pendingSimMessages: [], handleToId: () => "socketcand:can://localhost/vcan0",
         CHANNEL_RECOVERY_INTERVAL_MS: 5000,
         setTimeout: callback => { timers.set(++timerId, callback); return timerId; },
         clearTimeout: id => timers.delete(id),
@@ -338,6 +339,58 @@ test("Socketcand reconnect refreshes DBC definitions before rearming simulated m
     await h.ctx.attemptChannelRecovery(1, true);
     assert.equal(h.entry.periodicHandle, 42);
     assert.equal(h.entry.dlc, 2);
+});
+
+test("Socketcand reconnect preserves missing message simulations until their DBC definition returns", async () => {
+    const signal = { name: "Value", factor: 2 };
+    const generator = { mode: "counter" };
+    const missing = { messages: {} };
+    const restored = { messages: { 123: { id: 123, name: "Engine", dlc: 2, signals: [signal] } } };
+    const opens = [missing, missing, restored];
+    let transmissions = 0;
+    const h = harness("message", async command => {
+        if (command === "open_channel") return opens.shift();
+        assert.equal(command, "add_periodic_message");
+        transmissions++;
+        return 42;
+    });
+    h.entry.running = true;
+    h.entry.signals = [{ def: { name: "Value" }, value: 12, gen: generator }];
+    const getElement = h.ctx.document.getElementById;
+    h.ctx.document.getElementById = id => id === "sim-entries"
+        ? { querySelector: () => ({ remove() {} }), appendChild() {} } : getElement(id);
+    Object.assign(h.ctx, {
+        pendingPaneSignals: [], plotPanes: [], msgEntryCounter: 0,
+        idToHandle: id => id === "socketcand:can://localhost/vcan0" ? 1 : undefined,
+        savedDbcMessage: (dbc, id) => dbc?.messages[id],
+        renderDbcTree() {}, renderSimEntries() {}, updateSignalHighlights() {},
+        createSimEntryEl: () => ({}),
+    });
+
+    for (let n = 0; n < 2; n++) {
+        h.ch.open = false;
+        await h.ctx.attemptChannelRecovery(1, true);
+        assert.equal(h.ctx.simEntries.size, 0);
+        assert.equal(h.ctx.pendingSimMessages.length, 1);
+        const saved = h.ctx.pendingSimMessages[0];
+        assert.equal(saved.message_id, 123);
+        assert.equal(saved.period_ms, 100);
+        assert.equal(saved.running, true);
+        assert.equal(saved.signals[0].value, 12);
+        assert.deepEqual(saved.signals[0].generator, generator);
+        assert.equal(transmissions, 0);
+    }
+
+    h.ch.open = false;
+    await h.ctx.attemptChannelRecovery(1, true);
+    assert.equal(h.ctx.pendingSimMessages.length, 0);
+    assert.equal(h.ctx.simEntries.size, 1);
+    const entry = [...h.ctx.simEntries.values()][0];
+    assert.equal(entry.signals[0].def, signal);
+    assert.equal(entry.signals[0].value, 12);
+    assert.deepEqual(entry.signals[0].gen, generator);
+    assert.equal(entry.periodicHandle, 42);
+    assert.equal(transmissions, 1);
 });
 
 test("a Socketcand disconnect before the open response leaves the channel disconnected", async () => {
