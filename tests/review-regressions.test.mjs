@@ -311,8 +311,9 @@ test("opening another project resets backend registrations and cached traffic be
     assert.deepEqual(calls, ["stop", "reset", "clear trace", "register new"]);
 });
 
-test("restored short raw payloads can grow from zero to eight bytes and transmit the chosen DLC", async () => {
-    for (const data of [[], [0xAB]]) {
+test("restored raw payloads transmit the chosen length and retain bytes beyond it", async () => {
+    const stagedFdData = Array.from({ length: 64 }, (_, i) => i + 1);
+    for (const [data, dlc] of [[[], 0], [[0xAB], 1], [stagedFdData, 8]]) {
         const caches = Object.fromEntries(["signalLastValues", "signalLastRaw", "signalMinValues", "signalMaxValues", "sigKeyCache", "pgnMapCache"].map(k => [k, new Map()]));
         const sent = [];
         const ctx = harness(["applyProject", "sendSimOnce", "startSim", "queueSimOperation", "updateRunningSim"], {
@@ -329,21 +330,27 @@ test("restored short raw payloads can grow from zero to eight bytes and transmit
             restoreProjectEntries: async () => {}, updateSimTxStatus() {}, scheduleAutoSave() {},
         });
         await ctx.applyProject({ channels: [], plot_panes: [], simulate_raw_frames: [{
-            channel: "socketcand:can://localhost/vcan0", can_id: 0x123, is_extended: false,
-            dlc: data.length, data, period_ms: 100,
+            channel: "socketcan:vcan0", can_id: 0x123, is_extended: false,
+            dlc, data, period_ms: 100,
         }] });
         ctx.appRunning = true;
-        ctx.channels.set(1, { open: true, config: {} });
+        ctx.channels.set(1, { open: true, config: { mode: "fd" } });
         const [key, entry] = [...ctx.simEntries][0];
-        assert.equal(entry.data.length, 8, "restore all eight editable byte slots");
+        assert.equal(entry.data.length, Math.max(8, data.length));
         await ctx.sendSimOnce(key);
-        assert.deepEqual(sent.pop(), ["send_frame", data]);
+        assert.deepEqual(sent.pop(), ["send_frame", data.slice(0, dlc)]);
         entry.dlc = 8;
         const expected = Array.from({ length: 8 }, (_, i) => data[i] ?? 0);
         await ctx.sendSimOnce(key);
         await ctx.startSim(key);
         await ctx.updateRunningSim(key);
         assert.deepEqual(sent, [["send_frame", expected], ["add_periodic_frame", expected], ["update_periodic_frame", expected]]);
+        if (data === stagedFdData) {
+            entry.format = "fd";
+            entry.dlc = 64;
+            await ctx.sendSimOnce(key);
+            assert.deepEqual(sent.pop(), ["send_frame", stagedFdData]);
+        }
     }
 });
 

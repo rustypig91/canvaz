@@ -391,8 +391,10 @@ fn enable_error_frames(socket: &impl SocketOptions, name: &str) {
 }
 
 fn controller_flag(details: &str, expected: &str) -> bool {
-    details.lines().filter_map(|line| line.trim().strip_prefix("can <"))
-        .filter_map(|line| line.split_once('>')).any(|(flags, _)| flags.split(',').any(|flag| flag == expected))
+    details.lines()
+        .filter_map(|line| line.trim().strip_prefix("can <"))
+        .filter_map(|line| line.split_once('>'))
+        .any(|(flags, _)| flags.split(',').any(|flag| flag.trim() == expected))
 }
 
 fn link_is_up(details: &str) -> bool {
@@ -492,5 +494,27 @@ mod tests {
         let received = peer.read_frame_timeout(Duration::from_secs(1)).unwrap();
         assert_eq!(received.data(), outgoing.data);
         channel.close(index).unwrap();
+    }
+
+    #[test]
+    fn fd_timing_match_reads_each_controller_flag_with_or_without_spaces() {
+        let settings = ChannelSettings {
+            mode: FrameFormat::Fd,
+            bitrate: 500_000,
+            data_bitrate: Some(2_000_000),
+            listen_only: true,
+        };
+        for separator in [",", ", "] {
+            let details = format!(
+                "can <LISTEN-ONLY{separator}BERR-REPORTING{separator}FD> state ERROR-ACTIVE\n\
+                 bitrate 500000 sample-point 0.875\n\
+                 dbitrate 2000000 dsample-point 0.800"
+            );
+            assert!(configured_timing_matches(&details, settings));
+
+            let non_iso = details.replace("FD>", &format!("FD{separator}FD-NON-ISO>"));
+            assert!(controller_flag(&non_iso, "FD-NON-ISO"));
+            assert!(!configured_timing_matches(&non_iso, settings));
+        }
     }
 }

@@ -3823,12 +3823,14 @@ async function applyProject(project: Project) {
     for (const raw of project.simulate_raw_frames ?? []) {
         const key = `raw::${++rawEntryCounter}`;
         const rawHandle = idToHandle(raw.channel);
+        const format = raw.format ?? "classical";
+        const capacity = format === "fd" ? 64 : Math.min(64, Math.max(8, raw.data.length));
         const entry: SimRawEntry = {
             kind: "raw", channel: rawHandle ?? 0,
             pendingChannelId: rawHandle === undefined ? raw.channel : undefined,
-            canId: raw.can_id, isExtended: raw.is_extended, format: raw.format ?? "classical", brs: raw.brs ?? false,
-            // Keep every editable byte slot even when the saved payload is short.
-            dlc: raw.dlc, data: Array.from({ length: raw.format === "fd" ? 64 : 8 }, (_, i) => raw.data[i] ?? 0),
+            canId: raw.can_id, isExtended: raw.is_extended, format, brs: raw.brs ?? false,
+            // Keep editable slots and any FD bytes staged before switching to Classical CAN.
+            dlc: raw.dlc, data: Array.from({ length: capacity }, (_, i) => raw.data[i] ?? 0),
             periodMs: raw.period_ms, running: raw.running ?? false, periodicHandle: null,
         };
         simEntries.set(key, entry);
