@@ -409,6 +409,32 @@ fn previous_timing<'a>(details: &'a str, rate: &str, quantum: &str) -> Option<Ve
     timing_fields(details, rate).filter(|fields| fields[1] != "0")
 }
 
+fn previous_tdc(details: &str) -> Option<Vec<&str>> {
+    // ip reports several TDC settings on one line and lists supported ranges separately.
+    let fields: Vec<_> = details.split_whitespace().collect();
+    let value = |key| fields.windows(2).find_map(|pair| {
+        (pair[0] == key && pair[1].parse::<u32>().is_ok()).then_some(pair[1])
+    });
+    let mut args = if controller_flag(details, "TDC-MANUAL") {
+        vec!["tdc-mode", "manual", "tdcv", value("tdcv")?]
+    } else if controller_flag(details, "TDC-AUTO") {
+        // In auto mode an adapter can report a measured delay. Only manual mode accepts it as input.
+        vec!["tdc-mode", "auto"]
+    } else {
+        // Without an explicit off, the kernel can enable TDC when applying the old timing.
+        return Some(if fields.windows(2).any(|pair| pair[0] == "tdco" && pair[1].contains("..")) {
+            vec!["tdc-mode", "off"]
+        } else {
+            Vec::new()
+        });
+    };
+    args.extend(["tdco", value("tdco")?]);
+    if let Some(filter) = value("tdcf") {
+        args.extend(["tdcf", filter]);
+    }
+    Some(args)
+}
+
 fn configure_socketcan(
     name: &str,
     details: &str,
@@ -449,14 +475,9 @@ fn configure_socketcan(
             if was_non_iso {
                 restore.extend(["fd-non-iso", "on"]);
             }
-            let tdc_mode = [("TDC-MANUAL", "manual"), ("TDC-AUTO", "auto")].into_iter()
-                .find_map(|(flag, mode)| controller_flag(details, flag).then_some(mode));
-            if let Some(mode) = tdc_mode {
-                restore.extend(["tdc-mode", mode]);
-                if let Some(fields) = timing_fields(details, if mode == "manual" { "tdcv" } else { "tdco" }) {
-                    restore.extend(fields);
-                }
-            }
+            restore.extend(previous_tdc(details).ok_or_else(|| {
+                format!("Cannot read the active CAN FD transmitter delay compensation on '{name}'")
+            })?);
         } else if fd {
             restore.extend(["fd", "off"]);
         }
@@ -609,5 +630,48 @@ mod tests {
             assert_eq!(commands[failing_step + 1], "link set can0 type can tq 125 prop-seg 6 phase-seg1 7 phase-seg2 2 sjw 1 listen-only on dtq 50 dprop-seg 3 dphase-seg1 4 dphase-seg2 2 dsjw 1 fd on fd-non-iso on");
             assert_eq!(commands[failing_step + 2], "link set can0 up");
         }
+    }
+
+    #[test]
+    fn failed_fd_reconfiguration_preserves_transmitter_delay_compensation() {
+        let settings = ChannelSettings {
+            mode: FrameFormat::Fd,
+            bitrate: 500_000,
+            data_bitrate: Some(3_000_000),
+            listen_only: false,
+        };
+        for (mode, values, expected) in [
+            (",TDC-MANUAL", "tdcv 3 tdco 9 tdcf 12", "tdc-mode manual tdcv 3 tdco 9 tdcf 12"),
+            (",TDC-AUTO", "tdcv 4 tdco 9 tdcf 12", "tdc-mode auto tdco 9 tdcf 12"),
+            ("", "", "tdc-mode off"),
+        ] {
+            let details = format!(
+                "2: can0: <NOARP,UP,LOWER_UP> mtu 72\n\
+                 can <FD{mode}> state ERROR-ACTIVE\n\
+                 bitrate 500000 sample-point 0.875\n\
+                 dbitrate 4000000 dsample-point 0.800\n\
+                 {values}\n\
+                 tdcv 0..63 tdco 0..127 tdcf 0..127"
+            );
+            let mut commands = Vec::new();
+            let error = configure_socketcan("can0", &details, settings, |args| {
+                commands.push(args.join(" "));
+                if commands.len() == 2 { Err("Invalid timing".to_string().into()) } else { Ok(()) }
+            }).unwrap_err();
+            assert!(error.to_string().contains("Invalid timing"));
+            assert_eq!(commands[2], format!("link set can0 type can bitrate 500000 sample-point 0.875 listen-only off dbitrate 4000000 dsample-point 0.800 fd on {expected}"));
+            assert_eq!(commands[3], "link set can0 up");
+        }
+
+        let incomplete = "2: can0: <NOARP,UP,LOWER_UP> mtu 72\n\
+            can <FD,TDC-MANUAL> state ERROR-ACTIVE\n\
+            bitrate 500000 sample-point 0.875\n\
+            dbitrate 4000000 dsample-point 0.800\n\
+            tdcv 3\n\
+            tdcv 0..63 tdco 0..127";
+        let error = configure_socketcan("can0", incomplete, settings, |_| {
+            panic!("the link must stay up when its active TDC settings cannot be read");
+        }).unwrap_err();
+        assert!(error.to_string().contains("transmitter delay compensation"));
     }
 }

@@ -23,6 +23,7 @@ const PCAN_NONEBUS: TPCANHandle = 0x00;
 
 const PCAN_ERROR_OK: TPCANStatus = 0x00000;
 const PCAN_ERROR_QRCVEMPTY: TPCANStatus = 0x00020;
+const PCAN_ERROR_CAUTION: TPCANStatus = 0x0200_0000;
 
 // Bus-error flags that may be OR'd into an otherwise-valid CAN_Read status.
 const PCAN_ERROR_BUSLIGHT: TPCANStatus  = 0x00004;
@@ -530,6 +531,15 @@ impl CanBackend for PcanBackend {
             Some((api, timing)) => (unsafe { (api.initialize)(pcan_handle, timing.as_ptr()) }, "CAN_InitializeFD"),
             None => (unsafe { (lib.initialize)(pcan_handle, baud, 0, 0, 0) }, "CAN_Initialize"),
         };
+        if s & PCAN_ERROR_CAUTION != 0 {
+            // PCAN-Basic can open the channel at a different bitrate and return CAUTION.
+            let cleanup = unsafe { (lib.uninitialize)(pcan_handle) };
+            let reason = format!("{api} opened the channel at a different bitrate than requested");
+            if cleanup != PCAN_ERROR_OK {
+                return Err(format!("{reason}. CAN_Uninitialize could not release it ({})", pcan_err(cleanup)).into());
+            }
+            return Err(reason.into());
+        }
         if s & !PCAN_ERROR_ANYBUSERR != PCAN_ERROR_OK {
             return Err(format!("{api} failed: {}", pcan_err(s)).into());
         }
