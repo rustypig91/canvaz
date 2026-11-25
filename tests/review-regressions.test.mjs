@@ -26,7 +26,7 @@ function deferred() {
 function simHarness(invoke) {
     const entry = { kind: "raw", channel: 1, canId: 0x123, isExtended: false, dlc: 1, data: [0], periodMs: 100, running: false, periodicHandle: null };
     const ctx = harness(["startSim", "stopSim", "queueSimOperation", "removeSimEntry", "updateRunningSim"], {
-        invoke, simEntries: new Map([["raw", entry]]), channels: new Map([[1, { open: true }]]), appRunning: true,
+        invoke, simEntries: new Map([["raw", entry]]), channels: new Map([[1, { open: true, config: { mode: "fd" } }]]), appRunning: true,
         document: { querySelector: () => null }, scheduleAutoSave() {}, updateSimTxStatus() {}, updateSignalHighlights() {},
     });
     return { ctx, entry };
@@ -388,6 +388,34 @@ test("rejected FD simulator edits leave the running registration active", async 
     assert.equal(entry.running, true);
     assert.equal(entry.periodicHandle, 42);
     assert.match(entry.txError, /Invalid CAN FD payload length/);
+});
+
+test("an armed FD simulation waits for an FD-enabled channel without disarming", async () => {
+    const calls = [];
+    const { ctx, entry } = simHarness(async command => {
+        calls.push(command);
+        return 42;
+    });
+    const channel = ctx.channels.get(1);
+    channel.config.mode = "classical";
+    entry.format = "fd";
+    entry.running = true;
+    await ctx.startSim("raw");
+    assert.deepEqual(calls, []);
+    assert.equal(entry.running, true);
+    assert.equal(entry.periodicHandle, null);
+
+    channel.config.mode = "fd";
+    await ctx.startSim("raw");
+    assert.deepEqual(calls, ["add_periodic_frame"]);
+    assert.equal(entry.periodicHandle, 42);
+});
+
+test("Trace renders CAN FD ASCII payload characters as text", () => {
+    const ctx = harness(["buildTraceCellHtml", "fmtData", "escapeHtml"], { traceDataFormat: "ascii" });
+    const data = [...Array(60).fill(0x20), 0x3C, 0x26, 0x3E, 0x22];
+    assert.equal(ctx.buildTraceCellHtml("data", { direction: "rx", format: "fd", data }),
+        `<td data-col="data" class="td-data">${" ".repeat(60)}&lt;&amp;&gt;&quot;</td>`);
 });
 
 test("Trace rows keep an explicit DBC mismatch through expansion and column rebuilds", () => {

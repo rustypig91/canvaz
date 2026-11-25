@@ -3445,7 +3445,9 @@ async function startSim(key: string) {
     scheduleAutoSave("sim started");
     await queueSimOperation(entry, async () => {
         if (simEntries.get(key) !== entry || !entry.running || entry.periodicHandle !== null) return;
-        if (!appRunning || !channels.get(entry.channel)?.open || channels.get(entry.channel)?.config?.listen_only) return;
+        const channel = channels.get(entry.channel);
+        if (!appRunning || !channel?.open || channel.config?.listen_only) return;
+        if (entry.format === "fd" && channel.config?.mode !== "fd") return;
         try {
             if (entry.kind === "message") {
                 entry.periodicHandle = await invoke<number>("add_periodic_message", { cmd: { format: entry.format, brs: entry.brs, channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry), period_ms: entry.periodMs } });
@@ -5285,7 +5287,7 @@ function buildTraceCellHtml(key: string, entry: TraceEntry): string {
             return `<td data-col="format" data-tip="${tip}">${label}</td>`;
         }
         case "dlc": return `<td data-col="dlc">${entry.dlc}</td>`;
-        case "data": return `<td data-col="data" class="td-data">${fmtData(entry.data)}</td>`;
+        case "data": return `<td data-col="data" class="td-data">${escapeHtml(fmtData(entry.data))}</td>`;
         case "cycle": return `<td data-col="cycle" class="td-cycle">${entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—"}</td>`;
         default: return `<td data-col="${key}"></td>`;
     }
