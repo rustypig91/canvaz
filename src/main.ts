@@ -107,6 +107,7 @@ interface FrameInfo {
 
 interface CanFrameEvent {
     channel_handle: number;
+    socketcand_attempt?: number;
     can_id: number;
     is_extended: boolean;
     dlc: number;
@@ -145,6 +146,8 @@ interface CreatedChannel { handle: number; backend: string; available: boolean; 
 interface ChannelConfig { name: string; display_name?: string | null; backend: string; dbc_path: string | null; bitrate: number | null; protocol: string | null; listen_only: boolean; }
 // Everything the app tracks about one channel, keyed by its u32 handle in `channels`.
 interface Channel {
+    opening?: { failed: boolean; socketcandAttempt?: number; frames: CanFrameEvent[] };
+    socketcandAttempt?: number;
     info: ChannelInfo;       // backend + hardware name (immutable identity)
     config: ChannelConfig;   // user settings: DBC path + bitrate
     dbc: ParsedDbc | null;   // DBC tree, parsed by open_channel; null until opened
@@ -155,7 +158,7 @@ interface Channel {
 
 // Backend "channel-error" event: fatal means the RX loop died and the channel
 // no longer receives; non-fatal is a TX send failure on a live channel.
-interface ChannelErrorEvent { channel_handle: number; error: string; fatal: boolean; }
+interface ChannelErrorEvent { channel_handle: number; socketcand_attempt?: number; error: string; fatal: boolean; }
 // One simulated message instance; the same message can appear multiple times.
 interface SimMessageConfig {
     channel: string; message_id: number; period_ms: number; running?: boolean;
@@ -327,6 +330,9 @@ function markPaneDirty(pane: PlotPane, force = false) {
 }
 
 let appRunning = false;
+let startingCapture: Promise<void> | null = null;
+let stoppingCapture: Promise<void> | null = null;
+let nextSocketcandAttempt = 0;
 let appStartTime = Date.now();
 let demoMode = false;
 let plotTabActive = false; // trace tab is the default active tab (see index.html)
@@ -1810,6 +1816,25 @@ function setBitrateInDialog(bitrate: number | null, isVcan: boolean) {
     }
 }
 
+function updateChannelInterfaceInDialog(backend: string, name: string) {
+    const remote = backend === "socketcand";
+    document.getElementById("row-bitrate")!.style.display = remote ? "none" : "";
+    (document.getElementById("input-bitrate-custom") as HTMLInputElement).disabled = remote;
+    document.getElementById("label-listen-only")!.textContent = remote
+        ? "Receive only — send & simulate disabled; server ACK settings unchanged"
+        : "Silent — no ACKs, no error flags, send & simulate disabled";
+    // Remote channels leave local hardware settings intact, so switching back
+    // restores the chosen bitrate and does not silently enable listen-only.
+    if (!remote) setBitrateInDialog(getBitrateFromDialog(), name.startsWith("vcan"));
+}
+
+function setSocketcandAddressError(message: string) {
+    const input = document.getElementById("input-socketcand") as HTMLInputElement;
+    input.setAttribute("aria-invalid", String(Boolean(message)));
+    document.getElementById("error-socketcand")!.textContent = message;
+    if (message) input.focus();
+}
+
 async function openChannelDialog(mode: DialogMode, handle?: number) {
     const opener = document.activeElement as HTMLElement | null;
     dialogMode = mode;
@@ -1822,8 +1847,12 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
     const sel = document.getElementById("select-iface") as HTMLSelectElement;
 
     const nameInput = document.getElementById("input-channel-name") as HTMLInputElement;
+    const socketcandInput = document.getElementById("input-socketcand") as HTMLInputElement;
+    socketcandInput.value = "";
+    socketcandInput.oninput = () => setSocketcandAddressError("");
 
     document.getElementById("row-socketcand")!.style.display = "none";
+    setSocketcandAddressError("");
     if (mode === "add") {
         title.textContent = "Add CAN Channel";
         applyBtn.textContent = "Add";
@@ -1860,13 +1889,12 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         const updateSocketcand = () => {
             const remote = sel.value === "__socketcand__";
             document.getElementById("row-socketcand")!.style.display = remote ? "" : "none";
-            if (remote) { setBitrateInDialog(null, true); setListenOnlyInDialog(true); }
+            if (!remote) setSocketcandAddressError("");
+            const iface = available.find(i => i.name === sel.value);
+            updateChannelInterfaceInDialog(remote ? "socketcand" : iface?.backend ?? "", sel.value);
         };
         sel.onchange = updateSocketcand;
         updateSocketcand();
-
-        // Auto-detect vcan from first available item
-        if (available[0]?.name.startsWith("vcan")) setBitrateInDialog(null, true);
     } else {
         const ch = channels.get(handle!);
         const hwName = ch?.info.backend === "none" ? "Unassigned" : ch?.info.name ?? String(handle!);
@@ -1877,13 +1905,28 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         if (ch && ch.info.backend !== "none" && !availableIfaces.some(i => i.backend === ch.info.backend && i.name === ch.info.name)) availableIfaces.push(ch.info);
         sel.innerHTML = '<option value="">No hardware channel</option>' + availableIfaces.map((i, index) =>
             `<option value="${index}">${escapeHtml(i.name)} (${escapeHtml(i.backend)})</option>`).join("");
+        sel.insertAdjacentHTML("beforeend", '<option value="__socketcand__">Socketcand (TCP)...</option>');
         sel.value = ch?.info.backend === "none" ? "" : String(availableIfaces.findIndex(i => i.backend === ch?.info.backend && i.name === ch?.info.name));
-        sel.onchange = () => setBitrateInDialog(getBitrateFromDialog(), sel.value !== "" && availableIfaces[Number(sel.value)].name.startsWith("vcan"));
+        const socketcandDrafts = new Map<string, string>();
+        let selectedSocketcand: string | undefined;
+        const updateAssignment = () => {
+            const iface = sel.value === "" ? undefined : availableIfaces[Number(sel.value)];
+            const backend = sel.value === "__socketcand__" ? "socketcand" : iface?.backend ?? "none";
+            document.getElementById("row-socketcand")!.style.display = backend === "socketcand" ? "" : "none";
+            if (selectedSocketcand !== undefined) socketcandDrafts.set(selectedSocketcand, socketcandInput.value);
+            selectedSocketcand = backend === "socketcand" ? sel.value : undefined;
+            socketcandInput.value = selectedSocketcand === undefined
+                ? "" : socketcandDrafts.get(selectedSocketcand) ?? iface?.name ?? "";
+            setSocketcandAddressError("");
+            updateChannelInterfaceInDialog(backend, iface?.name ?? "");
+        };
+        sel.onchange = updateAssignment;
         dialogPendingDbc = ch?.config.dbc_path ?? null;
         setDbcLabel(dialogPendingDbc);
         setBitrateInDialog(ch?.config.bitrate ?? null, hwName.startsWith("vcan"));
         setProtocolInDialog(ch?.config.protocol ?? null);
         setListenOnlyInDialog(ch?.config.listen_only ?? false);
+        updateAssignment();
         nameInput.value = ch?.config.display_name ?? "";
         nameInput.placeholder = hwName;
         selectChannel(handle!);
@@ -1981,11 +2024,17 @@ async function registerChannel(config: ChannelConfig): Promise<RegisterResult> {
 
 // Open a channel by its u32 handle. If root is required the Rust side emits
 // "request-admin-password", the global listener shows the dialog, and open_channel
-// unblocks automatically. `quiet` demotes failure logs to debug — used by the
-// automatic recovery retries so a persistently absent device doesn't spam the log.
-async function openChannelByHandle(handle: number, quiet = false): Promise<boolean> {
+// unblocks automatically. Reopening during capture keeps retained frames and
+// demotes retry failures to debug.
+async function openChannelByHandle(handle: number, resumeCapture = false): Promise<boolean> {
     const ch = channels.get(handle);
-    if (!ch) return false;
+    if (!ch || ch.opening) return false;
+    const opening: NonNullable<Channel["opening"]> = {
+        failed: false,
+        socketcandAttempt: ch.info.backend === "socketcand" ? ++nextSocketcandAttempt : undefined,
+        frames: [],
+    };
+    ch.opening = opening;
     try {
         // open_channel opens the hardware (using the channel's configured bitrate
         // and DBC path) and returns the DBC it parsed fresh from disk.
@@ -1995,22 +2044,36 @@ async function openChannelByHandle(handle: number, quiet = false): Promise<boole
             listenOnly: ch.config.listen_only ?? false,
             dbcPath: ch.config.dbc_path ?? null,
             protocol: ch.config.protocol ?? null,
+            resumeCapture,
+            socketcandAttempt: opening.socketcandAttempt,
         });
+        if (ch.opening !== opening) return false;
         ch.dbc = dbc ?? null;
         sigKeyCache.delete(handle); // key tables are derived from the DBC just replaced
         pgnMapCache.delete(handle);
+        ch.socketcandAttempt = opening.socketcandAttempt;
+        // RX can emit frames before the open response reaches the webview.
+        // Apply them only after installing the DBC that decoded their signals.
+        if (opening.frames.length) onCanFrameBatch(opening.frames);
+        if (opening.failed) {
+            await failedChannelCloses.get(handle);
+            return false;
+        }
         ch.open = true;
         ch.error = null;
         return true;
     } catch (e) {
+        if (ch.opening !== opening) return false;
         const msg = String(e);
         if (msg === "Sudo authentication cancelled") {
             log("warn", "Cancelled — sudo password required.");
         } else {
-            log(quiet ? "debug" : "error", `Channel error: ${msg}`);
-            if (!quiet) { ch.error = msg; renderChannelList(); }
+            log(resumeCapture ? "debug" : "error", `Channel error: ${msg}`);
+            if (!resumeCapture) { ch.error = msg; renderChannelList(); }
         }
         return false;
+    } finally {
+        if (ch.opening === opening) delete ch.opening;
     }
 }
 
@@ -2021,11 +2084,15 @@ async function openChannelByHandle(handle: number, quiet = false): Promise<boole
 // background so replugging the device recovers without a manual restart.
 
 const channelRecoveryTimers = new Map<number, ReturnType<typeof setTimeout>>();
+const channelRecoveryTasks = new Map<number, Promise<void>>();
+const failedChannelCloses = new Map<number, Promise<void>>();
 const CHANNEL_RECOVERY_INTERVAL_MS = 5000;
 
 async function onChannelError(ev: ChannelErrorEvent) {
     const ch = channels.get(ev.channel_handle);
     if (!ch) return;
+    if (ev.socketcand_attempt !== undefined &&
+        ev.socketcand_attempt !== (ch.opening?.socketcandAttempt ?? ch.socketcandAttempt)) return;
     const name = channelName(ev.channel_handle);
     if (!ev.fatal) {
         // Debug only: bus trouble is continuously visible in the footer's
@@ -2034,59 +2101,90 @@ async function onChannelError(ev: ChannelErrorEvent) {
         log("debug", `TX error on ${name}: ${ev.error}`);
         return;
     }
+    if ((!ch.open && !ch.opening) || failedChannelCloses.has(ev.channel_handle)) return;
+    if (ch.opening) ch.opening.failed = true;
     log("error", `Channel ${name} stopped receiving: ${ev.error}`);
     ch.error = ev.error;
     // Block new transmissions immediately and drain pending registrations before
     // closing, so a late IPC response cannot restore a dead periodic handle.
     ch.open = false;
     updateSimTxStatus();
+    const closing = closeFailedChannel(ev.channel_handle, ev.socketcand_attempt);
+    failedChannelCloses.set(ev.channel_handle, closing);
+    try {
+        await closing;
+    } finally {
+        failedChannelCloses.delete(ev.channel_handle);
+    }
+    if (appRunning) scheduleChannelRecovery(ev.channel_handle);
+}
+
+async function closeFailedChannel(handle: number, socketcandAttempt?: number) {
     await Promise.all([...simEntries.values()]
-        .filter(entry => entry.channel === ev.channel_handle)
+        .filter(entry => entry.channel === handle)
         .map(entry => entry.operation?.catch(() => {})));
     // The RX thread is gone but the hardware handle is still registered as
     // open; close it so the next open starts from a clean state.
-    try { await invoke("close_channel", { channelHandle: ev.channel_handle }); }
+    try { await invoke("close_channel", { channelHandle: handle, socketcandAttempt }); }
     catch (e) { log("debug", `Close after channel error failed: ${e}`); }
-    ch.open = false;
     // The channel's backend periodics died with the hardware handle; clear the
     // stale registrations, otherwise recovery's startSim() bails on its
     // "already registered" guard and the entries never resume sending (and the
     // footer TX indicator would keep counting them).
     for (const entry of simEntries.values()) {
-        if (entry.channel === ev.channel_handle) {
+        if (entry.channel === handle) {
             entry.periodicHandle = null;
             delete entry.txError;
         }
     }
     updateSimTxStatus();
     renderChannelList();
-    if (appRunning) scheduleChannelRecovery(ev.channel_handle);
 }
 
 function scheduleChannelRecovery(handle: number) {
-    if (channelRecoveryTimers.has(handle)) return;
-    channelRecoveryTimers.set(handle, setTimeout(async () => {
+    if (channelRecoveryTimers.has(handle) || channelRecoveryTasks.has(handle)) return;
+    channelRecoveryTimers.set(handle, setTimeout(() => {
         channelRecoveryTimers.delete(handle);
-        const ch = channels.get(handle);
-        // Stop retrying once capture stops, the channel was removed, or
-        // something else (Start, Reload backends) already reopened it.
-        if (!ch || !appRunning || ch.open) return;
-        if (await openChannelByHandle(handle, true)) {
-            log("info", `Channel ${channelName(handle)} recovered`);
-            renderChannelList();
-            // Backend periodics died with the hardware handle; re-register the
-            // sim entries the user still has marked as running on this channel.
-            for (const [key, entry] of simEntries) {
-                if (entry.channel === handle && entry.running) await startSim(key);
-            }
-        } else {
-            scheduleChannelRecovery(handle);
-        }
+        return attemptChannelRecovery(handle, true);
     }, CHANNEL_RECOVERY_INTERVAL_MS));
 }
 
+async function attemptChannelRecovery(handle: number, resumeCapture: boolean) {
+    const task = recoverChannel(handle, resumeCapture);
+    channelRecoveryTasks.set(handle, task);
+    try {
+        await task;
+    } catch (e) {
+        log("error", `Channel ${channelName(handle)} recovery failed: ${e}`);
+    } finally {
+        if (channelRecoveryTasks.get(handle) === task) {
+            channelRecoveryTasks.delete(handle);
+            const ch = channels.get(handle);
+            if (appRunning && ch && !ch.open) scheduleChannelRecovery(handle);
+        }
+    }
+}
+
+async function recoverChannel(handle: number, resumeCapture: boolean) {
+    await failedChannelCloses.get(handle);
+    const ch = channels.get(handle);
+    if (!appRunning || !ch || ch.open) return;
+    if (!await openChannelByHandle(handle, resumeCapture) || !appRunning) return;
+    if (resumeCapture) log("info", `Channel ${channelName(handle)} recovered`);
+    renderChannelList();
+    if (ch.info.backend === "socketcand" && ch.dbc) {
+        reconcileSimMessages(handle);
+        renderDbcTree((document.getElementById("signal-search") as HTMLInputElement).value);
+        await restoreProjectEntries();
+    }
+    // Re-register simulations the user kept armed while disconnected.
+    for (const [key, entry] of simEntries) {
+        if (entry.channel === handle && entry.running) await startSim(key);
+    }
+}
+
 // Unique persisted identities keep unassigned channels distinct across project reloads.
-async function changeChannelAssignment(handle: number, target: ChannelInfo | null): Promise<boolean> {
+async function changeChannelAssignment(handle: number, target: ChannelInfo | null, onError?: (message: string) => void): Promise<boolean> {
     const ch = channels.get(handle)!;
     if ((!target && ch.info.backend === "none") || (target?.backend === ch.info.backend && target?.name === ch.info.name)) return true;
     const conflicts = target ? [...channels].filter(([h, c]) => h !== handle && c.info.backend === target.backend && c.info.name === target.name) : [];
@@ -2110,7 +2208,8 @@ async function changeChannelAssignment(handle: number, target: ChannelInfo | nul
         for (const entry of simEntries.values()) if (entry.kind === "raw" && entry.pendingChannelId) entry.pendingChannelId = ids.get(entry.pendingChannelId) ?? entry.pendingChannelId;
         return true;
     } catch (e) {
-        log("error", `Failed to change hardware channel: ${e}`);
+        if (onError) onError(String(e));
+        else log("error", `Failed to change hardware channel: ${e}`);
         return false;
     }
 }
@@ -2131,19 +2230,24 @@ async function saveChannelDialog() {
     const customName = (document.getElementById("input-channel-name") as HTMLInputElement).value.trim() || null;
 
     if (dialogMode === "add") {
-        const selected = (document.getElementById("select-iface") as HTMLSelectElement).value;
-        const name = selected === "__socketcand__"
-            ? (document.getElementById("input-socketcand") as HTMLInputElement).value.trim() : selected;
+        const ifaceSelect = document.getElementById("select-iface") as HTMLSelectElement;
+        const selected = ifaceSelect.value;
+        const socketcandInput = selected === "__socketcand__"
+            ? document.getElementById("input-socketcand") as HTMLInputElement : null;
+        const name = socketcandInput ? socketcandInput.value.trim() : selected;
         if (!name) {
-            log("error", "Channel name not set");
+            if (socketcandInput) setSocketcandAddressError("Enter a Socketcand address.");
+            else log("error", "Channel name not set");
             return;
         };
         if (ghostChannels.some(g => g.config.name === name)) {
-            log("error", `Channel '${name}' is already added (hardware not available)`);
+            const error = `Channel '${name}' is already added (hardware not available)`;
+            if (socketcandInput) setSocketcandAddressError(error);
+            else log("error", error);
             return;
         }
-        const backend = selected === "__socketcand__" ? "socketcand" : availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
-        const config: ChannelConfig = { name, display_name: customName, backend, dbc_path: dialogPendingDbc, bitrate, protocol, listen_only: listenOnly };
+        const backend = socketcandInput ? "socketcand" : availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
+        const config: ChannelConfig = { name, display_name: customName, backend, dbc_path: dialogPendingDbc, bitrate: backend === "socketcand" ? null : bitrate, protocol, listen_only: listenOnly };
         // Register channel with backend (allocates handle); hardware opens (and
         // the DBC is loaded) on Start. If the name exists in no backend the
         // channel is still added, as a ghost — same as a project channel whose
@@ -2152,7 +2256,11 @@ async function saveChannelDialog() {
         const res = await registerChannel(config);
         if (res.handle === undefined) {
             if (!res.notFound) {
-                log("error", `Failed to add channel: ${res.error}`);
+                if (!socketcandInput) {
+                    log("error", `Failed to add channel: ${res.error}`);
+                } else if (dialog.open && ifaceSelect.value === selected && socketcandInput.value.trim() === name) {
+                    setSocketcandAddressError(res.error || "Could not add the Socketcand channel.");
+                }
                 return;
             }
             ghostChannels.push({ config, error: res.error! });
@@ -2178,10 +2286,21 @@ async function saveChannelDialog() {
         // the change immediately (a fresh copy is also loaded on the next open).
         if (ch) {
             const selection = (document.getElementById("select-iface") as HTMLSelectElement).value;
-            if (!await changeChannelAssignment(h, selection === "" ? null : availableIfaces[Number(selection)])) return;
+            let target = selection === "" ? null : availableIfaces[Number(selection)];
+            const remote = selection === "__socketcand__" || target?.backend === "socketcand";
+            if (remote) {
+                const input = document.getElementById("input-socketcand") as HTMLInputElement;
+                const name = input.value.trim();
+                if (!name) {
+                    setSocketcandAddressError("Enter a Socketcand address.");
+                    return;
+                }
+                target = { backend: "socketcand", name };
+            }
+            if (!await changeChannelAssignment(h, target, remote ? setSocketcandAddressError : undefined)) return;
             ch.config.display_name = customName;
             ch.config.dbc_path = dialogPendingDbc;
-            ch.config.bitrate = bitrate;
+            ch.config.bitrate = ch.info.backend === "socketcand" ? null : bitrate;
             ch.config.protocol = protocol;
             ch.config.listen_only = listenOnly;
             // Sync (or clear) the custom name backend-side so CSV exports match.
@@ -2469,9 +2588,9 @@ async function renderChannelList() {
             ? `${ch.config.display_name ? `${escapeHtml(ch.config.display_name)} ` : ""}<span class="ch-unassigned">Unassigned</span>`
             : `${escapeHtml(name)}<span class="ch-backend label-muted"> ${escapeHtml(backend)}</span>`;
         const isSelected = h === selectedChannel;
-        const bitrateLabel = hwName.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
+        const bitrateLabel = backend === "socketcand" ? "—" : hwName.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
         const protoLabel = ch.config.protocol === "j1939" ? " · J1939" : "";
-        const listenOnlyLabel = ch.config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">silent</span>` : "";
+        const listenOnlyLabel = ch.config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">${backend === "socketcand" ? "receive-only" : "silent"}</span>` : "";
         const item = document.createElement("div");
         item.className = `channel-item${isSelected ? " selected" : ""}`;
         item.dataset.channelHandle = String(h);
@@ -2501,33 +2620,13 @@ async function renderChannelList() {
                     }
                 },
                 {
-                    label: "Remove Channel", danger: true, action: async () => {
-                        if (!await confirmAndStop(`Stop live capture and remove "${name}"?`, "Stop & remove channel")) return;
-                        channels.delete(h);
-                        if (selectedChannel === h) selectChannel(null);
-                        renderChannelList();
-                        rebuildTraceColumns();
-                        scheduleAutoSave("channel removed");
-                    }
+                    label: "Remove Channel", danger: true, action: () => removeChannel(h, name)
                 },
             ]);
         });
         item.querySelector(".btn-close-ch")!.addEventListener("click", async (e) => {
             e.stopPropagation();
-            if (!await confirmAndStop(`Stop live capture and remove "${name}"?`, "Stop & remove channel")) return;
-
-            try { await invoke("remove_channel", { channelHandle: h }); }
-            catch (e) {
-                log("error", `Remove channel error: ${e}`);
-                return;
-            }
-            channels.delete(h);
-
-            if (selectedChannel === h) selectChannel(null);
-
-            renderChannelList();
-            rebuildTraceColumns();
-            scheduleAutoSave("channel closed");
+            await removeChannel(h, name);
         });
         list.appendChild(item);
     }
@@ -2537,9 +2636,9 @@ async function renderChannelList() {
         const dbcPath = config.dbc_path;
         const bitrate = config.bitrate;
         const ghostName = config.display_name || config.name;
-        const bitrateLabel = config.name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
+        const bitrateLabel = config.backend === "socketcand" ? "—" : config.name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
         const protoLabel = config.protocol === "j1939" ? " · J1939" : "";
-        const listenOnlyLabel = config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">silent</span>` : "";
+        const listenOnlyLabel = config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">${config.backend === "socketcand" ? "receive-only" : "silent"}</span>` : "";
         const item = document.createElement("div");
         item.className = "channel-item";
         item.innerHTML = `
@@ -2687,6 +2786,8 @@ interface SimMessageEntry {
     messageName: string;
     dlc: number;
     signals: { def: DbcSignal; value: number; gen: SimGen | null }[];
+    // Retain settings for signals temporarily missing from a reloaded DBC.
+    unresolvedSignals?: SimMessageConfig["signals"];
     periodMs: number;
     running: boolean;
     periodicHandle: number | null;
@@ -2953,7 +3054,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         <div class="sim-raw-data-row">
           <span class="label-muted">DLC</span>
           <select class="sim-dlc-sel" aria-label="Data length">
-            ${[1, 2, 3, 4, 5, 6, 7, 8].map(n => `<option value="${n}"${n === entry.dlc ? " selected" : ""}>${n}</option>`).join("")}
+            ${[0, 1, 2, 3, 4, 5, 6, 7, 8].map(n => `<option value="${n}"${n === entry.dlc ? " selected" : ""}>${n}</option>`).join("")}
           </select>
           <span class="label-muted">Data</span>
           <div class="sim-bytes">
@@ -3311,7 +3412,7 @@ function idToHandle(id: string): number | undefined {
 
 function buildProject(): Project {
     return {
-        version: 1,
+        version: 2,
         channels: [
             ...[...channels.values()].map(ch => ({
                 name: ch.info.name,
@@ -3346,7 +3447,7 @@ function buildProject(): Project {
                 message_id: e.messageId,
                 period_ms: e.periodMs,
                 running: e.running,
-                signals: e.signals.map(s => ({ name: s.def.name, value: s.value, generator: s.gen ?? null })),
+                signals: simMessageSettings(e),
             }))],
         simulate_raw_frames: [...simEntries.values()]
             .filter((e): e is SimRawEntry => e.kind === "raw")
@@ -3385,7 +3486,7 @@ async function newProject() {
     ++projectRevision;
     if (autoSaveTimer) clearTimeout(autoSaveTimer);
     try {
-        if (appRunning) await stopApp();
+        if (appRunning || startingCapture || stoppingCapture) await stopApp();
 
         for (const h of [...channels.keys()]) {
             try { await invoke("remove_channel", { channelHandle: h }); } catch { }
@@ -3487,7 +3588,7 @@ async function openProject() {
 
 async function applyProject(project: Project) {
     // Stop any active capture before applying a new project.
-    if (appRunning) await stopApp();
+    if (appRunning || startingCapture || stoppingCapture) await stopApp();
     // Remove old hardware registrations before reusing any channel identities.
     await invoke("reset_backend");
     clearTrace();
@@ -3561,7 +3662,8 @@ async function applyProject(project: Project) {
             kind: "raw", channel: rawHandle ?? 0,
             pendingChannelId: rawHandle === undefined ? raw.channel : undefined,
             canId: raw.can_id, isExtended: raw.is_extended,
-            dlc: raw.dlc, data: raw.data,
+            // Keep every editable byte slot even when the saved payload is short.
+            dlc: raw.dlc, data: Array.from({ length: 8 }, (_, i) => raw.data[i] ?? 0),
             periodMs: raw.period_ms, running: raw.running ?? false, periodicHandle: null,
         };
         simEntries.set(key, entry);
@@ -3713,6 +3815,7 @@ async function restoreProjectEntries() {
                 kind: "message", channel: handle,
                 messageId: msg.key ?? msg.id, messageName: msg.name, dlc: msg.dlc,
                 signals: msg.signals.map(s => ({ def: s, value: valueByName.get(s.name) ?? simDefaultValue(s), gen: genByName.get(s.name) ?? null })),
+                unresolvedSignals: m.signals.filter(s => !msg.signals.some(def => def.name === s.name)),
                 periodMs: m.period_ms, running: m.running ?? false, periodicHandle: null,
             };
             simEntries.set(key, simEntry);
@@ -3726,10 +3829,10 @@ async function restoreProjectEntries() {
 
 }
 
-async function refreshHardware(): Promise<boolean> {
+async function refreshHardware(startCapture = false): Promise<boolean> {
     let remapped: { old_handle: number; new_handle: number; backend: string; available: boolean }[];
     try {
-        remapped = await invoke<{ old_handle: number; new_handle: number; backend: string; available: boolean }[]>("reload_backends");
+        remapped = await invoke<{ old_handle: number; new_handle: number; backend: string; available: boolean }[]>("reload_backends", { startCapture });
     } catch (e) {
         log("error", `Backend reload failed: ${e}`);
         return false;
@@ -3748,12 +3851,12 @@ async function refreshHardware(): Promise<boolean> {
         if (remap !== undefined && remap.new_handle === oldHandle) {
             renamedIds.set(`${ch.info.backend}:${ch.info.name}`, `${remap.backend}:${ch.info.name}`);
             ch.config.backend = remap.backend;
-            channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend }, open: false, available: remap.available, error: null });
+            channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend }, open: false, socketcandAttempt: undefined, available: remap.available, error: null });
         } else {
             // The destination owns the hardware mapping. The original offline
             // registration still exists and can reconnect under its own backend
             // later, so preserve its DBC and every reference to its handle.
-            channels.set(oldHandle, { ...ch, open: false, available: false, error: remap
+            channels.set(oldHandle, { ...ch, open: false, socketcandAttempt: undefined, available: false, error: remap
                 ? "Resolves to an already-configured channel"
                 : "Not found after backend reload" });
         }
@@ -3796,7 +3899,7 @@ async function refreshHardware(): Promise<boolean> {
 
 // Explicit Start reports missing interfaces; automatic startup stays quiet.
 async function openConfiguredChannels(reportMissing: boolean): Promise<boolean> {
-    if (!await refreshHardware()) return false;
+    if (!await refreshHardware(true)) return false;
     if (reportMissing) {
         for (const ghost of ghostChannels) {
             log("error", `Cannot start channel ${ghost.config.name}: ${ghost.error}`);
@@ -3809,37 +3912,73 @@ async function openConfiguredChannels(reportMissing: boolean): Promise<boolean> 
             if (reportMissing) log("error", `Cannot start channel ${ch.config.display_name || ch.info.name}: interface not found`);
             continue;
         }
-        if (await openChannelByHandle(handle)) opened = true;
+        // Remote channels connect once the capture view is ready so a slow
+        // server cannot delay local capture or swallow early remote frames.
+        if (ch.info.backend === "socketcand" || await openChannelByHandle(handle)) opened = true;
     }
     renderChannelList();
+    // Remote servers can come online after capture starts, even when there is
+    // no other channel open to keep capture running.
     return opened;
 }
 
 async function startApp(reportMissing = true) {
+    if (stoppingCapture) await stoppingCapture;
+    if (startingCapture) return startingCapture;
+    if (appRunning) return;
+    startingCapture = finishStartingCapture(reportMissing);
+    try {
+        await startingCapture;
+    } finally {
+        startingCapture = null;
+    }
+}
+
+function simMessageSettings(entry: SimMessageEntry): SimMessageConfig["signals"] {
+    return [...(entry.unresolvedSignals ?? []),
+        ...entry.signals.map(s => ({ name: s.def.name, value: s.value, generator: s.gen ?? null }))];
+}
+
+// Simulation entries cache their DBC definitions. Refresh them using the DBC
+// parsed at open, retaining values and generators until missing signals return.
+function reconcileSimMessages(handle: number) {
+    const dbc = channels.get(handle)?.dbc;
+    if (!dbc) return;
+    const simContainer = document.getElementById("sim-entries")!;
+    for (const [key, entry] of simEntries) {
+        if (entry.kind !== "message" || entry.channel !== handle) continue;
+        const msg = dbc.messages[entry.messageId];
+        const settings = simMessageSettings(entry);
+        if (!msg) {
+            // A reconnect can load an edited DBC that temporarily omits this
+            // message. Preserve the user's values, generators and armed state
+            // with the other unresolved project entries instead of losing them.
+            pendingSimMessages.push({
+                channel: handleToId(handle), message_id: entry.messageId,
+                period_ms: entry.periodMs, running: entry.running,
+                signals: settings,
+            });
+            log("warn", `${entry.messageName} is missing from the DBC; simulation settings retained until its definition returns`);
+            simEntries.delete(key);
+            simContainer.querySelector(`[data-sim-key="${key}"]`)?.remove();
+            continue;
+        }
+        const prevValues = new Map(settings.map(s => [s.name, s.value]));
+        const prevGens = new Map(settings.map(s => [s.name, s.generator]));
+        const signalNames = new Set(msg.signals.map(s => s.name));
+        entry.unresolvedSignals = settings.filter(s => !signalNames.has(s.name));
+        entry.messageName = msg.name;
+        entry.dlc = msg.dlc;
+        entry.signals = msg.signals.map(s => ({ def: s, value: prevValues.get(s.name) ?? simDefaultValue(s), gen: prevGens.get(s.name) ?? null }));
+        simContainer.querySelector(`[data-sim-key="${key}"]`)?.replaceWith(createSimEntryEl(key, entry));
+    }
+}
+
+async function finishStartingCapture(reportMissing: boolean) {
     if (!await openConfiguredChannels(reportMissing)) return;
 
-    // Reconcile simulated message entries with the reloaded DBC. Entries hold a
-    // snapshot of each signal's definition, so after the DBC changes on disk we
-    // prune entries whose message is gone and, for survivors, swap in the fresh
-    // signal defs (preserving prior values by name), update the DLC, and re-render
-    // so added/removed signals and changed scaling take effect.
-    {
-        const simContainer = document.getElementById("sim-entries")!;
-        for (const [key, entry] of [...simEntries]) {
-            if (entry.kind !== "message") continue;
-            const msg = channels.get(entry.channel)?.dbc?.messages[entry.messageId];
-            if (!msg) {
-                simEntries.delete(key);
-                simContainer.querySelector(`[data-sim-key="${key}"]`)?.remove();
-                continue;
-            }
-            const prevValues = new Map(entry.signals.map(s => [s.def.name, s.value]));
-            const prevGens = new Map(entry.signals.map(s => [s.def.name, s.gen]));
-            entry.messageName = msg.name;
-            entry.dlc = msg.dlc;
-            entry.signals = msg.signals.map(s => ({ def: s, value: prevValues.get(s.name) ?? simDefaultValue(s), gen: prevGens.get(s.name) ?? null }));
-            simContainer.querySelector(`[data-sim-key="${key}"]`)?.replaceWith(createSimEntryEl(key, entry));
-        }
+    for (const [handle, ch] of channels) {
+        if (ch.info.backend !== "socketcand") reconcileSimMessages(handle);
     }
 
     // Prune message names from filter that no longer exist in any DBC
@@ -3891,6 +4030,9 @@ async function startApp(reportMissing = true) {
     clearTrace();
     startScrollLoop();
     startBusStatsPoll();
+    for (const [handle, ch] of channels) {
+        if (ch.info.backend === "socketcand" && ch.available && !ch.open) void attemptChannelRecovery(handle, false);
+    }
 
     const btn = document.getElementById("btn-app-run")!;
     btn.textContent = "■ Stop";
@@ -3900,6 +4042,18 @@ async function startApp(reportMissing = true) {
 }
 
 async function stopApp() {
+    if (startingCapture) await startingCapture;
+    if (stoppingCapture) return stoppingCapture;
+    if (!appRunning) return;
+    stoppingCapture = finishStoppingCapture();
+    try {
+        await stoppingCapture;
+    } finally {
+        stoppingCapture = null;
+    }
+}
+
+async function finishStoppingCapture() {
     // If the view is paused, resume it first so pending trace/plot/sidebar
     // updates are flushed and the final live state is shown before stopping.
     if (viewPaused) {
@@ -3910,6 +4064,21 @@ async function stopApp() {
     updateSimTxStatus();
     updatePauseViewBtn();
     stopBusStatsPoll();
+    for (const timer of channelRecoveryTimers.values()) clearTimeout(timer);
+    channelRecoveryTimers.clear();
+    const cancelledOpens = [];
+    for (const [handle, ch] of channels) {
+        const opening = ch.opening;
+        delete ch.socketcandAttempt;
+        if (!opening?.socketcandAttempt || opening.failed) continue;
+        delete ch.opening;
+        channelRecoveryTasks.delete(handle);
+        cancelledOpens.push(invoke("close_channel", { channelHandle: handle, socketcandAttempt: opening.socketcandAttempt })
+            .catch(e => log("debug", `Failed to cancel connection for ${ch.info.name}: ${e}`)));
+    }
+    await Promise.all(cancelledOpens);
+    await Promise.allSettled(channelRecoveryTasks.values());
+    await Promise.allSettled(failedChannelCloses.values());
     await Promise.all([...simEntries.values()].map(entry => entry.operation?.catch(() => {})));
     // Close hardware connections; they will reopen on the next Start.
     for (const [handle, ch] of channels) {
@@ -3917,9 +4086,9 @@ async function stopApp() {
         // the next Start reports fresh errors if the problem persists.
         ch.error = null;
         if (!ch.open) continue;
+        ch.open = false;
         try { await invoke("close_channel", { channelHandle: handle }); }
         catch (e) { log("debug", `Failed to close channel ${ch.info.name}: ${e}`); }
-        ch.open = false;
     }
     // Channels are closed so backend periodics are gone; preserve running intent so
     // entries auto-restart on next Start and the UI shows "Armed".
@@ -3974,10 +4143,27 @@ function showConfirm(message: string, actionLabel: string): Promise<boolean> {
 
 // Shows a confirm dialog if running, stops capture, then returns true so the caller can proceed.
 async function confirmAndStop(prompt: string, actionLabel: string): Promise<boolean> {
+    if (startingCapture) await startingCapture;
+    if (stoppingCapture) await stoppingCapture;
     if (!appRunning) return true;
     if (!await showConfirm(prompt, actionLabel)) return false;
     await stopApp();
     return true;
+}
+
+async function removeChannel(handle: number, name: string) {
+    if (!await confirmAndStop(`Stop live capture and remove "${name}"?`, "Stop & remove channel")) return;
+    try {
+        await invoke("remove_channel", { channelHandle: handle });
+    } catch (e) {
+        log("error", `Remove channel error: ${e}`);
+        return;
+    }
+    channels.delete(handle);
+    if (selectedChannel === handle) selectChannel(null);
+    renderChannelList();
+    rebuildTraceColumns();
+    scheduleAutoSave("channel removed");
 }
 
 async function exportCsv() {
@@ -4795,8 +4981,12 @@ function updateTraceEmptyState() {
         action = "Add channel"; target = "btn-add-channel";
     } else if (!configured.some(ch => ch.open) && (details.length > 0 || appRunning)) {
         title = "Channels disconnected or unable to start";
-        description = "Check the hardware connection and channel settings, then reload hardware and start capture.";
-        action = "Reload hardware"; target = "btn-reload-backends";
+        if (appRunning && configured.some(ch => ch.info?.backend === "socketcand" && ch.available)) {
+            description = "Capture is retrying the Socketcand connection.";
+        } else {
+            description = "Check the hardware connection and channel settings, then reload hardware and start capture.";
+            action = "Reload hardware"; target = "btn-reload-backends";
+        }
     } else if (!appRunning) {
         title = "Capture stopped";
         description = "Start capture to display CAN traffic.";
@@ -5079,6 +5269,13 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
     const appendEntries: TraceEntry[] = [];
 
     for (const ev of events) {
+        if (ev.socketcand_attempt !== undefined) {
+            const channel = channels.get(ev.channel_handle);
+            if (channel?.socketcandAttempt !== ev.socketcand_attempt) {
+                if (channel?.opening?.socketcandAttempt === ev.socketcand_attempt) channel.opening.frames.push(ev);
+                continue;
+            }
+        }
         const isError = ev.error != null;
         // Message identity comes from the frontend's copy of the DBC (the event
         // carries no strings); both sides parsed the same file at open. On J1939
@@ -5241,7 +5438,7 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
 // live-event layout.
 function interleaveFrameSignals(f: FrameInfo): (number | null)[] {
     const msg = dbcMessageFor(f.channel_handle, f.can_id, f.is_extended);
-    if (!msg || msg.signals.length === f.signals.length) {
+    if (!msg || (msg.signals.length === f.signals.length && msg.signals.every((sig, i) => sig.name === f.signals[i].name))) {
         return f.signals.flatMap(s => [s.value, s.raw]);
     }
     const byName = new Map(f.signals.map(s => [s.name, s]));
@@ -6462,7 +6659,7 @@ interface BusStats {
     channel_handle: number;
     rx_fps: number;
     tx_fps: number;
-    bus_load: number;
+    bus_load: number | null;
     error_frames: number;
     status?: BusStatus | null;
 }
@@ -6521,22 +6718,27 @@ function renderBusStats(stats: BusStats[]) {
 
         const st = s.status;
         const state = st?.bus_state ?? null;
+        const remote = channels.get(s.channel_handle)?.info.backend === "socketcand";
+        const load = s.bus_load?.toFixed(1);
         const tipLines = [
             channelName(s.channel_handle),
-            `Bus load: ${s.bus_load.toFixed(1)} % (estimated)`,
+            load == null ? "Bus load unavailable (bitrate unknown)" : `Bus load: ${load} % (estimated)`,
             `RX: ${s.rx_fps.toFixed(0)} f/s · TX: ${s.tx_fps.toFixed(0)} f/s`,
             `Error frames: ${s.error_frames}`,
         ];
         if (state) tipLines.push(`Bus state: ${BUS_STATE_LABEL[state] ?? state}`);
+        else if (remote) tipLines.push("Bus state unavailable");
         if (st?.tx_err != null && st?.rx_err != null) tipLines.push(`Error counters: TX ${st.tx_err} · RX ${st.rx_err}`);
         if (st?.overrun != null && st.overrun > 0) tipLines.push(`Overruns: ${st.overrun}`);
 
         chip.className = `bus-chip${s.error_frames > 0 ? " has-errors" : ""}`;
         chip.dataset.tip = tipLines.join("\n");
-        chip.querySelector<HTMLElement>(".bus-state")!.className =
-            `bus-state${state && state !== "active" ? ` ${state}` : ""}`;
+        const dot = chip.querySelector<HTMLElement>(".bus-state")!;
+        dot.className = "bus-state";
+        if (state && state !== "active") dot.classList.add(state);
+        else if (!state && remote) dot.classList.add("unknown");
         chip.querySelector<HTMLElement>(".bus-chip-name")!.textContent = channelName(s.channel_handle);
-        chip.querySelector<HTMLElement>(".bus-load")!.textContent = `${s.bus_load.toFixed(1)}%`;
+        chip.querySelector<HTMLElement>(".bus-load")!.textContent = load == null ? "—" : `${load}%`;
         chip.querySelector<HTMLElement>(".bus-fps")!.textContent = `${(s.rx_fps + s.tx_fps).toFixed(0)}/s`;
         const errEl = chip.querySelector<HTMLElement>(".bus-err-count")!;
         errEl.textContent = s.error_frames > 0 ? `${s.error_frames}⚠` : "";
@@ -6772,8 +6974,15 @@ window.addEventListener("DOMContentLoaded", async () => {
     document.getElementById("btn-add-raw-frame")!.addEventListener("click", addRawFrame);
 
     // Play / Stop
-    document.getElementById("btn-app-run")!.addEventListener("click", async () => {
-        if (appRunning) await stopApp(); else await startApp();
+    const runButton = document.getElementById("btn-app-run") as HTMLButtonElement;
+    runButton.addEventListener("click", async () => {
+        runButton.disabled = true;
+        try {
+            if (appRunning) await stopApp();
+            else await startApp();
+        } finally {
+            runButton.disabled = false;
+        }
     });
 
     document.getElementById("btn-pause-view")!.addEventListener("click", () => {

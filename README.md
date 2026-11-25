@@ -255,17 +255,33 @@ The release workflow builds the demo after staging the normal packages, waits
 for the scene to render, and includes the 1600×900 PNG in the Linux workflow
 artifact and the release assets. The demo binary is never packaged.
 
-### Socketcand monitoring
+### Socketcand connections
 
 Choose **Add CAN Channel → Socketcand (TCP)** and enter
-`can://127.0.0.1:29537/vcan0`. You can also paste the advertised label
-`vcan0@SIL (can://127.0.0.1:29537)`. Add the channel, then start capture.
-The connection is saved with the project and can be reopened after stopping.
+`can://127.0.0.1:29536/vcan0`. You can also paste the advertised label
+`vcan0@SIL (can://127.0.0.1:29536)`. Add the channel, then start capture.
+The connection is saved with the project. Stop capture and use **Edit** to
+change the address while keeping the channel's plots and simulations. While
+capture is running, Canvaz retries unavailable or unresponsive Socketcand
+servers, including when the configured server is the only channel. During
+connection setup, Canvaz retains up to the latest 1,024 classic frames and bus
+errors while waiting for the server to confirm RAW mode.
 
-Socketcand monitoring works over TCP on all platforms and receives classic CAN
-standard and extended frames with server timestamps, plus reported bus errors.
-The server must already expose and configure the requested interface; the bitrate
-selection does not reconfigure it. This backend is receive-only and does not
-change the server's physical listen-only/ACK settings. CAN FD is not supported.
+Socketcand works over TCP on all platforms and sends and receives classic CAN
+standard and extended frames, plus reported bus errors. Send and Simulate use
+the same connection as capture. Received timestamps are anchored to the local
+clock on the first frame, preserving server-relative timing even when the
+server clock is not synchronized with this computer.
+The server configures the bitrate, so the remote channel has no bitrate control
+or bus load estimate. **Listen-only** blocks sending from this client and leaves
+the server's physical listen-only and ACK settings alone. Socketcand channels
+from older projects open in Listen-only mode. To enable Send and Simulate, stop
+capture, clear **Listen-only**, and restart. TX timestamps indicate when the
+client wrote the command to TCP. Incoming CAN FD messages are skipped so that
+classic CAN capture continues on mixed buses.
+If a reloaded DBC omits a simulated message, its settings and armed state are
+retained and restored when that message definition becomes available again.
+Values and generators for individual missing signals are also retained across
+reconnects and project saves until their definitions return.
 
 Protocol reference: [socketcand protocol](https://github.com/linux-can/socketcand/blob/master/doc/protocol.md).

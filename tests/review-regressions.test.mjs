@@ -158,6 +158,7 @@ test("New Project keeps session saving and dirty tracking active for subsequent 
     const writes = [], timers = new Map();
     let nextTimer = 0, value = 0;
     const ctx = harness(["newProject", "scheduleAutoSave"], {
+        startingCapture: null, stoppingCapture: null,
         sessionFilePath: "session.canvaz", projectPath: "old.canvaz", projectDirty: false, projectRevision: 0, restoringProject: false,
         autoSaveTimer: null, appRunning: false, channels: new Map(), ghostChannels: [], plotPanes: [], pendingPaneSignals: [], pendingSimMessages: [], simEntries: new Map(),
         signalLastValues: new Map(), signalLastRaw: new Map(), signalMinValues: new Map(), signalMaxValues: new Map(),
@@ -245,9 +246,10 @@ test("raw frame edits and DBC period edits schedule persistence while stopped", 
     });
     const raw = { kind: "raw", channel: 1, canId: 0x123, isExtended: false, dlc: 1, data: [0], periodMs: 100, running: false, periodicHandle: null };
     const el = ctx.createSimEntryEl("raw", raw);
+    assert.match(el.innerHTML, /<option value="0"/);
     for (const [selector, event, value, checked] of [
         [".sim-channel-sel", "change", "2"], [".sim-canid-input", "input", "321"],
-        [".sim-ext-cb", "change", "", true], [".sim-dlc-sel", "change", "2"],
+        [".sim-ext-cb", "change", "", true], [".sim-dlc-sel", "change", "0"],
         [".sim-period", "input", "250"], [".sim-byte", "input", "AB"],
     ]) {
         const before = saved.length;
@@ -257,6 +259,9 @@ test("raw frame edits and DBC period edits schedule persistence while stopped", 
     assert.equal(raw.data[0], 0xAB);
     assert.equal(raw.canId, 0x321);
     assert.equal(raw.periodMs, 250);
+    assert.equal(raw.dlc, 0);
+    assert.equal(el.querySelector(".sim-byte").disabled, true);
+    assert.match(ctx.createSimEntryEl("restored", raw).innerHTML, /<option value="0" selected>/);
     const message = { kind: "message", channel: 1, messageId: 1, messageName: "Message", signals: [], periodMs: 100, running: false };
     const msgEl = ctx.createSimEntryEl("msg", message);
     const before = saved.length;
@@ -291,6 +296,42 @@ test("opening another project resets backend registrations and cached traffic be
     });
     await ctx.applyProject({ channels: [{ name: "new" }], plot_panes: [] });
     assert.deepEqual(calls, ["stop", "reset", "clear trace", "register new"]);
+});
+
+test("restored short raw payloads can grow from zero to eight bytes and transmit the chosen DLC", async () => {
+    for (const data of [[], [0xAB]]) {
+        const caches = Object.fromEntries(["signalLastValues", "signalLastRaw", "signalMinValues", "signalMaxValues", "sigKeyCache", "pgnMapCache"].map(k => [k, new Map()]));
+        const sent = [];
+        const ctx = harness(["applyProject", "sendSimOnce", "startSim", "queueSimOperation", "updateRunningSim"], {
+            ...caches, appRunning: false, startingCapture: null, stoppingCapture: null,
+            channels: new Map(), ghostChannels: [], plotPanes: [], rawEntryCounter: 0,
+            simEntries: new Map(), pendingPaneSignals: [], pendingSimMessages: [], DEFAULT_WINDOW_SEC: 60,
+            invoke: async (command, args) => {
+                if (command !== "reset_backend") sent.push([command, Array.from(args.cmd.data)]);
+                return 42;
+            },
+            clearTrace() {}, idToHandle: () => 1,
+            document: { getElementById: () => ({ innerHTML: "", appendChild() {} }) }, createSimEntryEl() {},
+            refreshChannelList() {}, renderDbcTree() {}, rebuildTraceColumns() {}, setWindowSize() {},
+            restoreProjectEntries: async () => {}, updateSimTxStatus() {}, scheduleAutoSave() {},
+        });
+        await ctx.applyProject({ channels: [], plot_panes: [], simulate_raw_frames: [{
+            channel: "socketcand:can://localhost/vcan0", can_id: 0x123, is_extended: false,
+            dlc: data.length, data, period_ms: 100,
+        }] });
+        ctx.appRunning = true;
+        ctx.channels.set(1, { open: true, config: {} });
+        const [key, entry] = [...ctx.simEntries][0];
+        assert.equal(entry.data.length, 8, "restore all eight editable byte slots");
+        await ctx.sendSimOnce(key);
+        assert.deepEqual(sent.pop(), ["send_frame", data]);
+        entry.dlc = 8;
+        const expected = Array.from({ length: 8 }, (_, i) => data[i] ?? 0);
+        await ctx.sendSimOnce(key);
+        await ctx.startSim(key);
+        await ctx.updateRunningSim(key);
+        assert.deepEqual(sent, [["send_frame", expected], ["add_periodic_frame", expected], ["update_periodic_frame", expected]]);
+    }
 });
 
 test("clearing trace invalidates an in-flight fetch from the previous project", async () => {

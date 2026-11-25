@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::sim_generator::SignalGen;
 
+const PROJECT_VERSION: u32 = 2;
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Project {
     pub version: u32,
@@ -34,19 +36,19 @@ pub struct ChannelConfig {
     #[serde(default = "default_backend")]
     pub backend: String,
     pub dbc_path: Option<String>,
+    /// Unspecified for virtual interfaces and server-configured socketcand buses.
     #[serde(default = "default_bitrate")]
-    pub bitrate: u32,
+    pub bitrate: Option<u32>,
     /// Protocol interpretation for received frames ("j1939"); None = raw CAN.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
-    /// Open the channel silent (no ACKs, no error flags injected) so the tool
-    /// cannot disturb the bus. Send/simulate controls are disabled in the UI.
+    /// Disable sending locally and request silent mode on supported hardware.
     #[serde(default, skip_serializing_if = "is_false")]
     pub listen_only: bool,
 }
 
-fn default_bitrate() -> u32 {
-    500_000
+fn default_bitrate() -> Option<u32> {
+    Some(500_000)
 }
 
 fn default_backend() -> String {
@@ -173,7 +175,7 @@ pub struct TraceColumnsConfig {
 impl Project {
     pub fn new() -> Self {
         Self {
-            version: 1,
+            version: PROJECT_VERSION,
             ..Default::default()
         }
     }
@@ -184,7 +186,15 @@ impl Project {
             Err(_) => return true,  // If we can't serialize, assume there are changes to save.
         };
         let current_json = std::fs::read_to_string(path).unwrap_or_default();
-        json != current_json
+        if json == current_json {
+            return false;
+        }
+        let Ok(mut current) = serde_json::from_str::<Self>(&current_json) else { return true };
+        if current.version >= PROJECT_VERSION {
+            return true;
+        }
+        current.migrate();
+        serde_json::to_string_pretty(&current).map_or(true, |current| current != json)
     }
 
     pub fn save(&self, path: &str) -> Result<(), String> {
@@ -206,6 +216,81 @@ impl Project {
     pub fn load(path: &str) -> Result<Self, String> {
         info!("Loading project from '{}'", path);
         let json = std::fs::read_to_string(path).map_err(|e| format!("Read error: {e}"))?;
-        serde_json::from_str(&json).map_err(|e| format!("Parse error: {e}"))
+        let mut project: Self = serde_json::from_str(&json).map_err(|e| format!("Parse error: {e}"))?;
+        project.migrate();
+        Ok(project)
+    }
+
+    fn migrate(&mut self) {
+        if self.version < PROJECT_VERSION {
+            // Socketcand was receive-only in v1 regardless of the saved flag.
+            for channel in &mut self.channels {
+                if channel.backend == "socketcand" {
+                    channel.listen_only = true;
+                    channel.bitrate = None;
+                }
+            }
+            self.version = PROJECT_VERSION;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_socketcand_channels_stay_receive_only_until_sending_is_enabled() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy.canvaz");
+        std::fs::write(&path, r#"{
+            "version": 1,
+            "channels": [
+                {"backend": "socketcand", "name": "can://localhost/can0", "bitrate": 250000, "listen_only": false},
+                {"backend": "socketcand", "name": "can://localhost/can1"},
+                {"name": "can0", "bitrate": 250000}
+            ],
+            "plot_panes": []
+        }"#).unwrap();
+        let path = path.to_str().unwrap();
+
+        let mut project = Project::load(path).unwrap();
+        assert_eq!(project.version, PROJECT_VERSION);
+        assert!(project.channels[..2].iter().all(|channel| channel.listen_only && channel.bitrate.is_none()));
+        assert!(!project.channels[2].listen_only);
+        assert_eq!(project.channels[2].bitrate, Some(250_000));
+        assert!(!project.has_changes(path));
+
+        project.channels[0].listen_only = false;
+        assert!(project.has_changes(path));
+        project.save(path).unwrap();
+        let reopened = Project::load(path).unwrap();
+        assert!(!reopened.channels[0].listen_only);
+        assert!(reopened.channels[1].listen_only);
+    }
+
+    #[test]
+    fn project_round_trip_accepts_unknown_virtual_and_physical_bitrates() {
+        let project: Project = serde_json::from_value(serde_json::json!({
+            "version": PROJECT_VERSION,
+            "channels": [
+                { "backend": "socketcand", "name": "can://localhost/vcan0", "bitrate": null },
+                { "backend": "socketcan", "name": "vcan0", "bitrate": null },
+                { "backend": "pcan", "name": "USB", "bitrate": 250000 },
+                { "name": "can0" }
+            ],
+            "plot_panes": []
+        })).unwrap();
+        assert_eq!(project.channels.iter().map(|ch| ch.bitrate).collect::<Vec<_>>(), [None, None, Some(250000), Some(500000)]);
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("socketcand.canvaz");
+        project.save(path.to_str().unwrap()).unwrap();
+        let loaded = Project::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(serde_json::to_value(&loaded).unwrap(), serde_json::to_value(&project).unwrap());
+        for invalid in [serde_json::json!(-1), serde_json::json!(1.5), serde_json::json!(4294967296u64)] {
+            let mut value = serde_json::to_value(&project.channels[0]).unwrap();
+            value["bitrate"] = invalid;
+            assert!(serde_json::from_value::<ChannelConfig>(value).is_err());
+        }
     }
 }

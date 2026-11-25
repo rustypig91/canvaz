@@ -194,6 +194,7 @@ kbd {
 .bus-chip .bus-state.warning { background: var(--warning); }
 .bus-chip .bus-state.passive { background: #fb923c; }
 .bus-chip .bus-state.busoff  { background: var(--danger); }
+.bus-chip .bus-state.unknown { background: var(--text-muted); }
 .bus-chip.has-errors { border-color: var(--danger); }
 .bus-chip.has-errors .bus-err-count { color: var(--danger); }
 
@@ -1421,6 +1422,9 @@ dialog h3 { margin-bottom: 16px; font-size: 15px; }
   padding: 5px 8px;
   font-size: 13px;
 }
+.form-row input[aria-invalid="true"] { border-color: var(--danger); }
+.form-error { color: var(--danger); }
+.form-error:empty { display: none; }
 .form-row-controls { display: flex; gap: 6px; align-items: center; }
 .checkbox-label {
   display: flex;

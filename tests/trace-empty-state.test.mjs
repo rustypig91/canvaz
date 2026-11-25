@@ -5,7 +5,7 @@ import vm from "node:vm";
 import ts from "typescript";
 
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
-const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && ["updateTraceEmptyState", "onCanFrameBatch", "applyTraceFilter"].includes(n.name?.text));
+const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && ["updateTraceEmptyState", "onCanFrameBatch", "applyTraceFilter", "openChannelByHandle", "interleaveFrameSignals"].includes(n.name?.text));
 const code = ts.transpileModule(functions.map(fn => fn.getText(source)).join("\n"), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
 
 function harness() {
@@ -86,6 +86,44 @@ test("paused incoming traffic does not incorrectly claim filters hide frames", (
     Object.assign(h.context, { appRunning: true, viewPaused: true, filtered: true, traceLocalBuffer: [{}] });
     h.update();
     assert.equal(h.title(), "Trace view paused");
+});
+
+test("Socketcand frames wait for their DBC and frames from a cancelled open are ignored", async () => {
+    const h = harness();
+    const remote = channel({ info: { backend: "socketcand", name: "can://host/vcan0" }, dbc: { name: "Old" } });
+    const dbc = { name: "New" };
+    h.context.channels.set(1, remote);
+    let openChannel;
+    const names = [];
+    Object.assign(h.context, {
+        appRunning: true, traceMode: "append", traceTabActive: false,
+        traceSeenChannels: new Set(), traceSeenCanIds: new Set(), traceSeenMsgNames: new Set(),
+        traceLastTs: new Map(), traceKey: (_handle, id) => id, traceSeenNoJ1939: false, traceSeenNoMsg: false,
+        dbcMessageFor: () => { names.push(remote.dbc.name); return null; },
+        sigKeyCache: new Map(), pgnMapCache: new Map(), nextSocketcandAttempt: 1,
+        invoke: () => new Promise(resolve => { openChannel = resolve; }),
+        log: (_level, message) => assert.fail(message),
+    });
+    const frame = (id, attempt) => ({ channel_handle: 1, socketcand_attempt: attempt, can_id: id,
+        timestamp_ms: id, data: [], dlc: 0, signals: [] });
+    const opening = h.context.openChannelByHandle(1);
+    h.context.onCanFrameBatch([frame(1, 1), frame(2, 2)]);
+    assert.deepEqual(names, []);
+    openChannel(dbc);
+    assert.equal(await opening, true);
+    assert.deepEqual(names, ["New"]);
+    assert.deepEqual([...h.context.traceSeenCanIds], [2]);
+    h.context.onCanFrameBatch([frame(3, 1), frame(4, 2)]);
+    assert.deepEqual([...h.context.traceSeenCanIds], [2, 4]);
+});
+
+test("retained frames follow signal names when the DBC changes during a reconnect", () => {
+    const h = harness();
+    h.context.dbcMessageFor = () => ({ signals: [{ name: "B" }, { name: "A" }, { name: "D" }] });
+    const frame = { channel_handle: 1, can_id: 123, signals: [
+        { name: "A", value: 10, raw: 1 }, { name: "B", value: 20, raw: 2 }, { name: "C", value: 30, raw: 3 },
+    ] };
+    assert.deepEqual(Array.from(h.context.interleaveFrameSignals(frame)), [20, 2, 10, 1, null, null]);
 });
 
 for (const mode of ["overwrite", "append"]) {

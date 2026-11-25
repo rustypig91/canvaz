@@ -1,5 +1,6 @@
 mod socketcand;
 pub use socketcand::SocketcandBackend;
+pub(crate) use socketcand::{SocketcandConnect, SOCKETCAND_OPEN_CANCELLED};
 #[cfg(feature = "kvaser")]
 mod kvaser;
 #[cfg(feature = "pcan")]
@@ -155,7 +156,13 @@ pub trait RxHandle: Send + 'static {
 
 pub trait CanBackend: Send + 'static {
     fn register_channel(&mut self, _name: &str) -> Result<(), String> { Ok(()) }
+    fn unregister_channel(&mut self, _index: u8) {}
+    fn replace_registrations(&mut self, _removed: &[u8], _names: &[&str]) -> Result<(), String> { Ok(()) }
     fn list_channels(&self) -> Vec<String>;
+    fn channel_index(&self, name: &str) -> Option<u8> {
+        let index = self.list_channels().iter().position(|channel| channel == name)?;
+        u8::try_from(index).ok()
+    }
     /// `listen_only`: open the channel silent (no ACKs, no error flags injected)
     /// so the tool cannot disturb the bus. Backends that cannot honor it should
     /// still open normally rather than fail.
@@ -250,6 +257,18 @@ impl Can {
         self.backend.register_channel(name)
     }
 
+    pub fn unregister_channel(&mut self, index: u8) {
+        self.backend.unregister_channel(index);
+    }
+
+    pub fn replace_registrations(&mut self, removed: &[u8], names: &[&str]) -> Result<(), String> {
+        self.backend.replace_registrations(removed, names)
+    }
+
+    pub fn channel_index(&self, name: &str) -> Option<u8> {
+        self.backend.channel_index(name)
+    }
+
     pub fn list_channels(&self) -> Vec<String> {
         self.backend.list_channels()
     }
@@ -258,18 +277,28 @@ impl Can {
         self.backend.reinitialize();
     }
 
-    pub fn open(&mut self, channel: u8, bitrate: u32, listen_only: bool, admin_password: Option<&str>) -> Result<(), CanOpenError> {
+    pub(crate) fn ensure_closed(&self, channel: u8) -> Result<(), CanOpenError> {
         if self.is_open(channel) {
-            error!("Attempted to open channel {channel} which is already open");
             return Err(CanOpenError::AlreadyOpen(format!("Channel {channel} is already open")));
         }
+        Ok(())
+    }
+
+    pub fn open(&mut self, channel: u8, bitrate: u32, listen_only: bool, admin_password: Option<&str>) -> Result<(), CanOpenError> {
+        self.ensure_closed(channel)?;
 
         if self.admin_password.is_none() && admin_password.is_some() {
             self.admin_password = Some(admin_password.unwrap().to_string());
         }
 
         let (tx_handle, rx_handle) = self.backend.open_channel(channel, bitrate, listen_only, self.admin_password.as_deref())?;
+        self.start_channel(channel, tx_handle, rx_handle);
+        info!("Opened channel {channel} with baudrate {bitrate}");
+        Ok(())
+    }
 
+    pub(crate) fn start_channel(&mut self, channel: u8, tx_handle: Box<dyn TxHandle>, rx_handle: Box<dyn RxHandle>) {
+        debug_assert!(!self.is_open(channel));
         let queue: SendQueue = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
 
@@ -298,8 +327,6 @@ impl Can {
                 tx_thread,
             },
         );
-        info!("Opened channel {channel} with baudrate {bitrate}");
-        Ok(())
     }
 
     pub fn close(&mut self, channel: u8) -> Result<(), String> {
@@ -308,8 +335,14 @@ impl Can {
             format!("Channel {channel} is not open")
         })?;
         state.stop.store(true, Ordering::Relaxed);
-        state.queue.1.notify_one();
         let _ = state.rx_thread.join();
+        // Synchronize with the TX worker's stop check and entry into the
+        // condition wait. RX closes the shared socket before we take the lock.
+        {
+            let (lock, cvar) = state.queue.as_ref();
+            let _queue = lock.lock();
+            cvar.notify_one();
+        }
         let _ = state.tx_thread.join();
         info!("Closed channel {channel}");
         Ok(())
@@ -453,6 +486,7 @@ fn rx_loop(
             Ok(Some(frame)) => on_rx(channel, frame),
             Ok(None) => {}
             Err(e) => {
+                if stop.load(Ordering::Relaxed) { break; }
                 error!("RX error on channel {channel}: {e}");
                 // Fatal: this loop is the channel's only receive path, so the
                 // channel is dead from here on — let the app surface it.
@@ -490,7 +524,7 @@ fn tx_loop(
             last_tx_err = None;
             on_tx(channel, f);
         }
-        Err(e) => {
+        Err(e) if !stop.load(Ordering::Relaxed) => {
             // Debug, not error: TX failures are continuously visible in the
             // bus-stats footer (bus state, error counters), and a failing bus
             // would otherwise flood the user-facing log via periodic sends.
@@ -500,6 +534,7 @@ fn tx_loop(
                 last_tx_err = Some(e);
             }
         }
+        Err(_) => {}
     };
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -514,7 +549,7 @@ fn tx_loop(
             Err(_) => break,
         };
         let mut i = 0;
-        while i < q.len() {
+        while i < q.len() && !stop.load(Ordering::Relaxed) {
             match &mut q[i] {
                 SendEntry::OneShot(_) => {
                     if let SendEntry::OneShot(mut f) = q.remove(i) {
@@ -546,6 +581,8 @@ fn tx_loop(
                 }
             }
         }
+
+        if stop.load(Ordering::Relaxed) { break; }
 
         // Sleep until the next periodic deadline, or up to 1 s if there are
         // none. notify_one() in send_once/add_periodic/close wakes us early
