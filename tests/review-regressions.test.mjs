@@ -246,9 +246,10 @@ test("raw frame edits and DBC period edits schedule persistence while stopped", 
     });
     const raw = { kind: "raw", channel: 1, canId: 0x123, isExtended: false, dlc: 1, data: [0], periodMs: 100, running: false, periodicHandle: null };
     const el = ctx.createSimEntryEl("raw", raw);
+    assert.match(el.innerHTML, /<option value="0"/);
     for (const [selector, event, value, checked] of [
         [".sim-channel-sel", "change", "2"], [".sim-canid-input", "input", "321"],
-        [".sim-ext-cb", "change", "", true], [".sim-dlc-sel", "change", "2"],
+        [".sim-ext-cb", "change", "", true], [".sim-dlc-sel", "change", "0"],
         [".sim-period", "input", "250"], [".sim-byte", "input", "AB"],
     ]) {
         const before = saved.length;
@@ -258,6 +259,9 @@ test("raw frame edits and DBC period edits schedule persistence while stopped", 
     assert.equal(raw.data[0], 0xAB);
     assert.equal(raw.canId, 0x321);
     assert.equal(raw.periodMs, 250);
+    assert.equal(raw.dlc, 0);
+    assert.equal(el.querySelector(".sim-byte").disabled, true);
+    assert.match(ctx.createSimEntryEl("restored", raw).innerHTML, /<option value="0" selected>/);
     const message = { kind: "message", channel: 1, messageId: 1, messageName: "Message", signals: [], periodMs: 100, running: false };
     const msgEl = ctx.createSimEntryEl("msg", message);
     const before = saved.length;
