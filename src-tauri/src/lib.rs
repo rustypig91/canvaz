@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use app_state::AppState;
+use can_communication::{ChannelCapabilities, ChannelSettings, FrameFormat, FrameUpdate, TxFormat};
 use can_manager::{CanManager, ChannelInfo, FrameInfo, ManagerState, SignalSample};
 use dbc_parser::ParsedDbc;
 use project::Project;
@@ -109,6 +110,8 @@ fn created_channels(state: State<'_, TauriState>) -> Result<Vec<ChannelInfo>, St
 async fn open_channel(
     channel_handle: u32,
     bitrate: u32,
+    mode: Option<FrameFormat>,
+    data_bitrate: Option<u32>,
     listen_only: Option<bool>,
     dbc_path: Option<String>,
     protocol: Option<String>,
@@ -118,10 +121,12 @@ async fn open_channel(
 ) -> Result<Option<ParsedDbc>, String> {
     let can_manager = Arc::clone(&state.can_manager);
     let proto = can_manager::Protocol::from_config(protocol.as_deref());
-    let listen_only = listen_only.unwrap_or(false);
+    let settings = ChannelSettings {
+        bitrate, mode: mode.unwrap_or_default(), data_bitrate, listen_only: listen_only.unwrap_or(false),
+    };
     let result = tauri::async_runtime::spawn_blocking(move || {
         CanManager::open_channel(
-            &can_manager, channel_handle, bitrate, listen_only, dbc_path.as_deref(), proto,
+            &can_manager, channel_handle, settings, dbc_path.as_deref(), proto,
             resume_capture.unwrap_or(false), socketcand_attempt,
         )
     })
@@ -162,6 +167,7 @@ fn reset_backend(state: State<'_, TauriState>) -> Result<(), String> {
 #[derive(Serialize)]
 struct RemappedChannel {
     old_handle: u32,
+    capabilities: Option<ChannelCapabilities>,
     new_handle: u32,
     /// Backend the channel resolved to after the reload — may differ from the
     /// backend it had before when the name moved backends.
@@ -176,6 +182,7 @@ fn reload_backends(start_capture: Option<bool>, state: State<'_, TauriState>) ->
         .into_iter()
         .map(|(old_handle, created)| RemappedChannel {
             old_handle,
+            capabilities: created.capabilities,
             new_handle: created.handle,
             backend: created.backend,
             available: created.available,
@@ -194,6 +201,8 @@ fn parse_dbc(path: String) -> Result<ParsedDbc, String> {
 
 #[derive(Deserialize)]
 struct SendMessageCmd {
+    #[serde(flatten)]
+    tx: TxFormat,
     channel_handle: u32,
     message_id: u32,
     signal_values: HashMap<String, f64>,
@@ -209,11 +218,13 @@ fn send_message(cmd: SendMessageCmd, state: State<'_, TauriState>) -> Result<(),
         .can_manager
         .lock()
         .map_err(|e| e.to_string())?
-        .send_message(cmd.channel_handle, cmd.message_id, &cmd.signal_values, &cmd.generators)
+        .send_message(cmd.channel_handle, cmd.message_id, &cmd.signal_values, &cmd.generators, cmd.tx)
 }
 
 #[derive(Deserialize)]
 struct SendFrameCmd {
+    #[serde(flatten)]
+    tx: TxFormat,
     channel_handle: u32,
     can_id: u32,
     data: Vec<u8>,
@@ -228,11 +239,13 @@ fn send_frame(cmd: SendFrameCmd, state: State<'_, TauriState>) -> Result<(), Str
         .can_manager
         .lock()
         .map_err(|e| e.to_string())?
-        .send_frame(cmd.channel_handle, cmd.can_id, cmd.data, cmd.is_extended)
+        .send_frame(cmd.channel_handle, cmd.can_id, cmd.data, cmd.is_extended, cmd.tx)
 }
 
 #[derive(Deserialize)]
 struct AddPeriodicFrameCmd {
+    #[serde(flatten)]
+    tx: TxFormat,
     channel_handle: u32,
     can_id: u32,
     data: Vec<u8>,
@@ -248,6 +261,7 @@ fn add_periodic_frame(cmd: AddPeriodicFrameCmd, state: State<'_, TauriState>) ->
     state.can_manager.lock().map_err(|e| e.to_string())?.add_periodic_frame(
         cmd.channel_handle,
         RawFrame {
+            metadata: cmd.tx.metadata(FrameFormat::Classical),
             can_id: cmd.can_id,
             is_extended: cmd.is_extended.unwrap_or(cmd.can_id > 0x7FF),
             data: cmd.data,
@@ -260,6 +274,8 @@ fn add_periodic_frame(cmd: AddPeriodicFrameCmd, state: State<'_, TauriState>) ->
 
 #[derive(Deserialize)]
 struct AddPeriodicMessageCmd {
+    #[serde(flatten)]
+    tx: TxFormat,
     channel_handle: u32,
     message_id: u32,
     signal_values: HashMap<String, f64>,
@@ -278,11 +294,14 @@ fn add_periodic_message(cmd: AddPeriodicMessageCmd, state: State<'_, TauriState>
         &cmd.signal_values,
         &cmd.generators,
         cmd.period_ms,
+        cmd.tx,
     )
 }
 
 #[derive(Deserialize)]
 struct UpdatePeriodicMessageCmd {
+    #[serde(flatten)]
+    tx: TxFormat,
     channel_handle: u32,
     periodic_handle: u64,
     message_id: u32,
@@ -303,25 +322,29 @@ fn update_periodic_message(cmd: UpdatePeriodicMessageCmd, state: State<'_, Tauri
         &cmd.signal_values,
         &cmd.generators,
         cmd.period_ms,
+        cmd.tx,
     )
 }
 
 #[derive(Deserialize)]
 struct UpdatePeriodicFrameCmd {
+    can_id: Option<u32>,
+    is_extended: Option<bool>,
+    #[serde(flatten)]
+    tx: TxFormat,
     channel_handle: u32,
     periodic_handle: u64,
     data: Vec<u8>,
     period_ms: u64,
 }
 
-/// Swap a running periodic raw frame's data/period in place (id and frame
-/// format changes still go through remove + add).
+/// Update a running periodic raw frame in place.
 #[tauri::command]
 fn update_periodic_frame(cmd: UpdatePeriodicFrameCmd, state: State<'_, TauriState>) -> Result<(), String> {
     state.can_manager.lock().map_err(|e| e.to_string())?.update_periodic_frame(
         cmd.channel_handle,
         cmd.periodic_handle,
-        cmd.data,
+        FrameUpdate { data: cmd.data, can_id: cmd.can_id, is_extended: cmd.is_extended, tx: cmd.tx },
         cmd.period_ms,
     )
 }

@@ -6,9 +6,12 @@ import ts from "typescript";
 
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 function harness(names, globals = {}) {
+    names = [...new Set([...names, "defaultSimFormat", "simFormatControls"])];
+    const constants = source.statements.filter(n => ts.isVariableStatement(n)
+        && n.declarationList.declarations.some(d => d.name.getText(source) === "FD_LENGTHS"));
     const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text));
     assert.equal(functions.length, names.length);
-    const code = ts.transpileModule(functions.map(n => n.getText(source)).join("\n").replaceAll("import.meta.env.DEV", "false"), {
+    const code = ts.transpileModule([...constants, ...functions].map(n => n.getText(source)).join("\n").replaceAll("import.meta.env.DEV", "false"), {
         compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
     }).outputText;
     const context = vm.createContext({ log() {}, ...globals });
@@ -248,7 +251,7 @@ test("raw frame edits and DBC period edits schedule persistence while stopped", 
     const el = ctx.createSimEntryEl("raw", raw);
     assert.match(el.innerHTML, /<option value="0"/);
     for (const [selector, event, value, checked] of [
-        [".sim-channel-sel", "change", "2"], [".sim-canid-input", "input", "321"],
+        [".sim-channel-sel", "change", "2"], [".sim-canid-input", "change", "321"],
         [".sim-ext-cb", "change", "", true], [".sim-dlc-sel", "change", "0"],
         [".sim-period", "input", "250"], [".sim-byte", "input", "AB"],
     ]) {
@@ -332,6 +335,82 @@ test("restored short raw payloads can grow from zero to eight bytes and transmit
         await ctx.updateRunningSim(key);
         assert.deepEqual(sent, [["send_frame", expected], ["add_periodic_frame", expected], ["update_periodic_frame", expected]]);
     }
+});
+
+test("FD raw editor offers legal lengths and delivers byte 64 to Send and Simulate", async () => {
+    class Element {
+        dataset = {};
+        addEventListener() {}
+        querySelector() { return new Element(); }
+        querySelectorAll() { return []; }
+    }
+    const sent = [];
+    const ctx = harness(["createSimEntryEl", "escapeHtml", "sendSimOnce", "startSim", "queueSimOperation", "updateRunningSim"], {
+        channels: new Map([[1, { open: true, info: { backend: "socketcan", name: "vcan0" }, config: { mode: "fd" } }]]),
+        simEntries: new Map(), appRunning: true,
+        document: { createElement: () => new Element() }, updateSimEntryStatus() {},
+        updateSimTxStatus() {}, scheduleAutoSave() {},
+        invoke: async (command, { cmd }) => { sent.push([command, cmd]); return 42; },
+    });
+    const data = Array.from({ length: 64 }, (_, i) => i);
+    const entry = {
+        kind: "raw", channel: 1, canId: 0x123, isExtended: true, format: "fd", brs: true, dlc: 64,
+        data, periodMs: 100, running: false, periodicHandle: null,
+    };
+    ctx.simEntries.set("fd", entry);
+    const editor = ctx.createSimEntryEl("fd", entry).innerHTML;
+    assert.match(editor, /<option value="64" selected>/);
+    assert.doesNotMatch(editor, /<option value="63"/);
+    assert.match(editor, /Data byte 64 in hexadecimal/);
+    await ctx.sendSimOnce("fd");
+    await ctx.startSim("fd");
+    await ctx.updateRunningSim("fd");
+    assert.deepEqual(sent.map(([command]) => command), ["send_frame", "add_periodic_frame", "update_periodic_frame"]);
+    for (const [, command] of sent) {
+        assert.equal(command.format, "fd");
+        assert.equal(command.brs, true);
+        assert.equal(command.is_extended, true);
+        assert.deepEqual(Array.from(command.data), data);
+    }
+});
+
+test("rejected FD simulator edits leave the running registration active", async () => {
+    const calls = [];
+    const { ctx, entry } = simHarness(async command => {
+        calls.push(command);
+        if (command === "add_periodic_frame") return 42;
+        throw new Error("Invalid CAN FD payload length");
+    });
+    entry.format = "fd";
+    await ctx.startSim("raw");
+    await ctx.updateRunningSim("raw");
+    assert.deepEqual(calls, ["add_periodic_frame", "update_periodic_frame"]);
+    assert.equal(entry.running, true);
+    assert.equal(entry.periodicHandle, 42);
+    assert.match(entry.txError, /Invalid CAN FD payload length/);
+});
+
+test("retained CAN FD and Classical frames with the same ID track independent cycle times", async () => {
+    const frames = [
+        { format: "fd", brs: true, esi: true, timestamp_ms: 100, dlc: 8, data: Array(8).fill(0) },
+        { format: "classical", timestamp_ms: 103, dlc: 8, data: Array(8).fill(0) },
+        { format: "fd", brs: true, timestamp_ms: 110, dlc: 64, data: Array(64).fill(0xAB) },
+        { format: "classical", timestamp_ms: 123, dlc: 8, data: Array(8).fill(0) },
+    ].map(frame => ({ ...frame, can_id: 0x123, is_extended: true, channel_handle: 1, direction: "rx" }));
+    const ctx = harness(["loadTraceFrames", "traceKey"], {
+        invoke: async () => frames, traceMaxRows: 100, traceLoadGeneration: 0, traceLocalBuffer: [],
+        traceSeenChannels: new Set(), traceSeenCanIds: new Set(), traceSeenMsgNames: new Set(),
+        traceSeenNoJ1939: false, interleaveFrameSignals: () => [],
+    });
+    assert.equal(await ctx.loadTraceFrames(), true);
+    const [classic, longFd, firstClassic, shortFd] = ctx.traceLocalBuffer;
+    assert.equal(classic.cycleTimeMs, 20);
+    assert.equal(longFd.cycleTimeMs, 10);
+    assert.equal(longFd.brs, true);
+    assert.equal(longFd.data[63], 0xAB);
+    assert.equal(firstClassic.cycleTimeMs, null);
+    assert.equal(shortFd.cycleTimeMs, null);
+    assert.equal(shortFd.esi, true);
 });
 
 test("clearing trace invalidates an in-flight fetch from the previous project", async () => {

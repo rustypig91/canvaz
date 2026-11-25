@@ -6,7 +6,7 @@ import ts from "typescript";
 
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 const names = ["openChannelDialog", "saveChannelDialog", "updateChannelInterfaceInDialog",
-    "setBitrateInDialog", "getBitrateFromDialog", "setListenOnlyInDialog", "getListenOnlyFromDialog",
+    "setBitrateInDialog", "getBitrateFromDialog", "setChannelTimingInDialog", "updateChannelTimingInDialog", "setListenOnlyInDialog", "getListenOnlyFromDialog",
     "setProtocolInDialog", "getProtocolFromDialog", "setDbcLabel", "setSocketcandAddressError", "removeChannel"];
 const code = ts.transpileModule(source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text))
     .map(n => n.getText(source)).join("\n"), {
@@ -17,7 +17,9 @@ function harness(ifaces = []) {
     const elements = new Map(), saved = [];
     function element(id) {
         if (!elements.has(id)) elements.set(id, {
-            value: "", checked: false, style: {}, textContent: "", open: false,
+            value: "", options: [{}, {}],
+            get valueAsNumber() { return this.value === "" ? NaN : Number(this.value); },
+            checked: false, style: {}, textContent: "", open: false,
             set innerHTML(html) {
                 this.html = html;
                 this.value = html.match(/<option value="([^"]*)"/)?.[1] ?? "";
@@ -36,7 +38,7 @@ function harness(ifaces = []) {
     }
     const context = vm.createContext({
         document: { activeElement: null, getElementById: element },
-        dialogMode: "add", dialogEditTarget: null, dialogPendingDbc: null,
+        dialogExternalTiming: false, dialogMode: "add", dialogEditTarget: null, dialogPendingDbc: null,
         availableIfaces: [], channels: new Map(), ghostChannels: [], selectedChannel: null,
         escapeHtml: text => text, channelName: () => "Remote", selectChannel() {},
         invoke: async command => {
@@ -61,6 +63,8 @@ test("adding Socketcand without hardware enables sending and saves an unspecifie
     assert.equal(h.element("row-socketcand").style.display, "");
     assert.equal(h.element("row-bitrate").style.display, "none");
     assert.equal(h.element("input-listen-only").checked, false);
+    assert.equal(h.element("select-can-mode").options[1].disabled, true);
+    assert.equal(h.element("row-data-bitrate").hidden, true);
     assert.match(h.element("label-listen-only").textContent, /server ACK settings unchanged/);
     h.element("input-socketcand").value = "can://127.0.0.1:29537/vcan0";
     await h.context.saveChannelDialog();
@@ -242,14 +246,32 @@ test("editing a Socketcand address keeps the channel and reports invalid replace
     assert.equal(h.element("dialog-channel").open, false);
 });
 
-test("local virtual interfaces still use the virtual bitrate selection", async () => {
+test("local virtual interfaces use externally managed timing", async () => {
     const h = harness([{ backend: "socketcan", name: "vcan0" }]);
     await h.context.openChannelDialog("add");
-    assert.equal(h.element("row-bitrate").style.display, "");
+    assert.equal(h.element("row-bitrate").style.display, "none");
+    assert.match(h.element("hint-can-mode").textContent, /operating system/);
     assert.equal(h.context.getBitrateFromDialog(), null);
     await h.context.saveChannelDialog();
     assert.equal(h.saved[0].backend, "socketcan");
     assert.equal(h.saved[0].bitrate, null);
+});
+
+test("CAN FD channel settings keep both bitrates and reject invalid data timing", async () => {
+    const h = harness([{ backend: "pcan", name: "PCAN-USB FD", capabilities: { fd: true, external_timing: false } }]);
+    await h.context.openChannelDialog("add");
+    h.element("select-can-mode").value = "fd";
+    h.context.updateChannelTimingInDialog();
+    assert.equal(h.element("row-data-bitrate").hidden, false);
+    h.element("input-data-bitrate").value = "250000";
+    await h.context.saveChannelDialog();
+    assert.match(h.element("error-can-timing").textContent, /at least as high/);
+    assert.equal(h.saved.length, 0);
+    h.element("input-data-bitrate").value = "2000000";
+    await h.context.saveChannelDialog();
+    assert.equal(h.saved[0].mode, "fd");
+    assert.equal(h.saved[0].bitrate, 500000);
+    assert.equal(h.saved[0].data_bitrate, 2000000);
 });
 
 test("removing a Socketcand channel keeps it configured until backend removal succeeds", async () => {

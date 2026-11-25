@@ -1,4 +1,5 @@
 use super::StoredFrame;
+use crate::can_communication::FrameFormat;
 use serde::Serialize;
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -6,7 +7,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-pub(super) const HEADER: &str = "timestamp_ms,elapsed_s,channel,can_id,direction,dlc,data,message,pgn,src,dst,prio,reassembled\n";
+pub(super) const HEADER: &str = "timestamp_ms,elapsed_s,channel,can_id,direction,dlc,data,message,pgn,src,dst,prio,reassembled,frame_format,brs,esi\n";
 
 pub(super) fn write_frame(writer: &mut impl Write, channel: &str, f: &StoredFrame, start_ms: u64) -> std::io::Result<()> {
     let elapsed = (f.timestamp_ms as f64 - start_ms as f64) / 1000.0;
@@ -23,7 +24,7 @@ pub(super) fn write_frame(writer: &mut impl Write, channel: &str, f: &StoredFram
         .unwrap_or_else(|| ",,,".into());
     writeln!(
         writer,
-        "{},{:.3},\"{}\",{},{},{},\"{}\",\"{}\",{},{}",
+        "{},{:.3},\"{}\",{},{},{},\"{}\",\"{}\",{},{},{},{},{}",
         f.timestamp_ms,
         elapsed,
         channel.replace('"', "\"\""),
@@ -33,7 +34,12 @@ pub(super) fn write_frame(writer: &mut impl Write, channel: &str, f: &StoredFram
         data,
         message,
         j1939,
-        f.reassembled as u8
+        f.reassembled as u8,
+        if f.reassembled { "j1939_tp" } else if f.error.is_some() { "error" } else {
+            match f.metadata.format { FrameFormat::Classical => "classical", FrameFormat::Fd => "fd" }
+        },
+        u8::from(f.metadata.brs),
+        u8::from(f.metadata.esi),
     )
 }
 
@@ -159,6 +165,7 @@ mod tests {
 
     fn frame(timestamp_ms: u64) -> StoredFrame {
         StoredFrame {
+            metadata: Default::default(),
             can_id: 0x123,
             is_extended: false,
             data: vec![0xAB, 0xCD],
@@ -180,7 +187,12 @@ mod tests {
         let mut recorder = Recorder::default();
         recorder.start(path.to_string_lossy().into_owned(), 1000).unwrap();
         for timestamp in [1000, 32000, 64000] {
-            recorder.record("CAN, \"one\"", &frame(timestamp));
+            let mut frame = frame(timestamp);
+            if timestamp == 64_000 {
+                frame.metadata = crate::can_communication::FrameMetadata::fd(true, true);
+                frame.data.resize(64, 0xFF);
+            }
+            recorder.record("CAN, \"one\"", &frame);
         }
         let status = recorder.stop();
         assert!(!status.active);
@@ -190,7 +202,10 @@ mod tests {
         assert_eq!(status.bytes, csv.len() as u64);
         assert_eq!(csv.lines().count(), 4);
         assert!(csv.contains("1000,0.000,\"CAN, \"\"one\"\"\",123,rx,2,\"AB CD\",\"Message, \"\"quoted\"\"\""));
-        assert!(csv.contains("64000,63.000"));
+        let fd = csv.lines().last().unwrap();
+        assert!(fd.starts_with("64000,63.000"));
+        assert!(fd.contains(",rx,64,"));
+        assert!(fd.ends_with(",fd,1,1"));
     }
 
     #[test]

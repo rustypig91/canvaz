@@ -13,8 +13,8 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter};
 
 use crate::app_state::AppState;
-use crate::can_communication::{BusStatus, Can, CanFrame, FrameDataSource};
-use crate::dbc_parser::{message_key, ParsedDbc};
+use crate::can_communication::{BusStatus, Can, CanFrame, ChannelCapabilities, ChannelSettings, FrameDataSource, FrameFormat, FrameMetadata, FrameUpdate, TxFormat};
+use crate::dbc_parser::{message_key, ParsedDbc, ParsedMessage};
 use crate::j1939::{self, J1939Info, TpReassembler};
 use crate::sim_generator::{build_frame_source, SignalGen};
 
@@ -60,11 +60,14 @@ struct CanFrameEvent {
     socketcand_attempt: Option<u32>,
     can_id: u32,
     is_extended: bool,
+    #[serde(flatten)]
+    metadata: FrameMetadata,
     /// u16: reassembled J1939 transport messages carry up to 1785 data bytes.
     dlc: u16,
     data: Vec<u8>,
     timestamp_ms: u64,
     direction: &'static str,
+    dbc_message_id: Option<u32>,
     /// J1939 breakdown of the identifier; only set on J1939 channels.
     #[serde(skip_serializing_if = "Option::is_none")]
     j1939: Option<J1939Info>,
@@ -107,11 +110,14 @@ pub struct FrameInfo {
     pub channel_handle: u32,
     pub can_id: u32,
     pub is_extended: bool,
+    #[serde(flatten)]
+    pub metadata: FrameMetadata,
     pub dlc: u16,
     pub data: Vec<u8>,
     pub timestamp_ms: u64,
     pub direction: &'static str,
     pub message_name: Option<String>,
+    pub dbc_message_id: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub j1939: Option<J1939Info>,
     /// True if this row is a synthetic frame reassembled from a J1939 TP.CM /
@@ -140,6 +146,8 @@ pub struct SignalSample {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelInfo {
+    #[serde(skip_deserializing, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ChannelCapabilities>,
     pub backend: String,
     pub name: String,
 }
@@ -148,6 +156,7 @@ pub struct ChannelInfo {
 /// channel name was actually found in (which may differ from the hint).
 #[derive(Debug, Clone, Serialize)]
 pub struct CreatedChannel {
+    pub capabilities: Option<ChannelCapabilities>,
     pub handle: u32,
     pub backend: String,
     pub available: bool,
@@ -184,6 +193,7 @@ struct StoredSignal {
 
 #[derive(Clone)]
 struct StoredFrame {
+    metadata: FrameMetadata,
     can_id: u32,
     is_extended: bool,
     data: Vec<u8>,
@@ -310,6 +320,7 @@ impl ChannelData {
                 channel_handle: handle,
                 can_id: f.can_id,
                 is_extended: f.is_extended,
+                metadata: f.metadata,
                 dlc: f.data.len() as u16,
                 j1939: f.j1939,
                 reassembled: f.reassembled,
@@ -318,6 +329,7 @@ impl ChannelData {
                 timestamp_ms: f.timestamp_ms,
                 direction: f.direction,
                 message_name: f.message_name.clone(),
+                dbc_message_id: f.dbc_msg_id,
                 signals: f
                     .signals
                     .iter()
@@ -512,9 +524,10 @@ impl CanManager {
     pub fn list_channels(&self) -> Result<Vec<ChannelInfo>, String> {
         let mut out = Vec::new();
         for (backend_name, can) in &self.cans {
-            for ch in can.list_channels() {
+            for (index, ch) in can.list_channels().into_iter().enumerate() {
                 debug!("Found channel '{ch}' on backend '{backend_name}'");
                 out.push(ChannelInfo {
+                    capabilities: u8::try_from(index).ok().map(|i| can.capabilities(i)),
                     backend: backend_name.clone(),
                     name: ch,
                 });
@@ -547,6 +560,7 @@ impl CanManager {
             })
         };
         let available = found.is_some();
+        let capabilities = found.as_ref().and_then(|(backend, index)| Some(self.cans.get(backend)?.capabilities(*index)));
         let hinted_backend = backend_name;
         let backend_name = found.as_ref().map(|(name, _)| name.as_str()).unwrap_or(backend_name).to_string();
 
@@ -555,7 +569,7 @@ impl CanManager {
         if let Some((backend, index)) = &found {
             if backend == "socketcand" {
                 if let Some(&handle) = lock.index_to_handle.get(&(backend.clone(), *index)) {
-                    return Ok(CreatedChannel { handle, backend: backend.clone(), available: true });
+                    return Ok(CreatedChannel { handle, capabilities, backend: backend.clone(), available: true });
                 }
             }
         }
@@ -573,6 +587,7 @@ impl CanManager {
             .map(|(&handle, _)| handle)
             .unwrap_or_else(|| NEXT_CHANNEL_HANDLE.fetch_add(1, Ordering::Relaxed));
         let info = ChannelInfo {
+            capabilities,
             backend: backend_name.clone(),
             name: channel_name.to_string(),
         };
@@ -587,6 +602,7 @@ impl CanManager {
         info!("Created {backend_name} channel {channel_name} (handle: {handle})");
         Ok(CreatedChannel {
             handle,
+            capabilities,
             backend: backend_name,
             available,
         })
@@ -715,8 +731,7 @@ impl CanManager {
     pub fn open_channel(
         manager: &Mutex<Self>,
         handle: u32,
-        bitrate: u32,
-        listen_only: bool,
+        settings: ChannelSettings,
         dbc_path: Option<&str>,
         protocol: Protocol,
         resume_capture: bool,
@@ -732,8 +747,10 @@ impl CanManager {
                 return Err(SOCKETCAND_OPEN_CANCELLED.into());
             }
         }
-        guard.cans.get(&backend_name).ok_or("Backend not found")?
-            .ensure_closed(hw_index).map_err(|e| e.to_string())?;
+        let can = guard.cans.get(&backend_name).ok_or("Backend not found")?;
+        can.ensure_closed(hw_index).map_err(|e| e.to_string())?;
+        let capabilities = can.capabilities(hw_index);
+        capabilities.validate(settings)?;
         if guard.opening_socketcand.contains_key(&handle) {
             return Err("Socketcand channel is already connecting".into());
         }
@@ -747,9 +764,9 @@ impl CanManager {
             ch.prepare_capture(resume_capture);
             ch.dbc = dbc.clone();
             ch.protocol = protocol;
-            ch.listen_only = listen_only;
-            // Socketcand uses the server's bitrate, which RAW mode does not report.
-            ch.bitrate = if remote { 0 } else { bitrate };
+            ch.listen_only = settings.listen_only;
+            // Bus load is available for Classical CAN with a known bit rate.
+            ch.bitrate = if capabilities.external_timing || settings.mode == FrameFormat::Fd { 0 } else { settings.bitrate };
             remote.then(|| ch.info.name.clone())
         };
 
@@ -761,7 +778,7 @@ impl CanManager {
                 connection: Arc::clone(&opening),
             });
             drop(guard);
-            let connection = SocketcandBackend::connect(&endpoint, listen_only, &opening);
+            let connection = SocketcandBackend::connect(&endpoint, settings.listen_only, &opening);
             let mut guard = manager.lock().map_err(|e| e.to_string())?;
             if !guard.opening_socketcand.get(&handle).is_some_and(|current| Arc::ptr_eq(&current.connection, &opening)) {
                 return Err(SOCKETCAND_OPEN_CANCELLED.into());
@@ -772,18 +789,18 @@ impl CanManager {
                 .channels.get_mut(&handle).ok_or("Channel not found")?
                 .socketcand_attempt = socketcand_attempt;
             let can = guard.cans.get_mut(&backend_name).ok_or("Backend not found")?;
-            can.start_channel(hw_index, tx, rx);
+            can.start_channel(hw_index, settings, tx, rx);
             return Ok(dbc.map(|d| (*d).clone()));
         }
 
         let manager = &mut *guard;
         let can = manager.cans.get_mut(&backend_name).ok_or("Backend not found")?;
-        match can.open(hw_index, bitrate, listen_only, None) {
+        match can.open(hw_index, settings, None) {
             Ok(()) => {}
             Err(crate::can_communication::CanOpenError::PasswordRequired) => {
                 info!("Backend '{backend_name}' requires admin password to open channel {handle}");
                 let pw = manager.app_state.get_admin_password()?;
-                can.open(hw_index, bitrate, listen_only, Some(&pw)).map_err(|e| e.to_string())?;
+                can.open(hw_index, settings, Some(&pw)).map_err(|e| e.to_string())?;
             }
             Err(e) => return Err(e.to_string()),
         }
@@ -931,12 +948,13 @@ impl CanManager {
     /// `is_extended: None` falls back to inferring the frame format from the id
     /// value (> 0x7FF ⇒ extended); pass an explicit value to send e.g. a 29-bit
     /// frame whose id fits in 11 bits.
-    pub fn send_frame(&self, handle: u32, can_id: u32, data: Vec<u8>, is_extended: Option<bool>) -> Result<(), String> {
+    pub fn send_frame(&self, handle: u32, can_id: u32, data: Vec<u8>, is_extended: Option<bool>, tx: TxFormat) -> Result<(), String> {
         self.ensure_not_listen_only(handle)?;
         let (backend_name, hw_index) = self.backend_index(handle)?;
         self.cans.get(&backend_name).ok_or("Backend not found")?.send_once(
             hw_index,
             CanFrame {
+                metadata: tx.metadata(FrameFormat::Classical),
                 can_id,
                 is_extended: is_extended.unwrap_or(can_id > 0x7FF),
                 data,
@@ -952,50 +970,16 @@ impl CanManager {
         msg_id: u32,
         signal_values: &HashMap<String, f64>,
         generators: &HashMap<String, SignalGen>,
+        tx: TxFormat,
     ) -> Result<(), String> {
         self.ensure_not_listen_only(handle)?;
         let (backend_name, hw_index) = self.backend_index(handle)?;
-        // Evaluate generators once at t=0 so a one-shot send of an E2E message
-        // still carries a valid checksum (and counter 0).
-        let (data, is_extended, source) = self.message_payload(handle, msg_id, signal_values, generators)?;
-        let data = match source {
-            Some(mut src) => src(),
-            None => data,
-        };
-        self.cans.get(&backend_name).ok_or("Backend not found")?.send_once(
-            hw_index,
-            CanFrame {
-                can_id: msg_id & 0x1FFF_FFFF,
-                is_extended,
-                data,
-                timestamp_ms: None,
-                error: None,
-            },
-        )
-    }
-
-    /// Encode `signal_values` against the channel's DBC message and return the
-    /// data plus the message's frame format. The format comes from the DBC's
-    /// extended-id flag, not from the id value — a 29-bit message with an id
-    /// ≤ 0x7FF must still go out as an extended frame.
-    fn encode_dbc_message(
-        &self,
-        handle: u32,
-        msg_id: u32,
-        signal_values: &HashMap<String, f64>,
-    ) -> Result<(Vec<u8>, bool), String> {
-        let dbc = {
-            let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
-            lock.channels
-                .get(&handle)
-                .and_then(|c| c.dbc.clone())
-                .ok_or_else(|| "No DBC loaded for this channel".to_string())?
-        };
-        let msg = dbc
-            .messages
-            .get(&msg_id)
-            .ok_or_else(|| format!("Message 0x{msg_id:X} not in DBC"))?;
-        Ok((msg.encode_signals(signal_values), msg.is_extended))
+        let (mut frame, source) = self.message_payload(handle, msg_id, signal_values, generators, tx)?;
+        // Evaluate generators once at t=0 for checksums and counters.
+        if let Some(mut source) = source {
+            frame.data = source();
+        }
+        self.cans.get(&backend_name).ok_or("Backend not found")?.send_once(hw_index, frame)
     }
 
     pub fn add_periodic_frame(&self, handle: u32, frame: CanFrame, period_ms: u64) -> Result<u64, String> {
@@ -1007,20 +991,20 @@ impl CanManager {
             .add_periodic(hw_index, frame, period_ms, None)
     }
 
-    /// Swap a periodic raw frame's data and period in place — no transmission
-    /// gap or phase reset (frame id/format changes still need remove + add).
+    /// Update a periodic raw frame while preserving its next deadline.
     pub fn update_periodic_frame(
         &self,
         handle: u32,
         periodic_handle: u64,
-        data: Vec<u8>,
+        replacement: FrameUpdate,
         period_ms: u64,
     ) -> Result<(), String> {
+        self.ensure_not_listen_only(handle)?;
         let (backend_name, hw_index) = self.backend_index(handle)?;
         self.cans
             .get(&backend_name)
             .ok_or("Backend not found")?
-            .update_periodic(hw_index, periodic_handle, data, None, period_ms)
+            .update_periodic(hw_index, periodic_handle, replacement, None, period_ms)
     }
 
     pub fn remove_periodic(&self, handle: u32, periodic_handle: u64) -> Result<(), String> {
@@ -1031,30 +1015,22 @@ impl CanManager {
             .remove_periodic(hw_index, periodic_handle)
     }
 
-    /// Encoded payload plus, when any generators are declared, the per-tick
-    /// data source evaluated by the TX loop.
+    /// Encode a DBC message and zero-fill from its declared size to the next
+    /// legal CAN FD wire length. Generators work on the declared DBC bytes;
+    /// the same zero-fill runs after generation on every transmission path.
     fn message_payload(
         &self,
         handle: u32,
         msg_id: u32,
         signal_values: &HashMap<String, f64>,
         generators: &HashMap<String, SignalGen>,
-    ) -> Result<(Vec<u8>, bool, Option<FrameDataSource>), String> {
-        let (data, is_extended) = self.encode_dbc_message(handle, msg_id, signal_values)?;
-        let source = if generators.is_empty() {
-            None
-        } else {
-            let lock = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?;
-            let msg = lock
-                .channels
-                .get(&handle)
-                .and_then(|c| c.dbc.as_ref())
-                .and_then(|d| d.messages.get(&msg_id))
-                .cloned()
-                .ok_or_else(|| format!("Message 0x{msg_id:X} not in DBC"))?;
-            Some(build_frame_source(msg, signal_values.clone(), generators.clone()))
-        };
-        Ok((data, is_extended, source))
+        tx: TxFormat,
+    ) -> Result<(CanFrame, Option<FrameDataSource>), String> {
+        let dbc = self.shared.lock().map_err(|_| "Lock poisoned".to_string())?
+            .channels.get(&handle).and_then(|channel| channel.dbc.clone())
+            .ok_or("No DBC loaded for this channel")?;
+        let msg = dbc.messages.get(&msg_id).ok_or_else(|| format!("Message 0x{msg_id:X} not in DBC"))?;
+        encode_dbc_transmission(msg, signal_values, generators, tx)
     }
 
     pub fn add_periodic_message(
@@ -1064,28 +1040,14 @@ impl CanManager {
         signal_values: &HashMap<String, f64>,
         generators: &HashMap<String, SignalGen>,
         period_ms: u64,
+        tx: TxFormat,
     ) -> Result<u64, String> {
         self.ensure_not_listen_only(handle)?;
         let (backend_name, hw_index) = self.backend_index(handle)?;
-        let (data, is_extended, source) = self.message_payload(handle, msg_id, signal_values, generators)?;
-        self.cans.get(&backend_name).ok_or("Backend not found")?.add_periodic(
-            hw_index,
-            CanFrame {
-                can_id: msg_id & 0x1FFF_FFFF,
-                is_extended,
-                data,
-                timestamp_ms: None,
-                error: None,
-            },
-            period_ms,
-            source,
-        )
+        let (frame, source) = self.message_payload(handle, msg_id, signal_values, generators, tx)?;
+        self.cans.get(&backend_name).ok_or("Backend not found")?.add_periodic(hw_index, frame, period_ms, source)
     }
 
-    /// Re-encode a running periodic DBC message with new values/generators and
-    /// swap it in place. The entry's send deadline is preserved (no gap);
-    /// generator phase and counter state restart, since the payload closure is
-    /// rebuilt.
     pub fn update_periodic_message(
         &self,
         handle: u32,
@@ -1094,13 +1056,19 @@ impl CanManager {
         signal_values: &HashMap<String, f64>,
         generators: &HashMap<String, SignalGen>,
         period_ms: u64,
+        tx: TxFormat,
     ) -> Result<(), String> {
+        self.ensure_not_listen_only(handle)?;
         let (backend_name, hw_index) = self.backend_index(handle)?;
-        let (data, _, source) = self.message_payload(handle, msg_id, signal_values, generators)?;
-        self.cans
-            .get(&backend_name)
-            .ok_or("Backend not found")?
-            .update_periodic(hw_index, periodic_handle, data, source, period_ms)
+        let (frame, source) = self.message_payload(handle, msg_id, signal_values, generators, tx)?;
+        let replacement = FrameUpdate {
+            data: frame.data,
+            can_id: Some(frame.can_id),
+            is_extended: Some(frame.is_extended),
+            tx: TxFormat { format: Some(frame.metadata.format), brs: Some(frame.metadata.brs) },
+        };
+        self.cans.get(&backend_name).ok_or("Backend not found")?
+            .update_periodic(hw_index, periodic_handle, replacement, source, period_ms)
     }
 
     // ── Queries ───────────────────────────────────────────────────────────────
@@ -1294,6 +1262,35 @@ impl CanManager {
     }
 }
 
+fn encode_dbc_transmission(
+    msg: &ParsedMessage,
+    signal_values: &HashMap<String, f64>,
+    generators: &HashMap<String, SignalGen>,
+    tx: TxFormat,
+) -> Result<(CanFrame, Option<FrameDataSource>), String> {
+    if msg.dlc > 8 && msg.wire_format().is_none() && tx.format.is_none() {
+        return Err(format!("Select a transmit frame format for {}", msg.name));
+    }
+    let metadata = tx.metadata(msg.wire_format().unwrap_or_default());
+    let wire_len = msg.transmit_length(metadata.format)?;
+    let mut data = msg.encode_signals(signal_values);
+    data.resize(wire_len, 0);
+    let source: Option<FrameDataSource> = if generators.is_empty() {
+        None
+    } else {
+        let mut generate = build_frame_source(msg.clone(), signal_values.clone(), generators.clone());
+        Some(Box::new(move || {
+            let mut data = generate();
+            data.resize(wire_len, 0);
+            data
+        }))
+    };
+    let frame = CanFrame {
+        metadata, can_id: msg.id, is_extended: msg.is_extended, data, timestamp_ms: None, error: None,
+    };
+    Ok((frame, source))
+}
+
 // ── Callback factories ────────────────────────────────────────────────────────
 
 fn make_frame_callback(
@@ -1326,7 +1323,7 @@ fn make_frame_callback(
         // than 8 bytes) ingested right after the raw frame that completed it.
         // Error frames have no identifier and are never J1939 traffic.
         let mut completed: Option<CanFrame> = None;
-        if protocol == Protocol::J1939 && raw.is_extended && raw.error.is_none() {
+        if protocol == Protocol::J1939 && raw.metadata.format == FrameFormat::Classical && raw.is_extended && raw.error.is_none() {
             let pgn = j1939::decode_id(raw.can_id).pgn;
             if pgn == j1939::PGN_TP_CM || pgn == j1939::PGN_TP_DT {
                 if let Some(ch) = lock.channels.get_mut(&handle) {
@@ -1410,16 +1407,18 @@ fn ingest_frame(
                 "tx" => ch.stats.tx_frames += 1,
                 _ => ch.stats.rx_frames += 1,
             }
-            ch.stats.wire_bits += estimate_frame_bits(raw.data.len(), raw.is_extended);
+            if raw.metadata.format == FrameFormat::Classical {
+                ch.stats.wire_bits += estimate_frame_bits(raw.data.len(), raw.is_extended);
+            }
         }
     }
 
-    let j1939_info = (protocol == Protocol::J1939 && raw.is_extended && !is_error).then(|| j1939::decode_id(raw.can_id));
+    let j1939_info = (protocol == Protocol::J1939 && raw.metadata.format == FrameFormat::Classical && raw.is_extended && !is_error).then(|| j1939::decode_id(raw.can_id));
 
     // Error frames carry no decodable payload.
     let decoded = match protocol {
         _ if is_error => None,
-        Protocol::J1939 => dbc.and_then(|d| d.decode_frame_j1939(&raw)),
+        Protocol::J1939 => dbc.and_then(|d| d.decode_frame_j1939(&raw, reassembled)),
         Protocol::None => dbc.and_then(|d| d.decode_frame(&raw)).map(|m| (m, message_key(raw.can_id, raw.is_extended))),
     };
     let (decoded_msg, dbc_msg_id) = match decoded {
@@ -1455,6 +1454,7 @@ fn ingest_frame(
     }
 
     let stored = StoredFrame {
+        metadata: raw.metadata,
         can_id: raw.can_id,
         is_extended: raw.is_extended,
         data: raw.data.clone(),
@@ -1469,6 +1469,8 @@ fn ingest_frame(
     };
 
     let event = CanFrameEvent {
+        metadata: raw.metadata,
+        dbc_message_id: dbc_msg_id,
         channel_handle: handle,
         socketcand_attempt: lock.channels.get(&handle).and_then(|ch| ch.socketcand_attempt),
         can_id: raw.can_id,
@@ -1517,7 +1519,7 @@ mod tests {
     #[test]
     fn duplicate_assignment_handles_are_rejected() {
         let info = ChannelInfo {
-            backend: "test".into(),
+            capabilities: None, backend: "test".into(),
             name: "CAN 1".into(),
         };
         let assignments = vec![(7, info.clone()), (7, info)];
@@ -1530,13 +1532,14 @@ mod tests {
 
     #[test]
     fn signal_history_separates_frame_formats_and_keeps_j1939_matching() {
-        let mut channel = ChannelData::new(ChannelInfo { backend: "test".into(), name: "test".into() });
+        let mut channel = ChannelData::new(ChannelInfo { capabilities: None, backend: "test".into(), name: "test".into() });
         for (can_id, extended, dbc_id, value) in [
             (0x123, false, 0x123, 1.0),
             (0x123, true, message_key(0x123, true), 2.0),
             (0x18F00400, true, 0x0CF00400, 3.0),
         ] {
             channel.frames.push_back(StoredFrame {
+                metadata: Default::default(),
                 can_id, is_extended: extended, data: vec![0; 8], timestamp_ms: 100, direction: "rx",
                 message_name: Some("Message".into()), j1939: None, reassembled: false, error: None,
                 dbc_msg_id: Some(dbc_id),
@@ -1559,6 +1562,82 @@ mod tests {
         channel.prepare_capture(false);
         assert!(channel.get_signal_history(0x123, "Value", 0).is_empty());
         assert_eq!(channel.stats.error_frames, 0);
+    }
+
+    #[test]
+    fn mixed_capture_preserves_fd_metadata_and_decodes_late_signals() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fd.dbc");
+        std::fs::write(&path, r#"VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_:
+
+BO_ 2147483939 FdMessage: 10 Vector__XXX
+ SG_ Late : 72|8@1+ (1,0) [0|255] "" Vector__XXX
+
+BA_DEF_ BO_ "VFrameFormat" ENUM "StandardCAN","ExtendedCAN_FD";
+BA_ "VFrameFormat" BO_ 2147483939 1;
+"#).unwrap();
+        let dbc = Arc::new(ParsedDbc::new(path.to_str().unwrap()).unwrap());
+        let mut channel = ChannelData::new(ChannelInfo { backend: "test".into(), name: "test".into(), capabilities: None });
+        channel.dbc = Some(dbc);
+        let dbc = channel.dbc.clone().unwrap();
+        let message = &dbc.messages[&message_key(0x123, true)];
+        let values = HashMap::from([("Late".into(), 42.0)]);
+        let tx = TxFormat { format: None, brs: Some(true) };
+        let (outgoing, source) = encode_dbc_transmission(message, &values, &HashMap::new(), tx).unwrap();
+        assert!(source.is_none());
+        assert_eq!(outgoing.metadata, FrameMetadata::fd(true, false));
+        assert!(outgoing.is_extended);
+        assert_eq!(outgoing.data, [0, 0, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0]);
+        let generators = HashMap::from([("Late".into(), SignalGen::Counter)]);
+        let (_, source) = encode_dbc_transmission(message, &values, &generators, tx).unwrap();
+        let mut source = source.unwrap();
+        assert_eq!(&source()[9..], &[0, 0, 0]);
+        assert_eq!(&source()[9..], &[1, 0, 0]);
+
+        let mut fd = CanFrame {
+            metadata: FrameMetadata::fd(true, true), can_id: 0x123, is_extended: true,
+            data: vec![0; 64], timestamp_ms: None, error: None,
+        };
+        fd.data[9] = 42;
+        let mut classic = fd.clone();
+        classic.metadata = FrameMetadata::default();
+        classic.data.truncate(8);
+        for raw in [classic, fd] {
+            let decoded = dbc.decode_frame(&raw);
+            channel.push(StoredFrame {
+                metadata: raw.metadata, can_id: raw.can_id, is_extended: raw.is_extended,
+                data: raw.data, timestamp_ms: 100, direction: "rx",
+                message_name: decoded.as_ref().map(|message| message.name.clone()),
+                j1939: None, reassembled: false, error: None, dbc_msg_id: None,
+                signals: decoded.into_iter().flat_map(|message| message.signals).map(|signal| StoredSignal {
+                    name: signal.name, value: signal.physical, raw: signal.raw, unit: signal.unit,
+                }).collect(),
+            }, 30_000);
+        }
+        let history = channel.get_frames(1, 2);
+        assert_eq!(history[0].metadata.format, FrameFormat::Classical);
+        assert!(history[0].message_name.is_none());
+        assert_eq!(history[1].metadata, FrameMetadata::fd(true, true));
+        assert_eq!(history[1].message_name.as_deref(), Some("FdMessage"));
+        assert_eq!(history[1].signals[0].value, 42.0);
+        assert_eq!(history[1].data.len(), 64);
+        let json = serde_json::to_value(&history[1]).unwrap();
+        assert_eq!(json["format"], "fd");
+        assert_eq!(json["brs"], true);
+        assert_eq!(json["esi"], true);
+        assert_eq!(json["dlc"], 64);
+        let mut csv = Vec::new();
+        for frame in &channel.frames { recording::write_frame(&mut csv, "test", frame, 100).unwrap(); }
+        let csv = String::from_utf8(csv).unwrap();
+        assert!(csv.lines().next().unwrap().ends_with(",classical,0,0"));
+        assert!(csv.lines().nth(1).unwrap().ends_with(",fd,1,1"));
+        assert_eq!(csv.lines().nth(1).unwrap().split(',').nth(3), Some("00000123"));
     }
 
     #[test]

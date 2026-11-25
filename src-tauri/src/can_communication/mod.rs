@@ -12,7 +12,7 @@ mod pcan;
 mod socketcan;
 
 use log::{debug, error, info};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "kvaser")]
 pub use kvaser::KvaserBackend;
@@ -32,8 +32,125 @@ use std::time::{Duration, Instant};
 
 // ── Frame ─────────────────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameFormat {
+    #[default]
+    Classical,
+    Fd,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct FrameMetadata {
+    pub format: FrameFormat,
+    pub brs: bool,
+    /// Received error state indicator. TX backends leave this unset.
+    pub esi: bool,
+}
+
+impl FrameMetadata {
+    pub fn fd(brs: bool, esi: bool) -> Self {
+        Self { format: FrameFormat::Fd, brs, esi }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+pub struct TxFormat {
+    pub format: Option<FrameFormat>,
+    pub brs: Option<bool>,
+}
+
+impl TxFormat {
+    pub fn metadata(self, default: FrameFormat) -> FrameMetadata {
+        let brs = self.brs.unwrap_or(false);
+        match self.format.unwrap_or(default) {
+            FrameFormat::Classical => FrameMetadata { brs, ..FrameMetadata::default() },
+            FrameFormat::Fd => FrameMetadata::fd(brs, false),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ChannelSettings {
+    pub mode: FrameFormat,
+    pub bitrate: u32,
+    pub data_bitrate: Option<u32>,
+    pub listen_only: bool,
+}
+
+impl ChannelSettings {
+    pub fn data_bitrate(self) -> Result<u32, String> {
+        self.data_bitrate.filter(|rate| *rate >= self.bitrate && self.bitrate > 0)
+            .ok_or_else(|| "CAN FD requires positive nominal and data bitrates, with data bitrate at least the nominal bitrate".into())
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ChannelCapabilities {
+    /// Unknown until the driver configures the controller, when None.
+    pub fd: Option<bool>,
+    pub external_timing: bool,
+    pub fd_limitation: Option<&'static str>,
+}
+
+impl ChannelCapabilities {
+    pub fn validate(self, settings: ChannelSettings) -> Result<(), String> {
+        if settings.mode == FrameFormat::Fd {
+            if self.fd == Some(false) {
+                return Err(self.fd_limitation.unwrap_or("This channel does not support ISO CAN FD").into());
+            }
+            if !self.external_timing {
+                settings.data_bitrate()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+// The controller-specific sample point/SJW controls in #30 can supply
+// different phase parameters through this shared timing calculation.
+#[cfg(any(feature = "kvaser", feature = "pcan"))]
+fn solve_fd_timing(
+    clock_hz: u32,
+    bitrate: u32,
+    (max_tseg1, max_tseg2, max_sjw): (u32, u32, u32),
+) -> Option<(u32, u32, u32, u32)> {
+    if bitrate == 0 || clock_hz % bitrate != 0 {
+        return None;
+    }
+    let divisor = clock_hz / bitrate;
+    (3..=1 + max_tseg1 + max_tseg2)
+        .rev()
+        .filter_map(|tq| {
+            let brp = divisor / tq;
+            if brp == 0 || brp > 1024 || divisor % tq != 0 {
+                return None;
+            }
+            let sample = ((tq * 8 + 5) / 10)
+                .clamp(2.max(tq.saturating_sub(max_tseg2)), (tq - 1).min(max_tseg1 + 1));
+            let tseg1 = sample - 1;
+            let tseg2 = tq - sample;
+            let error = (f64::from(sample) / f64::from(tq) - 0.8).abs();
+            Some(((brp, tseg1, tseg2, tseg1.min(tseg2).min(max_sjw)), error))
+        })
+        .min_by(|(_, a), (_, b)| a.total_cmp(b))
+        .map(|(timing, _)| timing)
+}
+
+pub const FD_LENGTHS: [usize; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64];
+
+pub fn fd_len_to_dlc(len: usize) -> Option<u8> {
+    FD_LENGTHS.iter().position(|&size| size == len).map(|code| code as u8)
+}
+
+#[cfg(any(feature = "pcan", test))]
+pub fn fd_dlc_to_len(dlc: u8) -> Option<usize> {
+    FD_LENGTHS.get(usize::from(dlc)).copied()
+}
+
 #[derive(Debug, Clone)]
 pub struct CanFrame {
+    pub metadata: FrameMetadata,
     pub can_id: u32,
     pub is_extended: bool,
     pub data: Vec<u8>,
@@ -53,20 +170,21 @@ impl CanFrame {
         if self.can_id > max_id {
             return Err("CAN ID is outside the selected frame format's range".into());
         }
-        validate_payload(&self.data)?;
+        match self.metadata.format {
+            FrameFormat::Classical if self.data.len() > 8 => return Err("Classical CAN payloads cannot exceed 8 bytes".into()),
+            FrameFormat::Classical if self.metadata.brs => return Err("Bit rate switch requires CAN FD".into()),
+            FrameFormat::Fd if fd_len_to_dlc(self.data.len()).is_none() =>
+                return Err("CAN FD payload length must be 0–8, 12, 16, 20, 24, 32, 48, or 64 bytes".into()),
+            _ => {}
+        }
+        if self.metadata.esi {
+            return Err("ESI is set by the CAN controller on transmission".into());
+        }
         if self.error.is_some() {
             return Err("Error frames cannot be transmitted".into());
         }
         Ok(())
     }
-}
-
-fn validate_payload(data: &[u8]) -> Result<(), String> {
-    // All current transmit backends use classic CAN, including DBC sends.
-    if data.len() > 8 {
-        return Err("Classic CAN payloads cannot exceed 8 bytes".into());
-    }
-    Ok(())
 }
 
 fn validate_period(period_ms: u64) -> Result<(), String> {
@@ -159,18 +277,20 @@ pub trait CanBackend: Send + 'static {
     fn unregister_channel(&mut self, _index: u8) {}
     fn replace_registrations(&mut self, _removed: &[u8], _names: &[&str]) -> Result<(), String> { Ok(()) }
     fn list_channels(&self) -> Vec<String>;
+    fn capabilities(&self, _index: u8) -> ChannelCapabilities {
+        ChannelCapabilities { fd: None, external_timing: false, fd_limitation: None }
+    }
     fn channel_index(&self, name: &str) -> Option<u8> {
         let index = self.list_channels().iter().position(|channel| channel == name)?;
         u8::try_from(index).ok()
     }
     /// `listen_only`: open the channel silent (no ACKs, no error flags injected)
-    /// so the tool cannot disturb the bus. Backends that cannot honor it should
-    /// still open normally rather than fail.
+    /// so the tool cannot disturb the bus. Backends with external timing and
+    /// controller configuration enforce receive-only at the application layer.
     fn open_channel(
         &mut self,
         index: u8,
-        bitrate: u32,
-        listen_only: bool,
+        settings: ChannelSettings,
         admin_password: Option<&str>,
     ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError>;
     /// Reset and re-enumerate hardware. Call only after all channels are closed.
@@ -207,11 +327,34 @@ enum SendEntry {
     },
 }
 
+pub struct FrameUpdate {
+    pub data: Vec<u8>,
+    pub can_id: Option<u32>,
+    pub is_extended: Option<bool>,
+    pub tx: TxFormat,
+}
+
+impl FrameUpdate {
+    fn apply(self, previous: &CanFrame) -> CanFrame {
+        let format = self.tx.format.unwrap_or(previous.metadata.format);
+        let brs = self.tx.brs.unwrap_or(format == FrameFormat::Fd && previous.metadata.brs);
+        CanFrame {
+            can_id: self.can_id.unwrap_or(previous.can_id),
+            is_extended: self.is_extended.unwrap_or(previous.is_extended),
+            metadata: FrameMetadata { format, brs, esi: false },
+            data: self.data,
+            timestamp_ms: None,
+            error: None,
+        }
+    }
+}
+
 type SendQueue = Arc<(Mutex<Vec<SendEntry>>, Condvar)>;
 
 // ── Per-channel open state ────────────────────────────────────────────────────
 
 struct OpenChannel {
+    settings: ChannelSettings,
     queue: SendQueue,
     stop: Arc<AtomicBool>,
     rx_thread: JoinHandle<()>,
@@ -273,6 +416,10 @@ impl Can {
         self.backend.list_channels()
     }
 
+    pub fn capabilities(&self, index: u8) -> ChannelCapabilities {
+        self.backend.capabilities(index)
+    }
+
     pub fn reinitialize(&self) {
         self.backend.reinitialize();
     }
@@ -284,20 +431,20 @@ impl Can {
         Ok(())
     }
 
-    pub fn open(&mut self, channel: u8, bitrate: u32, listen_only: bool, admin_password: Option<&str>) -> Result<(), CanOpenError> {
+    pub fn open(&mut self, channel: u8, settings: ChannelSettings, admin_password: Option<&str>) -> Result<(), CanOpenError> {
         self.ensure_closed(channel)?;
+        self.capabilities(channel).validate(settings)?;
 
         if self.admin_password.is_none() && admin_password.is_some() {
             self.admin_password = Some(admin_password.unwrap().to_string());
         }
 
-        let (tx_handle, rx_handle) = self.backend.open_channel(channel, bitrate, listen_only, self.admin_password.as_deref())?;
-        self.start_channel(channel, tx_handle, rx_handle);
-        info!("Opened channel {channel} with baudrate {bitrate}");
+        let (tx_handle, rx_handle) = self.backend.open_channel(channel, settings, self.admin_password.as_deref())?;
+        self.start_channel(channel, settings, tx_handle, rx_handle);
         Ok(())
     }
 
-    pub(crate) fn start_channel(&mut self, channel: u8, tx_handle: Box<dyn TxHandle>, rx_handle: Box<dyn RxHandle>) {
+    pub(crate) fn start_channel(&mut self, channel: u8, settings: ChannelSettings, tx_handle: Box<dyn TxHandle>, rx_handle: Box<dyn RxHandle>) {
         debug_assert!(!self.is_open(channel));
         let queue: SendQueue = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -321,6 +468,7 @@ impl Can {
         self.channels.insert(
             channel,
             OpenChannel {
+                settings,
                 queue,
                 stop,
                 rx_thread,
@@ -354,6 +502,7 @@ impl Can {
 
     /// Enqueue a frame to be sent exactly once.
     pub fn send_once(&self, channel: u8, frame: CanFrame) -> Result<(), String> {
+        self.validate_channel_frame(channel, frame.metadata)?;
         frame.validate_transmit()?;
         debug!("Enqueuing one-shot frame on channel {channel}: id=0x{:X}", frame.can_id);
         let q = self.queue(channel)?;
@@ -374,6 +523,7 @@ impl Can {
         period_ms: u64,
         source: Option<FrameDataSource>,
     ) -> Result<u64, String> {
+        self.validate_channel_frame(channel, frame.metadata)?;
         frame.validate_transmit()?;
         validate_period(period_ms)?;
         let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
@@ -394,7 +544,7 @@ impl Can {
         Ok(handle)
     }
 
-    /// Swap the payload (and period) of an existing periodic entry in place.
+    /// Update an existing periodic frame and period in place.
     /// Unlike remove + add, the entry's `next` deadline is preserved, so there
     /// is no transmission gap or phase reset; a shortened period only pulls the
     /// deadline earlier.
@@ -402,11 +552,10 @@ impl Can {
         &self,
         channel: u8,
         handle: u64,
-        data: Vec<u8>,
+        replacement: FrameUpdate,
         source: Option<FrameDataSource>,
         period_ms: u64,
     ) -> Result<(), String> {
-        validate_payload(&data)?;
         validate_period(period_ms)?;
         debug!("Updating periodic frame on channel {channel}: handle={handle}, period={period_ms}ms");
         let q = self.queue(channel)?;
@@ -425,7 +574,10 @@ impl Can {
         let Some((frame, p, next, s)) = found else {
             return Err(format!("Periodic handle {handle} not found on channel {channel}"));
         };
-        frame.data = data;
+        let candidate = replacement.apply(frame);
+        self.validate_channel_frame(channel, candidate.metadata)?;
+        candidate.validate_transmit()?;
+        *frame = candidate;
         *s = source;
         *next = (*next).min(Instant::now() + Duration::from_millis(period_ms));
         *p = period_ms;
@@ -445,6 +597,17 @@ impl Can {
             SendEntry::Periodic { handle: h, .. } => *h != handle,
             _ => true,
         });
+        Ok(())
+    }
+
+    fn validate_channel_frame(&self, channel: u8, metadata: FrameMetadata) -> Result<(), String> {
+        let settings = self.channels.get(&channel).ok_or_else(|| format!("Channel {channel} is not open"))?.settings;
+        if settings.listen_only {
+            return Err("Channel is listen-only — sending is disabled".into());
+        }
+        if metadata.format == FrameFormat::Fd && settings.mode != FrameFormat::Fd {
+            return Err("Enable CAN FD on the channel before sending FD frames".into());
+        }
         Ok(())
     }
 
@@ -600,7 +763,7 @@ mod tests {
     use super::*;
 
     fn frame(id: u32, extended: bool, size: usize) -> CanFrame {
-        CanFrame { can_id: id, is_extended: extended, data: vec![0; size], timestamp_ms: None, error: None }
+        CanFrame { metadata: Default::default(), can_id: id, is_extended: extended, data: vec![0; size], timestamp_ms: None, error: None }
     }
 
     #[test]
@@ -616,6 +779,26 @@ mod tests {
     }
 
     #[test]
+    fn fd_dlc_maps_every_wire_length_and_rejects_gaps() {
+        for (dlc, length) in [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64].into_iter().enumerate() {
+            assert_eq!(fd_dlc_to_len(dlc as u8), Some(length));
+            assert_eq!(fd_len_to_dlc(length), Some(dlc as u8));
+            let mut fd = frame(0x123, true, length);
+            fd.metadata = FrameMetadata::fd(true, false);
+            assert!(fd.validate_transmit().is_ok());
+        }
+        assert_eq!(fd_dlc_to_len(16), None);
+        for length in [9, 10, 11, 13, 63, 65] {
+            let mut fd = frame(0x123, false, length);
+            fd.metadata = FrameMetadata::fd(false, false);
+            assert!(fd.validate_transmit().is_err());
+        }
+        let mut fd = frame(0x123, false, 8);
+        fd.metadata = FrameMetadata::fd(false, true);
+        assert!(fd.validate_transmit().is_err());
+    }
+
+    #[test]
     fn generated_payloads_are_validated_before_reaching_the_driver() {
         struct NoSend;
         impl TxHandle for NoSend {
@@ -626,9 +809,11 @@ mod tests {
         }
         let stop = Arc::new(AtomicBool::new(false));
         let error_stop = stop.clone();
+        let mut fd = frame(1, false, 8);
+        fd.metadata = FrameMetadata::fd(false, false);
         let queue = Arc::new((Mutex::new(vec![SendEntry::Periodic {
             handle: 1,
-            frame: frame(1, false, 8),
+            frame: fd,
             period_ms: 1,
             next: Instant::now(),
             source: Some(Box::new(|| vec![0; 9])),
@@ -636,7 +821,7 @@ mod tests {
         tx_loop(Box::new(NoSend), queue, stop.clone(), 0,
             Arc::new(|_, _| panic!("invalid payload reported as transmitted")),
             Arc::new(move |_, error, fatal| {
-                assert!(error.contains("8 bytes"));
+                assert!(error.contains("CAN FD payload length"));
                 assert!(!fatal);
                 error_stop.store(true, Ordering::Relaxed);
             }));
@@ -646,7 +831,7 @@ mod tests {
     struct UnusedBackend;
     impl CanBackend for UnusedBackend {
         fn list_channels(&self) -> Vec<String> { vec![] }
-        fn open_channel(&mut self, _: u8, _: u32, _: bool, _: Option<&str>)
+        fn open_channel(&mut self, _: u8, _: ChannelSettings, _: Option<&str>)
             -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> { unreachable!() }
     }
 
@@ -655,15 +840,24 @@ mod tests {
         let mut can = Can::new(UnusedBackend, |_, _| {}, |_, _| {}, |_, _, _| {}, |_, _| {});
         let queue = Arc::new((Mutex::new(vec![]), Condvar::new()));
         can.channels.insert(0, OpenChannel {
+            settings: ChannelSettings { mode: FrameFormat::Classical, bitrate: 500_000, data_bitrate: None, listen_only: false },
             queue: queue.clone(), stop: Arc::new(AtomicBool::new(false)),
             rx_thread: std::thread::spawn(|| {}), tx_thread: std::thread::spawn(|| {}),
         });
+        let mut fd = frame(0x123, true, 64);
+        fd.metadata = FrameMetadata::fd(true, false);
+        assert!(can.send_once(0, fd.clone()).is_err());
+        can.channels.get_mut(&0).unwrap().settings.mode = FrameFormat::Fd;
+        can.channels.get_mut(&0).unwrap().settings.listen_only = true;
+        assert!(can.add_periodic(0, fd.clone(), 100, None).unwrap_err().contains("listen-only"));
+        can.channels.get_mut(&0).unwrap().settings.listen_only = false;
         assert!(can.send_once(0, frame(0x800, false, 1)).is_err());
         assert!(can.add_periodic(0, frame(1, false, 1), 0, None).is_err());
         assert!(queue.0.lock().unwrap().is_empty());
         let handle = can.add_periodic(0, frame(1, false, 1), 100, None).unwrap();
-        assert!(can.update_periodic(0, handle, vec![1], None, 0).is_err());
-        assert!(can.update_periodic(0, handle, vec![1; 9], None, 100).is_err());
+        let update = |data| FrameUpdate { data, can_id: None, is_extended: None, tx: TxFormat::default() };
+        assert!(can.update_periodic(0, handle, update(vec![1]), None, 0).is_err());
+        assert!(can.update_periodic(0, handle, update(vec![1; 9]), None, 100).is_err());
         let entries = queue.0.lock().unwrap();
         match &entries[0] {
             SendEntry::Periodic { frame, period_ms, .. } => {
@@ -672,7 +866,27 @@ mod tests {
             }
             _ => panic!("expected unchanged periodic entry"),
         }
+        let deadline = match &entries[0] {
+            SendEntry::Periodic { next, .. } => *next,
+            _ => unreachable!(),
+        };
         drop(entries);
+        let update_fd = |data| FrameUpdate {
+            data, can_id: Some(fd.can_id), is_extended: Some(true),
+            tx: TxFormat { format: Some(FrameFormat::Fd), brs: Some(true) },
+        };
+        can.update_periodic(0, handle, update_fd(vec![0xAB; 64]), None, 200).unwrap();
+        assert!(can.update_periodic(0, handle, update_fd(vec![1; 63]), None, 300).is_err());
+        match &queue.0.lock().unwrap()[0] {
+            SendEntry::Periodic { frame, period_ms, next, .. } => {
+                assert_eq!(frame.metadata, fd.metadata);
+                assert!(frame.is_extended);
+                assert_eq!(frame.data, vec![0xAB; 64]);
+                assert_eq!(*period_ms, 200);
+                assert_eq!(*next, deadline);
+            }
+            _ => panic!("expected updated periodic entry"),
+        }
         can.close(0).unwrap();
     }
 }

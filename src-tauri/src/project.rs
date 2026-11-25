@@ -1,6 +1,7 @@
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 
+use crate::can_communication::FrameFormat;
 use crate::sim_generator::SignalGen;
 
 const PROJECT_VERSION: u32 = 2;
@@ -39,6 +40,10 @@ pub struct ChannelConfig {
     /// Unspecified for virtual interfaces and server-configured socketcand buses.
     #[serde(default = "default_bitrate")]
     pub bitrate: Option<u32>,
+    #[serde(default)]
+    pub mode: FrameFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_bitrate: Option<u32>,
     /// Protocol interpretation for received frames ("j1939"); None = raw CAN.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
@@ -85,6 +90,10 @@ pub struct PlotSignalEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulateMessage {
+    #[serde(default)]
+    pub format: Option<FrameFormat>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub brs: bool,
     pub channel: String,
     pub message_id: u32,
     pub period_ms: u64,
@@ -104,6 +113,10 @@ pub struct SimulateMessageSignal {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulateRawFrame {
+    #[serde(default)]
+    pub format: FrameFormat,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub brs: bool,
     pub channel: String,
     pub can_id: u32,
     pub is_extended: bool,
@@ -267,6 +280,38 @@ mod tests {
         let reopened = Project::load(path).unwrap();
         assert!(!reopened.channels[0].listen_only);
         assert!(reopened.channels[1].listen_only);
+    }
+
+    #[test]
+    fn fd_channel_and_armed_simulations_round_trip_with_legacy_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fd.canvaz");
+        let bytes = (0..64).collect::<Vec<u8>>();
+        let project: Project = serde_json::from_value(serde_json::json!({
+            "version": PROJECT_VERSION,
+            "channels": [
+                {"name": "CAN FD", "backend": "pcan", "bitrate": 500000, "data_bitrate": 2000000, "mode": "fd"},
+                {"name": "legacy"}
+            ],
+            "plot_panes": [],
+            "simulate_messages": [{
+                "channel": "pcan:CAN FD", "message_id": 291, "format": "fd", "brs": true, "period_ms": 123,
+                "running": true, "signals": [{"name": "Counter", "value": 10, "generator": {"mode": "counter"}}]
+            }],
+            "simulate_raw_frames": [{
+                "channel": "pcan:CAN FD", "can_id": 291, "is_extended": true, "format": "fd", "brs": true,
+                "dlc": 64, "data": bytes, "period_ms": 200, "running": true
+            }, {
+                "channel": "socketcan:legacy", "can_id": 291, "is_extended": false,
+                "dlc": 0, "data": [], "period_ms": 100
+            }]
+        })).unwrap();
+        project.save(path.to_str().unwrap()).unwrap();
+        let reopened = Project::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.channels[1].mode, FrameFormat::Classical);
+        assert_eq!(reopened.simulate_raw_frames[1].format, FrameFormat::Classical);
+        assert_eq!(reopened.simulate_raw_frames[0].data.len(), 64);
+        assert_eq!(serde_json::to_value(&reopened).unwrap(), serde_json::to_value(&project).unwrap());
     }
 
     #[test]

@@ -9,6 +9,7 @@ impl CanManager {
 
 fn demo_channel(dbc: ParsedDbc, start_ms: u64) -> ChannelData {
     let mut channel = ChannelData::new(ChannelInfo {
+        capabilities: None,
         backend: "CAN".into(),
         name: "Powertrain CAN".into(),
     });
@@ -39,6 +40,7 @@ fn demo_channel(dbc: ParsedDbc, start_ms: u64) -> ChannelData {
             let data = message.encode_signals(&values);
             let decoded = message.decode_data(&data);
             channel.frames.push_back(StoredFrame {
+                metadata: Default::default(),
                 can_id: id,
                 is_extended: false,
                 data,

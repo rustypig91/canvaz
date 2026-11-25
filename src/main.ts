@@ -54,11 +54,16 @@ interface SignalEnumValue {
     description: string;
 }
 
+type FrameFormat = "classical" | "fd";
+const FD_LENGTHS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64];
+type DbcFrameFormat = FrameFormat | "j1939";
+
 interface DbcMessage {
     key?: number;
     id: number;
     name: string;
     dlc: number;
+    frame_format?: DbcFrameFormat;
     // 29-bit (extended) frame format, from bit 31 of the DBC's raw id. The
     // backend uses it when encoding sends; kept here for display parity.
     is_extended?: boolean;
@@ -88,6 +93,10 @@ interface FrameSignal {
 }
 
 interface FrameInfo {
+    format?: FrameFormat;
+    brs?: boolean;
+    esi?: boolean;
+    dbc_message_id?: number | null;
     channel_handle: number;
     can_id: number;
     is_extended: boolean;
@@ -106,6 +115,10 @@ interface FrameInfo {
 }
 
 interface CanFrameEvent {
+    format?: FrameFormat;
+    brs?: boolean;
+    esi?: boolean;
+    dbc_message_id?: number | null;
     channel_handle: number;
     socketcand_attempt?: number;
     can_id: number;
@@ -137,13 +150,14 @@ interface PlotPaneConfig {
     // Manual Y-axis lock; both set = locked, absent = auto-scale.
     y_min?: number | null; y_max?: number | null;
 }
-interface ChannelInfo { backend: string; name: string; }
+interface ChannelCapabilities { fd: boolean | null; external_timing: boolean; fd_limitation?: string | null; }
+interface ChannelInfo { backend: string; name: string; capabilities?: ChannelCapabilities | null; }
 // create_channel result: the backend is where the name was actually found —
 // the backend searches all of them, so it can differ from the hint we sent.
-interface CreatedChannel { handle: number; backend: string; available: boolean; }
+interface CreatedChannel { handle: number; backend: string; available: boolean; capabilities?: ChannelCapabilities | null; }
 // `display_name` is the user-chosen operating name (shown in the UI, trace and
 // CSV exports); `name` stays the hardware identity used for lookup.
-interface ChannelConfig { name: string; display_name?: string | null; backend: string; dbc_path: string | null; bitrate: number | null; protocol: string | null; listen_only: boolean; }
+interface ChannelConfig { name: string; display_name?: string | null; backend: string; dbc_path: string | null; bitrate: number | null; mode?: FrameFormat; data_bitrate?: number | null; protocol: string | null; listen_only: boolean; }
 // Everything the app tracks about one channel, keyed by its u32 handle in `channels`.
 interface Channel {
     opening?: { failed: boolean; socketcandAttempt?: number; frames: CanFrameEvent[] };
@@ -161,11 +175,15 @@ interface Channel {
 interface ChannelErrorEvent { channel_handle: number; socketcand_attempt?: number; error: string; fatal: boolean; }
 // One simulated message instance; the same message can appear multiple times.
 interface SimMessageConfig {
+    format?: FrameFormat | null;
+    brs?: boolean;
     channel: string; message_id: number; period_ms: number; running?: boolean;
     signals: { name: string; value: number; generator?: SimGen | null }[];
 }
 
 interface SimRawFrameConfig {
+    format?: FrameFormat | null;
+    brs?: boolean;
     channel: string; can_id: number; is_extended: boolean;
     dlc: number; data: number[]; period_ms: number; running?: boolean;
 }
@@ -618,10 +636,11 @@ function j1939MatchKey(canId: number): number {
 
 // DBC message for a frame: exact id match first, then (on J1939 channels) by
 // PGN + source address.
-function dbcMessageFor(handle: number, canId: number, isExtended: boolean): DbcMessage | null {
+function dbcMessageFor(handle: number, canId: number, isExtended: boolean, decodedId?: number | null): DbcMessage | null {
     const ch = channels.get(handle);
     const dbc = ch?.dbc;
     if (!dbc) return null;
+    if (decodedId !== undefined) return decodedId === null ? null : dbc.messages[decodedId] ?? null;
     const exact = dbc.messages[dbcMessageId(canId, isExtended)];
     if (exact && !!exact.is_extended === isExtended) return exact;
     if (ch!.config.protocol !== "j1939" || !isExtended) return null;
@@ -1777,7 +1796,7 @@ function setDbcLabel(path: string | null) {
 function getBitrateFromDialog(): number | null {
     const sel = (document.getElementById("select-bitrate") as HTMLSelectElement).value;
     if (sel === "vcan") return null;
-    if (sel === "custom") return parseInt((document.getElementById("input-bitrate-custom") as HTMLInputElement).value) || null;
+    if (sel === "custom") return (document.getElementById("input-bitrate-custom") as HTMLInputElement).valueAsNumber || null;
     return parseInt(sel);
 }
 
@@ -1816,16 +1835,38 @@ function setBitrateInDialog(bitrate: number | null, isVcan: boolean) {
     }
 }
 
-function updateChannelInterfaceInDialog(backend: string, name: string) {
+let dialogExternalTiming = false;
+
+function setChannelTimingInDialog(config?: ChannelConfig) {
+    (document.getElementById("select-can-mode") as HTMLSelectElement).value = config?.mode ?? "classical";
+    (document.getElementById("input-data-bitrate") as HTMLInputElement).value = String(config?.data_bitrate ?? 2_000_000);
+}
+
+function updateChannelTimingInDialog() {
+    const mode = document.getElementById("select-can-mode") as HTMLSelectElement;
+    const hidden = mode.value !== "fd" || mode.options[1].disabled || dialogExternalTiming;
+    document.getElementById("row-data-bitrate")!.hidden = hidden;
+    (document.getElementById("input-data-bitrate") as HTMLInputElement).disabled = hidden;
+    document.getElementById("error-can-timing")!.textContent = "";
+}
+
+function updateChannelInterfaceInDialog(backend: string, name: string, capabilities?: ChannelCapabilities | null) {
     const remote = backend === "socketcand";
-    document.getElementById("row-bitrate")!.style.display = remote ? "none" : "";
-    (document.getElementById("input-bitrate-custom") as HTMLInputElement).disabled = remote;
+    const virtual = backend === "socketcan" && (capabilities?.external_timing ?? name.startsWith("vcan"));
+    dialogExternalTiming = remote || virtual;
+    document.getElementById("row-bitrate")!.style.display = dialogExternalTiming ? "none" : "";
+    (document.getElementById("input-bitrate-custom") as HTMLInputElement).disabled = dialogExternalTiming;
+    const mode = document.getElementById("select-can-mode") as HTMLSelectElement;
+    mode.options[1].disabled = remote || capabilities?.fd === false;
+    document.getElementById("hint-can-mode")!.textContent = capabilities?.fd_limitation
+        ?? (remote ? "Socketcand supports Classical CAN. Timing is configured by the server."
+            : virtual ? "Virtual interface. Timing is managed by the operating system." : "");
     document.getElementById("label-listen-only")!.textContent = remote
-        ? "Receive only — send & simulate disabled; server ACK settings unchanged"
-        : "Silent — no ACKs, no error flags, send & simulate disabled";
-    // Remote channels leave local hardware settings intact, so switching back
-    // restores the chosen bitrate and does not silently enable listen-only.
-    if (!remote) setBitrateInDialog(getBitrateFromDialog(), name.startsWith("vcan"));
+        ? "Receive only · Send and Simulate disabled, server ACK settings unchanged"
+        : virtual ? "Receive only · Send and Simulate disabled"
+            : "Silent · no ACKs or error flags, Send and Simulate disabled";
+    if (!remote) setBitrateInDialog(getBitrateFromDialog(), virtual);
+    updateChannelTimingInDialog();
 }
 
 function setSocketcandAddressError(message: string) {
@@ -1862,6 +1903,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         dialogPendingDbc = null;
         setDbcLabel(null);
         setBitrateInDialog(500000, false);
+        setChannelTimingInDialog();
         setProtocolInDialog(null);
         setListenOnlyInDialog(false);
         nameInput.value = "";
@@ -1891,7 +1933,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
             document.getElementById("row-socketcand")!.style.display = remote ? "" : "none";
             if (!remote) setSocketcandAddressError("");
             const iface = available.find(i => i.name === sel.value);
-            updateChannelInterfaceInDialog(remote ? "socketcand" : iface?.backend ?? "", sel.value);
+            updateChannelInterfaceInDialog(remote ? "socketcand" : iface?.backend ?? "", sel.value, iface?.capabilities);
         };
         sel.onchange = updateSocketcand;
         updateSocketcand();
@@ -1918,12 +1960,13 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
             socketcandInput.value = selectedSocketcand === undefined
                 ? "" : socketcandDrafts.get(selectedSocketcand) ?? iface?.name ?? "";
             setSocketcandAddressError("");
-            updateChannelInterfaceInDialog(backend, iface?.name ?? "");
+            updateChannelInterfaceInDialog(backend, iface?.name ?? "", iface?.capabilities);
         };
         sel.onchange = updateAssignment;
         dialogPendingDbc = ch?.config.dbc_path ?? null;
         setDbcLabel(dialogPendingDbc);
         setBitrateInDialog(ch?.config.bitrate ?? null, hwName.startsWith("vcan"));
+        setChannelTimingInDialog(ch?.config);
         setProtocolInDialog(ch?.config.protocol ?? null);
         setListenOnlyInDialog(ch?.config.listen_only ?? false);
         updateAssignment();
@@ -2012,7 +2055,7 @@ async function registerChannel(config: ChannelConfig): Promise<RegisterResult> {
         return { error: `'${config.name}' resolves to already-configured channel ${existing.info.backend}:${existing.info.name}` };
     }
     config.backend = created.backend;
-    channels.set(created.handle, { info: { backend: created.backend, name: config.name }, config, dbc: null, open: false, available: created.available });
+    channels.set(created.handle, { info: { backend: created.backend, name: config.name, capabilities: created.capabilities }, config, dbc: null, open: false, available: created.available });
     // Push the custom name to the backend so CSV exports use it too.
     if (config.display_name) {
         await invoke("set_channel_display_name", { channelHandle: created.handle, displayName: config.display_name })
@@ -2041,6 +2084,8 @@ async function openChannelByHandle(handle: number, resumeCapture = false): Promi
         const dbc = await invoke<ParsedDbc | null>("open_channel", {
             channelHandle: handle,
             bitrate: ch.config.bitrate ?? 500000,
+            mode: ch.config.mode ?? "classical",
+            dataBitrate: ch.config.data_bitrate ?? null,
             listenOnly: ch.config.listen_only ?? false,
             dbcPath: ch.config.dbc_path ?? null,
             protocol: ch.config.protocol ?? null,
@@ -2172,7 +2217,7 @@ async function recoverChannel(handle: number, resumeCapture: boolean) {
     if (!await openChannelByHandle(handle, resumeCapture) || !appRunning) return;
     if (resumeCapture) log("info", `Channel ${channelName(handle)} recovered`);
     renderChannelList();
-    if (ch.info.backend === "socketcand" && ch.dbc) {
+    if (ch.dbc) {
         reconcileSimMessages(handle);
         renderDbcTree((document.getElementById("signal-search") as HTMLInputElement).value);
         await restoreProjectEntries();
@@ -2225,6 +2270,19 @@ async function applyChannelDialog() {
 async function saveChannelDialog() {
     const dialog = document.getElementById("dialog-channel") as HTMLDialogElement;
     const bitrate = getBitrateFromDialog();
+    const modeSelect = document.getElementById("select-can-mode") as HTMLSelectElement;
+    const mode: FrameFormat = modeSelect.value === "fd" ? "fd" : "classical";
+    if (mode === "fd" && modeSelect.options[1].disabled) {
+        modeSelect.focus();
+        return;
+    }
+    const dataInput = document.getElementById("input-data-bitrate") as HTMLInputElement;
+    const dataBitrate = mode === "fd" && !dialogExternalTiming ? dataInput.valueAsNumber : null;
+    if (dataBitrate !== null && (bitrate === null || !Number.isInteger(dataBitrate) || !Number.isInteger(bitrate) || bitrate <= 0 || dataBitrate < bitrate)) {
+        document.getElementById("error-can-timing")!.textContent = "Enter positive bitrates with the data bitrate at least as high as the nominal bitrate.";
+        dataInput.focus();
+        return;
+    }
     const protocol = getProtocolFromDialog();
     const listenOnly = getListenOnlyFromDialog();
     const customName = (document.getElementById("input-channel-name") as HTMLInputElement).value.trim() || null;
@@ -2247,7 +2305,7 @@ async function saveChannelDialog() {
             return;
         }
         const backend = socketcandInput ? "socketcand" : availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
-        const config: ChannelConfig = { name, display_name: customName, backend, dbc_path: dialogPendingDbc, bitrate: backend === "socketcand" ? null : bitrate, protocol, listen_only: listenOnly };
+        const config: ChannelConfig = { name, display_name: customName, backend, dbc_path: dialogPendingDbc, bitrate: dialogExternalTiming ? null : bitrate, mode, data_bitrate: dataBitrate, protocol, listen_only: listenOnly };
         // Register channel with backend (allocates handle); hardware opens (and
         // the DBC is loaded) on Start. If the name exists in no backend the
         // channel is still added, as a ghost — same as a project channel whose
@@ -2300,7 +2358,9 @@ async function saveChannelDialog() {
             if (!await changeChannelAssignment(h, target, remote ? setSocketcandAddressError : undefined)) return;
             ch.config.display_name = customName;
             ch.config.dbc_path = dialogPendingDbc;
-            ch.config.bitrate = ch.info.backend === "socketcand" ? null : bitrate;
+            ch.config.bitrate = dialogExternalTiming ? null : bitrate;
+            ch.config.mode = mode;
+            ch.config.data_bitrate = dataBitrate;
             ch.config.protocol = protocol;
             ch.config.listen_only = listenOnly;
             // Sync (or clear) the custom name backend-side so CSV exports match.
@@ -2588,9 +2648,11 @@ async function renderChannelList() {
             ? `${ch.config.display_name ? `${escapeHtml(ch.config.display_name)} ` : ""}<span class="ch-unassigned">Unassigned</span>`
             : `${escapeHtml(name)}<span class="ch-backend label-muted"> ${escapeHtml(backend)}</span>`;
         const isSelected = h === selectedChannel;
-        const bitrateLabel = backend === "socketcand" ? "—" : hwName.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
+        const virtual = backend === "socketcan" && (ch.info.capabilities?.external_timing ?? hwName.startsWith("vcan"));
+        const bitrateLabel = backend === "socketcand" ? "—" : virtual ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
+        const modeLabel = ch.config.mode === "fd" ? " · FD" : "";
         const protoLabel = ch.config.protocol === "j1939" ? " · J1939" : "";
-        const listenOnlyLabel = ch.config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">${backend === "socketcand" ? "receive-only" : "silent"}</span>` : "";
+        const listenOnlyLabel = ch.config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">${backend === "socketcand" || virtual ? "receive-only" : "silent"}</span>` : "";
         const item = document.createElement("div");
         item.className = `channel-item${isSelected ? " selected" : ""}`;
         item.dataset.channelHandle = String(h);
@@ -2598,7 +2660,7 @@ async function renderChannelList() {
       <span class="dot${ch.open ? "" : ch.error || (!ch.available && ch.info.backend !== "none") ? " error" : " closed"}"${ch.error ? ` title="${escapeHtml(ch.error)}"` : !ch.available ? ` title="${ch.info.backend === "none" ? "No hardware channel assigned" : "Disconnected"}"` : ""}></span>
       <button type="button" class="ch-name" aria-pressed="${isSelected}" title="${escapeHtml(channelLabel)}" aria-label="${escapeHtml(channelLabel)}">${nameMarkup}</button>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
-      <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}${listenOnlyLabel}</span>
+      <span class="ch-baud label-muted">${bitrateLabel}${modeLabel}${protoLabel}${listenOnlyLabel}</span>
       <button class="btn-edit-ch btn btn-sm" type="button" aria-label="Configure ${escapeHtml(name)}">Edit</button>
       <button class="btn-close-ch" aria-label="Remove channel" title="Remove channel">×</button>
     `;
@@ -2637,6 +2699,7 @@ async function renderChannelList() {
         const bitrate = config.bitrate;
         const ghostName = config.display_name || config.name;
         const bitrateLabel = config.backend === "socketcand" ? "—" : config.name.startsWith("vcan") ? "vcan" : (bitrate ? `${(bitrate / 1000).toFixed(0)}k` : "—");
+        const modeLabel = config.mode === "fd" ? " · FD" : "";
         const protoLabel = config.protocol === "j1939" ? " · J1939" : "";
         const listenOnlyLabel = config.listen_only ? ` · <span title="Listen-only — send &amp; simulate disabled">${config.backend === "socketcand" ? "receive-only" : "silent"}</span>` : "";
         const item = document.createElement("div");
@@ -2645,7 +2708,7 @@ async function renderChannelList() {
       <span class="dot error" title="${error}"></span>
       <span class="ch-name" title="${escapeHtml(ghostName === config.name ? ghostName : `${ghostName} (${config.name})`)}">${escapeHtml(ghostName)}<span class="ch-backend label-muted"> ${config.backend}</span></span>
       <span class="ch-dbc"${dbcPath ? ` title="${dbcPath}"` : ""}>${dbcPath ? dbcPath.replace(/.*[/\\]/, "") : "No DBC"}</span>
-      <span class="ch-baud label-muted">${bitrateLabel}${protoLabel}${listenOnlyLabel}</span>
+      <span class="ch-baud label-muted">${bitrateLabel}${modeLabel}${protoLabel}${listenOnlyLabel}</span>
       <button class="btn-close-ch" title="Remove channel" aria-label="Remove channel">×</button>
     `;
         item.querySelector(".btn-close-ch")!.addEventListener("click", (e) => {
@@ -2780,10 +2843,13 @@ interface SimGen {
 }
 
 interface SimMessageEntry {
+    format: FrameFormat | null;
+    brs: boolean;
     kind: "message";
     channel: number;
     messageId: number;
     messageName: string;
+    dbcFormat?: DbcFrameFormat;
     dlc: number;
     signals: { def: DbcSignal; value: number; gen: SimGen | null }[];
     // Retain settings for signals temporarily missing from a reloaded DBC.
@@ -2798,6 +2864,8 @@ interface SimMessageEntry {
 }
 
 interface SimRawEntry {
+    format: FrameFormat;
+    brs: boolean;
     kind: "raw";
     channel: number;
     // Stable persisted id retained while a duplicate/offline channel has no
@@ -2828,6 +2896,27 @@ let msgEntryCounter = 0;
 
 function isChannelListenOnly(handle: number): boolean {
     return channels.get(handle)?.config.listen_only ?? false;
+}
+
+function defaultSimFormat(msg: DbcMessage): FrameFormat | null {
+    if (msg.frame_format === "fd") return "fd";
+    return msg.dlc > 8 && !msg.frame_format ? null : "classical";
+}
+
+function simFormatControls(entry: SimEntry): string {
+    const fd = entry.format === "fd";
+    const declared = entry.kind === "message" && entry.dbcFormat;
+    const bytes = entry.kind === "message" && entry.format !== null
+        ? (fd ? FD_LENGTHS.find(len => len >= entry.dlc) : entry.dlc <= 8 ? entry.dlc : undefined) : undefined;
+    return `<label class="label-muted">Frame
+        <select class="sim-format-sel" aria-label="Transmit frame format"${declared ? ' disabled title="Defined by the DBC"' : ""}>
+            ${entry.format === null ? '<option value="" disabled selected>Select format</option>' : ""}
+            <option value="classical"${entry.format === "classical" ? " selected" : ""}>Classical CAN</option>
+            <option value="fd"${fd ? " selected" : ""}>CAN FD</option>
+        </select>
+    </label>
+    <label class="sim-ext-label label-muted" title="Bit rate switch"><input type="checkbox" class="sim-brs-cb" aria-label="Bit rate switch"${entry.brs ? " checked" : ""}${fd ? "" : " disabled"}> BRS</label>
+    ${bytes !== undefined ? `<span class="label-muted">${bytes} bytes</span>` : ""}`;
 }
 
 function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
@@ -2866,6 +2955,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         </div>
       </div>
       <div class="sim-group-body${hasEnums ? " has-enums" : ""}">
+        <div class="sim-raw-data-row">${simFormatControls(entry)}</div>
         ${entry.signals.map((s, i) => {
             const { phys, raw } = normalizeSignalValue(s.def, s.value);
             const rr = signalRawRange(s.def);
@@ -3050,15 +3140,16 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
           <span class="label-muted">ID</span>
           <input type="text" class="sim-canid-input small-input" aria-label="CAN ID in hexadecimal" value="${idHex}" maxlength="8" placeholder="hex">
           <label class="sim-ext-label label-muted"><input type="checkbox" class="sim-ext-cb"${entry.isExtended ? " checked" : ""}> Ext</label>
+          ${simFormatControls(entry)}
         </div>
         <div class="sim-raw-data-row">
-          <span class="label-muted">DLC</span>
+          <span class="label-muted">Bytes</span>
           <select class="sim-dlc-sel" aria-label="Data length">
-            ${[0, 1, 2, 3, 4, 5, 6, 7, 8].map(n => `<option value="${n}"${n === entry.dlc ? " selected" : ""}>${n}</option>`).join("")}
+            ${(entry.format === "fd" ? FD_LENGTHS : FD_LENGTHS.slice(0, 9)).map(n => `<option value="${n}"${n === entry.dlc ? " selected" : ""}>${n}</option>`).join("")}
           </select>
           <span class="label-muted">Data</span>
           <div class="sim-bytes">
-            ${entry.data.map((b, i) => `<input type="text" class="sim-byte" aria-label="Data byte ${i + 1} in hexadecimal" data-idx="${i}" value="${b.toString(16).toUpperCase().padStart(2, "0")}" maxlength="2"${i >= entry.dlc ? " disabled" : ""}>`).join("")}
+            ${entry.data.slice(0, entry.format === "fd" ? 64 : 8).map((b, i) => `<input type="text" class="sim-byte" aria-label="Data byte ${i + 1} in hexadecimal" data-idx="${i}" value="${b.toString(16).toUpperCase().padStart(2, "0")}" maxlength="2"${i >= entry.dlc ? " disabled" : ""}>`).join("")}
           </div>
         </div>
       </div>`;
@@ -3073,9 +3164,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             if (wasRunning && !listenOnly) await startSim(key);
             updateSimTxStatus();
         });
-        el.querySelector<HTMLInputElement>(".sim-canid-input")!.addEventListener("input", async (e) => {
-            const wasRunning = entry.running;
-            await stopSim(key);
+        el.querySelector<HTMLInputElement>(".sim-canid-input")!.addEventListener("change", async (e) => {
             entry.canId = parseInt((e.target as HTMLInputElement).value, 16) || 0;
             // An id that doesn't fit in 11 bits can only be an extended frame;
             // reflect that in the checkbox so the UI matches what will be sent.
@@ -3084,7 +3173,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
                 el.querySelector<HTMLInputElement>(".sim-ext-cb")!.checked = true;
             }
             scheduleAutoSave("sim CAN ID changed");
-            if (wasRunning) await startSim(key);
+            await updateRunningSim(key);
         });
         el.querySelector<HTMLInputElement>(".sim-ext-cb")!.addEventListener("change", async (e) => {
             const cb = e.target as HTMLInputElement;
@@ -3095,8 +3184,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             }
             entry.isExtended = cb.checked;
             scheduleAutoSave("sim frame format changed");
-            // Re-register a running periodic so the new frame format takes effect.
-            if (entry.running) { await stopSim(key); await startSim(key); }
+            await updateRunningSim(key);
         });
         el.querySelector<HTMLSelectElement>(".sim-dlc-sel")!.addEventListener("change", async (e) => {
             entry.dlc = parseInt((e.target as HTMLSelectElement).value);
@@ -3113,6 +3201,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         });
         el.querySelectorAll<HTMLInputElement>(".sim-byte").forEach(inp => {
             inp.addEventListener("input", async () => {
+                inp.value = inp.value.replace(/[^a-f0-9]/gi, "");
                 entry.data[parseInt(inp.dataset.idx ?? "0")] = parseInt(inp.value, 16) || 0;
                 scheduleAutoSave("sim data changed");
                 await updateRunningSim(key);
@@ -3127,6 +3216,27 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
         });
     }
 
+    el.querySelector<HTMLSelectElement>(".sim-format-sel")!.addEventListener("change", async e => {
+        entry.format = (e.target as HTMLSelectElement).value === "fd" ? "fd" : "classical";
+        if (entry.format === "classical") entry.brs = false;
+        if (entry.kind === "raw") {
+            if (entry.format === "classical") entry.dlc = Math.min(entry.dlc, 8);
+            if (entry.format === "fd" && entry.data.length < 64) {
+                entry.data = Array.from({ length: 64 }, (_, i) => entry.data[i] ?? 0);
+            }
+        }
+        const replacement = createSimEntryEl(key, entry);
+        el.replaceWith(replacement);
+        replacement.querySelector<HTMLSelectElement>(".sim-format-sel")!.focus();
+        await updateRunningSim(key);
+        updateSimTxStatus();
+        scheduleAutoSave("sim transmit format changed");
+    });
+    el.querySelector<HTMLInputElement>(".sim-brs-cb")!.addEventListener("change", async e => {
+        entry.brs = (e.target as HTMLInputElement).checked;
+        await updateRunningSim(key);
+        scheduleAutoSave("sim BRS changed");
+    });
     el.querySelector(".sim-toggle")!.addEventListener("click", async () => {
         try {
             entry.running || entry.periodicHandle !== null ? await stopSim(key) : await startSim(key);
@@ -3158,6 +3268,12 @@ function simEntryStatus(entry: SimEntry) {
     const unavailable = !ch || ch.available === false ? "Channel disconnected; reconnect it and start capture"
         : ch.config.listen_only ? "Channel is listen-only; sending is disabled"
         : ch.error && !ch.open ? `Channel unavailable: ${ch.error}` : "";
+    const formatError = entry.format === null ? "Select a transmit frame format"
+        : entry.format === "fd" && ch?.config.mode !== "fd" ? "Enable CAN FD on this channel"
+        : entry.kind === "message" && entry.format === "classical" && entry.dlc > 8
+            ? "Message exceeds the Classical CAN frame limit"
+            : entry.kind === "message" && entry.format === "fd" && entry.dlc > 64
+                ? "Message exceeds the CAN FD frame limit" : "";
     let label = "Idle", detail = "";
     if (entry.pendingStops) {
         label = "Stopping";
@@ -3173,6 +3289,9 @@ function simEntryStatus(entry: SimEntry) {
     } else if (unavailable) {
         label = ch?.config.listen_only ? "Listen-only" : "Disconnected";
         detail = `${unavailable}${entry.running ? "; armed" : ""}`;
+    } else if (formatError) {
+        label = "Error";
+        detail = formatError;
     } else if (entry.running) {
         label = "Armed";
         detail = "Waiting for capture to start";
@@ -3181,9 +3300,9 @@ function simEntryStatus(entry: SimEntry) {
     return {
         label, detail, active,
         action: stopping ? (active ? "Stop" : "Disarm") : entry.txError ? "Retry" : appRunning && ch?.open ? "Start" : "Arm",
-        toggleDisabled: busy || (!stopping && !!unavailable),
-        sendDisabled: busy || !!unavailable || !appRunning || !ch?.open,
-        reason: unavailable || (!appRunning || !ch?.open ? "Start capture before sending" : ""),
+        toggleDisabled: busy || (!stopping && !!(unavailable || formatError)),
+        sendDisabled: busy || !!(unavailable || formatError) || !appRunning || !ch?.open,
+        reason: unavailable || formatError || (!appRunning || !ch?.open ? "Start capture before sending" : ""),
     };
 }
 
@@ -3253,7 +3372,8 @@ function addSimMessage(handle: number, msg: DbcMessage) {
 
     const entry: SimMessageEntry = {
         kind: "message", channel: handle,
-        messageId: msg.key ?? msg.id, messageName: msg.name, dlc: msg.dlc,
+        messageId: msg.key ?? msg.id, messageName: msg.name, dlc: msg.dlc, dbcFormat: msg.frame_format,
+        format: defaultSimFormat(msg), brs: false,
         signals: msg.signals.map(s => ({ def: s, value: simDefaultValue(s), gen: null })),
         periodMs: msg.cycle_time_ms ?? 100, running: false, periodicHandle: null,
     };
@@ -3268,7 +3388,7 @@ function addRawFrame() {
     const entry: SimRawEntry = {
         kind: "raw",
         channel: channels.size ? channels.keys().next().value as number : 0,
-        canId: 0x100, isExtended: false, dlc: 8,
+        canId: 0x100, isExtended: false, dlc: 8, format: "classical", brs: false,
         data: new Array(8).fill(0),
         periodMs: 100, running: false, periodicHandle: null,
     };
@@ -3295,9 +3415,9 @@ async function sendSimOnce(key: string) {
     }
     try {
         if (entry.kind === "message") {
-            await invoke("send_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry) } });
+            await invoke("send_message", { cmd: { format: entry.format, brs: entry.brs, channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry) } });
         } else {
-            await invoke("send_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), is_extended: entry.isExtended } });
+            await invoke("send_frame", { cmd: { format: entry.format, brs: entry.brs, channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), is_extended: entry.isExtended } });
         }
     } catch (e) { log("error", `Send error: ${e}`); }
 }
@@ -3331,9 +3451,9 @@ async function startSim(key: string) {
         if (!appRunning || !channels.get(entry.channel)?.open || channels.get(entry.channel)?.config?.listen_only) return;
         try {
             if (entry.kind === "message") {
-                entry.periodicHandle = await invoke<number>("add_periodic_message", { cmd: { channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry), period_ms: entry.periodMs } });
+                entry.periodicHandle = await invoke<number>("add_periodic_message", { cmd: { format: entry.format, brs: entry.brs, channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry), period_ms: entry.periodMs } });
             } else {
-                entry.periodicHandle = await invoke<number>("add_periodic_frame", { cmd: { channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs, is_extended: entry.isExtended } });
+                entry.periodicHandle = await invoke<number>("add_periodic_frame", { cmd: { format: entry.format, brs: entry.brs, channel_handle: entry.channel, can_id: entry.canId, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs, is_extended: entry.isExtended } });
             }
             updateSimTxStatus();
         } catch (e) {
@@ -3371,9 +3491,8 @@ async function stopSim(key: string) {
 
 // Push an edited entry's current values/generators/period to its running
 // backend periodic in place — the send deadline is preserved, so there is no
-// transmission gap or phase reset (unlike stop + start). No-op when the entry
-// isn't registered (app stopped); falls back to a restart if the in-place
-// update fails (e.g. the handle went stale with a channel recovery).
+// transmission gap or phase reset. Rejected edits leave the last valid
+// registration active so users can correct the entry and try again.
 async function updateRunningSim(key: string) {
     const entry = simEntries.get(key);
     if (!entry) return;
@@ -3381,16 +3500,18 @@ async function updateRunningSim(key: string) {
         await queueSimOperation(entry, async () => {
             if (simEntries.get(key) !== entry || !entry.running || entry.periodicHandle === null) return;
             if (entry.kind === "message") {
-                await invoke("update_periodic_message", { cmd: { channel_handle: entry.channel, periodic_handle: entry.periodicHandle, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry), period_ms: entry.periodMs } });
+                await invoke("update_periodic_message", { cmd: { format: entry.format, brs: entry.brs, channel_handle: entry.channel, periodic_handle: entry.periodicHandle, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry), period_ms: entry.periodMs } });
             } else {
-                await invoke("update_periodic_frame", { cmd: { channel_handle: entry.channel, periodic_handle: entry.periodicHandle, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs } });
+                await invoke("update_periodic_frame", { cmd: { format: entry.format, brs: entry.brs, channel_handle: entry.channel, periodic_handle: entry.periodicHandle, can_id: entry.canId, is_extended: entry.isExtended, data: entry.data.slice(0, entry.dlc), period_ms: entry.periodMs } });
             }
+            delete entry.txError;
+            updateSimTxStatus();
         });
     } catch (e) {
         if (!entry.running || simEntries.get(key) !== entry) return;
-        log("warn", `In-place sim update failed (${e}); restarting entry`);
-        await stopSim(key);
-        await startSim(key);
+        entry.txError = `Update failed: ${e}`;
+        log("warn", entry.txError);
+        updateSimTxStatus();
     }
 }
 
@@ -3420,6 +3541,8 @@ function buildProject(): Project {
                 backend: ch.info.backend,
                 dbc_path: ch.config.dbc_path,
                 bitrate: ch.config.bitrate,
+                mode: ch.config.mode,
+                data_bitrate: ch.config.data_bitrate,
                 protocol: ch.config.protocol,
                 listen_only: ch.config.listen_only,
             })),
@@ -3429,6 +3552,8 @@ function buildProject(): Project {
                 backend: g.config.backend,
                 dbc_path: g.config.dbc_path,
                 bitrate: g.config.bitrate,
+                mode: g.config.mode,
+                data_bitrate: g.config.data_bitrate,
                 protocol: g.config.protocol,
                 listen_only: g.config.listen_only,
             })),
@@ -3445,13 +3570,14 @@ function buildProject(): Project {
             .map(e => ({
                 channel: handleToId(e.channel),
                 message_id: e.messageId,
+                format: e.format, brs: e.brs,
                 period_ms: e.periodMs,
                 running: e.running,
                 signals: simMessageSettings(e),
             }))],
         simulate_raw_frames: [...simEntries.values()]
             .filter((e): e is SimRawEntry => e.kind === "raw")
-            .map(e => ({ channel: e.pendingChannelId ?? handleToId(e.channel), can_id: e.canId, is_extended: e.isExtended, dlc: e.dlc, data: e.data, period_ms: e.periodMs, running: e.running })),
+            .map(e => ({ channel: e.pendingChannelId ?? handleToId(e.channel), can_id: e.canId, is_extended: e.isExtended, format: e.format, brs: e.brs, dlc: e.dlc, data: e.data, period_ms: e.periodMs, running: e.running })),
         trace_filters: {
             channels: traceFilterChannels ? [...traceFilterChannels].map(handleToId) : null,
             can_ids: traceFilterCanIds ? [...traceFilterCanIds] : null,
@@ -3605,7 +3731,7 @@ async function applyProject(project: Project) {
     for (const ch of project.channels) {
         const backend = ch.backend ?? "socketcan";
         const bitrate = ch.bitrate ?? null;
-        const config: ChannelConfig = { name: ch.name, display_name: ch.display_name ?? null, backend, dbc_path: ch.dbc_path ?? null, bitrate, protocol: ch.protocol ?? null, listen_only: ch.listen_only ?? false };
+        const config: ChannelConfig = { name: ch.name, display_name: ch.display_name ?? null, backend, dbc_path: ch.dbc_path ?? null, bitrate, mode: ch.mode ?? "classical", data_bitrate: ch.data_bitrate ?? null, protocol: ch.protocol ?? null, listen_only: ch.listen_only ?? false };
         // Any failure keeps the saved config as a ghost — including a name that
         // currently resolves to an already-added channel (a duplicate ghost
         // recovers under its own backend once that hardware appears, since
@@ -3661,9 +3787,9 @@ async function applyProject(project: Project) {
         const entry: SimRawEntry = {
             kind: "raw", channel: rawHandle ?? 0,
             pendingChannelId: rawHandle === undefined ? raw.channel : undefined,
-            canId: raw.can_id, isExtended: raw.is_extended,
+            canId: raw.can_id, isExtended: raw.is_extended, format: raw.format ?? "classical", brs: raw.brs ?? false,
             // Keep every editable byte slot even when the saved payload is short.
-            dlc: raw.dlc, data: Array.from({ length: 8 }, (_, i) => raw.data[i] ?? 0),
+            dlc: raw.dlc, data: Array.from({ length: raw.format === "fd" ? 64 : 8 }, (_, i) => raw.data[i] ?? 0),
             periodMs: raw.period_ms, running: raw.running ?? false, periodicHandle: null,
         };
         simEntries.set(key, entry);
@@ -3813,7 +3939,9 @@ async function restoreProjectEntries() {
             const key = `msg::${++msgEntryCounter}`;
             const simEntry: SimMessageEntry = {
                 kind: "message", channel: handle,
-                messageId: msg.key ?? msg.id, messageName: msg.name, dlc: msg.dlc,
+                messageId: msg.key ?? msg.id, messageName: msg.name, dlc: msg.dlc, dbcFormat: msg.frame_format,
+                format: msg.frame_format ? defaultSimFormat(msg) : m.format ?? defaultSimFormat(msg),
+                brs: (msg.frame_format === "fd" || (!msg.frame_format && m.format === "fd")) && (m.brs ?? false),
                 signals: msg.signals.map(s => ({ def: s, value: valueByName.get(s.name) ?? simDefaultValue(s), gen: genByName.get(s.name) ?? null })),
                 unresolvedSignals: m.signals.filter(s => !msg.signals.some(def => def.name === s.name)),
                 periodMs: m.period_ms, running: m.running ?? false, periodicHandle: null,
@@ -3830,9 +3958,9 @@ async function restoreProjectEntries() {
 }
 
 async function refreshHardware(startCapture = false): Promise<boolean> {
-    let remapped: { old_handle: number; new_handle: number; backend: string; available: boolean }[];
+    let remapped: { old_handle: number; new_handle: number; backend: string; available: boolean; capabilities?: ChannelCapabilities | null }[];
     try {
-        remapped = await invoke<{ old_handle: number; new_handle: number; backend: string; available: boolean }[]>("reload_backends", { startCapture });
+        remapped = await invoke<{ old_handle: number; new_handle: number; backend: string; available: boolean; capabilities?: ChannelCapabilities | null }[]>("reload_backends", { startCapture });
     } catch (e) {
         log("error", `Backend reload failed: ${e}`);
         return false;
@@ -3851,7 +3979,7 @@ async function refreshHardware(startCapture = false): Promise<boolean> {
         if (remap !== undefined && remap.new_handle === oldHandle) {
             renamedIds.set(`${ch.info.backend}:${ch.info.name}`, `${remap.backend}:${ch.info.name}`);
             ch.config.backend = remap.backend;
-            channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend }, open: false, socketcandAttempt: undefined, available: remap.available, error: null });
+            channels.set(remap.new_handle, { ...ch, info: { ...ch.info, backend: remap.backend, capabilities: remap.capabilities }, open: false, socketcandAttempt: undefined, available: remap.available, error: null });
         } else {
             // The destination owns the hardware mapping. The original offline
             // registration still exists and can reconnect under its own backend
@@ -3954,7 +4082,7 @@ function reconcileSimMessages(handle: number) {
             // message. Preserve the user's values, generators and armed state
             // with the other unresolved project entries instead of losing them.
             pendingSimMessages.push({
-                channel: handleToId(handle), message_id: entry.messageId,
+                channel: handleToId(handle), message_id: entry.messageId, format: entry.format, brs: entry.brs,
                 period_ms: entry.periodMs, running: entry.running,
                 signals: settings,
             });
@@ -3969,6 +4097,9 @@ function reconcileSimMessages(handle: number) {
         entry.unresolvedSignals = settings.filter(s => !signalNames.has(s.name));
         entry.messageName = msg.name;
         entry.dlc = msg.dlc;
+        entry.dbcFormat = msg.frame_format;
+        if (msg.frame_format) entry.format = defaultSimFormat(msg);
+        if (entry.format !== "fd") entry.brs = false;
         entry.signals = msg.signals.map(s => ({ def: s, value: prevValues.get(s.name) ?? simDefaultValue(s), gen: prevGens.get(s.name) ?? null }));
         simContainer.querySelector(`[data-sim-key="${key}"]`)?.replaceWith(createSimEntryEl(key, entry));
     }
@@ -4788,6 +4919,10 @@ interface TraceEntry {
     channelHandle: number;
     canId: number;
     isExtended: boolean;
+    format: FrameFormat;
+    brs: boolean;
+    esi: boolean;
+    dbcMessageId?: number | null;
     dlc: number;
     data: number[];
     messageName: string | null;
@@ -4828,7 +4963,8 @@ const TRACE_COL_DEFS: TraceColDef[] = [
     { key: "sa", label: "Src", defaultWidth: 52 },
     { key: "da", label: "Dst", defaultWidth: 52 },
     { key: "msg", label: "Message", defaultWidth: 160 },
-    { key: "dlc", label: "DLC", defaultWidth: 56 },
+    { key: "format", label: "Format", defaultWidth: 118 },
+    { key: "dlc", label: "Bytes", defaultWidth: 56 },
     { key: "data", label: "Data", defaultWidth: 220 },
     { key: "cycle", label: "Cycle (ms)", defaultWidth: 90 },
 ];
@@ -4888,14 +5024,14 @@ let traceFilterCycleMax: number | null = null;
 let traceFilterDlcMin: number | null = null;
 let traceFilterDlcMax: number | null = null;
 let traceFilterDir: Set<string> | null = null;
-type TraceSortCol = "ts" | "dir" | "channel" | "canId" | "pgn" | "prio" | "sa" | "da" | "msg" | "dlc" | "data" | "cycle" | null;
+type TraceSortCol = "ts" | "dir" | "channel" | "canId" | "pgn" | "prio" | "sa" | "da" | "msg" | "format" | "dlc" | "data" | "cycle" | null;
 let traceSortCol: TraceSortCol = null;
 let traceSortDir: "asc" | "desc" = "asc";
 let traceLocalBuffer: TraceEntry[] = [];
 const traceEntryRows = new WeakMap<TraceEntry, HTMLTableRowElement>();
 
-function traceKey(handle: number, canId: number, direction: "rx" | "tx" | "err", isExtended: boolean) {
-    return `${handle}::${canId}::${direction}::${isExtended ? "ext" : "std"}`;
+function traceKey(handle: number, canId: number, direction: "rx" | "tx" | "err", isExtended: boolean, format: FrameFormat = "classical", reassembled = false) {
+    return `${handle}::${canId}::${direction}::${isExtended ? "ext" : "std"}::${reassembled ? "j1939_tp" : format}`;
 }
 
 function fmtId(canId: number, isExtended: boolean): string {
@@ -5071,6 +5207,7 @@ function traceRowSortKey(tr: HTMLTableRowElement, col: Exclude<TraceSortCol, nul
         case "sa": return parseInt(tr.dataset.sa ?? "-1");
         case "da": return parseInt(tr.dataset.da ?? "-1");
         case "msg": return tr.dataset.msg ?? "";
+        case "format": return tr.querySelector('[data-col="format"]')?.textContent ?? "";
         case "dlc": return parseInt(tr.dataset.dlc ?? "0");
         case "data": return JSON.parse(tr.dataset.bytes ?? "[]");
         // Missing cycle sorts last ascending (first descending), as before.
@@ -5141,7 +5278,15 @@ function buildTraceCellHtml(key: string, entry: TraceEntry): string {
         case "canId": return `<td data-col="canId" class="td-canid">${entry.reassembled ? `<span class="tp-badge" data-tip="Reassembled from J1939 TP.CM/TP.DT — this frame did not appear on the bus in this form">${fmtId(entry.canId, entry.isExtended)}</span>` : fmtId(entry.canId, entry.isExtended)}</td>`;
         case "msg": return entry.error
             ? `<td data-col="msg" class="td-msg-err">${escapeHtml(entry.error)}</td>`
-            : `<td data-col="msg">${entry.messageName ?? "<em style='color:var(--text-muted)'>-</em>"}</td>`;
+            : `<td data-col="msg">${entry.messageName !== null ? escapeHtml(entry.messageName) : "<em style='color:var(--text-muted)'>-</em>"}</td>`;
+        case "format": {
+            const label = entry.reassembled ? "J1939 TP" : entry.direction === "err" ? "Error" : entry.format === "fd"
+                ? ["FD", entry.brs ? "BRS" : "", entry.esi ? "ESI" : ""].filter(Boolean).join(" · ") : "Classical CAN";
+            const tip = entry.format === "fd"
+                ? `CAN FD · BRS ${entry.brs ? "on" : "off"}${entry.direction === "rx" ? ` · ESI ${entry.esi ? "set (error passive)" : "clear (error active)"}` : ""}`
+                : label;
+            return `<td data-col="format" data-tip="${tip}">${label}</td>`;
+        }
         case "dlc": return `<td data-col="dlc">${entry.dlc}</td>`;
         case "data": return `<td data-col="data" class="td-data">${fmtData(entry.data)}</td>`;
         case "cycle": return `<td data-col="cycle" class="td-cycle">${entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—"}</td>`;
@@ -5155,6 +5300,10 @@ function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
         channelHandle: parseInt(tr.dataset.channelHandle ?? "0"),
         canId: parseInt(tr.dataset.canid ?? "0"),
         isExtended: tr.dataset.ext === "1",
+        format: tr.dataset.format === "fd" ? "fd" : "classical",
+        brs: tr.dataset.brs === "1",
+        esi: tr.dataset.esi === "1",
+        dbcMessageId: tr.dataset.dbcMessageId !== undefined ? Number(tr.dataset.dbcMessageId) : undefined,
         timestampMs: parseInt(tr.dataset.ts ?? "0"),
         direction: (tr.dataset.dir as "rx" | "tx" | "err") ?? "rx",
         messageName: tr.dataset.msg || null,
@@ -5186,6 +5335,11 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
     tr.dataset.dir = entry.direction;
     tr.dataset.msg = entry.messageName ?? "";
     tr.dataset.dlc = String(entry.dlc);
+    tr.dataset.format = entry.format;
+    tr.dataset.brs = entry.brs ? "1" : "0";
+    tr.dataset.esi = entry.esi ? "1" : "0";
+    if (entry.dbcMessageId != null) tr.dataset.dbcMessageId = String(entry.dbcMessageId);
+    else delete tr.dataset.dbcMessageId;
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
     if (entry.reassembled) tr.dataset.reassembled = "1";
     if (entry.error) tr.dataset.err = entry.error;
@@ -5206,27 +5360,33 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     tr.dataset.bytes = JSON.stringify(entry.data);
     tr.dataset.ts = String(entry.timestampMs);
     tr.dataset.dlc = String(entry.dlc);
+    tr.dataset.format = entry.format;
+    tr.dataset.brs = entry.brs ? "1" : "0";
+    tr.dataset.esi = entry.esi ? "1" : "0";
+    if (entry.dbcMessageId != null) tr.dataset.dbcMessageId = String(entry.dbcMessageId);
+    else delete tr.dataset.dbcMessageId;
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
     if (entry.reassembled) tr.dataset.reassembled = "1"; else delete tr.dataset.reassembled;
+    tr.dataset.msg = entry.messageName ?? "";
+    tr.classList.toggle("dbc-match", entry.messageName !== null);
     tr.style.display = traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName, entry.j1939) ? "" : "none";
     const gc = (k: string) => tr.querySelector<HTMLTableCellElement>(`[data-col="${k}"]`);
     const tsCell = gc("ts"); if (tsCell) tsCell.textContent = fmtElapsed(entry.timestampMs);
+    const formatCell = gc("format"); if (formatCell) formatCell.outerHTML = buildTraceCellHtml("format", entry);
     const dlcCell = gc("dlc"); if (dlcCell) dlcCell.textContent = String(entry.dlc);
     const dataCell = gc("data"); if (dataCell) dataCell.textContent = fmtData(entry.data);
     const cycleCell = gc("cycle"); if (cycleCell) cycleCell.textContent = entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—";
     const canIdCell = gc("canId"); if (canIdCell) canIdCell.outerHTML = buildTraceCellHtml("canId", entry);
-    // Error rows share one overwrite key per channel but the description can
-    // differ from frame to frame — keep the Message cell current.
-    if (entry.error) {
-        tr.dataset.err = entry.error;
-        const msgCell = gc("msg"); if (msgCell) msgCell.textContent = entry.error;
-    }
+    const msgCell = gc("msg"); if (msgCell) msgCell.outerHTML = buildTraceCellHtml("msg", entry);
+    if (entry.error) tr.dataset.err = entry.error;
 
     // Refresh open expansion row with updated signal values + current min/max
     const next = tr.nextElementSibling as HTMLTableRowElement | null;
     if (next?.dataset.expand) {
-        const msg = dbcMessageFor(entry.channelHandle, entry.canId, entry.isExtended);
-        if (msg) {
+        const msg = dbcMessageFor(entry.channelHandle, entry.canId, entry.isExtended, entry.dbcMessageId);
+        if (!msg || next.dataset.msgid !== String(msg.key ?? msg.id)) {
+            collapseTraceRow(tr, next);
+        } else {
             const vals = entry.signals; // interleaved [value, raw], index-aligned with msg.signals
             const valCells = next.querySelectorAll<HTMLElement>(".te-val");
             const minCells = next.querySelectorAll<HTMLElement>(".te-min");
@@ -5277,11 +5437,9 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
             }
         }
         const isError = ev.error != null;
-        // Message identity comes from the frontend's copy of the DBC (the event
-        // carries no strings); both sides parsed the same file at open. On J1939
-        // channels the lookup falls back to PGN + source-address matching,
-        // mirroring the backend. Error frames have no identifier to decode.
-        const msg = isError ? null : dbcMessageFor(ev.channel_handle, ev.can_id, ev.is_extended);
+        // Rust supplies the decoded DBC identity. Resolve it against the same
+        // DBC here to get names and units for the interleaved signal values.
+        const msg = isError ? null : dbcMessageFor(ev.channel_handle, ev.can_id, ev.is_extended, ev.dbc_message_id);
         const messageName = msg?.name ?? null;
 
         // Update seen sets (for filter autocomplete) and cycle timing. Error
@@ -5303,7 +5461,7 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
         }
 
         const direction = ev.direction ?? "rx";
-        const key = traceKey(ev.channel_handle, ev.can_id, direction, ev.is_extended);
+        const key = traceKey(ev.channel_handle, ev.can_id, direction, ev.is_extended, ev.format, ev.reassembled);
         const prev = traceLastTs.get(key);
         const cycleTime = prev != null ? ev.timestamp_ms - prev : null;
         traceLastTs.set(key, ev.timestamp_ms);
@@ -5345,6 +5503,10 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
             channelHandle: ev.channel_handle,
             canId: ev.can_id,
             isExtended: ev.is_extended,
+            format: ev.format ?? "classical",
+            brs: ev.brs ?? false,
+            esi: ev.esi ?? false,
+            dbcMessageId: ev.dbc_message_id,
             dlc: ev.dlc,
             data: ev.data,
             messageName,
@@ -5437,7 +5599,7 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
 // message's signal order and fill the gaps with null pairs, mirroring the
 // live-event layout.
 function interleaveFrameSignals(f: FrameInfo): (number | null)[] {
-    const msg = dbcMessageFor(f.channel_handle, f.can_id, f.is_extended);
+    const msg = dbcMessageFor(f.channel_handle, f.can_id, f.is_extended, f.dbc_message_id);
     if (!msg || (msg.signals.length === f.signals.length && msg.signals.every((sig, i) => sig.name === f.signals[i].name))) {
         return f.signals.flatMap(s => [s.value, s.raw]);
     }
@@ -5458,7 +5620,7 @@ async function loadTraceFrames() {
     const cycleTimes = new Map<string, number>();
     // Backend returns oldest-first; we want newest-first in traceLocalBuffer.
     traceLocalBuffer = frames.map(f => {
-        const k = traceKey(f.channel_handle, f.can_id, f.direction, f.is_extended);
+        const k = traceKey(f.channel_handle, f.can_id, f.direction, f.is_extended, f.format, f.reassembled);
         const prev = cycleTimes.get(k);
         const cycleTimeMs = prev != null ? f.timestamp_ms - prev : null;
         cycleTimes.set(k, f.timestamp_ms);
@@ -5478,6 +5640,10 @@ async function loadTraceFrames() {
             channelHandle: f.channel_handle,
             canId: f.can_id,
             isExtended: f.is_extended,
+            format: f.format ?? "classical",
+            brs: f.brs ?? false,
+            esi: f.esi ?? false,
+            dbcMessageId: f.dbc_message_id,
             dlc: f.dlc,
             data: f.data,
             messageName: f.message_name,
@@ -5557,15 +5723,15 @@ function traceFilterCriteria(): { key: string; text: string; clear: () => void }
     addSet("da", "Destination", traceFilterDas, j1939(v => v === 255 ? "All (FFh)" : fmtJ1939Addr(v)), () => { traceFilterDas = null; });
     if (traceFilterBroadcast !== null) criteria.push({ key: "broadcast", text: `PGN type: ${traceFilterBroadcast ? "Broadcast" : "Destination-specific"}`, clear: () => { traceFilterBroadcast = null; } });
     for (const [key, label, value, clear] of [
-        ["dlc-min", "DLC ≥", traceFilterDlcMin, () => { traceFilterDlcMin = null; }],
-        ["dlc-max", "DLC ≤", traceFilterDlcMax, () => { traceFilterDlcMax = null; }],
+        ["dlc-min", "Bytes ≥", traceFilterDlcMin, () => { traceFilterDlcMin = null; }],
+        ["dlc-max", "Bytes ≤", traceFilterDlcMax, () => { traceFilterDlcMax = null; }],
         ["cycle-min", "Cycle (ms) ≥", traceFilterCycleMin, () => { traceFilterCycleMin = null; }],
         ["cycle-max", "Cycle (ms) ≤", traceFilterCycleMax, () => { traceFilterCycleMax = null; }],
     ] as const) {
         if (value !== null) criteria.push({ key, text: `${label} ${value}`, clear });
     }
     traceFilterData.forEach((value, i) => {
-        if (value !== null) criteria.push({ key: `data-${i}`, text: `Data byte ${i}: 0x${value.toString(16).toUpperCase().padStart(2, "0")}`, clear: () => { traceFilterData[i] = null; } });
+        if (value !== null) criteria.push({ key: `data-${i}`, text: `Data byte ${i + 1}: 0x${value.toString(16).toUpperCase().padStart(2, "0")}`, clear: () => { traceFilterData[i] = null; } });
     });
     return criteria;
 }
@@ -5991,8 +6157,8 @@ function setupTraceHeaders() {
                 menu.appendChild(fmtRow);
                 const sep = document.createElement("div"); sep.className = "data-filter-sep"; menu.appendChild(sep);
 
-                // How many data byte positions to filter on. Default 8; raise it
-                // to match reassembled J1939 transport messages (dlc > 8).
+                // Start with eight filter positions and allow up to 64 for
+                // CAN FD and long J1939 transport messages.
                 const countRow = document.createElement("div"); countRow.className = "range-filter-row";
                 const countLbl = document.createElement("span"); countLbl.className = "range-filter-lbl"; countLbl.textContent = "Bytes:";
                 const countInp = document.createElement("input");
@@ -6011,10 +6177,10 @@ function setupTraceHeaders() {
                     inputs.length = 0;
                     for (let idx = 0; idx < traceFilterData.length; idx++) {
                         const cell = document.createElement("div"); cell.className = "data-filter-cell";
-                        const lbl = document.createElement("span"); lbl.className = "data-filter-lbl"; lbl.textContent = String(idx);
+                        const lbl = document.createElement("span"); lbl.className = "data-filter-lbl"; lbl.textContent = String(idx + 1);
                         const inp = document.createElement("input");
                         inp.type = "text"; inp.className = "data-filter-inp"; inp.placeholder = "—"; inp.maxLength = 4;
-                        inp.setAttribute("aria-label", `Data byte ${idx}`);
+                        inp.setAttribute("aria-label", `Data byte ${idx + 1}`);
                         const cur = traceFilterData[idx];
                         if (cur !== null) inp.value = cur.toString(16).toUpperCase().padStart(2, "0");
                         inp.addEventListener("input", () => {
@@ -6067,7 +6233,7 @@ function setupTraceHeaders() {
         } else if (key === "dlc") {
             onFilterOpen((e) => {
                 e.preventDefault();
-                showRangeFilterMenu(e.clientX, e.clientY, "DLC", traceFilterDlcMin, traceFilterDlcMax, (mn, mx) => {
+                showRangeFilterMenu(e.clientX, e.clientY, "Bytes", traceFilterDlcMin, traceFilterDlcMax, (mn, mx) => {
                     traceFilterDlcMin = mn; traceFilterDlcMax = mx; syncFilteredHeaders(); applyTraceFilter();
                 });
             });
@@ -6278,7 +6444,7 @@ function expandTraceRow(tr: HTMLTableRowElement) {
 
     const trHandle = parseInt(tr.dataset.channelHandle ?? "0");
     const canId = parseInt(tr.dataset.canid ?? "0");
-    const msg = dbcMessageFor(trHandle, canId, tr.dataset.ext === "1");
+    const msg = dbcMessageFor(trHandle, canId, tr.dataset.ext === "1", tr.dataset.dbcMessageId !== undefined ? Number(tr.dataset.dbcMessageId) : undefined);
     if (!msg) return;
     // Interleaved [value, raw] pairs, index-aligned with msg.signals.
     const vals = traceRowSignals.get(tr) ?? [];
@@ -6722,7 +6888,7 @@ function renderBusStats(stats: BusStats[]) {
         const load = s.bus_load?.toFixed(1);
         const tipLines = [
             channelName(s.channel_handle),
-            load == null ? "Bus load unavailable (bitrate unknown)" : `Bus load: ${load} % (estimated)`,
+            load == null ? (channels.get(s.channel_handle)?.config.mode === "fd" ? "Bus load estimate unavailable for CAN FD" : "Bus load unavailable (bitrate unknown)") : `Bus load: ${load} % (estimated)`,
             `RX: ${s.rx_fps.toFixed(0)} f/s · TX: ${s.tx_fps.toFixed(0)} f/s`,
             `Error frames: ${s.error_frames}`,
         ];
@@ -6950,6 +7116,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     });
     document.getElementById("btn-channel-cancel")!.addEventListener("click", () => chanDialog.close());
     document.getElementById("form-channel")!.addEventListener("submit", async (e) => { e.preventDefault(); await applyChannelDialog(); });
+
+    document.getElementById("select-can-mode")!.addEventListener("change", updateChannelTimingInDialog);
 
     // Bitrate custom field toggle
     document.getElementById("select-bitrate")!.addEventListener("change", (e) => {

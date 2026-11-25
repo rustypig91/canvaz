@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
 use can_dbc::{
-    AttributeValue, ByteOrder, Comment, Dbc, MessageId, MultiplexIndicator, NumericValue, SignalExtendedValueType,
+    AttributeDefinition, AttributeValue, AttributeValueType, ByteOrder, Comment, Dbc, MessageId, MultiplexIndicator, NumericValue, SignalExtendedValueType,
     ValueType,
 };
 use serde::{Deserialize, Serialize};
 
-use crate::can_communication::CanFrame;
+use crate::can_communication::{CanFrame, FrameFormat, FD_LENGTHS};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedDbc {
@@ -28,6 +28,14 @@ pub struct ParsedDbc {
     pub nodes: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DbcFrameFormat {
+    Classical,
+    Fd,
+    J1939,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedMessage {
     /// Stable application identity; `id` remains the actual wire identifier.
@@ -35,6 +43,8 @@ pub struct ParsedMessage {
     pub id: u32,
     pub name: String,
     pub dlc: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_format: Option<DbcFrameFormat>,
     /// 29-bit (extended) frame format, from bit 31 of the DBC's raw id. Kept
     /// separate from the id value: a 29-bit message whose id happens to be
     /// ≤ 0x7FF is legal and must still be sent as an extended frame.
@@ -132,9 +142,44 @@ pub fn message_key(can_id: u32, is_extended: bool) -> u32 {
 }
 
 impl ParsedMessage {
+    pub fn wire_format(&self) -> Option<FrameFormat> {
+        match self.frame_format {
+            Some(DbcFrameFormat::Classical | DbcFrameFormat::J1939) => Some(FrameFormat::Classical),
+            Some(DbcFrameFormat::Fd) => Some(FrameFormat::Fd),
+            None => None,
+        }
+    }
+
+    pub fn transmit_length(&self, format: FrameFormat) -> Result<usize, String> {
+        if self.wire_format().is_some_and(|declared| declared != format) {
+            return Err(format!("The DBC specifies a different frame format for {}", self.name));
+        }
+        let len = self.dlc as usize;
+        match format {
+            FrameFormat::Classical if len <= 8 => Ok(len),
+            FrameFormat::Classical => Err(format!("{} exceeds the 8-byte Classical CAN frame limit", self.name)),
+            FrameFormat::Fd => FD_LENGTHS.into_iter().find(|&wire_len| wire_len >= len)
+                .ok_or_else(|| format!("{} exceeds the 64-byte CAN FD frame limit", self.name)),
+        }
+    }
+
+    fn matches_payload(&self, frame: &CanFrame, reassembled: bool) -> bool {
+        if self.dlc > frame.data.len() as u64 {
+            return false;
+        }
+        if reassembled {
+            return self.dlc > 8 && matches!(self.frame_format, None | Some(DbcFrameFormat::J1939));
+        }
+        self.wire_format().is_none_or(|format| format == frame.metadata.format)
+            && (frame.metadata.format == FrameFormat::Fd || self.dlc <= 8)
+    }
+
     pub fn decode_frame(&self, frame: &CanFrame) -> Result<DecodedCanMessage, String> {
         if frame.can_id != self.id || frame.is_extended != self.is_extended {
             return Err(format!("Frame CAN ID {} does not match message ID {}", frame.can_id, self.id));
+        }
+        if !self.matches_payload(frame, false) {
+            return Err("Frame format or byte length does not match the DBC message".into());
         }
         Ok(self.decode_data(&frame.data))
     }
@@ -279,6 +324,17 @@ impl ParsedDbc {
             .filter(|a| a.name == "GenMsgCycleTime")
             .filter_map(|a| attribute_to_f64(&a.value).map(|v| (a.message_id, v)))
             .collect();
+        let frame_formats = dbc.attribute_definitions.iter().find_map(|definition| match definition {
+            AttributeDefinition::Message(name, AttributeValueType::Enum(variants)) if name == "VFrameFormat" =>
+                Some(variants.as_slice()),
+            _ => None,
+        });
+        let default_format = dbc.attribute_defaults.iter().find(|attribute| attribute.name == "VFrameFormat")
+            .and_then(|attribute| dbc_frame_format(&attribute.value, frame_formats));
+        let explicit_formats: HashMap<_, _> = dbc.attribute_values_message.iter()
+            .filter(|attribute| attribute.name == "VFrameFormat")
+            .map(|attribute| (attribute.message_id, dbc_frame_format(&attribute.value, frame_formats)))
+            .collect();
         let sig_start_values: HashMap<(MessageId, &str), f64> = dbc
             .attribute_values_signal
             .iter()
@@ -406,6 +462,12 @@ impl ParsedDbc {
                     id: raw_id,
                     name: msg_name,
                     dlc: msg.size,
+                    // A generic Classical default is common in DBCs
+                    // containing long J1939 definitions. Only a per-message
+                    // assignment can explicitly declare Classical for those.
+                    frame_format: explicit_formats.get(&msg.id).copied().unwrap_or_else(|| {
+                        default_format.filter(|format| msg.size <= 8 || *format != DbcFrameFormat::Classical)
+                    }),
                     is_extended,
                     signals,
                     transmitter,
@@ -421,7 +483,7 @@ impl ParsedDbc {
 
         self.pgn_index = messages
             .values()
-            .filter(|m| m.is_extended)
+            .filter(|m| m.is_extended && m.wire_format() != Some(FrameFormat::Fd))
             .map(|m| {
                 let j = crate::j1939::decode_id(m.id);
                 ((j.pgn << 8) | j.sa as u32, m.key)
@@ -443,16 +505,19 @@ impl ParsedDbc {
     /// groups, the destination address. Returns the decoded message and the
     /// DBC message id it matched, which callers store so signal-history
     /// queries keyed on the DBC id can find these frames.
-    pub fn decode_frame_j1939(&self, frame: &CanFrame) -> Option<(DecodedCanMessage, u32)> {
-        if let Some(msg) = self.messages.get(&message_key(frame.can_id, frame.is_extended)) {
+    pub fn decode_frame_j1939(&self, frame: &CanFrame, reassembled: bool) -> Option<(DecodedCanMessage, u32)> {
+        if let Some(msg) = self.messages.get(&message_key(frame.can_id, frame.is_extended))
+            .filter(|msg| msg.matches_payload(frame, reassembled))
+        {
             return Some((msg.decode_data(&frame.data), msg.key));
         }
-        if !frame.is_extended {
+        if !frame.is_extended || frame.metadata.format == FrameFormat::Fd {
             return None;
         }
         let j = crate::j1939::decode_id(frame.can_id);
         let key = (j.pgn << 8) | j.sa as u32;
-        let msg = self.pgn_index.get(&key).and_then(|id| self.messages.get(id))?;
+        let msg = self.pgn_index.get(&key).and_then(|id| self.messages.get(id))
+            .filter(|msg| msg.matches_payload(frame, reassembled))?;
         Some((msg.decode_data(&frame.data), msg.key))
     }
 
@@ -565,6 +630,21 @@ pub(crate) fn pack_bits(data: &mut [u8], raw: u64, start_bit: u64, length: u64, 
 
 /// Numeric view of a `BA_` attribute value. DBC tools disagree on whether
 /// numeric attributes are written quoted or bare, so parse strings too.
+fn dbc_frame_format(value: &AttributeValue, variants: Option<&[String]>) -> Option<DbcFrameFormat> {
+    let label = match value {
+        AttributeValue::String(label) => label,
+        AttributeValue::Uint(index) => variants?.get(usize::try_from(*index).ok()?)?,
+        AttributeValue::Int(index) => variants?.get(usize::try_from(*index).ok()?)?,
+        _ => return None,
+    };
+    match label.to_ascii_lowercase().as_str() {
+        "standardcan_fd" | "extendedcan_fd" | "standardcanfd" | "extendedcanfd" => Some(DbcFrameFormat::Fd),
+        "standardcan" | "extendedcan" => Some(DbcFrameFormat::Classical),
+        "j1939pg" | "j1939" => Some(DbcFrameFormat::J1939),
+        _ => None,
+    }
+}
+
 fn attribute_to_f64(v: &AttributeValue) -> Option<f64> {
     match v {
         AttributeValue::Uint(n) => Some(*n as f64),
@@ -634,6 +714,58 @@ mod tests {
         assert!(integer_dbc(64, 0, 1, '+', 1785).is_ok());
     }
 
+    #[test]
+    fn dbc_frame_format_distinguishes_fd_and_j1939_and_rounds_wire_size() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("mixed.dbc");
+        std::fs::write(&path, r#"VERSION ""
+
+NS_ :
+
+BS_:
+
+BU_:
+
+BO_ 291 ShortFd: 2 Vector__XXX
+ SG_ ShortValue : 8|8@1+ (1,0) [0|255] "" Vector__XXX
+
+BO_ 292 LongFd: 10 Vector__XXX
+ SG_ Late : 72|8@1+ (1,0) [0|255] "" Vector__XXX
+
+BO_ 2364531712 Transport: 10 Vector__XXX
+ SG_ Late : 72|8@1+ (1,0) [0|255] "" Vector__XXX
+
+BA_DEF_ BO_ "VFrameFormat" ENUM "StandardCAN","StandardCAN_FD","J1939PG";
+BA_DEF_DEF_ "VFrameFormat" "StandardCAN";
+BA_ "VFrameFormat" BO_ 291 1;
+BA_ "VFrameFormat" BO_ 292 1;
+BA_ "VFrameFormat" BO_ 2364531712 2;
+"#).unwrap();
+        let dbc = ParsedDbc::new(path.to_str().unwrap()).unwrap();
+        let mut short = CanFrame {
+            metadata: Default::default(), can_id: 291, is_extended: false,
+            data: vec![0xCA, 0xDB], timestamp_ms: None, error: None,
+        };
+        assert!(dbc.decode_frame(&short).is_none());
+        short.metadata.format = FrameFormat::Fd;
+        assert_eq!(dbc.decode_frame(&short).unwrap().signals[0].raw, 0xDB);
+        let long = &dbc.messages[&292];
+        assert_eq!(long.transmit_length(FrameFormat::Fd).unwrap(), 12);
+        assert!(long.transmit_length(FrameFormat::Classical).is_err());
+        let bytes = long.encode_signals(&HashMap::from([("Late".into(), 0xAB as f64)]));
+        assert_eq!(bytes[9], 0xAB);
+        let id = 2364531712u32 & 0x1FFF_FFFF;
+        let transport = &dbc.messages[&id];
+        assert!(transport.transmit_length(FrameFormat::Fd).is_err());
+        let mut reassembled = CanFrame {
+            metadata: Default::default(), can_id: id, is_extended: true,
+            data: bytes, timestamp_ms: None, error: None,
+        };
+        assert_eq!(dbc.decode_frame_j1939(&reassembled, true).unwrap().0.signals[0].raw, 0xAB);
+        reassembled.metadata.format = FrameFormat::Fd;
+        assert!(dbc.decode_frame_j1939(&reassembled, false).is_none());
+    }
+
     /// Parse a minimal J1939 DBC (one message, PGN 0xF004, SA 0x00) written to
     /// a temp file, since ParsedDbc only constructs from disk.
     fn j1939_dbc() -> ParsedDbc {
@@ -651,6 +783,7 @@ mod tests {
 
     fn frame(can_id: u32) -> CanFrame {
         CanFrame {
+            metadata: Default::default(),
             can_id,
             is_extended: true,
             data: vec![0; 8],
@@ -691,7 +824,7 @@ mod tests {
             let decoded = dbc.decode_frame(&raw).unwrap();
             assert_eq!(decoded.name, expected_name);
             assert_eq!(decoded.signals[0].physical, expected_value);
-            assert_eq!(dbc.decode_frame_j1939(&raw).unwrap().1, key);
+            assert_eq!(dbc.decode_frame_j1939(&raw, false).unwrap().1, key);
             raw.is_extended = !extended;
             assert!(msg.decode_frame(&raw).is_err(), "opposite frame format must not decode");
         }
@@ -844,12 +977,12 @@ mod tests {
     fn j1939_match_ignores_priority_but_not_source_address() {
         let dbc = j1939_dbc();
         // Same PGN and SA, different priority (6 instead of 3): must match.
-        let hit = dbc.decode_frame_j1939(&frame(0x18F00400));
+        let hit = dbc.decode_frame_j1939(&frame(0x18F00400), false);
         assert!(hit.is_some(), "same PGN+SA with different priority should match");
         assert_eq!(hit.unwrap().0.name, "EEC1");
         // Same PGN from a different source address: must NOT match.
         assert!(
-            dbc.decode_frame_j1939(&frame(0x18F00417)).is_none(),
+            dbc.decode_frame_j1939(&frame(0x18F00417), false).is_none(),
             "same PGN from another source address must not match"
         );
     }
