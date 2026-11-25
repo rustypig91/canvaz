@@ -204,12 +204,13 @@ fn pcan_baud(hz: u32) -> Option<TPCANBaudrate> {
 }
 
 fn pcan_err(s: TPCANStatus) -> String {
-    let desc = match s & !PCAN_ERROR_ANYBUSERR {
+    let desc = match s {
         0x00001 => "TX buffer full",
         0x00002 => "RX overrun",
-        0x00004 => "bus light error",
-        0x00008 => "bus heavy error",
-        0x00010 => "bus off",
+        PCAN_ERROR_BUSLIGHT => "bus light error",
+        PCAN_ERROR_BUSHEAVY => "bus heavy error",
+        PCAN_ERROR_BUSOFF => "bus off",
+        PCAN_ERROR_BUSPASSIVE => "bus passive",
         0x00020 => "RX queue empty",
         0x00200 => "no driver loaded",
         0x00400 => "hardware in use",

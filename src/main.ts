@@ -1848,14 +1848,14 @@ function updateChannelTimingInDialog() {
     document.getElementById("error-can-timing")!.textContent = "";
 }
 
-function updateChannelInterfaceInDialog(backend: string, name: string, capabilities?: ChannelCapabilities | null) {
+function updateChannelInterfaceInDialog(backend: string, name: string, capabilities?: ChannelCapabilities | null, preserveConfiguredFd = false) {
     const remote = backend === "socketcand";
     const virtual = backend === "socketcan" && (capabilities?.external_timing ?? name.startsWith("vcan"));
     dialogExternalTiming = remote || virtual;
     document.getElementById("row-bitrate")!.style.display = dialogExternalTiming ? "none" : "";
     const mode = document.getElementById("select-can-mode") as HTMLSelectElement;
     if (!mode.options[1].disabled) dialogCanMode = mode.value === "fd" ? "fd" : "classical";
-    mode.options[1].disabled = remote || capabilities?.fd === false;
+    mode.options[1].disabled = remote || (capabilities?.fd === false && !preserveConfiguredFd);
     mode.value = mode.options[1].disabled ? "classical" : dialogCanMode;
     document.getElementById("hint-can-mode")!.textContent = capabilities?.fd_limitation
         ?? (remote ? "Socketcand supports Classical CAN. Timing is configured by the server."
@@ -1956,7 +1956,11 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
             socketcandInput.value = selectedSocketcand === undefined
                 ? "" : socketcandDrafts.get(selectedSocketcand) ?? iface?.name ?? "";
             setSocketcandAddressError("");
-            updateChannelInterfaceInDialog(backend, iface?.name ?? "", iface?.capabilities);
+            // Driver support can change after a project was saved. Keep an
+            // existing FD configuration editable when its assignment is unchanged.
+            const preserveConfiguredFd = ch?.config.mode === "fd"
+                && ch.info.backend === backend && ch.info.name === iface?.name;
+            updateChannelInterfaceInDialog(backend, iface?.name ?? "", iface?.capabilities, preserveConfiguredFd);
         };
         sel.onchange = updateAssignment;
         dialogPendingDbc = ch?.config.dbc_path ?? null;
@@ -3112,6 +3116,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
 
     } else {
         const idHex = entry.canId.toString(16).toUpperCase().padStart(3, "0");
+        const lengths = entry.format === "fd" ? FD_LENGTHS : FD_LENGTHS.slice(0, 9);
         const pendingChannelOption = entry.pendingChannelId
             ? `<option value="" selected disabled>${escapeHtml(entry.pendingChannelId)}</option>`
             : "";
@@ -3135,14 +3140,15 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
       <div class="sim-group-body">
         <div class="sim-raw-data-row">
           <span class="label-muted">ID</span>
-          <input type="text" class="sim-canid-input small-input" aria-label="CAN ID in hexadecimal" value="${idHex}" maxlength="8" placeholder="hex">
+          <input type="text" class="sim-canid-input small-input" aria-label="CAN ID in hexadecimal" value="${idHex}" maxlength="10" placeholder="hex">
           <label class="sim-ext-label label-muted"><input type="checkbox" class="sim-ext-cb"${entry.isExtended ? " checked" : ""}> Ext</label>
           ${simFormatControls(entry)}
         </div>
         <div class="sim-raw-data-row">
           <span class="label-muted">Bytes</span>
           <select class="sim-dlc-sel" aria-label="Data length">
-            ${(entry.format === "fd" ? FD_LENGTHS : FD_LENGTHS.slice(0, 9)).map(n => `<option value="${n}"${n === entry.dlc ? " selected" : ""}>${n}</option>`).join("")}
+            ${lengths.includes(entry.dlc) ? "" : '<option value="" disabled selected>Select length</option>'}
+            ${lengths.map(n => `<option value="${n}"${n === entry.dlc ? " selected" : ""}>${n}</option>`).join("")}
           </select>
           <span class="label-muted">Data</span>
           <div class="sim-bytes">
@@ -3162,7 +3168,16 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
             updateSimTxStatus();
         });
         el.querySelector<HTMLInputElement>(".sim-canid-input")!.addEventListener("change", async (e) => {
-            entry.canId = parseInt((e.target as HTMLInputElement).value, 16) || 0;
+            const input = e.target as HTMLInputElement;
+            const typedId = input.value.trim();
+            const canId = /^(?:0x)?[0-9a-f]{1,8}$/i.test(typedId) ? parseInt(typedId, 16) : NaN;
+            if (!Number.isInteger(canId) || canId > 0x1FFFFFFF) {
+                input.value = entry.canId.toString(16).toUpperCase().padStart(3, "0");
+                log("warn", "Enter a hexadecimal CAN ID from 0 to 1FFFFFFF");
+                return;
+            }
+            entry.canId = canId;
+            input.value = canId.toString(16).toUpperCase().padStart(3, "0");
             // An id that doesn't fit in 11 bits can only be an extended frame;
             // reflect that in the checkbox so the UI matches what will be sent.
             if (entry.canId > 0x7FF && !entry.isExtended) {
@@ -3190,6 +3205,7 @@ function createSimEntryEl(key: string, entry: SimEntry): HTMLElement {
                 inp.disabled = i >= entry.dlc;
             });
             await updateRunningSim(key);
+            updateSimTxStatus();
         });
         el.querySelector<HTMLInputElement>(".sim-period")!.addEventListener("input", async (e) => {
             entry.periodMs = parseInt((e.target as HTMLInputElement).value) || 100;
@@ -3257,6 +3273,25 @@ function renderSimEntries() {
 
 // ── Sim actions ───────────────────────────────────────────────────────────────
 
+function simFormatError(entry: SimEntry, channelMode?: FrameFormat): string {
+    if (entry.format === null) return "Select a transmit frame format";
+    if (entry.format === "fd" && channelMode !== "fd") return "Enable CAN FD on this channel";
+
+    if (entry.kind === "raw") {
+        const validLength = FD_LENGTHS.includes(entry.dlc) && (entry.format === "fd" || entry.dlc <= 8);
+        if (!validLength) return "Select a valid payload length";
+    } else {
+        if (entry.format === "classical" && entry.dlc > 8) return "Message exceeds the Classical CAN frame limit";
+        if (entry.format === "fd" && entry.dlc > 64) return "Message exceeds the CAN FD frame limit";
+    }
+    return "";
+}
+
+function canRegisterSim(entry: SimEntry): boolean {
+    const channel = channels.get(entry.channel);
+    return appRunning && !!channel?.open && !channel.config.listen_only && !simFormatError(entry, channel.config.mode);
+}
+
 // Use the same confirmed registration as the footer, including while removal is pending.
 function simEntryStatus(entry: SimEntry) {
     const ch = channels.get(entry.channel);
@@ -3265,12 +3300,7 @@ function simEntryStatus(entry: SimEntry) {
     const unavailable = !ch || ch.available === false ? "Channel disconnected; reconnect it and start capture"
         : ch.config.listen_only ? "Channel is listen-only; sending is disabled"
         : ch.error && !ch.open ? `Channel unavailable: ${ch.error}` : "";
-    const formatError = entry.format === null ? "Select a transmit frame format"
-        : entry.format === "fd" && ch?.config.mode !== "fd" ? "Enable CAN FD on this channel"
-        : entry.kind === "message" && entry.format === "classical" && entry.dlc > 8
-            ? "Message exceeds the Classical CAN frame limit"
-            : entry.kind === "message" && entry.format === "fd" && entry.dlc > 64
-                ? "Message exceeds the CAN FD frame limit" : "";
+    const formatError = simFormatError(entry, ch?.config.mode);
     let label = "Idle", detail = "";
     if (entry.pendingStops) {
         label = "Stopping";
@@ -3406,8 +3436,14 @@ async function removeSimEntry(key: string) {
 async function sendSimOnce(key: string) {
     const entry = simEntries.get(key);
     if (!entry) return;
-    if (!channels.get(entry.channel)?.open) {
+    const channel = channels.get(entry.channel);
+    if (!appRunning || !channel?.open) {
         log("warn", "Cannot send: start capture with this channel connected first");
+        return;
+    }
+    const formatError = simFormatError(entry, channel.config.mode);
+    if (formatError) {
+        log("warn", formatError);
         return;
     }
     try {
@@ -3445,9 +3481,7 @@ async function startSim(key: string) {
     scheduleAutoSave("sim started");
     await queueSimOperation(entry, async () => {
         if (simEntries.get(key) !== entry || !entry.running || entry.periodicHandle !== null) return;
-        const channel = channels.get(entry.channel);
-        if (!appRunning || !channel?.open || channel.config?.listen_only) return;
-        if (entry.format === "fd" && channel.config?.mode !== "fd") return;
+        if (!canRegisterSim(entry)) return;
         try {
             if (entry.kind === "message") {
                 entry.periodicHandle = await invoke<number>("add_periodic_message", { cmd: { format: entry.format, brs: entry.brs, channel_handle: entry.channel, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry), period_ms: entry.periodMs } });
@@ -3495,9 +3529,15 @@ async function stopSim(key: string) {
 async function updateRunningSim(key: string) {
     const entry = simEntries.get(key);
     if (!entry) return;
+    if (entry.running && entry.periodicHandle === null && !entry.pendingStarts && !entry.pendingStops && canRegisterSim(entry)) {
+        await startSim(key);
+        return;
+    }
     try {
         await queueSimOperation(entry, async () => {
             if (simEntries.get(key) !== entry || !entry.running || entry.periodicHandle === null) return;
+            const formatError = simFormatError(entry, channels.get(entry.channel)?.config?.mode);
+            if (formatError) throw new Error(formatError);
             if (entry.kind === "message") {
                 await invoke("update_periodic_message", { cmd: { format: entry.format, brs: entry.brs, channel_handle: entry.channel, periodic_handle: entry.periodicHandle, message_id: entry.messageId, signal_values: simSignalValues(entry), generators: simGenerators(entry), period_ms: entry.periodMs } });
             } else {

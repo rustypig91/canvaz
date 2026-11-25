@@ -185,6 +185,24 @@ test("switching between FD, virtual, and Classical-only interfaces keeps the phy
     assert.equal(h.saved[0].data_bitrate, null);
 });
 
+test("editing a saved FD channel preserves timing if its driver stops reporting FD support", async () => {
+    const iface = { backend: "pcan", name: "USB", capabilities: { fd: false, external_timing: false, fd_limitation: "This adapter does not support CAN FD" } };
+    const h = harness([iface]);
+    const channel = { info: iface, config: { backend: iface.backend, name: iface.name, mode: "fd", bitrate: 500000, data_bitrate: 4000000 } };
+    h.context.channels.set(7, channel);
+
+    await h.context.openChannelDialog("edit", 7);
+    assert.equal(h.element("select-can-mode").value, "fd");
+    assert.equal(h.element("hint-can-mode").textContent, iface.capabilities.fd_limitation);
+    assert.equal(h.element("input-data-bitrate").value, "4000000");
+    h.element("input-channel-name").value = "Test bench";
+    await h.context.saveChannelDialog();
+
+    assert.equal(channel.config.display_name, "Test bench");
+    assert.equal(channel.config.mode, "fd");
+    assert.equal(channel.config.data_bitrate, 4000000);
+});
+
 test("previously registered Socketcand addresses use the same remote controls", async () => {
     const name = "can://localhost:29537/vcan0";
     const h = harness([{ backend: "socketcand", name }]);

@@ -11,7 +11,9 @@ function harness(names, globals) {
     names = [...new Set([...names, "savedDbcMessage", "dbcMessageId", "simMessageSettings", "defaultSimFormat"])];
     const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text));
     assert.equal(functions.length, names.length);
-    const code = ts.transpileModule(functions.map(n => n.getText(source)).join("\n"), {
+    const constants = source.statements.filter(n => ts.isVariableStatement(n)
+        && n.declarationList.declarations.some(d => d.name.getText(source) === "FD_LENGTHS"));
+    const code = ts.transpileModule([...constants, ...functions].map(n => n.getText(source)).join("\n"), {
         compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
     }).outputText;
     const context = vm.createContext({ pendingPaneSignals: [], pendingSimMessages: [], startingCapture: null, stoppingCapture: null, ...globals });
@@ -367,11 +369,12 @@ test("Start preserves duplicate offline channels, dependent entries and saved ID
 
 test("one-shot simulation sends only on an open channel and preserves offline settings", async () => {
     for (const kind of ["message", "raw"]) {
-        const entry = { kind, channel: 7, messageId: 123, canId: 123, data: [1, 2, 3], dlc: 2, isExtended: true, running: true, periodicHandle: null };
+        const entry = { kind, channel: 7, messageId: 123, canId: 123, data: [1, 2, 3], dlc: 2, format: "classical", isExtended: true, running: true, periodicHandle: null };
         const before = structuredClone(entry);
         const calls = [], warnings = [];
-        const ctx = harness(["sendSimOnce"], {
-            simEntries: new Map([["entry", entry]]), channels: new Map([[7, { open: false }]]),
+        const ctx = harness(["sendSimOnce", "simFormatError"], {
+            appRunning: true, simEntries: new Map([["entry", entry]]),
+            channels: new Map([[7, { open: false, config: { mode: "classical" } }]]),
             invoke: async (command, args) => calls.push({ command, args }),
             log: (level, message) => warnings.push({ level, message }),
             simSignalValues: () => ({ RPM: 900 }), simGenerators: () => [],

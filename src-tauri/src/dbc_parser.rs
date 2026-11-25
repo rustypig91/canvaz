@@ -168,7 +168,9 @@ impl ParsedMessage {
             return false;
         }
         if reassembled {
-            return self.dlc > 8 && matches!(self.frame_format, None | Some(DbcFrameFormat::J1939));
+            // A variable-length PGN can use the same DBC definition for a
+            // single frame and for the leading bytes of a transport message.
+            return self.frame_format != Some(DbcFrameFormat::Fd);
         }
         self.wire_format().is_none_or(|format| format == frame.metadata.format)
             && (frame.metadata.format == FrameFormat::Fd || self.dlc <= 8)
@@ -971,6 +973,29 @@ BA_ "VFrameFormat" BO_ 2364531712 2;
         .into();
         let buf = msg.encode_signals(&values);
         assert_eq!(buf, vec![0x01, 20, 0x00, 5, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn short_j1939_definition_decodes_the_start_of_a_reassembled_payload() {
+        let mut dbc = j1939_dbc();
+        let message_id = 0x0CF00400;
+        let mut assembled = frame(message_id);
+        assembled.data.resize(10, 0);
+        assembled.data[3] = 0x12;
+        let expected = dbc.decode_frame_j1939(&assembled, false).unwrap().0.signals[0].raw;
+
+        for format in [None, Some(DbcFrameFormat::Classical), Some(DbcFrameFormat::J1939)] {
+            dbc.messages.get_mut(&message_id).unwrap().frame_format = format;
+            for can_id in [message_id, 0x18F00400] {
+                assembled.can_id = can_id;
+                let (decoded, key) = dbc.decode_frame_j1939(&assembled, true).unwrap();
+                assert_eq!(key, message_id);
+                assert_eq!(decoded.signals[0].raw, expected);
+            }
+        }
+        dbc.messages.get_mut(&message_id).unwrap().frame_format = Some(DbcFrameFormat::Fd);
+        assembled.can_id = message_id;
+        assert!(dbc.decode_frame_j1939(&assembled, true).is_none());
     }
 
     #[test]

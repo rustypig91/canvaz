@@ -6,7 +6,7 @@ import ts from "typescript";
 
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 function harness(names, globals = {}) {
-    names = [...new Set([...names, "defaultSimFormat", "simFormatControls"])];
+    names = [...new Set([...names, "defaultSimFormat", "simFormatControls", "simFormatError", "canRegisterSim"])];
     const constants = source.statements.filter(n => ts.isVariableStatement(n)
         && n.declarationList.declarations.some(d => d.name.getText(source) === "FD_LENGTHS"));
     const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text));
@@ -25,7 +25,7 @@ function deferred() {
 }
 function simHarness(invoke) {
     const entry = { kind: "raw", channel: 1, canId: 0x123, isExtended: false, dlc: 1, data: [0], periodMs: 100, running: false, periodicHandle: null };
-    const ctx = harness(["startSim", "stopSim", "queueSimOperation", "removeSimEntry", "updateRunningSim"], {
+    const ctx = harness(["startSim", "sendSimOnce", "stopSim", "queueSimOperation", "removeSimEntry", "updateRunningSim"], {
         invoke, simEntries: new Map([["raw", entry]]), channels: new Map([[1, { open: true, config: { mode: "fd" } }]]), appRunning: true,
         document: { querySelector: () => null }, scheduleAutoSave() {}, updateSimTxStatus() {}, updateSignalHighlights() {},
     });
@@ -265,6 +265,16 @@ test("raw frame edits and DBC period edits schedule persistence while stopped", 
     assert.equal(raw.dlc, 0);
     assert.equal(el.querySelector(".sim-byte").disabled, true);
     assert.match(ctx.createSimEntryEl("restored", raw).innerHTML, /<option value="0" selected>/);
+    const beforeInvalidId = saved.length;
+    const canIdInput = el.querySelector(".sim-canid-input");
+    await canIdInput.fire("change", "");
+    await canIdInput.fire("change", "123Z");
+    await canIdInput.fire("change", "20000000");
+    assert.equal(raw.canId, 0x321);
+    assert.equal(canIdInput.value, "321");
+    assert.equal(saved.length, beforeInvalidId);
+    await canIdInput.fire("change", "0x1FFFFFFF");
+    assert.equal(raw.canId, 0x1FFFFFFF);
     const message = { kind: "message", channel: 1, messageId: 1, messageName: "Message", signals: [], periodMs: 100, running: false };
     const msgEl = ctx.createSimEntryEl("msg", message);
     const before = saved.length;
@@ -409,6 +419,37 @@ test("an armed FD simulation waits for an FD-enabled channel without disarming",
     await ctx.startSim("raw");
     assert.deepEqual(calls, ["add_periodic_frame"]);
     assert.equal(entry.periodicHandle, 42);
+});
+
+test("an armed DBC simulation resumes after its transmit format is resolved", async () => {
+    const sent = [];
+    const { ctx, entry } = simHarness(async (command, { cmd }) => {
+        sent.push([command, cmd.format]);
+        return 42;
+    });
+    ctx.simSignalValues = () => ({});
+    ctx.simGenerators = () => ({});
+    Object.assign(entry, { kind: "message", messageId: 0x123, dlc: 12, format: null, running: true });
+    await ctx.startSim("raw");
+    assert.deepEqual(sent, []);
+    assert.equal(entry.running, true);
+    assert.equal(entry.periodicHandle, null);
+
+    entry.format = "fd";
+    await ctx.updateRunningSim("raw");
+    assert.deepEqual(sent, [["add_periodic_message", "fd"]]);
+    assert.equal(entry.periodicHandle, 42);
+});
+
+test("a saved oversized raw length cannot silently transmit a shorter FD frame", async () => {
+    const sent = [];
+    const { ctx, entry } = simHarness(command => { sent.push(command); return 42; });
+    Object.assign(entry, { format: "fd", dlc: 65, data: Array(64).fill(0) });
+    await ctx.sendSimOnce("raw");
+    await ctx.startSim("raw");
+    assert.deepEqual(sent, []);
+    assert.equal(entry.running, true);
+    assert.equal(entry.periodicHandle, null);
 });
 
 test("Trace renders CAN FD ASCII payload characters as text", () => {
