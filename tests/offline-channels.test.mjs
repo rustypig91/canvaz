@@ -8,7 +8,7 @@ import ts from "typescript";
 // Tauri IPC. No CAN driver or physical interface is needed for these scenarios.
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 function harness(names, globals) {
-    names = [...new Set([...names, "savedDbcMessage", "dbcMessageId"])];
+    names = [...new Set([...names, "savedDbcMessage", "dbcMessageId", "simMessageSettings"])];
     const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text));
     assert.equal(functions.length, names.length);
     const code = ts.transpileModule(functions.map(n => n.getText(source)).join("\n"), {
@@ -171,6 +171,46 @@ test("saving partially restored panes retains both pending and visible signals a
     assert.deepEqual(JSON.parse(JSON.stringify(project.plot_panes[0].signals)), [saved,
         { signal_name: "Speed", channel: "kvaser:USB CAN", message_id: 456 }]);
     assert.equal(project.simulate_raw_frames[0].channel, "pcan:Missing");
+});
+
+test("saving and reopening with a partial DBC retains values and generators for missing simulation signals", async () => {
+    const keep = { name: "Keep", min: 0 }, temporary = { name: "Temporary", min: 0 };
+    const generator = { mode: "counter" };
+    const channel = { info: { backend: "socketcand", name: "can://localhost/can0" }, config: config(),
+        dbc: { messages: { 123: { id: 123, name: "Engine", dlc: 2, signals: [keep] } } } };
+    const filters = Object.fromEntries([
+        "Channels", "CanIds", "MsgNames", "Dir", "Pgns", "Prios", "Sas", "Das", "Broadcast",
+        "DlcMin", "DlcMax", "CycleMin", "CycleMax", "Data",
+    ].map(name => [`traceFilter${name}`, null]));
+    const ctx = harness(["restoreProjectEntries", "buildProject", "reconcileSimMessages"], {
+        ...filters, channels: new Map([[7, channel]]), ghostChannels: [], simEntries: new Map(),
+        plotPanes: [], msgEntryCounter: 0,
+        pendingSimMessages: [{ channel: "remote", message_id: 123, period_ms: 100, running: true, signals: [
+            { name: "Keep", value: 3 }, { name: "Temporary", value: 12, generator },
+        ] }],
+        idToHandle: () => 7, handleToId: () => "remote",
+        document: { getElementById: () => ({ appendChild() {}, querySelector: () => null }) },
+        createSimEntryEl: () => ({}), renderSimEntries() {}, updateSignalHighlights() {}, log() {},
+        simDefaultValue: sig => sig.min,
+        traceDataFormat: "hex", traceMaxRows: 100, windowSizeSec: 10, traceColOrder: [], traceColHidden: new Set(),
+    });
+    await ctx.restoreProjectEntries();
+    const entry = [...ctx.simEntries.values()][0];
+    assert.equal(entry.signals.length, 1);
+    entry.signals[0].value = 7;
+    const project = JSON.parse(JSON.stringify(ctx.buildProject()));
+    assert.equal(project.simulate_messages[0].signals.length, 2);
+    ctx.simEntries.clear();
+    ctx.pendingSimMessages = project.simulate_messages;
+    await ctx.restoreProjectEntries();
+    channel.dbc.messages[123].signals = [keep, temporary];
+    ctx.reconcileSimMessages(7);
+    const restored = [...ctx.simEntries.values()][0];
+    assert.equal(restored.signals[0].value, 7);
+    assert.equal(restored.signals[1].value, 12);
+    assert.deepEqual(restored.signals[1].gen, generator);
+    assert.equal(restored.running, true);
+    assert.equal(restored.unresolvedSignals.length, 0);
 });
 
 test("plot restoration autosaves retain unresolved entries in this pane and later panes", async () => {

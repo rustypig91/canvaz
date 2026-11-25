@@ -298,6 +298,42 @@ test("opening another project resets backend registrations and cached traffic be
     assert.deepEqual(calls, ["stop", "reset", "clear trace", "register new"]);
 });
 
+test("restored short raw payloads can grow from zero to eight bytes and transmit the chosen DLC", async () => {
+    for (const data of [[], [0xAB]]) {
+        const caches = Object.fromEntries(["signalLastValues", "signalLastRaw", "signalMinValues", "signalMaxValues", "sigKeyCache", "pgnMapCache"].map(k => [k, new Map()]));
+        const sent = [];
+        const ctx = harness(["applyProject", "sendSimOnce", "startSim", "queueSimOperation", "updateRunningSim"], {
+            ...caches, appRunning: false, startingCapture: null, stoppingCapture: null,
+            channels: new Map(), ghostChannels: [], plotPanes: [], rawEntryCounter: 0,
+            simEntries: new Map(), pendingPaneSignals: [], pendingSimMessages: [], DEFAULT_WINDOW_SEC: 60,
+            invoke: async (command, args) => {
+                if (command !== "reset_backend") sent.push([command, Array.from(args.cmd.data)]);
+                return 42;
+            },
+            clearTrace() {}, idToHandle: () => 1,
+            document: { getElementById: () => ({ innerHTML: "", appendChild() {} }) }, createSimEntryEl() {},
+            refreshChannelList() {}, renderDbcTree() {}, rebuildTraceColumns() {}, setWindowSize() {},
+            restoreProjectEntries: async () => {}, updateSimTxStatus() {}, scheduleAutoSave() {},
+        });
+        await ctx.applyProject({ channels: [], plot_panes: [], simulate_raw_frames: [{
+            channel: "socketcand:can://localhost/vcan0", can_id: 0x123, is_extended: false,
+            dlc: data.length, data, period_ms: 100,
+        }] });
+        ctx.appRunning = true;
+        ctx.channels.set(1, { open: true, config: {} });
+        const [key, entry] = [...ctx.simEntries][0];
+        assert.equal(entry.data.length, 8, "restore all eight editable byte slots");
+        await ctx.sendSimOnce(key);
+        assert.deepEqual(sent.pop(), ["send_frame", data]);
+        entry.dlc = 8;
+        const expected = Array.from({ length: 8 }, (_, i) => data[i] ?? 0);
+        await ctx.sendSimOnce(key);
+        await ctx.startSim(key);
+        await ctx.updateRunningSim(key);
+        assert.deepEqual(sent, [["send_frame", expected], ["add_periodic_frame", expected], ["update_periodic_frame", expected]]);
+    }
+});
+
 test("clearing trace invalidates an in-flight fetch from the previous project", async () => {
     const pending = deferred();
     const caches = Object.fromEntries([

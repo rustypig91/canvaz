@@ -281,5 +281,7 @@ client wrote the command to TCP. Incoming CAN FD messages are skipped so that
 classic CAN capture continues on mixed buses.
 If a reloaded DBC omits a simulated message, its settings and armed state are
 retained and restored when that message definition becomes available again.
+Values and generators for individual missing signals are also retained across
+reconnects and project saves until their definitions return.
 
 Protocol reference: [socketcand protocol](https://github.com/linux-can/socketcand/blob/master/doc/protocol.md).

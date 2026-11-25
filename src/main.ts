@@ -2786,6 +2786,8 @@ interface SimMessageEntry {
     messageName: string;
     dlc: number;
     signals: { def: DbcSignal; value: number; gen: SimGen | null }[];
+    // Retain settings for signals temporarily missing from a reloaded DBC.
+    unresolvedSignals?: SimMessageConfig["signals"];
     periodMs: number;
     running: boolean;
     periodicHandle: number | null;
@@ -3445,7 +3447,7 @@ function buildProject(): Project {
                 message_id: e.messageId,
                 period_ms: e.periodMs,
                 running: e.running,
-                signals: e.signals.map(s => ({ name: s.def.name, value: s.value, generator: s.gen ?? null })),
+                signals: simMessageSettings(e),
             }))],
         simulate_raw_frames: [...simEntries.values()]
             .filter((e): e is SimRawEntry => e.kind === "raw")
@@ -3660,7 +3662,8 @@ async function applyProject(project: Project) {
             kind: "raw", channel: rawHandle ?? 0,
             pendingChannelId: rawHandle === undefined ? raw.channel : undefined,
             canId: raw.can_id, isExtended: raw.is_extended,
-            dlc: raw.dlc, data: raw.data,
+            // Keep every editable byte slot even when the saved payload is short.
+            dlc: raw.dlc, data: Array.from({ length: 8 }, (_, i) => raw.data[i] ?? 0),
             periodMs: raw.period_ms, running: raw.running ?? false, periodicHandle: null,
         };
         simEntries.set(key, entry);
@@ -3812,6 +3815,7 @@ async function restoreProjectEntries() {
                 kind: "message", channel: handle,
                 messageId: msg.key ?? msg.id, messageName: msg.name, dlc: msg.dlc,
                 signals: msg.signals.map(s => ({ def: s, value: valueByName.get(s.name) ?? simDefaultValue(s), gen: genByName.get(s.name) ?? null })),
+                unresolvedSignals: m.signals.filter(s => !msg.signals.some(def => def.name === s.name)),
                 periodMs: m.period_ms, running: m.running ?? false, periodicHandle: null,
             };
             simEntries.set(key, simEntry);
@@ -3930,8 +3934,13 @@ async function startApp(reportMissing = true) {
     }
 }
 
+function simMessageSettings(entry: SimMessageEntry): SimMessageConfig["signals"] {
+    return [...(entry.unresolvedSignals ?? []),
+        ...entry.signals.map(s => ({ name: s.def.name, value: s.value, generator: s.gen ?? null }))];
+}
+
 // Simulation entries cache their DBC definitions. Refresh them using the DBC
-// parsed at open, preserving the values and generators of surviving signals.
+// parsed at open, retaining values and generators until missing signals return.
 function reconcileSimMessages(handle: number) {
     const dbc = channels.get(handle)?.dbc;
     if (!dbc) return;
@@ -3939,6 +3948,7 @@ function reconcileSimMessages(handle: number) {
     for (const [key, entry] of simEntries) {
         if (entry.kind !== "message" || entry.channel !== handle) continue;
         const msg = dbc.messages[entry.messageId];
+        const settings = simMessageSettings(entry);
         if (!msg) {
             // A reconnect can load an edited DBC that temporarily omits this
             // message. Preserve the user's values, generators and armed state
@@ -3946,15 +3956,17 @@ function reconcileSimMessages(handle: number) {
             pendingSimMessages.push({
                 channel: handleToId(handle), message_id: entry.messageId,
                 period_ms: entry.periodMs, running: entry.running,
-                signals: entry.signals.map(s => ({ name: s.def.name, value: s.value, generator: s.gen ?? null })),
+                signals: settings,
             });
             log("warn", `${entry.messageName} is missing from the DBC; simulation settings retained until its definition returns`);
             simEntries.delete(key);
             simContainer.querySelector(`[data-sim-key="${key}"]`)?.remove();
             continue;
         }
-        const prevValues = new Map(entry.signals.map(s => [s.def.name, s.value]));
-        const prevGens = new Map(entry.signals.map(s => [s.def.name, s.gen]));
+        const prevValues = new Map(settings.map(s => [s.name, s.value]));
+        const prevGens = new Map(settings.map(s => [s.name, s.generator]));
+        const signalNames = new Set(msg.signals.map(s => s.name));
+        entry.unresolvedSignals = settings.filter(s => !signalNames.has(s.name));
         entry.messageName = msg.name;
         entry.dlc = msg.dlc;
         entry.signals = msg.signals.map(s => ({ def: s, value: prevValues.get(s.name) ?? simDefaultValue(s), gen: prevGens.get(s.name) ?? null }));

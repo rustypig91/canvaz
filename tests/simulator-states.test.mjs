@@ -8,7 +8,7 @@ const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.
 const names = ["simEntryStatus", "updateSimEntryStatus", "updateSimTxStatus", "queueSimOperation",
     "startSim", "stopSim", "openConfiguredChannels", "startApp", "finishStartingCapture", "stopApp", "finishStoppingCapture",
     "onChannelError", "closeFailedChannel", "openChannelByHandle",
-    "scheduleChannelRecovery", "attemptChannelRecovery", "recoverChannel", "reconcileSimMessages", "restoreProjectEntries"];
+    "scheduleChannelRecovery", "attemptChannelRecovery", "recoverChannel", "reconcileSimMessages", "restoreProjectEntries", "simMessageSettings"];
 const code = ts.transpileModule(source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text)).map(n => n.getText(source)).join("\n"), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
@@ -417,6 +417,41 @@ test("a Socketcand disconnect before the open response leaves the channel discon
     assert.equal(await opening, false);
     await error;
     assert.equal(h.timers.size, 1);
+});
+
+test("Socketcand reconnect retains missing signal settings through repeated reloads and a missing message", async () => {
+    const keep = { name: "Keep", min: 0 }, missing = { name: "Temporary", min: 0 };
+    const generator = { mode: "counter" };
+    const partial = { messages: { 123: { id: 123, name: "Engine", dlc: 2, signals: [keep] } } };
+    const full = { messages: { 123: { id: 123, name: "Engine", dlc: 2, signals: [keep, missing] } } };
+    const opens = [partial, partial, { messages: {} }, partial, full];
+    const h = harness("message", async command => command === "open_channel" ? opens.shift() : 42);
+    h.entry.signals = [
+        { def: keep, value: 3, gen: null },
+        { def: missing, value: 12, gen: generator },
+    ];
+    const getElement = h.ctx.document.getElementById;
+    h.ctx.document.getElementById = id => id === "sim-entries"
+        ? { querySelector: () => null, appendChild() {} } : getElement(id);
+    Object.assign(h.ctx, {
+        pendingPaneSignals: [], plotPanes: [], msgEntryCounter: 0,
+        idToHandle: () => 1, savedDbcMessage: (dbc, id) => dbc?.messages[id],
+        renderDbcTree() {}, renderSimEntries() {}, updateSignalHighlights() {},
+        simDefaultValue: sig => sig.min, createSimEntryEl: () => ({}),
+    });
+    for (let n = 0; n < 4; n++) {
+        h.ch.open = false;
+        await h.ctx.attemptChannelRecovery(1, true);
+        if (n === 0) h.entry.signals[0].value = 7;
+    }
+    const partialEntry = [...h.ctx.simEntries.values()][0];
+    assert.equal(partialEntry.signals.length, 1, "missing signals must not be sent to the backend");
+    h.ch.open = false;
+    await h.ctx.attemptChannelRecovery(1, true);
+    const entry = [...h.ctx.simEntries.values()][0];
+    assert.equal(entry.signals[0].value, 7, "keep edits to surviving signals");
+    assert.equal(entry.signals[1].value, 12);
+    assert.deepEqual(entry.signals[1].gen, generator);
 });
 
 test("a stale Socketcand error cannot close a replacement connection", async () => {
