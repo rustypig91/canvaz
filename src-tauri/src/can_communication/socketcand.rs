@@ -79,12 +79,23 @@ fn endpoint(name: &str) -> Result<(String, u16, String), String> {
     if url.scheme() != "can" || !url.username().is_empty() || url.password().is_some() || url.query().is_some() || url.fragment().is_some() {
         return Err("Use can://host:port/interface for socketcand".into());
     }
-    let path_bus = url.path().strip_prefix('/').unwrap_or(url.path());
+    // Read the interface from the original address. URL parsing normalizes
+    // dot segments and strips some whitespace, which could select another bus.
+    let (_, location) = address.split_once("://")
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("can"))
+        .ok_or("Use can://host:port/interface for socketcand")?;
+    let (authority, path_bus) = location.split_once('/').unwrap_or((location, ""));
+    if authority.contains('@') || authority.bytes().any(|byte| byte.is_ascii_whitespace()) {
+        return Err("Use can://host:port/interface for socketcand".into());
+    }
+    if path_bus != url.path().strip_prefix('/').unwrap_or(url.path()) {
+        return Err("Socketcand requires a single interface name".into());
+    }
     if bus.is_some_and(|label_bus| !path_bus.is_empty() && label_bus != path_bus) {
         return Err("Socketcand label and address specify different interfaces".into());
     }
     let bus = bus.unwrap_or(path_bus);
-    if bus.is_empty() || bus.len() > 15 || !bus.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b)) {
+    if matches!(bus, "" | "." | "..") || bus.len() > 15 || !bus.bytes().all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b)) {
         return Err("Socketcand requires an interface, for example can://127.0.0.1:29536/vcan0".into());
     }
     let host = match url.host() {
@@ -435,6 +446,25 @@ mod tests {
         assert_eq!(f.timestamp_ms, Some(1700000000123));
         assert!(parse_frame("frame 123 1.000000").unwrap().data.is_empty());
         for bad in ["frame 800 1.000000 FF", "frame 123 1.000000 F", "frame 123 NaN FF", "error denied"] { assert!(parse_frame(bad).is_err()); }
+    }
+
+    #[test]
+    fn address_parsing_does_not_rewrite_the_requested_interface() {
+        for address in [
+            "can://localhost/other/../can0",
+            "can://localhost/./can0",
+            "can://localhost/%2e/can0",
+            "can://localhost/ca\tn0",
+            "can://@localhost/can0",
+            "can0@SIL (can://localhost/.)",
+            "..@SIL (can://localhost)",
+        ] {
+            assert!(endpoint(address).is_err(), "{address:?}");
+        }
+        assert_eq!(
+            endpoint("can0.1@SIL (can://localhost:29536/)").unwrap(),
+            endpoint("can://localhost/can0.1").unwrap(),
+        );
     }
 
     #[test]

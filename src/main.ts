@@ -1907,11 +1907,16 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
             `<option value="${index}">${escapeHtml(i.name)} (${escapeHtml(i.backend)})</option>`).join("");
         sel.insertAdjacentHTML("beforeend", '<option value="__socketcand__">Socketcand (TCP)...</option>');
         sel.value = ch?.info.backend === "none" ? "" : String(availableIfaces.findIndex(i => i.backend === ch?.info.backend && i.name === ch?.info.name));
+        const socketcandDrafts = new Map<string, string>();
+        let selectedSocketcand: string | undefined;
         const updateAssignment = () => {
             const iface = sel.value === "" ? undefined : availableIfaces[Number(sel.value)];
             const backend = sel.value === "__socketcand__" ? "socketcand" : iface?.backend ?? "none";
             document.getElementById("row-socketcand")!.style.display = backend === "socketcand" ? "" : "none";
-            socketcandInput.value = backend === "socketcand" ? iface?.name ?? "" : "";
+            if (selectedSocketcand !== undefined) socketcandDrafts.set(selectedSocketcand, socketcandInput.value);
+            selectedSocketcand = backend === "socketcand" ? sel.value : undefined;
+            socketcandInput.value = selectedSocketcand === undefined
+                ? "" : socketcandDrafts.get(selectedSocketcand) ?? iface?.name ?? "";
             setSocketcandAddressError("");
             updateChannelInterfaceInDialog(backend, iface?.name ?? "");
         };

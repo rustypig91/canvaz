@@ -177,6 +177,33 @@ test("editing a saved monitoring channel preserves receive-only until explicitly
     assert.equal(channel.config.bitrate, null);
 });
 
+test("switching interfaces while editing preserves the Socketcand address draft", async () => {
+    const name = "can://localhost/can0";
+    const edited = "can://localhost/can1";
+    const h = harness([{ backend: "pcan", name: "USB" }]);
+    h.context.channels.set(7, {
+        info: { backend: "socketcand", name },
+        config: { backend: "socketcand", name, bitrate: null },
+    });
+    await h.context.openChannelDialog("edit", 7);
+
+    const select = h.element("select-iface");
+    const input = h.element("input-socketcand");
+    const originalSelection = select.value;
+    assert.equal(input.value, name);
+    input.value = edited;
+
+    select.value = "0";
+    select.onchange();
+    assert.equal(h.element("row-socketcand").style.display, "none");
+    select.value = "__socketcand__";
+    select.onchange();
+    assert.equal(input.value, "");
+    select.value = originalSelection;
+    select.onchange();
+    assert.equal(input.value, edited);
+});
+
 test("editing a Socketcand address keeps the channel and reports invalid replacements inline", async () => {
     const name = "can://localhost/vcan0";
     const h = harness([{ backend: "socketcand", name }]);
