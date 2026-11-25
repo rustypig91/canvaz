@@ -1795,7 +1795,7 @@ function setDbcLabel(path: string | null) {
 
 function getBitrateFromDialog(): number | null {
     const sel = (document.getElementById("select-bitrate") as HTMLSelectElement).value;
-    if (sel === "vcan") return null;
+    if (dialogExternalTiming) return null;
     if (sel === "custom") return (document.getElementById("input-bitrate-custom") as HTMLInputElement).valueAsNumber || null;
     return parseInt(sel);
 }
@@ -1816,33 +1816,31 @@ function setListenOnlyInDialog(listenOnly: boolean) {
     (document.getElementById("input-listen-only") as HTMLInputElement).checked = listenOnly;
 }
 
-function setBitrateInDialog(bitrate: number | null, isVcan: boolean) {
+function setBitrateInDialog(bitrate: number | null) {
     const sel = document.getElementById("select-bitrate") as HTMLSelectElement;
     const custom = document.getElementById("input-bitrate-custom") as HTMLInputElement;
-    if (isVcan) {
-        sel.value = "vcan";
-        custom.style.display = "none";
-    } else if (bitrate != null && ["125000", "250000", "500000", "1000000"].includes(String(bitrate))) {
-        sel.value = String(bitrate);
-        custom.style.display = "none";
-    } else if (bitrate != null) {
-        sel.value = "custom";
-        custom.value = String(bitrate);
-        custom.style.display = "";
-    } else {
-        sel.value = "500000";
-        custom.style.display = "none";
-    }
+    const rate = String(bitrate ?? 500_000);
+    const preset = ["125000", "250000", "500000", "1000000"].includes(rate);
+    sel.value = preset ? rate : "custom";
+    custom.value = preset ? "" : rate;
 }
 
 let dialogExternalTiming = false;
+let dialogCanMode: FrameFormat = "classical";
 
 function setChannelTimingInDialog(config?: ChannelConfig) {
-    (document.getElementById("select-can-mode") as HTMLSelectElement).value = config?.mode ?? "classical";
+    dialogCanMode = config?.mode ?? "classical";
+    (document.getElementById("select-can-mode") as HTMLSelectElement).value = dialogCanMode;
     (document.getElementById("input-data-bitrate") as HTMLInputElement).value = String(config?.data_bitrate ?? 2_000_000);
 }
 
 function updateChannelTimingInDialog() {
+    const nominal = document.getElementById("select-bitrate") as HTMLSelectElement;
+    const custom = document.getElementById("input-bitrate-custom") as HTMLInputElement;
+    const showCustom = !dialogExternalTiming && nominal.value === "custom";
+    nominal.disabled = dialogExternalTiming;
+    custom.disabled = !showCustom;
+    custom.style.display = showCustom ? "" : "none";
     const mode = document.getElementById("select-can-mode") as HTMLSelectElement;
     const hidden = mode.value !== "fd" || mode.options[1].disabled || dialogExternalTiming;
     document.getElementById("row-data-bitrate")!.hidden = hidden;
@@ -1855,9 +1853,10 @@ function updateChannelInterfaceInDialog(backend: string, name: string, capabilit
     const virtual = backend === "socketcan" && (capabilities?.external_timing ?? name.startsWith("vcan"));
     dialogExternalTiming = remote || virtual;
     document.getElementById("row-bitrate")!.style.display = dialogExternalTiming ? "none" : "";
-    (document.getElementById("input-bitrate-custom") as HTMLInputElement).disabled = dialogExternalTiming;
     const mode = document.getElementById("select-can-mode") as HTMLSelectElement;
+    if (!mode.options[1].disabled) dialogCanMode = mode.value === "fd" ? "fd" : "classical";
     mode.options[1].disabled = remote || capabilities?.fd === false;
+    mode.value = mode.options[1].disabled ? "classical" : dialogCanMode;
     document.getElementById("hint-can-mode")!.textContent = capabilities?.fd_limitation
         ?? (remote ? "Socketcand supports Classical CAN. Timing is configured by the server."
             : virtual ? "Virtual interface. Timing is managed by the operating system." : "");
@@ -1865,7 +1864,6 @@ function updateChannelInterfaceInDialog(backend: string, name: string, capabilit
         ? "Receive only · Send and Simulate disabled, server ACK settings unchanged"
         : virtual ? "Receive only · Send and Simulate disabled"
             : "Silent · no ACKs or error flags, Send and Simulate disabled";
-    if (!remote) setBitrateInDialog(getBitrateFromDialog(), virtual);
     updateChannelTimingInDialog();
 }
 
@@ -1902,7 +1900,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         sel.onchange = null;
         dialogPendingDbc = null;
         setDbcLabel(null);
-        setBitrateInDialog(500000, false);
+        setBitrateInDialog(500000);
         setChannelTimingInDialog();
         setProtocolInDialog(null);
         setListenOnlyInDialog(false);
@@ -1913,27 +1911,25 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
 
         // Filter out interfaces already configured.
         const configured = new Set([...channels.values()].map(c => `${c.info.backend}:${c.info.name}`));
-        const available = ifaces.filter(i => !configured.has(`${i.backend}:${i.name}`));
-
-        // Group remaining interfaces by backend into <optgroup> elements
+        // Keep each option tied to its backend, even when interface names coincide.
         const byBackend = new Map<string, string[]>();
-        for (const i of available) {
-            const group = byBackend.get(i.backend) ?? [];
-            group.push(i.name);
-            byBackend.set(i.backend, group);
+        for (const [index, iface] of ifaces.entries()) {
+            if (configured.has(`${iface.backend}:${iface.name}`)) continue;
+            const group = byBackend.get(iface.backend) ?? [];
+            group.push(`<option value="${index}">${escapeHtml(iface.name)}</option>`);
+            byBackend.set(iface.backend, group);
         }
         sel.innerHTML = [...byBackend.entries()]
-            .map(([backend, names]) =>
-                `<optgroup label="${escapeHtml(backend)}">${names.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join("")}</optgroup>`
-            ).join("");
+            .map(([backend, options]) => `<optgroup label="${escapeHtml(backend)}">${options.join("")}</optgroup>`)
+            .join("");
 
         sel.insertAdjacentHTML("beforeend", '<option value="__socketcand__">Socketcand (TCP)...</option>');
         const updateSocketcand = () => {
             const remote = sel.value === "__socketcand__";
             document.getElementById("row-socketcand")!.style.display = remote ? "" : "none";
             if (!remote) setSocketcandAddressError("");
-            const iface = available.find(i => i.name === sel.value);
-            updateChannelInterfaceInDialog(remote ? "socketcand" : iface?.backend ?? "", sel.value, iface?.capabilities);
+            const iface = sel.value === "" ? undefined : ifaces[Number(sel.value)];
+            updateChannelInterfaceInDialog(remote ? "socketcand" : iface?.backend ?? "", iface?.name ?? "", iface?.capabilities);
         };
         sel.onchange = updateSocketcand;
         updateSocketcand();
@@ -1965,7 +1961,7 @@ async function openChannelDialog(mode: DialogMode, handle?: number) {
         sel.onchange = updateAssignment;
         dialogPendingDbc = ch?.config.dbc_path ?? null;
         setDbcLabel(dialogPendingDbc);
-        setBitrateInDialog(ch?.config.bitrate ?? null, hwName.startsWith("vcan"));
+        setBitrateInDialog(ch?.config.bitrate ?? null);
         setChannelTimingInDialog(ch?.config);
         setProtocolInDialog(ch?.config.protocol ?? null);
         setListenOnlyInDialog(ch?.config.listen_only ?? false);
@@ -2292,19 +2288,20 @@ async function saveChannelDialog() {
         const selected = ifaceSelect.value;
         const socketcandInput = selected === "__socketcand__"
             ? document.getElementById("input-socketcand") as HTMLInputElement : null;
-        const name = socketcandInput ? socketcandInput.value.trim() : selected;
+        const iface = selected === "" ? undefined : availableIfaces[Number(selected)];
+        const name = socketcandInput ? socketcandInput.value.trim() : iface?.name;
         if (!name) {
             if (socketcandInput) setSocketcandAddressError("Enter a Socketcand address.");
             else log("error", "Channel name not set");
             return;
         };
-        if (ghostChannels.some(g => g.config.name === name)) {
+        const backend = socketcandInput ? "socketcand" : iface!.backend;
+        if (ghostChannels.some(g => g.config.backend === backend && g.config.name === name)) {
             const error = `Channel '${name}' is already added (hardware not available)`;
             if (socketcandInput) setSocketcandAddressError(error);
             else log("error", error);
             return;
         }
-        const backend = socketcandInput ? "socketcand" : availableIfaces.find(i => i.name === name)?.backend ?? "socketcan";
         const config: ChannelConfig = { name, display_name: customName, backend, dbc_path: dialogPendingDbc, bitrate: dialogExternalTiming ? null : bitrate, mode, data_bitrate: dataBitrate, protocol, listen_only: listenOnly };
         // Register channel with backend (allocates handle); hardware opens (and
         // the DBC is loaded) on Start. If the name exists in no backend the
@@ -5294,6 +5291,11 @@ function buildTraceCellHtml(key: string, entry: TraceEntry): string {
     }
 }
 
+function traceRowDbcMessageId(tr: HTMLTableRowElement): number | null | undefined {
+    const id = tr.dataset.dbcMessageId;
+    return id === undefined ? undefined : id === "" ? null : Number(id);
+}
+
 function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
     return {
         data: JSON.parse(tr.dataset.bytes ?? "[]"),
@@ -5303,7 +5305,7 @@ function entryFromRow(tr: HTMLTableRowElement): TraceEntry {
         format: tr.dataset.format === "fd" ? "fd" : "classical",
         brs: tr.dataset.brs === "1",
         esi: tr.dataset.esi === "1",
-        dbcMessageId: tr.dataset.dbcMessageId !== undefined ? Number(tr.dataset.dbcMessageId) : undefined,
+        dbcMessageId: traceRowDbcMessageId(tr),
         timestampMs: parseInt(tr.dataset.ts ?? "0"),
         direction: (tr.dataset.dir as "rx" | "tx" | "err") ?? "rx",
         messageName: tr.dataset.msg || null,
@@ -5338,8 +5340,8 @@ function buildTraceRow(entry: TraceEntry): HTMLTableRowElement {
     tr.dataset.format = entry.format;
     tr.dataset.brs = entry.brs ? "1" : "0";
     tr.dataset.esi = entry.esi ? "1" : "0";
-    if (entry.dbcMessageId != null) tr.dataset.dbcMessageId = String(entry.dbcMessageId);
-    else delete tr.dataset.dbcMessageId;
+    if (entry.dbcMessageId === undefined) delete tr.dataset.dbcMessageId;
+    else tr.dataset.dbcMessageId = entry.dbcMessageId === null ? "" : String(entry.dbcMessageId);
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
     if (entry.reassembled) tr.dataset.reassembled = "1";
     if (entry.error) tr.dataset.err = entry.error;
@@ -5363,8 +5365,8 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     tr.dataset.format = entry.format;
     tr.dataset.brs = entry.brs ? "1" : "0";
     tr.dataset.esi = entry.esi ? "1" : "0";
-    if (entry.dbcMessageId != null) tr.dataset.dbcMessageId = String(entry.dbcMessageId);
-    else delete tr.dataset.dbcMessageId;
+    if (entry.dbcMessageId === undefined) delete tr.dataset.dbcMessageId;
+    else tr.dataset.dbcMessageId = entry.dbcMessageId === null ? "" : String(entry.dbcMessageId);
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
     if (entry.reassembled) tr.dataset.reassembled = "1"; else delete tr.dataset.reassembled;
     tr.dataset.msg = entry.messageName ?? "";
@@ -6444,7 +6446,7 @@ function expandTraceRow(tr: HTMLTableRowElement) {
 
     const trHandle = parseInt(tr.dataset.channelHandle ?? "0");
     const canId = parseInt(tr.dataset.canid ?? "0");
-    const msg = dbcMessageFor(trHandle, canId, tr.dataset.ext === "1", tr.dataset.dbcMessageId !== undefined ? Number(tr.dataset.dbcMessageId) : undefined);
+    const msg = dbcMessageFor(trHandle, canId, tr.dataset.ext === "1", traceRowDbcMessageId(tr));
     if (!msg) return;
     // Interleaved [value, raw] pairs, index-aligned with msg.signals.
     const vals = traceRowSignals.get(tr) ?? [];
@@ -7119,13 +7121,7 @@ window.addEventListener("DOMContentLoaded", async () => {
 
     document.getElementById("select-can-mode")!.addEventListener("change", updateChannelTimingInDialog);
 
-    // Bitrate custom field toggle
-    document.getElementById("select-bitrate")!.addEventListener("change", (e) => {
-        const v = (e.target as HTMLSelectElement).value;
-        const customInput = document.getElementById("input-bitrate-custom") as HTMLInputElement;
-        customInput.style.display = v === "custom" ? "" : "none";
-        if (v !== "custom") customInput.value = "";
-    });
+    document.getElementById("select-bitrate")!.addEventListener("change", updateChannelTimingInDialog);
 
     // DBC browse in dialog
     document.getElementById("btn-browse-dbc")!.addEventListener("click", async () => {

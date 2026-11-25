@@ -63,7 +63,8 @@ available when its driver is installed. SocketCAN is included by default on Linu
    To configure a physical interface beforehand, use a command such as
    `sudo ip link set can0 up type can bitrate 500000 dbitrate 2000000 fd on`.
    Canvaz reuses an active interface when its mode and rates match. Virtual
-   SocketCAN interfaces use kernel-managed settings and need MTU 72 for FD.
+   SocketCAN interfaces use kernel-managed settings and need an MTU of at
+   least 72 for FD. A virtual interface configured for CAN XL also accepts FD.
 3. In **Simulate**, choose the frame format independently of the identifier
    width. Choose a legal byte length for raw FD frames and enable **BRS** to
    use the data-phase bitrate. DBC entries use their `VFrameFormat` when
@@ -83,8 +84,9 @@ are unavailable on FD channels.
 
 ### Verification
 
-Mixed Classical CAN and FD RX/TX passed on Linux SocketCAN with a virtual
-`vcan` device, Linux kernel `7.0.0-1018-oem`, and iproute2 `6.19.0`. The check
+Mixed Classical CAN and FD RX/TX passed on Linux SocketCAN with virtual
+`vcan` devices using MTUs 72 and 2060, Linux kernel `7.0.0-1018-oem`, and
+iproute2 `6.19.0`. The check
 covers short and 64-byte FD frames, a shared low-valued extended ID, BRS, and
 received ESI. Rerun it on a Linux host with the `vcan` module available.
 

@@ -8,6 +8,8 @@ use socketcan::{CanAnyFrame, CanDataFrame, CanError, CanFdFrame, CanFdSocket, Ca
 
 use super::{BusState, BusStatus, CanBackend, CanFrame, CanOpenError, ChannelCapabilities, ChannelSettings, FrameFormat, FrameMetadata, RxHandle, TxHandle};
 
+const CAN_FD_MTU: u32 = 72;
+
 enum SocketCanSocket {
     Classical(CanSocket),
     Fd(CanFdSocket),
@@ -212,44 +214,47 @@ impl CanBackend for SocketCanBackend {
             })?
             .clone();
 
-        let virtual_link = is_vcan(&name);
+        let details = link_details(&name).ok_or_else(|| format!("Cannot inspect SocketCAN interface '{name}'"))?;
+        let virtual_link = is_vcan_details(&details);
         let fd = settings.mode == FrameFormat::Fd;
-        if !already_up(&name, virtual_link, settings) {
-            if virtual_link {
-                run_ip_auto(&["link", "set", &name, "up"], admin_password)?;
-            } else {
-                let nominal = settings.bitrate.to_string();
-                let silent = if settings.listen_only { "on" } else { "off" };
-                let mut args = vec!["link", "set", &name, "type", "can", "bitrate", &nominal, "listen-only", silent];
-                let data;
-                if fd {
-                    data = settings.data_bitrate()?.to_string();
-                    args.extend(["dbitrate", &data, "fd", "on"]);
-                    // The Linux default is ISO. Clear the flag explicitly only
-                    // when the controller currently has non-ISO mode enabled.
-                    if link_details(&name).is_some_and(|out| controller_flag(&out, "FD-NON-ISO")) {
-                        args.extend(["fd-non-iso", "off"]);
-                    }
-                } else if link_details(&name).is_some_and(|out| controller_flag(&out, "FD")) {
-                    args.extend(["fd", "off"]);
+        if virtual_link && fd && !link_mtu(&details).is_some_and(|mtu| mtu >= CAN_FD_MTU) {
+            return Err(format!("Virtual interface '{name}' requires an MTU of at least {CAN_FD_MTU} for CAN FD").into());
+        }
+
+        let was_up = link_is_up(&details);
+        let reconfigure = !virtual_link && !configured_timing_matches(&details, settings);
+        if reconfigure {
+            let nominal = settings.bitrate.to_string();
+            let silent = if settings.listen_only { "on" } else { "off" };
+            let mut args = vec!["link", "set", &name, "type", "can", "bitrate", &nominal, "listen-only", silent];
+            let data;
+            if fd {
+                data = settings.data_bitrate()?.to_string();
+                args.extend(["dbitrate", &data, "fd", "on"]);
+                // The Linux default is ISO. Clear non-ISO mode when active.
+                if controller_flag(&details, "FD-NON-ISO") {
+                    args.extend(["fd-non-iso", "off"]);
                 }
-                run_ip_auto(&["link", "set", &name, "down"], admin_password)?;
-                run_ip_auto(&args, admin_password).map_err(|e| match e {
-                    CanOpenError::Other(message) if fd => CanOpenError::Other(format!(
-                        "Cannot configure ISO CAN FD on '{name}'. Check adapter and driver support and both bitrates: {message}"
-                    )),
-                    error => error,
-                })?;
-                run_ip_auto(&["link", "set", &name, "up"], admin_password)?;
+            } else if controller_flag(&details, "FD") {
+                args.extend(["fd", "off"]);
             }
+            if was_up {
+                run_ip_auto(&["link", "set", &name, "down"], admin_password)?;
+            }
+            run_ip_auto(&args, admin_password).map_err(|e| match e {
+                CanOpenError::Other(message) if fd => CanOpenError::Other(format!(
+                    "Cannot configure ISO CAN FD on '{name}'. Check adapter and driver support and both bitrates: {message}"
+                )),
+                error => error,
+            })?;
+        }
+        if reconfigure || !was_up {
+            run_ip_auto(&["link", "set", &name, "up"], admin_password)?;
         }
 
         // Share one raw socket to avoid receiving our own TX entries as RX.
         let open_error = |e| CanOpenError::Other(format!("Failed to open SocketCAN on '{name}': {e}"));
         let socket = if fd {
-            if virtual_link && !link_details(&name).is_some_and(|out| out.split_whitespace().collect::<Vec<_>>().windows(2).any(|w| w == ["mtu", "72"])) {
-                return Err(format!("Virtual interface '{name}' requires CAN FD MTU 72").into());
-            }
             let socket = CanFdSocket::open(&name).map_err(open_error)?;
             enable_error_frames(&socket, &name);
             SocketCanSocket::Fd(socket)
@@ -361,7 +366,17 @@ fn socketcan_fd_capability(name: &str) -> Option<bool> {
 }
 
 fn is_vcan(name: &str) -> bool {
-    link_details(name).is_some_and(|out| out.split_whitespace().any(|token| token == "vcan"))
+    link_details(name).is_some_and(|details| is_vcan_details(&details))
+}
+
+fn is_vcan_details(details: &str) -> bool {
+    details.lines().skip(1).any(|line| line.split_whitespace().next() == Some("vcan"))
+}
+
+fn link_mtu(details: &str) -> Option<u32> {
+    let mut fields = details.lines().next()?.split_whitespace();
+    fields.find(|field| *field == "mtu")?;
+    fields.next()?.parse().ok()
 }
 
 fn link_details(name: &str) -> Option<String> {
@@ -380,16 +395,14 @@ fn controller_flag(details: &str, expected: &str) -> bool {
         .filter_map(|line| line.split_once('>')).any(|(flags, _)| flags.split(',').any(|flag| flag == expected))
 }
 
-fn already_up(name: &str, virtual_link: bool, settings: ChannelSettings) -> bool {
-    let Some(details) = link_details(name) else { return false };
-    if !details.lines().next().and_then(|line| line.split_once('<'))
+fn link_is_up(details: &str) -> bool {
+    details.lines().next().and_then(|line| line.split_once('<'))
         .and_then(|(_, rest)| rest.split_once('>')).is_some_and(|(flags, _)| flags.split(',').any(|flag| flag == "UP"))
-    {
-        return false;
-    }
-    if virtual_link { return true; }
+}
+
+fn configured_timing_matches(details: &str, settings: ChannelSettings) -> bool {
     let fd = settings.mode == FrameFormat::Fd;
-    if controller_flag(&details, "LISTEN-ONLY") != settings.listen_only || controller_flag(&details, "FD") != fd {
+    if controller_flag(details, "LISTEN-ONLY") != settings.listen_only || controller_flag(details, "FD") != fd {
         return false;
     }
     let bitrate = |key: &str| details.lines().find_map(|line| {
@@ -397,7 +410,7 @@ fn already_up(name: &str, virtual_link: bool, settings: ChannelSettings) -> bool
         (fields.next()? == key).then(|| fields.next()?.parse::<u32>().ok()).flatten()
     });
     bitrate("bitrate") == Some(settings.bitrate)
-        && (!fd || (!controller_flag(&details, "FD-NON-ISO") && bitrate("dbitrate") == settings.data_bitrate))
+        && (!fd || (!controller_flag(details, "FD-NON-ISO") && bitrate("dbitrate") == settings.data_bitrate))
 }
 
 #[cfg(test)]
@@ -405,7 +418,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires a configured vcan interface with MTU 72"]
+    #[ignore = "requires a configured vcan interface with MTU of at least 72"]
     fn socketcan_vcan_mixed_classical_and_fd() {
         let name = std::env::var("CANVAZ_TEST_VCAN").expect("set CANVAZ_TEST_VCAN to the virtual interface name");
         let mut backend = SocketCanBackend;

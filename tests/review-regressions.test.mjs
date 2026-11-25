@@ -390,6 +390,30 @@ test("rejected FD simulator edits leave the running registration active", async 
     assert.match(entry.txError, /Invalid CAN FD payload length/);
 });
 
+test("Trace rows keep an explicit DBC mismatch through expansion and column rebuilds", () => {
+    const message = { id: 0, signals: [] };
+    const ctx = harness(["buildTraceRow", "entryFromRow", "expandTraceRow", "traceRowDbcMessageId", "dbcMessageFor", "dbcMessageId"], {
+        channels: new Map([[1, { dbc: { messages: { 0: message } }, config: {} }]]),
+        traceEntryRows: new WeakMap(), traceRowSignals: new WeakMap(),
+        traceRowVisible: () => true, visibleTraceCols: () => [],
+        document: { createElement: tag => {
+            assert.equal(tag, "tr", "an incompatible frame must not open a signal expansion");
+            return { dataset: {}, classList: { add() {}, contains: name => name === "dbc-match" } };
+        } },
+    });
+    const entry = {
+        channelHandle: 1, canId: 0, isExtended: false, timestampMs: 100, format: "fd",
+        direction: "rx", messageName: null, dlc: 0, data: [], signals: [],
+    };
+    const unmatched = ctx.buildTraceRow({ ...entry, dbcMessageId: null });
+    assert.equal(ctx.entryFromRow(unmatched).dbcMessageId, null);
+    ctx.expandTraceRow(unmatched);
+    const decoded = ctx.buildTraceRow({ ...entry, dbcMessageId: 0 });
+    assert.equal(ctx.entryFromRow(decoded).dbcMessageId, 0);
+    const legacy = ctx.buildTraceRow(entry);
+    assert.equal(ctx.entryFromRow(legacy).dbcMessageId, undefined);
+});
+
 test("retained CAN FD and Classical frames with the same ID track independent cycle times", async () => {
     const frames = [
         { format: "fd", brs: true, esi: true, timestamp_ms: 100, dlc: 8, data: Array(8).fill(0) },

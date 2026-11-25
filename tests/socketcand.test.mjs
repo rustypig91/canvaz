@@ -38,7 +38,7 @@ function harness(ifaces = []) {
     }
     const context = vm.createContext({
         document: { activeElement: null, getElementById: element },
-        dialogExternalTiming: false, dialogMode: "add", dialogEditTarget: null, dialogPendingDbc: null,
+        dialogExternalTiming: false, dialogCanMode: "classical", dialogMode: "add", dialogEditTarget: null, dialogPendingDbc: null,
         availableIfaces: [], channels: new Map(), ghostChannels: [], selectedChannel: null,
         escapeHtml: text => text, channelName: () => "Remote", selectChannel() {},
         invoke: async command => {
@@ -129,14 +129,15 @@ test("Socketcand registration errors appear beside the address and clear on edit
 test("switching to Socketcand and back preserves the chosen physical bitrate and listen-only flag", async () => {
     const h = harness([{ backend: "pcan", name: "USB" }]);
     await h.context.openChannelDialog("add");
-    h.element("select-bitrate").value = "250000";
+    h.element("select-bitrate").value = "custom";
+    h.element("input-bitrate-custom").value = "250000";
     for (const listenOnly of [false, true]) {
         h.element("input-listen-only").checked = listenOnly;
         h.element("select-iface").value = "__socketcand__";
         h.element("select-iface").onchange();
         assert.equal(h.element("row-bitrate").style.display, "none");
         assert.equal(h.element("input-bitrate-custom").disabled, true);
-        h.element("select-iface").value = "USB";
+        h.element("select-iface").value = "0";
         h.element("select-iface").onchange();
         assert.equal(h.element("row-socketcand").style.display, "none");
         assert.equal(h.element("row-bitrate").style.display, "");
@@ -145,6 +146,43 @@ test("switching to Socketcand and back preserves the chosen physical bitrate and
         assert.equal(h.element("input-listen-only").checked, listenOnly);
         assert.match(h.element("label-listen-only").textContent, /no ACKs/);
     }
+});
+
+test("switching between FD, virtual, and Classical-only interfaces keeps the physical timing draft", async () => {
+    const h = harness([
+        { backend: "pcan", name: "CAN 1", capabilities: { fd: true, external_timing: false } },
+        { backend: "kvaser", name: "CAN 1", capabilities: { fd: false, external_timing: false } },
+        { backend: "socketcan", name: "testbus", capabilities: { fd: true, external_timing: true } },
+    ]);
+    await h.context.openChannelDialog("add");
+    const iface = h.element("select-iface");
+    const mode = h.element("select-can-mode");
+    const selectInterface = value => {
+        iface.value = value;
+        iface.onchange();
+    };
+    mode.value = "fd";
+    h.element("select-bitrate").value = "custom";
+    h.element("input-bitrate-custom").value = "800000";
+    h.element("input-data-bitrate").value = "4000000";
+
+    selectInterface("2");
+    assert.equal(mode.value, "fd");
+    assert.equal(h.element("row-data-bitrate").hidden, true);
+    selectInterface("__socketcand__");
+    assert.equal(mode.value, "classical");
+    assert.equal(mode.options[1].disabled, true);
+    selectInterface("0");
+    assert.equal(mode.value, "fd");
+    assert.equal(h.element("row-data-bitrate").hidden, false);
+    assert.equal(h.context.getBitrateFromDialog(), 800000);
+    assert.equal(h.element("input-data-bitrate").value, "4000000");
+    selectInterface("1");
+    assert.equal(mode.value, "classical");
+    await h.context.saveChannelDialog();
+    assert.equal(h.saved[0].backend, "kvaser");
+    assert.equal(h.saved[0].mode, "classical");
+    assert.equal(h.saved[0].data_bitrate, null);
 });
 
 test("previously registered Socketcand addresses use the same remote controls", async () => {
