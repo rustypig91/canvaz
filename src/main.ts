@@ -144,7 +144,7 @@ interface CanFrameEvent {
 
 interface J1939Info { pgn: number; priority: number; sa: number; da: number; }
 
-interface PlotSignalEntry { signal_name: string; channel: string; message_id?: number; }
+interface PlotSignalEntry { signal_name: string; channel: string; message_id?: number; message_is_extended?: boolean; }
 interface PlotPaneConfig {
     signals: PlotSignalEntry[]; interpolation?: string; show_points?: boolean;
     // Manual Y-axis lock; both set = locked, absent = auto-scale.
@@ -177,7 +177,7 @@ interface ChannelErrorEvent { channel_handle: number; socketcand_attempt?: numbe
 interface SimMessageConfig {
     format?: FrameFormat | null;
     brs?: boolean;
-    channel: string; message_id: number; period_ms: number; running?: boolean;
+    channel: string; message_id: number; message_is_extended?: boolean; period_ms: number; running?: boolean;
     signals: { name: string; value: number; generator?: SimGen | null }[];
 }
 
@@ -574,10 +574,21 @@ function dbcMessageId(canId: number, isExtended: boolean): number {
     return isExtended && canId <= 0x7FF ? canId + 0x80000000 : canId;
 }
 
-// Old projects used a bare numeric ID for low extended messages. Resolve those
-// references when unambiguous; new saves retain the format-aware key.
-function savedDbcMessage(dbc: ParsedDbc | null | undefined, id: number): DbcMessage | undefined {
-    return dbc?.messages[id] ?? (id <= 0x7FF ? dbc?.messages[dbcMessageId(id, true)] : undefined);
+function savedDbcMessage(
+    dbc: ParsedDbc | null | undefined, id: number, isExtended: boolean | undefined, signalNames: readonly string[],
+): DbcMessage | undefined {
+    const exact = dbc?.messages[id];
+    if (isExtended !== undefined) return exact && !!exact.is_extended === isExtended ? exact : undefined;
+    if (id > 0x7FF) return exact;
+
+    // A legacy bare ID can refer to either identifier width. If both exist,
+    // restore it only when the saved signal names identify one definition.
+    const extended = dbc?.messages[dbcMessageId(id, true)];
+    if (!exact || !extended) return exact ?? extended;
+    const matches = [exact, extended].filter(msg =>
+        signalNames.length > 0 && signalNames.every(name => msg.signals.some(signal => signal.name === name))
+    );
+    return matches.length === 1 ? matches[0] : undefined;
 }
 
 function plotKey(channel: number, messageId: number, signalName: string) {
@@ -3620,7 +3631,10 @@ function buildProject(): Project {
             })),
         ],
         plot_panes: plotPanes.map((pane, index) => ({
-            signals: [...(pendingPaneSignals[index] ?? []), ...[...pane.series.values()].map(s => ({ signal_name: s.signalName, channel: handleToId(s.channel), message_id: s.messageId }))],
+            signals: [...(pendingPaneSignals[index] ?? []), ...[...pane.series.values()].map(s => ({
+                signal_name: s.signalName, channel: handleToId(s.channel), message_id: s.messageId,
+                message_is_extended: s.messageId > 0x7FF,
+            }))],
             interpolation: pane.interpolation,
             show_points: pane.showPoints,
             y_min: pane.yLock?.min ?? null,
@@ -3631,6 +3645,7 @@ function buildProject(): Project {
             .map(e => ({
                 channel: handleToId(e.channel),
                 message_id: e.messageId,
+                message_is_extended: e.messageId > 0x7FF,
                 format: e.format, brs: e.brs,
                 period_ms: e.periodMs,
                 running: e.running,
@@ -3971,11 +3986,11 @@ async function restoreProjectEntries() {
                 if (!pending.includes(entry)) continue;
                 const handle = idToHandle(entry.channel);
                 const dbc = handle === undefined ? null : channels.get(handle)?.dbc;
-                const sig = dbc && Object.values(dbc.messages).flatMap((m: DbcMessage) => m.signals).find(
-                    (s: DbcSignal) => entry.message_id !== undefined
-                        ? s.message_id === (savedDbcMessage(dbc, entry.message_id)?.key ?? entry.message_id) && s.name === entry.signal_name
-                        : s.name === entry.signal_name
-                );
+                const message = entry.message_id === undefined ? undefined
+                    : savedDbcMessage(dbc, entry.message_id, entry.message_is_extended, [entry.signal_name]);
+                const signals = entry.message_id === undefined
+                    ? Object.values(dbc?.messages ?? {}).flatMap(msg => msg.signals) : message?.signals;
+                const sig = signals?.find(signal => signal.name === entry.signal_name);
                 if (sig && handle !== undefined) {
                     pending.splice(pending.indexOf(entry), 1);
                     await addSignalToPane(pane, handle, sig);
@@ -3992,7 +4007,8 @@ async function restoreProjectEntries() {
         const simContainer = document.getElementById("sim-entries")!;
         for (const m of toRestore) {
             const handle = idToHandle(m.channel);
-            const msg = handle === undefined ? null : savedDbcMessage(channels.get(handle)?.dbc, m.message_id);
+            const msg = handle === undefined ? undefined
+                : savedDbcMessage(channels.get(handle)?.dbc, m.message_id, m.message_is_extended, m.signals.map(s => s.name));
             if (!msg || handle === undefined) {
                 pendingSimMessages.push(m);
                 continue;
@@ -4144,7 +4160,8 @@ function reconcileSimMessages(handle: number) {
             // message. Preserve the user's values, generators and armed state
             // with the other unresolved project entries instead of losing them.
             pendingSimMessages.push({
-                channel: handleToId(handle), message_id: entry.messageId, format: entry.format, brs: entry.brs,
+                channel: handleToId(handle), message_id: entry.messageId,
+                message_is_extended: entry.messageId > 0x7FF, format: entry.format, brs: entry.brs,
                 period_ms: entry.periodMs, running: entry.running,
                 signals: settings,
             });

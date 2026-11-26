@@ -171,7 +171,7 @@ test("saving partially restored panes retains both pending and visible signals a
     const project = ctx.buildProject();
     assert.equal(project.plot_panes.length, 1);
     assert.deepEqual(JSON.parse(JSON.stringify(project.plot_panes[0].signals)), [saved,
-        { signal_name: "Speed", channel: "kvaser:USB CAN", message_id: 456 }]);
+        { signal_name: "Speed", channel: "kvaser:USB CAN", message_id: 456, message_is_extended: false }]);
     assert.equal(project.simulate_raw_frames[0].channel, "pcan:Missing");
 });
 
@@ -202,6 +202,7 @@ test("saving and reopening with a partial DBC retains values and generators for 
     entry.signals[0].value = 7;
     const project = JSON.parse(JSON.stringify(ctx.buildProject()));
     assert.equal(project.simulate_messages[0].signals.length, 2);
+    assert.equal(project.simulate_messages[0].message_is_extended, false);
     ctx.simEntries.clear();
     ctx.pendingSimMessages = project.simulate_messages;
     await ctx.restoreProjectEntries();

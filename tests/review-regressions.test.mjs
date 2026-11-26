@@ -193,7 +193,42 @@ test("standard and extended IDs have separate trace, decoding and plot identitie
     assert.equal(ctx.dbcMessageFor(1, 0x123, false), std);
     assert.equal(ctx.dbcMessageFor(1, 0x123, true), ext);
     assert.notEqual(ctx.sigKeysFor(1, std)[0], ctx.sigKeysFor(1, ext)[0]);
-    assert.equal(ctx.savedDbcMessage({ messages: { [ext.key]: ext } }, 0x123), ext, "legacy unambiguous references still resolve");
+    assert.equal(ctx.savedDbcMessage({ messages: { [ext.key]: ext } }, 0x123, undefined, ["Value"]), ext, "legacy unambiguous references still resolve");
+});
+
+test("restoring an armed DBC simulation preserves the identifier width", async () => {
+    const id = 0x123;
+    const std = { id, key: id, is_extended: false, dlc: 8, signals: [{ name: "Shared" }, { name: "Standard" }] };
+    const ext = { id, key: 0x80000123, is_extended: true, dlc: 8, signals: [{ name: "Shared" }, { name: "Extended" }] };
+    const both = { [std.key]: std, [ext.key]: ext };
+    const cases = [
+        { messages: { [ext.key]: ext }, savedWidth: false, signalName: "Shared" },
+        { messages: both, signalName: "Shared" },
+        { messages: both, signalName: "Extended", expected: ext },
+        { messages: both, savedWidth: false, signalName: "Shared", expected: std },
+        { messages: both, savedId: ext.key, savedWidth: true, signalName: "Shared", expected: ext },
+    ];
+    for (const { messages, savedId = id, savedWidth, signalName, expected } of cases) {
+        const reference = { channel: "test", message_id: savedId, message_is_extended: savedWidth };
+        const plotted = [];
+        const ctx = harness(["restoreProjectEntries", "savedDbcMessage", "dbcMessageId"], {
+            channels: new Map([[1, { dbc: { messages } }]]),
+            pendingPaneSignals: [[{ ...reference, signal_name: signalName }]],
+            pendingSimMessages: [{ ...reference, format: "classical", running: true, period_ms: 100,
+                signals: [{ name: signalName, value: 5 }] }],
+            plotPanes: [{}], simEntries: new Map(), msgEntryCounter: 0, idToHandle: () => 1,
+            addSignalToPane: async (_pane, _handle, sig) => plotted.push(sig),
+            simDefaultValue: () => 0,
+            document: { getElementById: () => ({ appendChild() {} }) }, createSimEntryEl() {}, renderSimEntries() {}, updateSignalHighlights() {},
+        });
+        await ctx.restoreProjectEntries();
+        const [entry] = ctx.simEntries.values();
+        assert.equal(entry?.messageId, expected?.key);
+        assert.equal(entry?.running, expected ? true : undefined);
+        assert.equal(plotted[0], expected?.signals.find(s => s.name === signalName));
+        assert.equal(ctx.pendingSimMessages.length, expected ? 0 : 1);
+        assert.equal(ctx.pendingPaneSignals.length, expected ? 0 : 1);
+    }
 });
 
 test("legacy and new low extended IDs restore plots and simulator references", async () => {

@@ -86,6 +86,8 @@ pub struct PlotSignalEntry {
     /// in different messages when a pane is restored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_is_extended: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -96,6 +98,8 @@ pub struct SimulateMessage {
     pub brs: bool,
     pub channel: String,
     pub message_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_is_extended: Option<bool>,
     pub period_ms: u64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub running: bool,
@@ -293,9 +297,12 @@ mod tests {
                 {"name": "CAN FD", "backend": "pcan", "bitrate": 500000, "data_bitrate": 2000000, "mode": "fd"},
                 {"name": "legacy"}
             ],
-            "plot_panes": [],
+            "plot_panes": [{"signals": [{
+                "signal_name": "Counter", "channel": "pcan:CAN FD", "message_id": 291, "message_is_extended": false
+            }]}],
             "simulate_messages": [{
-                "channel": "pcan:CAN FD", "message_id": 291, "format": "fd", "brs": true, "period_ms": 123,
+                "channel": "pcan:CAN FD", "message_id": 0x80000123_u32, "message_is_extended": true,
+                "format": "fd", "brs": true, "period_ms": 123,
                 "running": true, "signals": [{"name": "Counter", "value": 10, "generator": {"mode": "counter"}}]
             }],
             "simulate_raw_frames": [{
@@ -310,6 +317,8 @@ mod tests {
         let reopened = Project::load(path.to_str().unwrap()).unwrap();
         assert_eq!(reopened.channels[1].mode, FrameFormat::Classical);
         assert_eq!(reopened.simulate_raw_frames[1].format, FrameFormat::Classical);
+        assert_eq!(reopened.plot_panes[0].signals[0].message_is_extended, Some(false));
+        assert_eq!(reopened.simulate_messages[0].message_is_extended, Some(true));
         assert_eq!(reopened.simulate_raw_frames[0].data.len(), 64);
         assert_eq!(serde_json::to_value(&reopened).unwrap(), serde_json::to_value(&project).unwrap());
     }
