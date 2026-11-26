@@ -117,6 +117,33 @@ test("Socketcand frames wait for their DBC and frames from a cancelled open are 
     assert.deepEqual([...h.context.traceSeenCanIds], [2, 4]);
 });
 
+test("local CAN FD frames wait for the DBC that decoded them during a reconnect", async () => {
+    const h = harness();
+    const local = channel({ info: { backend: "socketcan", name: "can0" }, dbc: { name: "Old" } });
+    h.context.channels.set(1, local);
+    let finishOpen;
+    const decoded = [];
+    Object.assign(h.context, {
+        appRunning: true, traceMode: "append", traceTabActive: false,
+        traceSeenChannels: new Set(), traceSeenCanIds: new Set(), traceSeenMsgNames: new Set(),
+        traceLastTs: new Map(), traceKey: (_handle, id) => id, traceSeenNoJ1939: false, traceSeenNoMsg: false,
+        dbcMessageFor: (_handle, _canId, _isExtended, id) => { decoded.push([local.dbc.name, id]); return null; },
+        sigKeyCache: new Map(), pgnMapCache: new Map(),
+        invoke: () => new Promise(resolve => { finishOpen = resolve; }),
+        log: (_level, message) => assert.fail(message),
+    });
+    const opening = h.context.openChannelByHandle(1, true);
+    h.context.onCanFrameBatch([{
+        channel_handle: 1, can_id: 0x123, dbc_message_id: 0x123, format: "fd", is_extended: true,
+        timestamp_ms: 1, data: Array(12).fill(0), dlc: 12, signals: [],
+    }]);
+    assert.deepEqual(decoded, []);
+    finishOpen({ name: "New" });
+    assert.equal(await opening, true);
+    assert.deepEqual(decoded, [["New", 0x123]]);
+    assert.deepEqual([...h.context.traceSeenCanIds], [0x123]);
+});
+
 test("retained frames follow signal names when the DBC changes during a reconnect", () => {
     const h = harness();
     h.context.dbcMessageFor = () => ({ signals: [{ name: "B" }, { name: "A" }, { name: "D" }] });

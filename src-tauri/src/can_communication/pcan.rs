@@ -394,6 +394,9 @@ impl RxHandle for PcanRxHandle {
                 // Skip RTR, echo and status frames; error frames pass through
                 // as distinct error rows, everything else as data frames.
                 if msg.msg_type & (PCAN_MESSAGE_RTR | PCAN_MESSAGE_ECHO | PCAN_MESSAGE_STATUS) != 0 {
+                    if std::time::Instant::now() >= deadline {
+                        return Ok(None);
+                    }
                     continue;
                 }
                 let fd_frame = msg.msg_type & PCAN_MESSAGE_FD != 0 && msg.msg_type & PCAN_MESSAGE_ERRFRAME == 0;

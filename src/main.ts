@@ -2097,15 +2097,15 @@ async function openChannelByHandle(handle: number, resumeCapture = false): Promi
         sigKeyCache.delete(handle); // key tables are derived from the DBC just replaced
         pgnMapCache.delete(handle);
         ch.socketcandAttempt = opening.socketcandAttempt;
-        // RX can emit frames before the open response reaches the webview.
-        // Apply them only after installing the DBC that decoded their signals.
-        if (opening.frames.length) onCanFrameBatch(opening.frames);
         if (opening.failed) {
             await failedChannelCloses.get(handle);
             return false;
         }
         ch.open = true;
         ch.error = null;
+        // RX can emit frames before the open response reaches the webview.
+        // Apply them only after installing the DBC that decoded their signals.
+        if (opening.frames.length) onCanFrameBatch(opening.frames);
         return true;
     } catch (e) {
         if (ch.opening !== opening) return false;
@@ -5497,12 +5497,15 @@ function onCanFrameBatch(events: CanFrameEvent[]) {
     const appendEntries: TraceEntry[] = [];
 
     for (const ev of events) {
+        const channel = channels.get(ev.channel_handle);
         if (ev.socketcand_attempt !== undefined) {
-            const channel = channels.get(ev.channel_handle);
             if (channel?.socketcandAttempt !== ev.socketcand_attempt) {
                 if (channel?.opening?.socketcandAttempt === ev.socketcand_attempt) channel.opening.frames.push(ev);
                 continue;
             }
+        } else if (channel?.opening && !channel.open) {
+            channel.opening.frames.push(ev);
+            continue;
         }
         const isError = ev.error != null;
         // Rust supplies the decoded DBC identity. Resolve it against the same

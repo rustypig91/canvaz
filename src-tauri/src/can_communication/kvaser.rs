@@ -14,6 +14,7 @@ const CAN_OPEN_REQUIRE_INIT_ACCESS: i32 = 0x0080;
 const CAN_OPEN_NO_INIT_ACCESS: i32 = 0x0100;
 const CAN_OPEN_FD: i32 = 0x0400;
 const CANLIB_CHANNEL_DATA_CAP: i32 = 1;
+const CANLIB_CHANNEL_DATA_CAP_MASK: i32 = 38;
 const CAN_CHANNEL_CAP_FD: u32 = 0x0008_0000;
 const CAN_FD_MSG_FDF: u32 = 0x01_0000;
 const CAN_FD_MSG_BRS: u32 = 0x02_0000;
@@ -404,17 +405,26 @@ impl CanBackend for KvaserBackend {
     }
 
     fn capabilities(&self, index: u8) -> ChannelCapabilities {
-        let mut caps = 0u32;
-        let status = unsafe {
-            (self.lib.get_channel_data)(i32::from(index), CANLIB_CHANNEL_DATA_CAP, (&mut caps as *mut u32).cast(), size_of::<u32>())
+        let read_capability = |item| {
+            let mut value = 0u32;
+            let status = unsafe {
+                (self.lib.get_channel_data)(i32::from(index), item, (&mut value as *mut u32).cast(), size_of::<u32>())
+            };
+            (status == CAN_OK).then_some(value & CAN_CHANNEL_CAP_FD != 0)
         };
-        let (fd, fd_limitation) = if self.lib.set_bus_fd.is_none() {
-            (Some(false), Some("Installed Kvaser CANlib driver does not expose CAN FD"))
-        } else if status == CAN_OK && caps & CAN_CHANNEL_CAP_FD == 0 {
-            (Some(false), Some("This Kvaser channel does not support ISO CAN FD"))
-        } else {
-            ((status == CAN_OK).then_some(true), None)
+        if self.lib.set_bus_fd.is_none() {
+            return ChannelCapabilities {
+                fd: Some(false), external_timing: false,
+                fd_limitation: Some("Installed Kvaser CANlib driver does not expose CAN FD"),
+            };
+        }
+        let fd = match read_capability(CANLIB_CHANNEL_DATA_CAP_MASK) {
+            Some(true) => read_capability(CANLIB_CHANNEL_DATA_CAP),
+            Some(false) => None,
+            // Drivers without a mask can still report a known positive capability.
+            None => read_capability(CANLIB_CHANNEL_DATA_CAP).filter(|&supported| supported),
         };
+        let fd_limitation = (fd == Some(false)).then_some("This Kvaser channel does not support ISO CAN FD");
         ChannelCapabilities { fd, external_timing: false, fd_limitation }
     }
 
