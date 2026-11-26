@@ -5347,6 +5347,25 @@ function applyTraceSort() {
     tbody.appendChild(frag);
 }
 
+function traceFormatLabel(entry: TraceEntry): [string, string] {
+    const label = entry.reassembled ? "J1939 TP" : entry.direction === "err" ? "Error" : entry.format === "fd"
+        ? ["FD", entry.brs ? "BRS" : "", entry.esi ? "ESI" : ""].filter(Boolean).join(" · ") : "Classical CAN";
+    const tip = entry.format === "fd"
+        ? `CAN FD · BRS ${entry.brs ? "on" : "off"}${entry.direction === "rx" ? ` · ESI ${entry.esi ? "set (error passive)" : "clear (error active)"}` : ""}`
+        : label;
+    return [label, tip];
+}
+
+function updateTraceDataCell(cell: HTMLTableCellElement, data: number[]) {
+    const text = fmtData(data);
+    if (cell.textContent === text) return;
+    cell.textContent = text;
+    if (cell.dataset.clipTip !== undefined) {
+        cell.dataset.tip = text;
+        if (tipTarget === cell && tooltipEl) tooltipEl.textContent = text;
+    }
+}
+
 function buildTraceCellHtml(key: string, entry: TraceEntry): string {
     const dirClass = entry.direction === "tx" ? "dir-tx" : entry.direction === "err" ? "dir-err" : "dir-rx";
     const j = entry.j1939;
@@ -5363,11 +5382,7 @@ function buildTraceCellHtml(key: string, entry: TraceEntry): string {
             ? `<td data-col="msg" class="td-msg-err">${escapeHtml(entry.error)}</td>`
             : `<td data-col="msg">${entry.messageName !== null ? escapeHtml(entry.messageName) : "<em style='color:var(--text-muted)'>-</em>"}</td>`;
         case "format": {
-            const label = entry.reassembled ? "J1939 TP" : entry.direction === "err" ? "Error" : entry.format === "fd"
-                ? ["FD", entry.brs ? "BRS" : "", entry.esi ? "ESI" : ""].filter(Boolean).join(" · ") : "Classical CAN";
-            const tip = entry.format === "fd"
-                ? `CAN FD · BRS ${entry.brs ? "on" : "off"}${entry.direction === "rx" ? ` · ESI ${entry.esi ? "set (error passive)" : "clear (error active)"}` : ""}`
-                : label;
+            const [label, tip] = traceFormatLabel(entry);
             return `<td data-col="format" data-tip="${tip}">${label}</td>`;
         }
         case "dlc": return `<td data-col="dlc">${entry.dlc}</td>`;
@@ -5460,9 +5475,17 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     tr.style.display = traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName, entry.j1939) ? "" : "none";
     const gc = (k: string) => tr.querySelector<HTMLTableCellElement>(`[data-col="${k}"]`);
     const tsCell = gc("ts"); if (tsCell) tsCell.textContent = fmtElapsed(entry.timestampMs);
-    const formatCell = gc("format"); if (formatCell) formatCell.outerHTML = buildTraceCellHtml("format", entry);
+    const formatCell = gc("format");
+    if (formatCell) {
+        const [label, tip] = traceFormatLabel(entry);
+        if (formatCell.textContent !== label) formatCell.textContent = label;
+        if (formatCell.dataset.tip !== tip) {
+            formatCell.dataset.tip = tip;
+            if (tipTarget === formatCell && tooltipEl) tooltipEl.textContent = tip;
+        }
+    }
     const dlcCell = gc("dlc"); if (dlcCell) dlcCell.textContent = String(entry.dlc);
-    const dataCell = gc("data"); if (dataCell) dataCell.textContent = fmtData(entry.data);
+    const dataCell = gc("data"); if (dataCell) updateTraceDataCell(dataCell, entry.data);
     const cycleCell = gc("cycle"); if (cycleCell) cycleCell.textContent = entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—";
     const canIdCell = gc("canId"); if (canIdCell) canIdCell.outerHTML = buildTraceCellHtml("canId", entry);
     const msgCell = gc("msg"); if (msgCell) msgCell.outerHTML = buildTraceCellHtml("msg", entry);
@@ -5777,7 +5800,7 @@ function refreshTraceFormat() {
     for (const tr of Array.from(tbody.rows)) {
         const bytes: number[] = JSON.parse((tr as HTMLTableRowElement).dataset.bytes ?? "[]");
         const dc = (tr as HTMLTableRowElement).querySelector<HTMLTableCellElement>('[data-col="data"]');
-        if (dc) dc.textContent = fmtData(bytes);
+        if (dc) updateTraceDataCell(dc, bytes);
     }
 }
 

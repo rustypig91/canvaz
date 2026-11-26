@@ -518,6 +518,33 @@ test("Trace renders CAN FD ASCII payload characters as text", () => {
         `<td data-col="data" class="td-data">${" ".repeat(60)}&lt;&amp;&gt;&quot;</td>`);
 });
 
+test("Trace keeps live FD flags and clipped payload tooltips current", () => {
+    const formatCell = { textContent: "FD", dataset: { tip: "CAN FD · BRS off · ESI clear (error active)" } };
+    const dataCell = { textContent: "00", dataset: { tip: "00", clipTip: "1" } };
+    Object.defineProperty(formatCell, "outerHTML", {
+        set() { assert.fail("A live flag update must keep the hovered cell in place"); },
+    });
+    const cells = { '[data-col="format"]': formatCell, '[data-col="data"]': dataCell };
+    const row = { dataset: {}, style: {}, classList: { toggle() {} }, querySelector: key => cells[key] };
+    const tooltipEl = { textContent: "" };
+    const ctx = harness(["updateTraceRowEl", "traceFormatLabel", "updateTraceDataCell", "fmtData"], {
+        traceDataFormat: "hex", traceRowSignals: new WeakMap(), traceRowVisible: () => true,
+        tipTarget: formatCell, tooltipEl,
+    });
+    const entry = {
+        format: "fd", direction: "rx", brs: true, esi: true, data: Array(64).fill(0xAB),
+        signals: [], timestampMs: 1, dlc: 64, messageName: null,
+    };
+
+    ctx.updateTraceRowEl(row, entry);
+    assert.equal(formatCell.textContent, "FD · BRS · ESI");
+    assert.equal(tooltipEl.textContent, "CAN FD · BRS on · ESI set (error passive)");
+    ctx.tipTarget = dataCell;
+    entry.data[63] = 0xCD;
+    ctx.updateTraceRowEl(row, entry);
+    assert.equal(tooltipEl.textContent, `${"AB ".repeat(63)}CD`);
+});
+
 test("Trace rows keep an explicit DBC mismatch through expansion and column rebuilds", () => {
     const message = { id: 0, signals: [] };
     const ctx = harness(["buildTraceRow", "entryFromRow", "expandTraceRow", "traceRowDbcMessageId", "dbcMessageFor", "dbcMessageId"], {

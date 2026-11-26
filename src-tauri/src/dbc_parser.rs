@@ -13,14 +13,14 @@ pub struct ParsedDbc {
     pub path: String,
     /// Keyed by message_key: low extended IDs carry bit 31 to avoid standard-ID collisions.
     pub messages: HashMap<u32, ParsedMessage>,
-    /// J1939 (PGN, source address) → key into `messages`, for matching on J1939
+    /// J1939 (PGN, source address) → keys into `messages`, for matching on J1939
     /// channels where the frame's priority bits (and destination address for
     /// PDU1 groups) vary while the DBC lists one fixed 29-bit id per message.
     /// The source address stays part of the identity: the same PGN sent by two
     /// nodes can be two different DBC messages. Keys are `(pgn << 8) | sa`.
     /// Rebuilt on load, never serialized.
     #[serde(skip)]
-    pgn_index: HashMap<u32, u32>,
+    pgn_index: HashMap<u32, Vec<u32>>,
     /// All CAN network nodes (`BU_`) declared in the DBC, including ones that
     /// transmit no messages. `#[serde(default)]` so projects saved before this
     /// field existed still deserialize.
@@ -484,14 +484,11 @@ impl ParsedDbc {
             );
         }
 
-        self.pgn_index = messages
-            .values()
-            .filter(|m| m.is_extended && m.wire_format() != Some(FrameFormat::Fd))
-            .map(|m| {
-                let j = crate::j1939::decode_id(m.id);
-                ((j.pgn << 8) | j.sa as u32, m.key)
-            })
-            .collect();
+        self.pgn_index.clear();
+        for msg in messages.values().filter(|m| m.is_extended && m.wire_format() != Some(FrameFormat::Fd)) {
+            let j = crate::j1939::decode_id(msg.id);
+            self.pgn_index.entry((j.pgn << 8) | u32::from(j.sa)).or_default().push(msg.key);
+        }
         self.messages = messages;
         self.nodes = dbc.nodes.iter().map(|n| n.0.clone()).collect();
 
@@ -519,8 +516,12 @@ impl ParsedDbc {
         }
         let j = crate::j1939::decode_id(frame.can_id);
         let key = (j.pgn << 8) | j.sa as u32;
-        let msg = self.pgn_index.get(&key).and_then(|id| self.messages.get(id))
-            .filter(|msg| msg.matches_payload(frame, reassembled))?;
+        let len = frame.data.len() as u64;
+        let msg = self.pgn_index.get(&key)?.iter()
+            .filter_map(|id| self.messages.get(id))
+            .filter(|msg| msg.matches_payload(frame, reassembled))
+            // Prefer a layout that fits the received payload, then the closest length.
+            .min_by_key(|msg| (msg.dlc > len, msg.dlc.abs_diff(len), msg.key))?;
         Some((msg.decode_data(&frame.data), msg.key))
     }
 
@@ -1009,6 +1010,29 @@ BA_ "VFrameFormat" BO_ 2364531712 2;
         dbc.messages.get_mut(&message_id).unwrap().frame_format = Some(DbcFrameFormat::Fd);
         assembled.can_id = message_id;
         assert!(dbc.decode_frame_j1939(&assembled, true).is_none());
+    }
+
+    #[test]
+    fn j1939_fallback_considers_each_definition_for_a_pgn_and_source() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("variants.dbc");
+        let single_id = 0x0CF00400;
+        let transport_id = 0x18F00400;
+        let content = format!(
+            "VERSION \"\"\n\nNS_ :\n\nBS_:\n\nBU_:\n\nBO_ {} Single: 8 Vector__XXX\n\nBO_ {} Transport: 12 Vector__XXX\n",
+            single_id | 0x8000_0000u32, transport_id | 0x8000_0000u32
+        );
+        std::fs::write(&path, content).unwrap();
+        let dbc = ParsedDbc::new(path.to_str().unwrap()).unwrap();
+
+        let mut incoming = frame(transport_id);
+        let (_, key) = dbc.decode_frame_j1939(&incoming, false).unwrap();
+        assert_eq!(key, single_id);
+
+        incoming.can_id = 0x1CF00400;
+        incoming.data.resize(12, 0);
+        let (_, key) = dbc.decode_frame_j1939(&incoming, true).unwrap();
+        assert_eq!(key, transport_id);
     }
 
     #[test]
