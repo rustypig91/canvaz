@@ -214,18 +214,32 @@
           <input id="input-channel-name" type="text" maxlength="64" placeholder="Optional — defaults to interface name" />
         </div>
 
+        <div class="form-row">
+          <label for="select-can-mode">Bus mode</label>
+          <select id="select-can-mode" aria-describedby="hint-can-mode">
+            <option value="classical">Classical CAN</option>
+            <option value="fd">CAN FD (ISO)</option>
+          </select>
+          <small id="hint-can-mode"></small>
+        </div>
+
         <div class="form-row" id="row-bitrate">
-          <label for="select-bitrate">Bitrate</label>
+          <label for="select-bitrate">Nominal bitrate</label>
           <select id="select-bitrate">
             <option value="125000">125 kbps</option>
             <option value="250000">250 kbps</option>
             <option value="500000" selected>500 kbps</option>
             <option value="1000000">1 Mbps</option>
             <option value="custom">Custom…</option>
-            <option value="vcan">Virtual (vcan)</option>
           </select>
-          <input id="input-bitrate-custom" aria-label="Custom bitrate in bits per second" type="number" placeholder="bits/s" style="display:none" />
+          <input id="input-bitrate-custom" aria-label="Custom bitrate in bits per second" type="number" min="1" max="4294967295" step="1" placeholder="bits/s" style="display:none" aria-describedby="error-can-timing" />
         </div>
+
+        <div class="form-row" id="row-data-bitrate" hidden>
+          <label for="input-data-bitrate">Data bitrate (bit/s)</label>
+          <input id="input-data-bitrate" type="number" min="1" max="4294967295" step="1" value="2000000" aria-describedby="error-can-timing" />
+        </div>
+        <small id="error-can-timing" class="form-row form-error" role="alert"></small>
 
         <div class="form-row">
           <label for="select-protocol">Protocol</label>

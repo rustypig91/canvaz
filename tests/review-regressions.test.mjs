@@ -6,9 +6,12 @@ import ts from "typescript";
 
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 function harness(names, globals = {}) {
+    names = [...new Set([...names, "defaultSimFormat", "restoreSimMessageTransmission", "simFormatControls", "simFormatError", "canRegisterSim"])];
+    const constants = source.statements.filter(n => ts.isVariableStatement(n)
+        && n.declarationList.declarations.some(d => d.name.getText(source) === "FD_LENGTHS"));
     const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text));
     assert.equal(functions.length, names.length);
-    const code = ts.transpileModule(functions.map(n => n.getText(source)).join("\n").replaceAll("import.meta.env.DEV", "false"), {
+    const code = ts.transpileModule([...constants, ...functions].map(n => n.getText(source)).join("\n").replaceAll("import.meta.env.DEV", "false"), {
         compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
     }).outputText;
     const context = vm.createContext({ log() {}, ...globals });
@@ -22,8 +25,8 @@ function deferred() {
 }
 function simHarness(invoke) {
     const entry = { kind: "raw", channel: 1, canId: 0x123, isExtended: false, dlc: 1, data: [0], periodMs: 100, running: false, periodicHandle: null };
-    const ctx = harness(["startSim", "stopSim", "queueSimOperation", "removeSimEntry", "updateRunningSim"], {
-        invoke, simEntries: new Map([["raw", entry]]), channels: new Map([[1, { open: true }]]), appRunning: true,
+    const ctx = harness(["startSim", "sendSimOnce", "stopSim", "queueSimOperation", "removeSimEntry", "updateRunningSim"], {
+        invoke, simEntries: new Map([["raw", entry]]), channels: new Map([[1, { open: true, config: { mode: "fd" } }]]), appRunning: true,
         document: { querySelector: () => null }, scheduleAutoSave() {}, updateSimTxStatus() {}, updateSignalHighlights() {},
     });
     return { ctx, entry };
@@ -190,7 +193,43 @@ test("standard and extended IDs have separate trace, decoding and plot identitie
     assert.equal(ctx.dbcMessageFor(1, 0x123, false), std);
     assert.equal(ctx.dbcMessageFor(1, 0x123, true), ext);
     assert.notEqual(ctx.sigKeysFor(1, std)[0], ctx.sigKeysFor(1, ext)[0]);
-    assert.equal(ctx.savedDbcMessage({ messages: { [ext.key]: ext } }, 0x123), ext, "legacy unambiguous references still resolve");
+    assert.equal(ctx.savedDbcMessage({ messages: { [ext.key]: ext } }, 0x123, undefined, ["Value"]), ext, "legacy unambiguous references still resolve");
+});
+
+test("restoring an armed DBC simulation preserves the identifier width", async () => {
+    const id = 0x123;
+    const std = { id, key: id, is_extended: false, dlc: 8, signals: [{ name: "Shared" }, { name: "Standard" }] };
+    const ext = { id, key: 0x80000123, is_extended: true, dlc: 8, signals: [{ name: "Shared" }, { name: "Extended" }] };
+    const both = { [std.key]: std, [ext.key]: ext };
+    const cases = [
+        { messages: { [ext.key]: ext }, savedWidth: false, signalName: "Shared" },
+        { messages: both, signalName: "Shared" },
+        { messages: both, signalName: "Extended", expected: ext },
+        { messages: both, savedWidth: false, signalName: "Shared", expected: std },
+        { messages: both, savedWidth: true, signalName: "Shared", expected: ext },
+        { messages: both, savedId: ext.key, savedWidth: true, signalName: "Shared", expected: ext },
+    ];
+    for (const { messages, savedId = id, savedWidth, signalName, expected } of cases) {
+        const reference = { channel: "test", message_id: savedId, message_is_extended: savedWidth };
+        const plotted = [];
+        const ctx = harness(["restoreProjectEntries", "savedDbcMessage", "dbcMessageId"], {
+            channels: new Map([[1, { dbc: { messages } }]]),
+            pendingPaneSignals: [[{ ...reference, signal_name: signalName }]],
+            pendingSimMessages: [{ ...reference, format: "classical", running: true, period_ms: 100,
+                signals: [{ name: signalName, value: 5 }] }],
+            plotPanes: [{}], simEntries: new Map(), msgEntryCounter: 0, idToHandle: () => 1,
+            addSignalToPane: async (_pane, _handle, sig) => plotted.push(sig),
+            simDefaultValue: () => 0,
+            document: { getElementById: () => ({ appendChild() {} }) }, createSimEntryEl() {}, renderSimEntries() {}, updateSignalHighlights() {},
+        });
+        await ctx.restoreProjectEntries();
+        const [entry] = ctx.simEntries.values();
+        assert.equal(entry?.messageId, expected?.key);
+        assert.equal(entry?.running, expected ? true : undefined);
+        assert.equal(plotted[0], expected?.signals.find(s => s.name === signalName));
+        assert.equal(ctx.pendingSimMessages.length, expected ? 0 : 1);
+        assert.equal(ctx.pendingPaneSignals.length, expected ? 0 : 1);
+    }
 });
 
 test("legacy and new low extended IDs restore plots and simulator references", async () => {
@@ -248,7 +287,7 @@ test("raw frame edits and DBC period edits schedule persistence while stopped", 
     const el = ctx.createSimEntryEl("raw", raw);
     assert.match(el.innerHTML, /<option value="0"/);
     for (const [selector, event, value, checked] of [
-        [".sim-channel-sel", "change", "2"], [".sim-canid-input", "input", "321"],
+        [".sim-channel-sel", "change", "2"], [".sim-canid-input", "change", "321"],
         [".sim-ext-cb", "change", "", true], [".sim-dlc-sel", "change", "0"],
         [".sim-period", "input", "250"], [".sim-byte", "input", "AB"],
     ]) {
@@ -262,6 +301,16 @@ test("raw frame edits and DBC period edits schedule persistence while stopped", 
     assert.equal(raw.dlc, 0);
     assert.equal(el.querySelector(".sim-byte").disabled, true);
     assert.match(ctx.createSimEntryEl("restored", raw).innerHTML, /<option value="0" selected>/);
+    const beforeInvalidId = saved.length;
+    const canIdInput = el.querySelector(".sim-canid-input");
+    await canIdInput.fire("change", "");
+    await canIdInput.fire("change", "123Z");
+    await canIdInput.fire("change", "20000000");
+    assert.equal(raw.canId, 0x321);
+    assert.equal(canIdInput.value, "321");
+    assert.equal(saved.length, beforeInvalidId);
+    await canIdInput.fire("change", "0x1FFFFFFF");
+    assert.equal(raw.canId, 0x1FFFFFFF);
     const message = { kind: "message", channel: 1, messageId: 1, messageName: "Message", signals: [], periodMs: 100, running: false };
     const msgEl = ctx.createSimEntryEl("msg", message);
     const before = saved.length;
@@ -298,8 +347,9 @@ test("opening another project resets backend registrations and cached traffic be
     assert.deepEqual(calls, ["stop", "reset", "clear trace", "register new"]);
 });
 
-test("restored short raw payloads can grow from zero to eight bytes and transmit the chosen DLC", async () => {
-    for (const data of [[], [0xAB]]) {
+test("restored raw payloads transmit the chosen length and retain bytes beyond it", async () => {
+    const stagedFdData = Array.from({ length: 64 }, (_, i) => i + 1);
+    for (const [data, dlc] of [[[], 0], [[0xAB], 1], [stagedFdData, 8]]) {
         const caches = Object.fromEntries(["signalLastValues", "signalLastRaw", "signalMinValues", "signalMaxValues", "sigKeyCache", "pgnMapCache"].map(k => [k, new Map()]));
         const sent = [];
         const ctx = harness(["applyProject", "sendSimOnce", "startSim", "queueSimOperation", "updateRunningSim"], {
@@ -316,22 +366,261 @@ test("restored short raw payloads can grow from zero to eight bytes and transmit
             restoreProjectEntries: async () => {}, updateSimTxStatus() {}, scheduleAutoSave() {},
         });
         await ctx.applyProject({ channels: [], plot_panes: [], simulate_raw_frames: [{
-            channel: "socketcand:can://localhost/vcan0", can_id: 0x123, is_extended: false,
-            dlc: data.length, data, period_ms: 100,
+            channel: "socketcan:vcan0", can_id: 0x123, is_extended: false,
+            dlc, data, period_ms: 100,
         }] });
         ctx.appRunning = true;
-        ctx.channels.set(1, { open: true, config: {} });
+        ctx.channels.set(1, { open: true, config: { mode: "fd" } });
         const [key, entry] = [...ctx.simEntries][0];
-        assert.equal(entry.data.length, 8, "restore all eight editable byte slots");
+        assert.equal(entry.data.length, Math.max(8, data.length));
         await ctx.sendSimOnce(key);
-        assert.deepEqual(sent.pop(), ["send_frame", data]);
+        assert.deepEqual(sent.pop(), ["send_frame", data.slice(0, dlc)]);
         entry.dlc = 8;
         const expected = Array.from({ length: 8 }, (_, i) => data[i] ?? 0);
         await ctx.sendSimOnce(key);
         await ctx.startSim(key);
         await ctx.updateRunningSim(key);
         assert.deepEqual(sent, [["send_frame", expected], ["add_periodic_frame", expected], ["update_periodic_frame", expected]]);
+        if (data === stagedFdData) {
+            entry.format = "fd";
+            entry.dlc = 64;
+            await ctx.sendSimOnce(key);
+            assert.deepEqual(sent.pop(), ["send_frame", stagedFdData]);
+        }
     }
+});
+
+test("FD raw editor offers legal lengths and delivers byte 64 to Send and Simulate", async () => {
+    class Element {
+        dataset = {};
+        addEventListener() {}
+        querySelector() { return new Element(); }
+        querySelectorAll() { return []; }
+    }
+    const sent = [];
+    const ctx = harness(["createSimEntryEl", "escapeHtml", "sendSimOnce", "startSim", "queueSimOperation", "updateRunningSim"], {
+        channels: new Map([[1, { open: true, info: { backend: "socketcan", name: "vcan0" }, config: { mode: "fd" } }]]),
+        simEntries: new Map(), appRunning: true,
+        document: { createElement: () => new Element() }, updateSimEntryStatus() {},
+        updateSimTxStatus() {}, scheduleAutoSave() {},
+        invoke: async (command, { cmd }) => { sent.push([command, cmd]); return 42; },
+    });
+    const data = Array.from({ length: 64 }, (_, i) => i);
+    const entry = {
+        kind: "raw", channel: 1, canId: 0x123, isExtended: true, format: "fd", brs: true, dlc: 64,
+        data, periodMs: 100, running: false, periodicHandle: null,
+    };
+    ctx.simEntries.set("fd", entry);
+    const editor = ctx.createSimEntryEl("fd", entry).innerHTML;
+    assert.match(editor, /<option value="64" selected>/);
+    assert.doesNotMatch(editor, /<option value="63"/);
+    assert.match(editor, /Data byte 64 in hexadecimal/);
+    await ctx.sendSimOnce("fd");
+    await ctx.startSim("fd");
+    await ctx.updateRunningSim("fd");
+    assert.deepEqual(sent.map(([command]) => command), ["send_frame", "add_periodic_frame", "update_periodic_frame"]);
+    for (const [, command] of sent) {
+        assert.equal(command.format, "fd");
+        assert.equal(command.brs, true);
+        assert.equal(command.is_extended, true);
+        assert.deepEqual(Array.from(command.data), data);
+    }
+});
+
+test("rejected FD simulator edits leave the running registration active", async () => {
+    const calls = [];
+    const { ctx, entry } = simHarness(async command => {
+        calls.push(command);
+        if (command === "add_periodic_frame") return 42;
+        throw new Error("Invalid CAN FD payload length");
+    });
+    entry.format = "fd";
+    await ctx.startSim("raw");
+    await ctx.updateRunningSim("raw");
+    assert.deepEqual(calls, ["add_periodic_frame", "update_periodic_frame"]);
+    assert.equal(entry.running, true);
+    assert.equal(entry.periodicHandle, 42);
+    assert.match(entry.txError, /Invalid CAN FD payload length/);
+});
+
+test("an armed FD simulation waits for an FD-enabled channel without disarming", async () => {
+    const calls = [];
+    const { ctx, entry } = simHarness(async command => {
+        calls.push(command);
+        return 42;
+    });
+    const channel = ctx.channels.get(1);
+    channel.config.mode = "classical";
+    entry.format = "fd";
+    entry.running = true;
+    await ctx.startSim("raw");
+    assert.deepEqual(calls, []);
+    assert.equal(entry.running, true);
+    assert.equal(entry.periodicHandle, null);
+
+    channel.config.mode = "fd";
+    await ctx.startSim("raw");
+    assert.deepEqual(calls, ["add_periodic_frame"]);
+    assert.equal(entry.periodicHandle, 42);
+});
+
+test("an armed DBC simulation resumes after its transmit format is resolved", async () => {
+    const sent = [];
+    const { ctx, entry } = simHarness(async (command, { cmd }) => {
+        sent.push([command, cmd.format]);
+        return 42;
+    });
+    ctx.simSignalValues = () => ({});
+    ctx.simGenerators = () => ({});
+    Object.assign(entry, { kind: "message", messageId: 0x123, dlc: 12, format: null, running: true });
+    await ctx.startSim("raw");
+    assert.deepEqual(sent, []);
+    assert.equal(entry.running, true);
+    assert.equal(entry.periodicHandle, null);
+
+    entry.format = "fd";
+    await ctx.updateRunningSim("raw");
+    assert.deepEqual(sent, [["add_periodic_message", "fd"]]);
+    assert.equal(entry.periodicHandle, 42);
+});
+
+test("an armed legacy DBC simulation needs confirmation before switching to FD", () => {
+    const { restoreSimMessageTransmission } = harness([]);
+    const msg = { dlc: 8, frame_format: "fd" };
+    for (const legacyFormat of [undefined, null, "classical"]) {
+        const restored = restoreSimMessageTransmission(msg, legacyFormat, false, true);
+        assert.equal(restored.format, "fd");
+        assert.equal(restored.running, false);
+        assert.match(restored.txError, /Review the format/);
+    }
+    const savedFd = restoreSimMessageTransmission(msg, "fd", true, true);
+    assert.equal(savedFd.running, true);
+    assert.equal(savedFd.brs, true);
+    assert.equal(restoreSimMessageTransmission({ dlc: 8 }, undefined, false, true).running, true);
+    assert.equal(restoreSimMessageTransmission({ dlc: 12 }, null, false, true).running, true);
+});
+
+test("a saved oversized raw length cannot silently transmit a shorter FD frame", async () => {
+    const sent = [];
+    const { ctx, entry } = simHarness(command => { sent.push(command); return 42; });
+    Object.assign(entry, { format: "fd", dlc: 65, data: Array(64).fill(0) });
+    await ctx.sendSimOnce("raw");
+    await ctx.startSim("raw");
+    assert.deepEqual(sent, []);
+    assert.equal(entry.running, true);
+    assert.equal(entry.periodicHandle, null);
+});
+
+test("Trace renders CAN FD ASCII payload characters as text", () => {
+    const ctx = harness(["buildTraceCellHtml", "fmtData", "escapeHtml"], { traceDataFormat: "ascii" });
+    const data = [...Array(60).fill(0x20), 0x3C, 0x26, 0x3E, 0x22];
+    assert.equal(ctx.buildTraceCellHtml("data", { direction: "rx", format: "fd", data }),
+        `<td data-col="data" class="td-data">${" ".repeat(60)}&lt;&amp;&gt;&quot;</td>`);
+});
+
+test("Trace keeps live FD flags and clipped payload tooltips current", () => {
+    const formatCell = { textContent: "FD", dataset: { tip: "CAN FD · BRS off · ESI clear (error active)" } };
+    const dataCell = { textContent: "00", dataset: { tip: "00", clipTip: "1" } };
+    Object.defineProperty(formatCell, "outerHTML", {
+        set() { assert.fail("A live flag update must keep the hovered cell in place"); },
+    });
+    const cells = { '[data-col="format"]': formatCell, '[data-col="data"]': dataCell };
+    const row = { dataset: {}, style: {}, classList: { toggle() {} }, querySelector: key => cells[key] };
+    const tooltipEl = { textContent: "" };
+    const ctx = harness(["updateTraceRowEl", "traceFormatLabel", "updateTraceDataCell", "fmtData"], {
+        traceDataFormat: "hex", traceRowSignals: new WeakMap(), traceRowVisible: () => true,
+        tipTarget: formatCell, tooltipEl,
+    });
+    const entry = {
+        format: "fd", direction: "rx", brs: true, esi: true, data: Array(64).fill(0xAB),
+        signals: [], timestampMs: 1, dlc: 64, messageName: null,
+    };
+
+    ctx.updateTraceRowEl(row, entry);
+    assert.equal(formatCell.textContent, "FD · BRS · ESI");
+    assert.equal(tooltipEl.textContent, "CAN FD · BRS on · ESI set (error passive)");
+    ctx.tipTarget = dataCell;
+    entry.data[63] = 0xCD;
+    ctx.updateTraceRowEl(row, entry);
+    assert.equal(tooltipEl.textContent, `${"AB ".repeat(63)}CD`);
+});
+
+test("Trace reuses the CAN ID and message cells until the message changes", () => {
+    const replacements = [];
+    const canIdCell = { set outerHTML(_) { assert.fail("CAN ID is part of the overwrite key"); } };
+    const msgCell = { set outerHTML(html) { replacements.push(html); } };
+    const cells = { '[data-col="canId"]': canIdCell, '[data-col="msg"]': msgCell };
+    const row = {
+        dataset: { msg: "First" }, style: {},
+        classList: { toggle() {} }, querySelector: key => cells[key],
+    };
+    const ctx = harness(["updateTraceRowEl"], {
+        buildTraceCellHtml: (col, entry) => [col, entry.messageName, entry.error],
+        traceRowSignals: new WeakMap(), traceRowVisible: () => true,
+    });
+    const entry = { data: [], signals: [], timestampMs: 1, dlc: 0, messageName: "First" };
+    ctx.updateTraceRowEl(row, entry);
+    assert.deepEqual(replacements, []);
+
+    ctx.updateTraceRowEl(row, { ...entry, messageName: "Second" });
+    assert.equal(row.dataset.msg, "Second");
+    assert.deepEqual(replacements, [["msg", "Second", undefined]]);
+
+    row.dataset.msg = "";
+    row.dataset.err = "First bus error";
+    const error = { ...entry, messageName: null, error: "Second bus error" };
+    ctx.updateTraceRowEl(row, error);
+    ctx.updateTraceRowEl(row, error);
+    assert.equal(row.dataset.err, "Second bus error");
+    assert.deepEqual(replacements.at(-1), ["msg", null, "Second bus error"]);
+    assert.equal(replacements.length, 2);
+});
+
+test("Trace rows keep an explicit DBC mismatch through expansion and column rebuilds", () => {
+    const message = { id: 0, signals: [] };
+    const ctx = harness(["buildTraceRow", "entryFromRow", "expandTraceRow", "traceRowDbcMessageId", "dbcMessageFor", "dbcMessageId"], {
+        channels: new Map([[1, { dbc: { messages: { 0: message } }, config: {} }]]),
+        traceEntryRows: new WeakMap(), traceRowSignals: new WeakMap(),
+        traceRowVisible: () => true, visibleTraceCols: () => [],
+        document: { createElement: tag => {
+            assert.equal(tag, "tr", "an incompatible frame must not open a signal expansion");
+            return { dataset: {}, classList: { add() {}, contains: name => name === "dbc-match" } };
+        } },
+    });
+    const entry = {
+        channelHandle: 1, canId: 0, isExtended: false, timestampMs: 100, format: "fd",
+        direction: "rx", messageName: null, dlc: 0, data: [], signals: [],
+    };
+    const unmatched = ctx.buildTraceRow({ ...entry, dbcMessageId: null });
+    assert.equal(ctx.entryFromRow(unmatched).dbcMessageId, null);
+    ctx.expandTraceRow(unmatched);
+    const decoded = ctx.buildTraceRow({ ...entry, dbcMessageId: 0 });
+    assert.equal(ctx.entryFromRow(decoded).dbcMessageId, 0);
+    const legacy = ctx.buildTraceRow(entry);
+    assert.equal(ctx.entryFromRow(legacy).dbcMessageId, undefined);
+});
+
+test("retained CAN FD and Classical frames with the same ID track independent cycle times", async () => {
+    const frames = [
+        { format: "fd", brs: true, esi: true, timestamp_ms: 100, dlc: 8, data: Array(8).fill(0) },
+        { format: "classical", timestamp_ms: 103, dlc: 8, data: Array(8).fill(0) },
+        { format: "fd", brs: true, timestamp_ms: 110, dlc: 64, data: Array(64).fill(0xAB) },
+        { format: "classical", timestamp_ms: 123, dlc: 8, data: Array(8).fill(0) },
+    ].map(frame => ({ ...frame, can_id: 0x123, is_extended: true, channel_handle: 1, direction: "rx" }));
+    const ctx = harness(["loadTraceFrames", "traceKey"], {
+        invoke: async () => frames, traceMaxRows: 100, traceLoadGeneration: 0, traceLocalBuffer: [],
+        traceSeenChannels: new Set(), traceSeenCanIds: new Set(), traceSeenMsgNames: new Set(),
+        traceSeenNoJ1939: false, interleaveFrameSignals: () => [],
+    });
+    assert.equal(await ctx.loadTraceFrames(), true);
+    const [classic, longFd, firstClassic, shortFd] = ctx.traceLocalBuffer;
+    assert.equal(classic.cycleTimeMs, 20);
+    assert.equal(longFd.cycleTimeMs, 10);
+    assert.equal(longFd.brs, true);
+    assert.equal(longFd.data[63], 0xAB);
+    assert.equal(firstClassic.cycleTimeMs, null);
+    assert.equal(shortFd.cycleTimeMs, null);
+    assert.equal(shortFd.esi, true);
 });
 
 test("clearing trace invalidates an in-flight fetch from the previous project", async () => {

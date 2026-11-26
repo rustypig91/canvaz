@@ -8,10 +8,12 @@ import ts from "typescript";
 // Tauri IPC. No CAN driver or physical interface is needed for these scenarios.
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 function harness(names, globals) {
-    names = [...new Set([...names, "savedDbcMessage", "dbcMessageId", "simMessageSettings"])];
+    names = [...new Set([...names, "savedDbcMessage", "dbcMessageId", "simMessageSettings", "defaultSimFormat", "restoreSimMessageTransmission"])];
     const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text));
     assert.equal(functions.length, names.length);
-    const code = ts.transpileModule(functions.map(n => n.getText(source)).join("\n"), {
+    const constants = source.statements.filter(n => ts.isVariableStatement(n)
+        && n.declarationList.declarations.some(d => d.name.getText(source) === "FD_LENGTHS"));
+    const code = ts.transpileModule([...constants, ...functions].map(n => n.getText(source)).join("\n"), {
         compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
     }).outputText;
     const context = vm.createContext({ pendingPaneSignals: [], pendingSimMessages: [], startingCapture: null, stoppingCapture: null, ...globals });
@@ -169,7 +171,7 @@ test("saving partially restored panes retains both pending and visible signals a
     const project = ctx.buildProject();
     assert.equal(project.plot_panes.length, 1);
     assert.deepEqual(JSON.parse(JSON.stringify(project.plot_panes[0].signals)), [saved,
-        { signal_name: "Speed", channel: "kvaser:USB CAN", message_id: 456 }]);
+        { signal_name: "Speed", channel: "kvaser:USB CAN", message_id: 456, message_is_extended: false }]);
     assert.equal(project.simulate_raw_frames[0].channel, "pcan:Missing");
 });
 
@@ -200,6 +202,7 @@ test("saving and reopening with a partial DBC retains values and generators for 
     entry.signals[0].value = 7;
     const project = JSON.parse(JSON.stringify(ctx.buildProject()));
     assert.equal(project.simulate_messages[0].signals.length, 2);
+    assert.equal(project.simulate_messages[0].message_is_extended, false);
     ctx.simEntries.clear();
     ctx.pendingSimMessages = project.simulate_messages;
     await ctx.restoreProjectEntries();
@@ -211,6 +214,35 @@ test("saving and reopening with a partial DBC retains values and generators for 
     assert.deepEqual(restored.signals[1].gen, generator);
     assert.equal(restored.running, true);
     assert.equal(restored.unresolvedSignals.length, 0);
+});
+
+test("a DBC frame format change disarms a saved or reconnecting simulation", async () => {
+    const message = { id: 123, name: "Engine", dlc: 8, frame_format: "fd", signals: [] };
+    const channel = { dbc: { messages: { 123: message } } };
+    const ctx = harness(["restoreProjectEntries", "reconcileSimMessages"], {
+        channels: new Map([[7, channel]]), pendingPaneSignals: [], simEntries: new Map(), msgEntryCounter: 0,
+        pendingSimMessages: [
+            { channel: "can", message_id: 123, format: "classical", running: true, period_ms: 100, signals: [] },
+            { channel: "can", message_id: 123, format: "fd", brs: true, running: true, period_ms: 200, signals: [] },
+        ],
+        idToHandle: () => 7,
+        document: { getElementById: () => ({ appendChild() {}, querySelector: () => null }) },
+        createSimEntryEl: () => ({}), renderSimEntries() {}, updateSignalHighlights() {},
+    });
+    await ctx.restoreProjectEntries();
+    const [changed, unchanged] = ctx.simEntries.values();
+    assert.equal(changed.format, "fd");
+    assert.equal(changed.running, false);
+    assert.match(changed.txError, /DBC frame format changed/);
+    assert.equal(unchanged.running, true);
+    assert.equal(unchanged.brs, true);
+
+    message.frame_format = "classical";
+    ctx.reconcileSimMessages(7);
+    assert.equal(unchanged.format, "classical");
+    assert.equal(unchanged.running, false);
+    assert.equal(unchanged.brs, false);
+    assert.match(unchanged.txError, /DBC frame format changed/);
 });
 
 test("plot restoration autosaves retain unresolved entries in this pane and later panes", async () => {
@@ -367,11 +399,12 @@ test("Start preserves duplicate offline channels, dependent entries and saved ID
 
 test("one-shot simulation sends only on an open channel and preserves offline settings", async () => {
     for (const kind of ["message", "raw"]) {
-        const entry = { kind, channel: 7, messageId: 123, canId: 123, data: [1, 2, 3], dlc: 2, isExtended: true, running: true, periodicHandle: null };
+        const entry = { kind, channel: 7, messageId: 123, canId: 123, data: [1, 2, 3], dlc: 2, format: "classical", isExtended: true, running: true, periodicHandle: null };
         const before = structuredClone(entry);
         const calls = [], warnings = [];
-        const ctx = harness(["sendSimOnce"], {
-            simEntries: new Map([["entry", entry]]), channels: new Map([[7, { open: false }]]),
+        const ctx = harness(["sendSimOnce", "simFormatError"], {
+            appRunning: true, simEntries: new Map([["entry", entry]]),
+            channels: new Map([[7, { open: false, config: { mode: "classical" } }]]),
             invoke: async (command, args) => calls.push({ command, args }),
             log: (level, message) => warnings.push({ level, message }),
             simSignalValues: () => ({ RPM: 900 }), simGenerators: () => [],

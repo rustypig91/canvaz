@@ -59,6 +59,9 @@ jobs:
 
       - uses: tauri-apps/tauri-action@v0
         id: tauri
+        # AppImage bundling downloads external tools. Retry once on Linux so a
+        # transient download failure doesn't discard a successful compilation.
+        continue-on-error: ${{ runner.os == 'Linux' }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # On a tag build, pin the in-app version to the tag so it isn't marked
@@ -68,10 +71,20 @@ jobs:
         with:
           args: ${{ matrix.args }}
 
+      - name: Retry Linux build and packaging
+        if: ${{ !cancelled() && runner.os == 'Linux' && steps.tauri.outcome == 'failure' }}
+        uses: tauri-apps/tauri-action@v0
+        id: tauri-retry
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CANVAZ_VERSION: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+        with:
+          args: ${{ matrix.args }}
+
       - name: Stage release bundles with canonical filenames
         shell: bash
         env:
-          ARTIFACT_PATHS: ${{ steps.tauri.outputs.artifactPaths }}
+          ARTIFACT_PATHS: ${{ steps.tauri-retry.outputs.artifactPaths || steps.tauri.outputs.artifactPaths }}
         run: |
           set -euo pipefail
           node <<'JS'

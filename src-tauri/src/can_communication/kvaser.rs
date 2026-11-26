@@ -3,13 +3,22 @@ use std::sync::Arc;
 
 use libloading::Library;
 
-use super::{BusState, BusStatus, CanBackend, CanFrame, CanOpenError, RxHandle, TxHandle};
+use super::{solve_fd_timing, BusState, BusStatus, CanBackend, CanFrame, CanOpenError, ChannelCapabilities, ChannelSettings, FrameFormat, FrameMetadata, RxHandle, TxHandle};
 
 #[cfg(unix)]
 const CANLIB: &str = "libcanlib.so.1";
 #[cfg(windows)]
 const CANLIB: &str = "canlib32.dll";
 
+const CAN_OPEN_REQUIRE_INIT_ACCESS: i32 = 0x0080;
+const CAN_OPEN_NO_INIT_ACCESS: i32 = 0x0100;
+const CAN_OPEN_FD: i32 = 0x0400;
+const CANLIB_CHANNEL_DATA_CAP: i32 = 1;
+const CANLIB_CHANNEL_DATA_CAP_MASK: i32 = 38;
+const CAN_CHANNEL_CAP_FD: u32 = 0x0008_0000;
+const CAN_FD_MSG_FDF: u32 = 0x01_0000;
+const CAN_FD_MSG_BRS: u32 = 0x02_0000;
+const CAN_FD_MSG_ESI: u32 = 0x04_0000;
 const CAN_OPEN_ACCEPT_VIRTUAL: i32 = 0x0020;
 const CANLIB_CHANNEL_DATA_NAME: i32 = 13;
 
@@ -57,6 +66,7 @@ type FnGetCount = unsafe extern "system" fn(*mut i32) -> i32;
 type FnOpen = unsafe extern "system" fn(i32, i32) -> i32;
 type FnClose = unsafe extern "system" fn(i32) -> i32;
 type FnSetBus = unsafe extern "system" fn(i32, c_long, u32, u32, u32, u32, u32) -> i32;
+type FnSetBusFd = unsafe extern "system" fn(i32, c_long, u32, u32, u32) -> i32;
 type FnBusOn = unsafe extern "system" fn(i32) -> i32;
 type FnBusOff = unsafe extern "system" fn(i32) -> i32;
 type FnIoCtl = unsafe extern "system" fn(i32, u32, *mut std::ffi::c_void, u32) -> i32;
@@ -76,6 +86,7 @@ struct CanLib {
     open: FnOpen,
     close: FnClose,
     set_bus: FnSetBus,
+    set_bus_fd: Option<FnSetBusFd>,
     bus_on: FnBusOn,
     bus_off: FnBusOff,
     ioctl: FnIoCtl,
@@ -111,6 +122,7 @@ impl CanLib {
                 open: sym!(b"canOpenChannel\0", FnOpen),
                 close: sym!(b"canClose\0", FnClose),
                 set_bus: sym!(b"canSetBusParams\0", FnSetBus),
+                set_bus_fd: lib.get::<FnSetBusFd>(b"canSetBusParamsFd\0").ok().map(|symbol| *symbol),
                 bus_on: sym!(b"canBusOn\0", FnBusOn),
                 bus_off: sym!(b"canBusOff\0", FnBusOff),
                 ioctl: sym!(b"canIoCtl\0", FnIoCtl),
@@ -140,6 +152,22 @@ fn bitrate_params(hz: u32) -> Option<(c_long, u32, u32, u32)> {
         return Some((freq, 0, 0, 0));
     }
     solve_timing(hz)
+}
+
+fn fd_timing(hz: u32, data_phase: bool) -> Result<(c_long, u32, u32, u32), String> {
+    let preset = match hz {
+        500_000 => -1000,
+        1_000_000 => -1001,
+        2_000_000 => -1002,
+        4_000_000 => -1003,
+        8_000_000 => -1005,
+        _ => 0,
+    };
+    if preset != 0 { return Ok((preset, 0, 0, 0)); }
+    let limits = if data_phase { (32, 16, 16) } else { (256, 128, 128) };
+    solve_fd_timing(80_000_000, hz, limits)
+        .map(|(_, tseg1, tseg2, sjw)| (hz as c_long, tseg1, tseg2, sjw))
+        .ok_or_else(|| format!("Cannot compute Kvaser CAN FD timing for {hz} bps"))
 }
 
 fn solve_timing(hz: u32) -> Option<(c_long, u32, u32, u32)> {
@@ -243,7 +271,11 @@ unsafe impl Send for KvaserTxHandle {}
 impl TxHandle for KvaserTxHandle {
     fn send(&mut self, frame: &mut CanFrame) -> Result<(), String> {
         let h = &self.0;
-        let flags = if frame.is_extended { CAN_MSG_EXT } else { 0 };
+        let mut flags = if frame.is_extended { CAN_MSG_EXT } else { 0 };
+        if frame.metadata.format == FrameFormat::Fd {
+            flags |= CAN_FD_MSG_FDF;
+            if frame.metadata.brs { flags |= CAN_FD_MSG_BRS; }
+        }
         let s = unsafe {
             (h.lib.write_wait)(h.handle, frame.can_id as c_long, frame.data.as_ptr(), frame.data.len() as u32, flags, 100)
         };
@@ -267,7 +299,7 @@ impl RxHandle for KvaserRxHandle {
     fn receive(&mut self, timeout_ms: u64) -> Result<Option<CanFrame>, String> {
         let h = &mut self.0;
         let mut id: c_long = 0;
-        let mut data = [0u8; 8];
+        let mut data = [0u8; 64];
         let mut dlc: u32 = 0;
         let mut flags: u32 = 0;
         let mut timestamp: c_ulong = 0;
@@ -291,22 +323,27 @@ impl RxHandle for KvaserRxHandle {
         }
         let (hw_base, wall_base) = h.ts_anchor.unwrap();
         let abs_ms = wall_base.saturating_add(hw_ms.saturating_sub(hw_base));
-        let dlc = (dlc as usize).min(8);
+        let fd = flags & CAN_FD_MSG_FDF != 0;
+        let len = (dlc as usize).min(if fd { 64 } else { 8 });
         if flags & CAN_MSG_ERROR_FRAME != 0 {
             // CANlib gives no per-frame error detail beyond the flag; counters
             // and bus state come from poll_status.
             return Ok(Some(CanFrame {
+                metadata: Default::default(),
                 can_id: 0,
                 is_extended: false,
-                data: data[..dlc].to_vec(),
+                data: data[..len].to_vec(),
                 timestamp_ms: Some(abs_ms),
                 error: Some("Bus error frame".to_string()),
             }));
         }
         Ok(Some(CanFrame {
+            metadata: if fd {
+                FrameMetadata::fd(flags & CAN_FD_MSG_BRS != 0, flags & CAN_FD_MSG_ESI != 0)
+            } else { FrameMetadata::default() },
             can_id: id as u32,
             is_extended: (flags & CAN_MSG_EXT) != 0,
-            data: data[..dlc].to_vec(),
+            data: data[..len].to_vec(),
             timestamp_ms: Some(abs_ms),
             error: None,
         }))
@@ -359,30 +396,61 @@ impl KvaserBackend {
 }
 
 impl CanBackend for KvaserBackend {
-    fn list_channels(&self) -> Vec<String> {
+    fn list_channels(&self) -> Vec<(u8, String)> {
         let mut n: i32 = 0;
         unsafe { (self.lib.get_count)(&mut n) };
-        (0..n.max(0) as i32)
-            .map(|i| kvaser_channel_name(&self.lib, i).unwrap_or_else(|| format!("Channel {i}")))
+        (0..n.min(256))
+            .map(|i| (i as u8, kvaser_channel_name(&self.lib, i).unwrap_or_else(|| format!("Channel {i}"))))
             .collect()
+    }
+
+    fn capabilities(&self, index: u8) -> ChannelCapabilities {
+        let read_capability = |item| {
+            let mut value = 0u32;
+            let status = unsafe {
+                (self.lib.get_channel_data)(i32::from(index), item, (&mut value as *mut u32).cast(), size_of::<u32>())
+            };
+            (status == CAN_OK).then_some(value & CAN_CHANNEL_CAP_FD != 0)
+        };
+        if self.lib.set_bus_fd.is_none() {
+            return ChannelCapabilities {
+                fd: Some(false), external_timing: false,
+                fd_limitation: Some("Installed Kvaser CANlib driver does not expose CAN FD"),
+            };
+        }
+        let fd = match read_capability(CANLIB_CHANNEL_DATA_CAP_MASK) {
+            Some(true) => read_capability(CANLIB_CHANNEL_DATA_CAP),
+            Some(false) => None,
+            // Drivers without a mask can still report a known positive capability.
+            None => read_capability(CANLIB_CHANNEL_DATA_CAP).filter(|&supported| supported),
+        };
+        let fd_limitation = (fd == Some(false)).then_some("This Kvaser channel does not support ISO CAN FD");
+        ChannelCapabilities { fd, external_timing: false, fd_limitation }
     }
 
     fn open_channel(
         &mut self,
         index: u8,
-        bitrate: u32,
-        listen_only: bool,
+        settings: ChannelSettings,
         _admin_password: Option<&str>,
     ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
-        let (freq, tseg1, tseg2, sjw) = bitrate_params(bitrate).ok_or_else(|| {
-            format!(
-                "Cannot compute CANlib timing for {} bps \
-                 (bitrate must evenly divide 80 MHz Kvaser clock)",
-                bitrate
-            )
-        })?;
+        let bitrate = settings.bitrate;
+        let listen_only = settings.listen_only;
         let lib = &self.lib;
-        let idx = index as i32;
+        let idx = i32::from(index);
+        let fd = settings.mode == FrameFormat::Fd;
+        let data_timing = if fd {
+            let set_fd = lib.set_bus_fd.ok_or("Installed Kvaser CANlib driver does not expose CAN FD")?;
+            Some((set_fd, fd_timing(settings.data_bitrate()?, true)?))
+        } else {
+            None
+        };
+        let (freq, tseg1, tseg2, sjw) = if fd {
+            fd_timing(bitrate, false)?
+        } else {
+            bitrate_params(bitrate).ok_or_else(|| format!("Cannot compute CANlib timing for {bitrate} bps"))?
+        };
+        let open_flags = CAN_OPEN_ACCEPT_VIRTUAL | if fd { CAN_OPEN_FD } else { 0 };
 
         // Clear LOCAL_TXECHO on a handle. CANlib documents the setting from the
         // receiving side — "when on, messages sent from another handle on the
@@ -399,26 +467,39 @@ impl CanBackend for KvaserBackend {
         };
 
         // Selects normal vs. silent transceiver mode. Must be called before canBusOn().
-        let set_driver_mode = |h: i32| {
+        let set_driver_mode = |h: i32| -> Result<(), CanOpenError> {
             let mode = if listen_only { CAN_DRIVER_SILENT } else { CAN_DRIVER_NORMAL };
             let s = unsafe { (lib.set_bus_output_control)(h, mode) };
             if s < CAN_OK {
-                log::warn!("canSetBusOutputControl failed: {} — listen-only may not be applied", canlib_err(s));
+                let reason = format!("canSetBusOutputControl failed: {}", canlib_err(s));
+                if listen_only { return Err(reason.into()); }
+                log::warn!("{reason}");
             }
+            Ok(())
         };
 
         // TX handle: has init access and sets the bitrate.
-        let tx_raw = unsafe { (lib.open)(idx, CAN_OPEN_ACCEPT_VIRTUAL) };
+        let tx_raw = unsafe { (lib.open)(idx, open_flags | CAN_OPEN_REQUIRE_INIT_ACCESS) };
         if tx_raw < 0 {
-            return Err(format!("Failed to open Kvaser channel {idx} (TX): {}", canlib_err(tx_raw)).into());
+            return Err(format!("Failed to open Kvaser channel {idx} (TX, {:?}): {}", settings.mode, canlib_err(tx_raw)).into());
         }
         let s = unsafe { (lib.set_bus)(tx_raw, freq, tseg1, tseg2, sjw, 1, 0) };
         if s < CAN_OK {
             unsafe { (lib.close)(tx_raw) };
             return Err(format!("canSetBusParams failed: {}", canlib_err(s)).into());
         }
+        if let Some((set_fd, (freq, tseg1, tseg2, sjw))) = data_timing {
+            let status = unsafe { set_fd(tx_raw, freq, tseg1, tseg2, sjw) };
+            if status < CAN_OK {
+                unsafe { (lib.close)(tx_raw) };
+                return Err(format!("Kvaser CAN FD data timing failed: {}", canlib_err(status)).into());
+            }
+        }
         set_echo_off(tx_raw);
-        set_driver_mode(tx_raw);
+        if let Err(error) = set_driver_mode(tx_raw) {
+            unsafe { (lib.close)(tx_raw) };
+            return Err(error);
+        }
         let s = unsafe { (lib.bus_on)(tx_raw) };
         if s < CAN_OK {
             unsafe { (lib.close)(tx_raw) };
@@ -427,14 +508,13 @@ impl CanBackend for KvaserBackend {
 
         // RX handle: separate OS handle per CANlib threading requirements.
         // canBusOn must be called once per handle even on the same physical channel.
-        let rx_raw = unsafe { (lib.open)(idx, CAN_OPEN_ACCEPT_VIRTUAL) };
+        let rx_raw = unsafe { (lib.open)(idx, open_flags | CAN_OPEN_NO_INIT_ACCESS) };
         if rx_raw < 0 {
             unsafe { (lib.bus_off)(tx_raw); (lib.close)(tx_raw) };
             return Err(format!("Failed to open Kvaser channel {idx} (RX): {}", canlib_err(rx_raw)).into());
         }
         // The RX handle is the one that would receive the echo — see set_echo_off.
         set_echo_off(rx_raw);
-        set_driver_mode(rx_raw);
         let s = unsafe { (lib.bus_on)(rx_raw) };
         if s < CAN_OK {
             unsafe { (lib.bus_off)(tx_raw); (lib.close)(tx_raw); (lib.close)(rx_raw) };

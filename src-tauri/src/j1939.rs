@@ -177,6 +177,7 @@ impl TpReassembler {
         }
         session.data.truncate(session.total_size);
         Some(CanFrame {
+            metadata: Default::default(),
             can_id: build_id(session.priority, session.pgn, session.da, id.sa),
             is_extended: true,
             data: session.data,
@@ -196,6 +197,7 @@ mod tests {
 
     fn frame(can_id: u32, data: Vec<u8>) -> CanFrame {
         CanFrame {
+            metadata: Default::default(),
             can_id,
             is_extended: true,
             data,

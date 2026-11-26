@@ -8,7 +8,7 @@ Store builds use [separate settings and session data](docs/store-data.md).
 
 ## Features
 
-- **Trace** — live frame table with filtering by channel, CAN ID, message name, DLC, direction, cycle time, and data bytes
+- **Trace** — live frame table with frame format and flags, with filtering by channel, CAN ID, message name, byte length, direction, cycle time, and data bytes
 - **Plot** — real-time signal plots with zoom, multi-signal panes, and drag-and-drop from the DBC browser
 - **Simulate** — send DBC-defined messages or raw frames on a configurable interval
 - **DBC browser** — load a DBC file per channel, browse messages and signals, see live decoded values (including value-table enums) and min/max
@@ -42,15 +42,68 @@ node tests/accessibility.browser.mjs
 
 ## Hardware support
 
-| Backend | Platforms | Runtime requirement |
-|---------|-----------|---------------------|
-| Kvaser CANlib (`canlib32.dll` / `libcanlib.so`) | Windows, Linux | [Kvaser drivers](https://www.kvaser.com/download/) |
-| PEAK PCAN-Basic (`PCANBasic.dll` / `libpcanbasic.so`) | Windows, Linux | [PCAN-Basic API](https://www.peak-system.com/products/software/development-packages/pcan-basic/) |
-| SocketCAN, including virtual `vcan` | Linux | — |
+| Backend | Platforms | Bus formats | Runtime requirement |
+|---------|-----------|-------------|---------------------|
+| Kvaser CANlib (`canlib32.dll` / `libcanlib.so.1`) | Windows, Linux | Classical CAN and ISO CAN FD on FD-capable adapters | [Kvaser CANlib drivers](https://www.kvaser.com/download/) |
+| PEAK PCAN-Basic (`PCANBasic.dll` / `libpcanbasic.so`) | Windows, Linux | Classical CAN and ISO CAN FD on FD-capable adapters | [PCAN-Basic with the native FD APIs](https://www.peak-system.com/products/software/development-packages/pcan-basic/) |
+| SocketCAN | Linux | Classical CAN and ISO CAN FD, including mixed traffic on `vcan` | Linux SocketCAN and `iproute2` |
+| Socketcand (TCP) | Windows, Linux, macOS | Classical CAN and ISO CAN FD on compatible servers and buses | Reachable Socketcand server. The server configures bus timing. [Socketcand protocol](https://github.com/linux-can/socketcand/blob/master/doc/protocol.md#can-fd-frames) |
 
-All backends are included in a default build (SocketCAN automatically on
-Linux). Kvaser and PCAN load their driver library at runtime; a missing driver
-just disables that backend rather than preventing startup.
+Kvaser and PCAN drivers are loaded at runtime. The corresponding backend is
+available when its driver is installed. SocketCAN is included by default on Linux.
+
+### CAN FD setup
+
+1. Add or edit a channel and set **Bus mode** to **CAN FD (ISO)**. Select the
+   nominal bitrate and enter the data bitrate in bit/s. For example, a
+   500 kbit/s nominal and 2 Mbit/s data bus uses `500000` and `2000000`.
+   Use the rates configured on your bus. CAN FD mode receives and can send
+   both frame formats, and **Listen-only** disables sending.
+2. On Linux, Canvaz uses `ip link` to configure physical SocketCAN interfaces.
+   To configure a physical interface beforehand, use a command such as
+   `sudo ip link set can0 up type can bitrate 500000 dbitrate 2000000 fd on`.
+   Canvaz reuses an active interface when its mode and rates match. Virtual
+   SocketCAN interfaces use kernel-managed settings and need an MTU of at
+   least 72 for FD. A virtual interface configured for CAN XL also accepts FD.
+   For Socketcand, configure ISO CAN FD on the server's interface and use a
+   daemon that implements RAW mode `fdframe` and `fdsend`. Select **CAN FD
+   (ISO)** for that channel in Canvaz. RAW mode provides no capability query
+   or transmission acknowledgement. Choose **Classical CAN** for legacy servers.
+3. In **Simulate**, choose the frame format independently of the identifier
+   width. Choose a legal byte length for raw FD frames and enable **BRS** to
+   use the data-phase bitrate. DBC entries use their `VFrameFormat` when
+   specified. For an ambiguous definition, select the transmit format in the
+   simulator. Classical CAN is the initial choice for definitions up to eight
+   bytes. DBC FD transmissions zero-fill up to the next legal wire length.
+   Signal generators operate on the DBC-declared bytes before padding.
+   Classical J1939 transport messages continue to be reassembled for decoding.
+
+The Trace **Format** and **Bytes** columns show frame type, FD flags, and byte
+length. Classical CAN and FD frames with the same ID keep separate latest rows
+and cycle times. Data filtering covers the first 64 bytes. Frame CSV exports
+and live recordings append `frame_format`, `brs`, and `esi`. The existing
+`dlc` column contains byte length. A value of `1` in `esi` marks a received FD
+frame whose transmitter had set the error state indicator. Bus load estimates
+are unavailable on FD channels.
+
+### Verification
+
+Mixed Classical CAN and FD RX/TX passed on Linux SocketCAN with virtual
+`vcan` devices using MTUs 72 and 2060, Linux kernel `7.0.0-1018-oem`, and
+iproute2 `6.19.0`. The check
+covers short and 64-byte FD frames, a shared low-valued extended ID, BRS, and
+received ESI. Rerun it on a Linux host with the `vcan` module available.
+
+```sh
+sudo ip link add dev vcan0 type vcan
+sudo ip link set dev vcan0 mtu 72 up
+CANVAZ_TEST_VCAN=vcan0 cargo test --locked --manifest-path src-tauri/Cargo.toml socketcan_vcan_mixed_classical_and_fd -- --ignored
+```
+
+Mixed Classical CAN and FD RX/TX also passed on both virtual MTUs through
+[Socketcand 0.6.1 development revision `343fad6`](https://github.com/linux-can/socketcand/commit/343fad6ff62fb3dd1275c4e33a08dc382c987020).
+The localhost tests cover the legacy handshake and mixed periodic transmission.
+Physical SocketCAN, Kvaser CANlib, and PCAN-Basic adapter testing remains pending.
 
 ## Building
 
@@ -264,21 +317,23 @@ The connection is saved with the project. Stop capture and use **Edit** to
 change the address while keeping the channel's plots and simulations. While
 capture is running, Canvaz retries unavailable or unresponsive Socketcand
 servers, including when the configured server is the only channel. During
-connection setup, Canvaz retains up to the latest 1,024 classic frames and bus
-errors while waiting for the server to confirm RAW mode.
+connection setup, Canvaz retains up to the latest 1,024 frames and bus errors
+accepted by the selected bus mode while waiting for the server to confirm RAW
+mode.
 
-Socketcand works over TCP on all platforms and sends and receives classic CAN
-standard and extended frames, plus reported bus errors. Send and Simulate use
-the same connection as capture. Received timestamps are anchored to the local
-clock on the first frame, preserving server-relative timing even when the
-server clock is not synchronized with this computer.
+Socketcand works over TCP on all platforms and carries standard and extended
+identifiers, plus reported bus errors. **Classical CAN** mode skips received FD
+frames so Classical CAN capture continues on mixed buses. **CAN FD (ISO)**
+mode sends and receives both frame formats with a compatible server and bus.
+Send and Simulate use the same connection as capture. Received timestamps are
+anchored to the local clock on the first frame, preserving server-relative
+timing even when the server clock is not synchronized with this computer.
 The server configures the bitrate, so the remote channel has no bitrate control
 or bus load estimate. **Listen-only** blocks sending from this client and leaves
 the server's physical listen-only and ACK settings alone. Socketcand channels
 from older projects open in Listen-only mode. To enable Send and Simulate, stop
 capture, clear **Listen-only**, and restart. TX timestamps indicate when the
-client wrote the command to TCP. Incoming CAN FD messages are skipped so that
-classic CAN capture continues on mixed buses.
+client wrote the command to TCP.
 If a reloaded DBC omits a simulated message, its settings and armed state are
 retained and restored when that message definition becomes available again.
 Values and generators for individual missing signals are also retained across

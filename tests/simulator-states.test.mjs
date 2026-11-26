@@ -5,11 +5,13 @@ import vm from "node:vm";
 import ts from "typescript";
 
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
-const names = ["simEntryStatus", "updateSimEntryStatus", "updateSimTxStatus", "queueSimOperation",
+const names = ["simEntryStatus", "simFormatError", "canRegisterSim", "updateSimEntryStatus", "updateSimTxStatus", "queueSimOperation",
     "startSim", "stopSim", "openConfiguredChannels", "startApp", "finishStartingCapture", "stopApp", "finishStoppingCapture",
     "onChannelError", "closeFailedChannel", "openChannelByHandle",
-    "scheduleChannelRecovery", "attemptChannelRecovery", "recoverChannel", "reconcileSimMessages", "restoreProjectEntries", "simMessageSettings"];
-const code = ts.transpileModule(source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text)).map(n => n.getText(source)).join("\n"), {
+    "scheduleChannelRecovery", "attemptChannelRecovery", "recoverChannel", "reconcileSimMessages", "restoreProjectEntries", "simMessageSettings", "defaultSimFormat", "restoreSimMessageTransmission"];
+const declarations = source.statements.filter(n => (ts.isFunctionDeclaration(n) && names.includes(n.name?.text))
+    || (ts.isVariableStatement(n) && n.declarationList.declarations.some(d => d.name.getText(source) === "FD_LENGTHS")));
+const code = ts.transpileModule(declarations.map(n => n.getText(source)).join("\n"), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.None },
 }).outputText;
 function element() {
@@ -346,7 +348,7 @@ test("Socketcand reconnect preserves missing message simulations until their DBC
     const generator = { mode: "counter" };
     const missing = { messages: {} };
     const restored = { messages: { 123: { id: 123, name: "Engine", dlc: 2, signals: [signal] } } };
-    const opens = [missing, missing, restored];
+    const opens = [null, missing, restored];
     let transmissions = 0;
     const h = harness("message", async command => {
         if (command === "open_channel") return opens.shift();

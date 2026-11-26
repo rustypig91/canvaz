@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use libloading::Library;
 
-use super::{BusState, BusStatus, CanBackend, CanFrame, CanOpenError, RxHandle, TxHandle};
+use super::{fd_dlc_to_len, fd_len_to_dlc, solve_fd_timing, BusState, BusStatus, CanBackend, CanFrame, CanOpenError, ChannelCapabilities, ChannelSettings, FrameFormat, FrameMetadata, RxHandle, TxHandle};
 
 #[cfg(unix)]
 const PCAN_LIB: &str = "libpcanbasic.so";
@@ -23,6 +23,8 @@ const PCAN_NONEBUS: TPCANHandle = 0x00;
 
 const PCAN_ERROR_OK: TPCANStatus = 0x00000;
 const PCAN_ERROR_QRCVEMPTY: TPCANStatus = 0x00020;
+const PCAN_ERROR_ILLDATA: TPCANStatus = 0x20000;
+const PCAN_ERROR_CAUTION: TPCANStatus = 0x0200_0000;
 
 // Bus-error flags that may be OR'd into an otherwise-valid CAN_Read status.
 const PCAN_ERROR_BUSLIGHT: TPCANStatus  = 0x00004;
@@ -35,6 +37,10 @@ const PCAN_ERROR_ANYBUSERR: TPCANStatus =
 // MSGTYPE flags in TPCANMsg
 const PCAN_MESSAGE_EXTENDED: u8  = 0x02;
 const PCAN_MESSAGE_RTR: u8       = 0x01;
+const PCAN_MESSAGE_FD: u8 = 0x04;
+const PCAN_MESSAGE_BRS: u8 = 0x08;
+const PCAN_MESSAGE_ESI: u8 = 0x10;
+const PCAN_FEATURE_FD_CAPABLE: u32 = 0x01;
 const PCAN_MESSAGE_ECHO: u8      = 0x20;  // TX echo frame (self-reception)
 const PCAN_MESSAGE_ERRFRAME: u8  = 0x40;
 const PCAN_MESSAGE_STATUS: u8    = 0x80;
@@ -46,6 +52,8 @@ const PCAN_CHANNEL_CONDITION: u8      = 0x0D;
 const PCAN_HARDWARE_NAME: u8          = 0x0E;
 const PCAN_ATTACHED_CHANNELS_COUNT: u8 = 0x2A;
 const PCAN_ATTACHED_CHANNELS: u8      = 0x2B;
+const PCAN_BUSSPEED_NOMINAL: u8 = 0x1A;
+const PCAN_BUSSPEED_FD: u8 = 0x1B;
 // CAN_SetValue parameter: listen-only mode (no ACKs, no error frames transmitted).
 const PCAN_LISTEN_ONLY: u8 = 0x08;
 // CAN_SetValue parameter: deliver bus error frames through CAN_Read
@@ -94,6 +102,25 @@ struct TPCANMsg {
     data: [u8; 8],
 }
 
+#[repr(C)]
+struct TPCANMsgFd {
+    id: u32,
+    msg_type: u8,
+    dlc: u8,
+    data: [u8; 64],
+}
+
+#[derive(Clone, Copy)]
+struct PcanFdApi {
+    initialize: FnInitializeFd,
+    read: FnReadFd,
+    write: FnWriteFd,
+}
+
+type FnInitializeFd = unsafe extern "system" fn(TPCANHandle, *const std::ffi::c_char) -> TPCANStatus;
+type FnReadFd = unsafe extern "system" fn(TPCANHandle, *mut TPCANMsgFd, *mut u64) -> TPCANStatus;
+type FnWriteFd = unsafe extern "system" fn(TPCANHandle, *mut TPCANMsgFd) -> TPCANStatus;
+
 // millis + millis_overflow give the milliseconds since CAN_Initialize, where
 // millis wraps at 0xFFFFFFFF. total_ms = millis_overflow * 2^32 + millis.
 #[repr(C)]
@@ -118,6 +145,7 @@ type FnGetStatus = unsafe extern "system" fn(TPCANHandle) -> TPCANStatus;
 struct PcanLib {
     _lib: Library,
     initialize: FnInitialize,
+    fd: Option<PcanFdApi>,
     uninitialize: FnUninitialize,
     read: FnRead,
     write: FnWrite,
@@ -142,7 +170,13 @@ impl PcanLib {
                     *lib.get::<$t>($b).map_err(|e| e.to_string())?
                 };
             }
+            let fd = (|| Some(PcanFdApi {
+                initialize: *lib.get(b"CAN_InitializeFD\0").ok()?,
+                read: *lib.get(b"CAN_ReadFD\0").ok()?,
+                write: *lib.get(b"CAN_WriteFD\0").ok()?,
+            }))();
             Ok(Arc::new(Self {
+                fd,
                 initialize: sym!(b"CAN_Initialize\0", FnInitialize),
                 uninitialize: sym!(b"CAN_Uninitialize\0", FnUninitialize),
                 read: sym!(b"CAN_Read\0", FnRead),
@@ -174,12 +208,13 @@ fn pcan_baud(hz: u32) -> Option<TPCANBaudrate> {
 }
 
 fn pcan_err(s: TPCANStatus) -> String {
-    let desc = match s & !PCAN_ERROR_ANYBUSERR {
+    let desc = match s {
         0x00001 => "TX buffer full",
         0x00002 => "RX overrun",
-        0x00004 => "bus light error",
-        0x00008 => "bus heavy error",
-        0x00010 => "bus off",
+        PCAN_ERROR_BUSLIGHT => "bus light error",
+        PCAN_ERROR_BUSHEAVY => "bus heavy error",
+        PCAN_ERROR_BUSOFF => "bus off",
+        PCAN_ERROR_BUSPASSIVE => "bus passive",
         0x00020 => "RX queue empty",
         0x00200 => "no driver loaded",
         0x00400 => "hardware in use",
@@ -193,10 +228,30 @@ fn pcan_err(s: TPCANStatus) -> String {
     format!("PCAN error 0x{s:05X} ({desc})")
 }
 
-/// Returns `(TPCANHandle, display_name)` for every physically connected channel.
+fn verify_pcan_bitrates(
+    settings: ChannelSettings,
+    mut read: impl FnMut(u8) -> Result<u32, TPCANStatus>,
+) -> Result<(), String> {
+    let mut verify = |parameter, phase, expected| {
+        let actual = read(parameter).map_err(|status| {
+            format!("Could not verify PCAN {phase} bitrate after a driver warning: {}", pcan_err(status))
+        })?;
+        if actual != expected {
+            return Err(format!("PCAN applied a {phase} bitrate of {actual} bit/s, expected {expected} bit/s"));
+        }
+        Ok(())
+    };
+    verify(PCAN_BUSSPEED_NOMINAL, "nominal", settings.bitrate)?;
+    if settings.mode == FrameFormat::Fd {
+        verify(PCAN_BUSSPEED_FD, "data", settings.data_bitrate()?)?;
+    }
+    Ok(())
+}
+
+/// Returns handle, display name, and device capabilities for every physically connected channel.
 /// Uses PCAN_ATTACHED_CHANNELS (PCAN-Basic v4+) which asks the driver for the
 /// current list of present devices, rather than probing 32 fixed handles.
-fn enumerate_channels(lib: &PcanLib) -> Vec<(TPCANHandle, String)> {
+fn enumerate_channels(lib: &PcanLib) -> Vec<(TPCANHandle, String, u32)> {
     let mut count: u32 = 0;
     // SAFETY: count is a valid u32; CAN_GetValue writes 4 bytes.
     let s = unsafe {
@@ -220,9 +275,9 @@ fn enumerate_channels(lib: &PcanLib) -> Vec<(TPCANHandle, String)> {
 
     (0..count as usize)
         .filter_map(|i| {
-            // SAFETY: each struct_size slice starts on a naturally aligned offset
-            // because the struct's largest alignment is 4 and the buffer is vec-allocated.
-            let info = unsafe { &*(buf[i * struct_size..].as_ptr() as *const TPCANChannelInformation) };
+            // SAFETY: the buffer contains count complete records. A byte buffer
+            // need not be aligned for TPCANChannelInformation.
+            let info = unsafe { buf[i * struct_size..].as_ptr().cast::<TPCANChannelInformation>().read_unaligned() };
             if info.channel_condition & (PCAN_CHANNEL_AVAILABLE | PCAN_CHANNEL_OCCUPIED) == 0 {
                 return None;
             }
@@ -230,7 +285,7 @@ fn enumerate_channels(lib: &PcanLib) -> Vec<(TPCANHandle, String)> {
             let hw_name = String::from_utf8_lossy(&info.device_name[..len]);
             let ch = info.channel_handle;
             let bus: u16 = if ch >= 0x51 { ch - 0x50 } else if ch >= 0x41 { ch - 0x40 } else { ch };
-            Some((ch, format!("{hw_name} {bus}")))
+            Some((ch, format!("{hw_name} {bus}"), info.device_features))
         })
         .collect()
 }
@@ -244,6 +299,7 @@ fn enumerate_channels(lib: &PcanLib) -> Vec<(TPCANHandle, String)> {
 struct PcanChannel {
     lib: Arc<PcanLib>,
     handle: TPCANHandle,
+    fd: Option<PcanFdApi>,
     /// Anchors the PCAN hardware timer to wall clock on the first received frame.
     /// (hw_ms_at_first_frame, wall_ms_at_first_frame). None until first frame arrives.
     /// This handles drivers that don't reset their timer at CAN_Initialize.
@@ -271,18 +327,26 @@ unsafe impl Send for PcanTxHandle {}
 impl TxHandle for PcanTxHandle {
     fn send(&mut self, frame: &mut CanFrame) -> Result<(), String> {
         let ch = &*self.0;
-        let dlc = frame.data.len().min(8);
-        let mut msg = TPCANMsg {
-            id: frame.can_id,
-            msg_type: if frame.is_extended { PCAN_MESSAGE_EXTENDED } else { 0 },
-            len: dlc as u8,
-            data: [0u8; 8],
+        frame.validate_transmit()?;
+        let len = frame.data.len();
+        let id_flag = if frame.is_extended { PCAN_MESSAGE_EXTENDED } else { 0 };
+        let (s, api) = if let Some(fd) = ch.fd {
+            let mut msg = TPCANMsgFd { id: frame.can_id, msg_type: id_flag, dlc: len as u8, data: [0; 64] };
+            if frame.metadata.format == FrameFormat::Fd {
+                msg.msg_type |= PCAN_MESSAGE_FD;
+                if frame.metadata.brs { msg.msg_type |= PCAN_MESSAGE_BRS; }
+                msg.dlc = fd_len_to_dlc(len).ok_or("Invalid CAN FD payload length")?;
+            }
+            msg.data[..len].copy_from_slice(&frame.data);
+            (unsafe { (fd.write)(ch.handle, &mut msg) }, "CAN_WriteFD")
+        } else {
+            if frame.metadata.format == FrameFormat::Fd { return Err("PCAN channel requires Classical CAN".into()); }
+            let mut msg = TPCANMsg { id: frame.can_id, msg_type: id_flag, len: len as u8, data: [0; 8] };
+            msg.data[..len].copy_from_slice(&frame.data);
+            (unsafe { (ch.lib.write)(ch.handle, &mut msg) }, "CAN_Write")
         };
-        msg.data[..dlc].copy_from_slice(&frame.data[..dlc]);
-        // SAFETY: handle is valid; msg is a valid stack TPCANMsg
-        let s = unsafe { (ch.lib.write)(ch.handle, &mut msg) };
-        if s & !PCAN_ERROR_ANYBUSERR != PCAN_ERROR_OK {
-            return Err(format!("CAN_Write failed: {}", pcan_err(s)));
+        if s != PCAN_ERROR_OK {
+            return Err(format!("{api} failed: {}", pcan_err(s)));
         }
         // PCAN_Write has no built-in hardware timestamp; use wall clock post-send.
         frame.timestamp_ms = Some(
@@ -306,29 +370,73 @@ unsafe impl Send for PcanRxHandle {}
 impl RxHandle for PcanRxHandle {
     fn receive(&mut self, timeout_ms: u64) -> Result<Option<CanFrame>, String> {
         let ch = &*self.0;
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+        if let Some(fd) = ch.fd {
+            Self::receive_pcan_frame(timeout_ms, &ch.ts_anchor, "CAN_ReadFD", |msg| {
+                let mut micros = 0u64;
+                let status = unsafe { (fd.read)(ch.handle, msg, &mut micros) };
+                (status, micros / 1_000)
+            })
+        } else {
+            Self::receive_pcan_frame(timeout_ms, &ch.ts_anchor, "CAN_Read", |msg| {
+                let mut classic = TPCANMsg { id: 0, msg_type: 0, len: 0, data: [0; 8] };
+                let mut ts = TPCANTimestamp { millis: 0, millis_overflow: 0, micros: 0 };
+                let status = unsafe { (ch.lib.read)(ch.handle, &mut classic, &mut ts) };
+                msg.id = classic.id;
+                msg.msg_type = classic.msg_type;
+                msg.dlc = classic.len;
+                msg.data[..8].copy_from_slice(&classic.data);
+                (status, u64::from(ts.millis_overflow) * 0x1_0000_0000 + u64::from(ts.millis))
+            })
+        }
+    }
+
+    fn poll_status(&mut self) -> Option<BusStatus> {
+        let ch = &*self.0;
+        // SAFETY: handle is a valid initialized channel.
+        let s = unsafe { (ch.lib.get_status)(ch.handle) };
+        Some(BusStatus {
+            bus_state: Some(pcan_bus_state(s)),
+            ..BusStatus::default()
+        })
+    }
+
+    fn close(&mut self) {}
+}
+
+impl PcanRxHandle {
+    fn receive_pcan_frame(
+        timeout_ms: u64,
+        ts_anchor: &Mutex<Option<(u64, u64)>>,
+        api: &str,
+        mut read: impl FnMut(&mut TPCANMsgFd) -> (TPCANStatus, u64),
+    ) -> Result<Option<CanFrame>, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
 
         loop {
-            let mut msg = TPCANMsg { id: 0, msg_type: 0, len: 0, data: [0u8; 8] };
-            let mut ts = TPCANTimestamp { millis: 0, millis_overflow: 0, micros: 0 };
-            // SAFETY: handle is valid; all out-pointers are valid stack locations
-            let s = unsafe { (ch.lib.read)(ch.handle, &mut msg, &mut ts) };
+            let mut msg = TPCANMsgFd { id: 0, msg_type: 0, dlc: 0, data: [0; 64] };
+            let (s, hw_ms) = read(&mut msg);
             let s_primary = s & !PCAN_ERROR_ANYBUSERR;
 
-            if s_primary == PCAN_ERROR_OK {
-                // Skip RTR, echo and status frames; error frames pass through
-                // as distinct error rows, everything else as data frames.
-                if msg.msg_type & (PCAN_MESSAGE_RTR | PCAN_MESSAGE_ECHO | PCAN_MESSAGE_STATUS) != 0 {
-                    continue;
+            // Read/ReadFD return the status code carried by a status frame,
+            // including RX overruns. The next queued frame can still be read.
+            let skip = msg.msg_type & PCAN_MESSAGE_STATUS != 0
+                || (s_primary == PCAN_ERROR_OK && msg.msg_type & (PCAN_MESSAGE_RTR | PCAN_MESSAGE_ECHO) != 0);
+            if skip {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
                 }
-                let dlc = (msg.len as usize).min(8);
-                let hw_ms = ts.millis_overflow as u64 * 0x1_0000_0000 + ts.millis as u64;
+                continue;
+            }
+            if s_primary == PCAN_ERROR_OK {
+                let fd_frame = msg.msg_type & PCAN_MESSAGE_FD != 0 && msg.msg_type & PCAN_MESSAGE_ERRFRAME == 0;
+                let len = if fd_frame {
+                    fd_dlc_to_len(msg.dlc).ok_or_else(|| format!("PCAN returned invalid CAN FD DLC {}", msg.dlc))?
+                } else { usize::from(msg.dlc).min(8) };
                 // Anchor the hw timer to wall clock on the first frame. The PCAN driver
                 // may not reset its counter at CAN_Initialize (it can count from driver
                 // load or device plug-in), so we cannot simply add open_time_ms.
                 let abs_ms = {
-                    let mut anchor = ch.ts_anchor.lock().unwrap();
+                    let mut anchor = ts_anchor.lock().unwrap();
                     if anchor.is_none() {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -343,100 +451,139 @@ impl RxHandle for PcanRxHandle {
                     // PCAN-Basic reports no structured error detail; the raw
                     // payload is kept as the frame data.
                     return Ok(Some(CanFrame {
+                        metadata: Default::default(),
                         can_id: 0,
                         is_extended: false,
-                        data: msg.data[..dlc].to_vec(),
+                        data: msg.data[..len].to_vec(),
                         timestamp_ms: Some(abs_ms),
                         error: Some("Bus error frame".to_string()),
                     }));
                 }
                 return Ok(Some(CanFrame {
+                    metadata: if fd_frame {
+                        FrameMetadata::fd(msg.msg_type & PCAN_MESSAGE_BRS != 0, msg.msg_type & PCAN_MESSAGE_ESI != 0)
+                    } else { FrameMetadata::default() },
                     can_id: msg.id,
                     is_extended: (msg.msg_type & PCAN_MESSAGE_EXTENDED) != 0,
-                    data: msg.data[..dlc].to_vec(),
+                    data: msg.data[..len].to_vec(),
                     timestamp_ms: Some(abs_ms),
                     error: None,
                 }));
-            } else if s_primary == PCAN_ERROR_QRCVEMPTY {
+            } else if s_primary & !(PCAN_ERROR_QRCVEMPTY | PCAN_ERROR_ILLDATA) == 0 {
                 if std::time::Instant::now() >= deadline {
                     return Ok(None);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                // ILLDATA indicates a discarded frame. Check the next queued
+                // frame immediately and only wait when the queue is empty.
+                if s_primary & PCAN_ERROR_QRCVEMPTY != 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             } else {
-                return Err(format!("CAN_Read failed: {}", pcan_err(s)));
+                return Err(format!("{api} failed: {}", pcan_err(s)));
             }
         }
     }
+}
 
-    fn poll_status(&mut self) -> Option<BusStatus> {
-        let ch = &*self.0;
-        // SAFETY: handle is a valid initialized channel.
-        let s = unsafe { (ch.lib.get_status)(ch.handle) };
-        // PCAN-Basic exposes no TEC/REC; only the coarse bus state. BUSHEAVY
-        // means an error counter passed 128, which is the error-passive limit.
-        let bus_state = if s & PCAN_ERROR_BUSOFF != 0 {
-            BusState::BusOff
-        } else if s & (PCAN_ERROR_BUSPASSIVE | PCAN_ERROR_BUSHEAVY) != 0 {
-            BusState::Passive
-        } else if s & PCAN_ERROR_BUSLIGHT != 0 {
-            BusState::Warning
-        } else {
-            BusState::Active
-        };
-        Some(BusStatus {
-            bus_state: Some(bus_state),
-            ..BusStatus::default()
-        })
+fn pcan_bus_state(status: TPCANStatus) -> BusState {
+    if status & PCAN_ERROR_BUSOFF != 0 {
+        BusState::BusOff
+    } else if status & PCAN_ERROR_BUSPASSIVE != 0 {
+        BusState::Passive
+    } else if status & (PCAN_ERROR_BUSLIGHT | PCAN_ERROR_BUSHEAVY) != 0 {
+        BusState::Warning
+    } else {
+        BusState::Active
     }
-
-    fn close(&mut self) {}
 }
 
 // ── Backend ───────────────────────────────────────────────────────────────────
 
 pub struct PcanBackend {
     lib: Arc<PcanLib>,
+    // Configured channels retain their indices while attached devices change.
+    channel_ids: Mutex<Vec<(TPCANHandle, String)>>,
 }
 
 impl PcanBackend {
     pub fn new() -> Result<Self, String> {
-        Ok(Self { lib: PcanLib::load()? })
+        Ok(Self { lib: PcanLib::load()?, channel_ids: Mutex::new(Vec::new()) })
+    }
+
+    fn find_channel(&self, index: u8) -> Option<(TPCANHandle, u32)> {
+        let (handle, name) = self.channel_ids.lock().unwrap().get(usize::from(index))?.clone();
+        enumerate_channels(&self.lib).into_iter().find_map(|(current, current_name, features)| {
+            (current == handle && current_name == name).then_some((handle, features))
+        })
     }
 }
 
+fn index_pcan_channels(
+    known: &mut Vec<(TPCANHandle, String)>,
+    attached: Vec<(TPCANHandle, String, u32)>,
+) -> Vec<(u8, String)> {
+    attached.into_iter().filter_map(|(handle, name, _)| {
+        let index = known.iter()
+            .position(|(known_handle, known_name)| *known_handle == handle && known_name == &name)
+            .unwrap_or(known.len());
+        let index = u8::try_from(index).ok()?;
+        if usize::from(index) == known.len() {
+            known.push((handle, name.clone()));
+        }
+        Some((index, name))
+    }).collect()
+}
+
 impl CanBackend for PcanBackend {
-    fn list_channels(&self) -> Vec<String> {
-        enumerate_channels(&self.lib).into_iter().map(|(_, name)| name).collect()
+    fn list_channels(&self) -> Vec<(u8, String)> {
+        let attached = enumerate_channels(&self.lib);
+        index_pcan_channels(&mut self.channel_ids.lock().unwrap(), attached)
+    }
+
+    fn reinitialize(&self) {
+        self.channel_ids.lock().unwrap().clear();
+    }
+
+    fn capabilities(&self, index: u8) -> ChannelCapabilities {
+        let (fd, fd_limitation) = if self.lib.fd.is_none() {
+            (Some(false), Some("Installed PCAN-Basic driver does not expose CAN FD"))
+        } else {
+            let fd = self.find_channel(index).map(|(_, features)| features & PCAN_FEATURE_FD_CAPABLE != 0);
+            (fd, (fd == Some(false)).then_some("This PCAN adapter does not support CAN FD"))
+        };
+        ChannelCapabilities { fd, external_timing: false, fd_limitation }
     }
 
     fn open_channel(
         &mut self,
         index: u8,
-        bitrate: u32,
-        listen_only: bool,
+        settings: ChannelSettings,
         _admin_password: Option<&str>,
     ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
-        let baud = pcan_baud(bitrate).ok_or_else(|| {
-            format!(
-                "Unsupported PCAN baud rate {bitrate} bps \
-                 (supported: 5k, 10k, 20k, 50k, 100k, 125k, 250k, 500k, 1M)"
-            )
-        })?;
+        let bitrate = settings.bitrate;
+        let listen_only = settings.listen_only;
+        let fd = if settings.mode == FrameFormat::Fd {
+            let api = self.lib.fd.ok_or("Installed PCAN-Basic driver does not expose CAN FD")?;
+            Some((api, pcan_fd_bitrate(bitrate, settings.data_bitrate()?)?))
+        } else {
+            None
+        };
+        let baud = if fd.is_none() {
+            pcan_baud(bitrate).ok_or_else(|| format!(
+                "Unsupported PCAN baud rate {bitrate} bps (supported: 5k, 10k, 20k, 50k, 100k, 125k, 250k, 500k, 1M)"
+            ))?
+        } else { 0 };
 
-        let lib = Arc::clone(&self.lib);
-        let channels = enumerate_channels(&lib);
-        let (pcan_handle, _) = channels
-            .get(index as usize)
-            .ok_or_else(|| {
-                CanOpenError::ChannelIndexOutOfRange(format!(
-                    "PCAN channel index {index} out of range ({} found)",
-                    channels.len()
-                ))
-            })?
-            .clone();
+        let (pcan_handle, features) = self.find_channel(index).ok_or_else(|| {
+            CanOpenError::ChannelIndexOutOfRange(format!("PCAN channel {index} is no longer available"))
+        })?;
+        if fd.is_some() && features & PCAN_FEATURE_FD_CAPABLE == 0 {
+            return Err("This PCAN adapter does not support CAN FD".into());
+        }
 
         // Uninitialize first in case the channel was left open by a previous
         // crash. CAN_Uninitialize on an already-closed channel is a no-op.
+        let lib = Arc::clone(&self.lib);
         unsafe { (lib.uninitialize)(pcan_handle) };
 
         // PCAN_LISTEN_ONLY must be set before CAN_Initialize — it configures
@@ -444,13 +591,36 @@ impl CanBackend for PcanBackend {
         let mut listen_only_val: u32 = if listen_only { PCAN_PARAMETER_ON } else { PCAN_PARAMETER_OFF };
         let s = unsafe { (lib.set_value)(pcan_handle, PCAN_LISTEN_ONLY, &mut listen_only_val as *mut u32 as *mut u8, 4) };
         if s & !PCAN_ERROR_ANYBUSERR != PCAN_ERROR_OK {
-            log::warn!("CAN_SetValue(PCAN_LISTEN_ONLY) failed: {} — listen-only may not be applied", pcan_err(s));
+            let reason = format!("CAN_SetValue(PCAN_LISTEN_ONLY) failed: {}", pcan_err(s));
+            if listen_only { return Err(reason.into()); }
+            log::warn!("{reason}");
         }
 
-        // SAFETY: valid handle, baud, and zeros for the legacy ISA/DNG args
-        let s = unsafe { (lib.initialize)(pcan_handle, baud, 0, 0, 0) };
-        if s & !PCAN_ERROR_ANYBUSERR != PCAN_ERROR_OK {
-            return Err(format!("CAN_Initialize failed: {}", pcan_err(s)).into());
+        let (s, api) = match &fd {
+            Some((api, timing)) => (unsafe { (api.initialize)(pcan_handle, timing.as_ptr()) }, "CAN_InitializeFD"),
+            None => (unsafe { (lib.initialize)(pcan_handle, baud, 0, 0, 0) }, "CAN_Initialize"),
+        };
+        if s & !(PCAN_ERROR_ANYBUSERR | PCAN_ERROR_CAUTION) != PCAN_ERROR_OK {
+            return Err(format!("{api} failed: {}", pcan_err(s)).into());
+        }
+        if s & PCAN_ERROR_CAUTION != 0 {
+            // Linux can also return CAUTION when initialization succeeded but
+            // the bus had yet to become active. Read back the applied rates.
+            let verified = verify_pcan_bitrates(settings, |parameter| {
+                let mut bitrate = 0u32;
+                let status = unsafe {
+                    (lib.get_value)(pcan_handle, parameter, (&mut bitrate as *mut u32).cast(), 4)
+                };
+                if status == PCAN_ERROR_OK { Ok(bitrate) } else { Err(status) }
+            });
+            if let Err(reason) = verified {
+                let cleanup = unsafe { (lib.uninitialize)(pcan_handle) };
+                if cleanup != PCAN_ERROR_OK {
+                    return Err(format!("{reason}. CAN_Uninitialize could not release it ({})", pcan_err(cleanup)).into());
+                }
+                return Err(reason.into());
+            }
+            log::warn!("{api} returned CAUTION with the requested bitrates applied");
         }
 
         // Ask the driver to deliver bus error frames through CAN_Read (as
@@ -462,11 +632,116 @@ impl CanBackend for PcanBackend {
             log::warn!("CAN_SetValue(PCAN_ALLOW_ERROR_FRAMES) failed: {} — error frames will not be shown", pcan_err(s));
         }
 
-        let channel = Arc::new(PcanChannel { lib, handle: pcan_handle, ts_anchor: Mutex::new(None) });
+        let channel = Arc::new(PcanChannel { lib, handle: pcan_handle, fd: fd.map(|(api, _)| api), ts_anchor: Mutex::new(None) });
 
         Ok((
             Box::new(PcanTxHandle(Arc::clone(&channel))),
             Box::new(PcanRxHandle(channel)),
         ))
+    }
+}
+
+
+fn pcan_fd_bitrate(nominal: u32, data: u32) -> Result<std::ffi::CString, String> {
+    // Stay within FD timing limits of older PEAK controllers as well as
+    // newer hardware. Use a common clock for both phases.
+    let (clock, (nom_brp, nom_tseg1, nom_tseg2, nom_sjw), (data_brp, data_tseg1, data_tseg2, data_sjw)) =
+        [80, 60, 40, 30, 24, 20].into_iter().find_map(|clock| {
+            let nom_timing = solve_fd_timing(clock * 1_000_000, nominal, (64, 16, 16))?;
+            let data_timing = solve_fd_timing(clock * 1_000_000, data, (16, 8, 4))?;
+            Some((clock, nom_timing, data_timing))
+        }).ok_or_else(|| format!("Cannot compute PCAN CAN FD timing for {nominal} bps nominal and {data} bps data"))?;
+    let timing = format!(
+        "f_clock_mhz={clock},nom_brp={nom_brp},nom_tseg1={nom_tseg1},nom_tseg2={nom_tseg2},nom_sjw={nom_sjw},\
+        data_brp={data_brp},data_tseg1={data_tseg1},data_tseg2={data_tseg2},data_sjw={data_sjw}"
+    );
+    std::ffi::CString::new(timing).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pcan_indices_follow_registered_channels_across_discovery_changes() {
+        let mut known = Vec::new();
+        let fd = (0x51, "PCAN-USB FD 1".into(), PCAN_FEATURE_FD_CAPABLE);
+        let classical = (0x52, "PCAN-USB 2".into(), 0);
+        assert_eq!(index_pcan_channels(&mut known, vec![fd.clone(), classical.clone()]),
+            [(0, fd.1.clone()), (1, classical.1.clone())]);
+        assert_eq!(index_pcan_channels(&mut known, vec![classical.clone(), fd.clone()]),
+            [(1, classical.1.clone()), (0, fd.1.clone())]);
+        assert_eq!(index_pcan_channels(&mut known, vec![classical]), [(1, "PCAN-USB 2".into())]);
+        assert_eq!(known[0], (fd.0, fd.1));
+    }
+
+    #[test]
+    fn initializing_with_caution_requires_the_requested_pcan_bitrates() {
+        let settings = ChannelSettings {
+            mode: FrameFormat::Fd, bitrate: 500_000, data_bitrate: Some(2_000_000), listen_only: true,
+        };
+        let rates = |parameter| match parameter {
+            PCAN_BUSSPEED_NOMINAL => Ok(500_000),
+            PCAN_BUSSPEED_FD => Ok(2_000_000),
+            _ => unreachable!(),
+        };
+        assert!(verify_pcan_bitrates(settings, rates).is_ok());
+        let different_data_rate = |parameter| {
+            if parameter == PCAN_BUSSPEED_FD { Ok(4_000_000) } else { rates(parameter) }
+        };
+        assert!(verify_pcan_bitrates(settings, different_data_rate).unwrap_err().contains("4000000"));
+        assert!(verify_pcan_bitrates(settings, |_| Err(0x08000)).unwrap_err().contains("Could not verify"));
+
+        let classical = ChannelSettings { mode: FrameFormat::Classical, data_bitrate: None, ..settings };
+        assert!(verify_pcan_bitrates(classical, |parameter| {
+            assert_eq!(parameter, PCAN_BUSSPEED_NOMINAL);
+            Ok(500_000)
+        }).is_ok());
+    }
+
+    #[test]
+    fn pcan_capture_continues_after_an_overrun_status_frame() {
+        const PCAN_ERROR_OVERRUN: TPCANStatus = 0x00002;
+        const PCAN_ERROR_INITIALIZE: TPCANStatus = 0x0400_0000;
+        let anchor = Mutex::new(None);
+        let mut statuses = [PCAN_ERROR_OVERRUN, PCAN_ERROR_OK, PCAN_ERROR_INITIALIZE].into_iter();
+        let mut read = |msg: &mut TPCANMsgFd| {
+            let status = statuses.next().unwrap();
+            match status {
+                PCAN_ERROR_OVERRUN => msg.msg_type = PCAN_MESSAGE_STATUS,
+                PCAN_ERROR_OK => {
+                    msg.id = 0x123;
+                    msg.msg_type = PCAN_MESSAGE_FD | PCAN_MESSAGE_BRS | PCAN_MESSAGE_EXTENDED;
+                    msg.dlc = 9;
+                    msg.data[..12].fill(0xAB);
+                }
+                _ => {}
+            }
+            (status, 1)
+        };
+
+        let frame = PcanRxHandle::receive_pcan_frame(100, &anchor, "CAN_ReadFD", &mut read).unwrap().unwrap();
+        assert_eq!(frame.can_id, 0x123);
+        assert!(frame.is_extended);
+        assert_eq!(frame.metadata, FrameMetadata::fd(true, false));
+        assert_eq!(frame.data, [0xAB; 12]);
+        let failure = PcanRxHandle::receive_pcan_frame(100, &anchor, "CAN_ReadFD", read).unwrap_err();
+        assert!(failure.contains("not initialized"));
+    }
+
+    #[test]
+    fn pcan_bus_warning_is_distinct_from_error_passive() {
+        assert_eq!(pcan_bus_state(PCAN_ERROR_BUSHEAVY), BusState::Warning);
+        assert_eq!(pcan_bus_state(PCAN_ERROR_BUSHEAVY | PCAN_ERROR_BUSPASSIVE), BusState::Passive);
+        assert_eq!(pcan_bus_state(PCAN_ERROR_BUSPASSIVE | PCAN_ERROR_BUSOFF), BusState::BusOff);
+    }
+
+    #[test]
+    fn default_fd_rates_fit_older_peak_controller_limits() {
+        let timing = pcan_fd_bitrate(500_000, 2_000_000).unwrap();
+        assert_eq!(timing.to_str().unwrap(),
+            "f_clock_mhz=80,nom_brp=2,nom_tseg1=63,nom_tseg2=16,nom_sjw=16,data_brp=2,data_tseg1=15,data_tseg2=4,data_sjw=4");
+        assert!(pcan_fd_bitrate(500_000, 8_000_000).is_ok());
+        assert!(pcan_fd_bitrate(0, 2_000_000).is_err());
     }
 }

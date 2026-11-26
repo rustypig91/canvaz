@@ -36,7 +36,7 @@ test("summaries include empty selections, unnamed messages, J1939 and each range
     assert.equal(texts.msg, "Message: (no message), <Engine>");
     assert.equal(texts.pgn, "PGN: (non-J1939), 61444");
     assert.equal(texts.broadcast, "PGN type: Destination-specific");
-    assert.equal(texts["data-63"], "Data byte 63: 0xFF");
+    assert.equal(texts["data-63"], "Data byte 64: 0xFF");
     for (const criterion of criteria) {
         const before = h.traceFilterCriteria().length;
         criterion.clear();

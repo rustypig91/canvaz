@@ -1,9 +1,10 @@
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 
+use crate::can_communication::FrameFormat;
 use crate::sim_generator::SignalGen;
 
-const PROJECT_VERSION: u32 = 2;
+const PROJECT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Project {
@@ -39,6 +40,10 @@ pub struct ChannelConfig {
     /// Unspecified for virtual interfaces and server-configured socketcand buses.
     #[serde(default = "default_bitrate")]
     pub bitrate: Option<u32>,
+    #[serde(default)]
+    pub mode: FrameFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_bitrate: Option<u32>,
     /// Protocol interpretation for received frames ("j1939"); None = raw CAN.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub protocol: Option<String>,
@@ -81,12 +86,20 @@ pub struct PlotSignalEntry {
     /// in different messages when a pane is restored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_is_extended: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulateMessage {
+    #[serde(default)]
+    pub format: Option<FrameFormat>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub brs: bool,
     pub channel: String,
     pub message_id: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_is_extended: Option<bool>,
     pub period_ms: u64,
     #[serde(default, skip_serializing_if = "is_false")]
     pub running: bool,
@@ -104,6 +117,10 @@ pub struct SimulateMessageSignal {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulateRawFrame {
+    #[serde(default)]
+    pub format: FrameFormat,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub brs: bool,
     pub channel: String,
     pub can_id: u32,
     pub is_extended: bool,
@@ -222,7 +239,7 @@ impl Project {
     }
 
     fn migrate(&mut self) {
-        if self.version < PROJECT_VERSION {
+        if self.version < 2 {
             // Socketcand was receive-only in v1 regardless of the saved flag.
             for channel in &mut self.channels {
                 if channel.backend == "socketcand" {
@@ -230,8 +247,21 @@ impl Project {
                     channel.bitrate = None;
                 }
             }
-            self.version = PROJECT_VERSION;
         }
+        if self.version == 2 {
+            // v2 saved the DBC key. Extended IDs that fit in 11 bits have bit 31 set.
+            for signal in self.plot_panes.iter_mut().flat_map(|pane| &mut pane.signals) {
+                if signal.message_is_extended.is_none() {
+                    signal.message_is_extended = signal.message_id.map(|id| id > 0x7FF);
+                }
+            }
+            for message in &mut self.simulate_messages {
+                if message.message_is_extended.is_none() {
+                    message.message_is_extended = Some(message.message_id > 0x7FF);
+                }
+            }
+        }
+        self.version = self.version.max(PROJECT_VERSION);
     }
 }
 
@@ -267,6 +297,73 @@ mod tests {
         let reopened = Project::load(path).unwrap();
         assert!(!reopened.channels[0].listen_only);
         assert!(reopened.channels[1].listen_only);
+    }
+
+    #[test]
+    fn project_migration_preserves_dbc_key_widths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.canvaz");
+        for (version, standard, extended) in [(1, None, None), (2, Some(false), Some(true))] {
+            let json = serde_json::json!({
+                "version": version,
+                "channels": [],
+                "plot_panes": [{"signals": [
+                    {"signal_name": "Value", "channel": "test", "message_id": 0x123},
+                    {"signal_name": "Value", "channel": "test", "message_id": 0x80000123_u32}
+                ]}],
+                "simulate_messages": [
+                    {"channel": "test", "message_id": 0x123, "running": true, "period_ms": 100, "signals": []},
+                    {"channel": "test", "message_id": 0x80000123_u32, "running": true, "period_ms": 100, "signals": []}
+                ]
+            });
+            std::fs::write(&path, json.to_string()).unwrap();
+            let project = Project::load(path.to_str().unwrap()).unwrap();
+            assert_eq!(project.version, PROJECT_VERSION);
+            project.save(path.to_str().unwrap()).unwrap();
+            let reopened = Project::load(path.to_str().unwrap()).unwrap();
+            for (index, width) in [standard, extended].into_iter().enumerate() {
+                assert_eq!(reopened.plot_panes[0].signals[index].message_is_extended, width);
+                assert_eq!(reopened.simulate_messages[index].message_is_extended, width);
+                assert!(reopened.simulate_messages[index].running);
+            }
+        }
+    }
+
+    #[test]
+    fn fd_channel_and_armed_simulations_round_trip_with_legacy_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fd.canvaz");
+        let bytes = (0..64).collect::<Vec<u8>>();
+        let project: Project = serde_json::from_value(serde_json::json!({
+            "version": PROJECT_VERSION,
+            "channels": [
+                {"name": "CAN FD", "backend": "pcan", "bitrate": 500000, "data_bitrate": 2000000, "mode": "fd"},
+                {"name": "legacy"}
+            ],
+            "plot_panes": [{"signals": [{
+                "signal_name": "Counter", "channel": "pcan:CAN FD", "message_id": 291, "message_is_extended": false
+            }]}],
+            "simulate_messages": [{
+                "channel": "pcan:CAN FD", "message_id": 0x80000123_u32, "message_is_extended": true,
+                "format": "fd", "brs": true, "period_ms": 123,
+                "running": true, "signals": [{"name": "Counter", "value": 10, "generator": {"mode": "counter"}}]
+            }],
+            "simulate_raw_frames": [{
+                "channel": "pcan:CAN FD", "can_id": 291, "is_extended": true, "format": "fd", "brs": true,
+                "dlc": 64, "data": bytes, "period_ms": 200, "running": true
+            }, {
+                "channel": "socketcan:legacy", "can_id": 291, "is_extended": false,
+                "dlc": 0, "data": [], "period_ms": 100
+            }]
+        })).unwrap();
+        project.save(path.to_str().unwrap()).unwrap();
+        let reopened = Project::load(path.to_str().unwrap()).unwrap();
+        assert_eq!(reopened.channels[1].mode, FrameFormat::Classical);
+        assert_eq!(reopened.simulate_raw_frames[1].format, FrameFormat::Classical);
+        assert_eq!(reopened.plot_panes[0].signals[0].message_is_extended, Some(false));
+        assert_eq!(reopened.simulate_messages[0].message_is_extended, Some(true));
+        assert_eq!(reopened.simulate_raw_frames[0].data.len(), 64);
+        assert_eq!(serde_json::to_value(&reopened).unwrap(), serde_json::to_value(&project).unwrap());
     }
 
     #[test]
