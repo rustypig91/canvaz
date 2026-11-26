@@ -317,21 +317,23 @@ The connection is saved with the project. Stop capture and use **Edit** to
 change the address while keeping the channel's plots and simulations. While
 capture is running, Canvaz retries unavailable or unresponsive Socketcand
 servers, including when the configured server is the only channel. During
-connection setup, Canvaz retains up to the latest 1,024 classic frames and bus
-errors while waiting for the server to confirm RAW mode.
+connection setup, Canvaz retains up to the latest 1,024 frames and bus errors
+accepted by the selected bus mode while waiting for the server to confirm RAW
+mode.
 
-Socketcand works over TCP on all platforms and sends and receives classic CAN
-standard and extended frames, plus reported bus errors. Send and Simulate use
-the same connection as capture. Received timestamps are anchored to the local
-clock on the first frame, preserving server-relative timing even when the
-server clock is not synchronized with this computer.
+Socketcand works over TCP on all platforms and carries standard and extended
+identifiers, plus reported bus errors. **Classical CAN** mode skips received FD
+frames so Classical CAN capture continues on mixed buses. **CAN FD (ISO)**
+mode sends and receives both frame formats with a compatible server and bus.
+Send and Simulate use the same connection as capture. Received timestamps are
+anchored to the local clock on the first frame, preserving server-relative
+timing even when the server clock is not synchronized with this computer.
 The server configures the bitrate, so the remote channel has no bitrate control
 or bus load estimate. **Listen-only** blocks sending from this client and leaves
 the server's physical listen-only and ACK settings alone. Socketcand channels
 from older projects open in Listen-only mode. To enable Send and Simulate, stop
 capture, clear **Listen-only**, and restart. TX timestamps indicate when the
-client wrote the command to TCP. Incoming CAN FD messages are skipped so that
-classic CAN capture continues on mixed buses.
+client wrote the command to TCP.
 If a reloaded DBC omits a simulated message, its settings and armed state are
 retained and restored when that message definition becomes available again.
 Values and generators for individual missing signals are also retained across
