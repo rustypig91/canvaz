@@ -2916,7 +2916,8 @@ function defaultSimFormat(msg: DbcMessage): FrameFormat | null {
 function restoreSimMessageTransmission(msg: DbcMessage, savedFormat: FrameFormat | null | undefined, savedBrs: boolean | undefined, armed: boolean | undefined) {
     const defaultFormat = defaultSimFormat(msg);
     const format = msg.frame_format ? defaultFormat : savedFormat ?? defaultFormat;
-    const formatChanged = savedFormat != null && format !== savedFormat;
+    // Projects saved before CAN FD only transmitted Classical CAN.
+    const formatChanged = !!msg.frame_format && format !== (savedFormat ?? "classical");
     return {
         format,
         brs: format === "fd" && !formatChanged && (savedBrs ?? false),

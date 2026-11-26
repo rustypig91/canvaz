@@ -51,6 +51,8 @@ const PCAN_CHANNEL_CONDITION: u8      = 0x0D;
 const PCAN_HARDWARE_NAME: u8          = 0x0E;
 const PCAN_ATTACHED_CHANNELS_COUNT: u8 = 0x2A;
 const PCAN_ATTACHED_CHANNELS: u8      = 0x2B;
+const PCAN_BUSSPEED_NOMINAL: u8 = 0x1A;
+const PCAN_BUSSPEED_FD: u8 = 0x1B;
 // CAN_SetValue parameter: listen-only mode (no ACKs, no error frames transmitted).
 const PCAN_LISTEN_ONLY: u8 = 0x08;
 // CAN_SetValue parameter: deliver bus error frames through CAN_Read
@@ -225,6 +227,26 @@ fn pcan_err(s: TPCANStatus) -> String {
     format!("PCAN error 0x{s:05X} ({desc})")
 }
 
+fn verify_pcan_bitrates(
+    settings: ChannelSettings,
+    mut read: impl FnMut(u8) -> Result<u32, TPCANStatus>,
+) -> Result<(), String> {
+    let mut verify = |parameter, phase, expected| {
+        let actual = read(parameter).map_err(|status| {
+            format!("Could not verify PCAN {phase} bitrate after a driver warning: {}", pcan_err(status))
+        })?;
+        if actual != expected {
+            return Err(format!("PCAN applied a {phase} bitrate of {actual} bit/s, expected {expected} bit/s"));
+        }
+        Ok(())
+    };
+    verify(PCAN_BUSSPEED_NOMINAL, "nominal", settings.bitrate)?;
+    if settings.mode == FrameFormat::Fd {
+        verify(PCAN_BUSSPEED_FD, "data", settings.data_bitrate()?)?;
+    }
+    Ok(())
+}
+
 /// Returns handle, display name, and device capabilities for every physically connected channel.
 /// Uses PCAN_ATTACHED_CHANNELS (PCAN-Basic v4+) which asks the driver for the
 /// current list of present devices, rather than probing 32 fixed handles.
@@ -252,9 +274,9 @@ fn enumerate_channels(lib: &PcanLib) -> Vec<(TPCANHandle, String, u32)> {
 
     (0..count as usize)
         .filter_map(|i| {
-            // SAFETY: each struct_size slice starts on a naturally aligned offset
-            // because the struct's largest alignment is 4 and the buffer is vec-allocated.
-            let info = unsafe { &*(buf[i * struct_size..].as_ptr() as *const TPCANChannelInformation) };
+            // SAFETY: the buffer contains count complete records. A byte buffer
+            // need not be aligned for TPCANChannelInformation.
+            let info = unsafe { buf[i * struct_size..].as_ptr().cast::<TPCANChannelInformation>().read_unaligned() };
             if info.channel_condition & (PCAN_CHANNEL_AVAILABLE | PCAN_CHANNEL_OCCUPIED) == 0 {
                 return None;
             }
@@ -455,26 +477,54 @@ fn pcan_bus_state(status: TPCANStatus) -> BusState {
 
 pub struct PcanBackend {
     lib: Arc<PcanLib>,
+    // Configured channels retain their indices while attached devices change.
+    channel_ids: Mutex<Vec<(TPCANHandle, String)>>,
 }
 
 impl PcanBackend {
     pub fn new() -> Result<Self, String> {
-        Ok(Self { lib: PcanLib::load()? })
+        Ok(Self { lib: PcanLib::load()?, channel_ids: Mutex::new(Vec::new()) })
     }
+
+    fn find_channel(&self, index: u8) -> Option<(TPCANHandle, u32)> {
+        let (handle, name) = self.channel_ids.lock().unwrap().get(usize::from(index))?.clone();
+        enumerate_channels(&self.lib).into_iter().find_map(|(current, current_name, features)| {
+            (current == handle && current_name == name).then_some((handle, features))
+        })
+    }
+}
+
+fn index_pcan_channels(
+    known: &mut Vec<(TPCANHandle, String)>,
+    attached: Vec<(TPCANHandle, String, u32)>,
+) -> Vec<(u8, String)> {
+    attached.into_iter().filter_map(|(handle, name, _)| {
+        let index = known.iter()
+            .position(|(known_handle, known_name)| *known_handle == handle && known_name == &name)
+            .unwrap_or(known.len());
+        let index = u8::try_from(index).ok()?;
+        if usize::from(index) == known.len() {
+            known.push((handle, name.clone()));
+        }
+        Some((index, name))
+    }).collect()
 }
 
 impl CanBackend for PcanBackend {
     fn list_channels(&self) -> Vec<(u8, String)> {
-        enumerate_channels(&self.lib).into_iter().take(256).enumerate()
-            .map(|(index, (_, name, _))| (index as u8, name)).collect()
+        let attached = enumerate_channels(&self.lib);
+        index_pcan_channels(&mut self.channel_ids.lock().unwrap(), attached)
+    }
+
+    fn reinitialize(&self) {
+        self.channel_ids.lock().unwrap().clear();
     }
 
     fn capabilities(&self, index: u8) -> ChannelCapabilities {
         let (fd, fd_limitation) = if self.lib.fd.is_none() {
             (Some(false), Some("Installed PCAN-Basic driver does not expose CAN FD"))
         } else {
-            let channels = enumerate_channels(&self.lib);
-            let fd = channels.get(index as usize).map(|(_, _, features)| features & PCAN_FEATURE_FD_CAPABLE != 0);
+            let fd = self.find_channel(index).map(|(_, features)| features & PCAN_FEATURE_FD_CAPABLE != 0);
             (fd, (fd == Some(false)).then_some("This PCAN adapter does not support CAN FD"))
         };
         ChannelCapabilities { fd, external_timing: false, fd_limitation }
@@ -500,22 +550,16 @@ impl CanBackend for PcanBackend {
             ))?
         } else { 0 };
 
-        let lib = Arc::clone(&self.lib);
-        let channels = enumerate_channels(&lib);
-        let &(pcan_handle, _, features) = channels
-            .get(index as usize)
-            .ok_or_else(|| {
-                CanOpenError::ChannelIndexOutOfRange(format!(
-                    "PCAN channel index {index} out of range ({} found)",
-                    channels.len()
-                ))
-            })?;
+        let (pcan_handle, features) = self.find_channel(index).ok_or_else(|| {
+            CanOpenError::ChannelIndexOutOfRange(format!("PCAN channel {index} is no longer available"))
+        })?;
         if fd.is_some() && features & PCAN_FEATURE_FD_CAPABLE == 0 {
             return Err("This PCAN adapter does not support CAN FD".into());
         }
 
         // Uninitialize first in case the channel was left open by a previous
         // crash. CAN_Uninitialize on an already-closed channel is a no-op.
+        let lib = Arc::clone(&self.lib);
         unsafe { (lib.uninitialize)(pcan_handle) };
 
         // PCAN_LISTEN_ONLY must be set before CAN_Initialize — it configures
@@ -532,17 +576,27 @@ impl CanBackend for PcanBackend {
             Some((api, timing)) => (unsafe { (api.initialize)(pcan_handle, timing.as_ptr()) }, "CAN_InitializeFD"),
             None => (unsafe { (lib.initialize)(pcan_handle, baud, 0, 0, 0) }, "CAN_Initialize"),
         };
-        if s & PCAN_ERROR_CAUTION != 0 {
-            // PCAN-Basic can open the channel at a different bitrate and return CAUTION.
-            let cleanup = unsafe { (lib.uninitialize)(pcan_handle) };
-            let reason = format!("{api} opened the channel at a different bitrate than requested");
-            if cleanup != PCAN_ERROR_OK {
-                return Err(format!("{reason}. CAN_Uninitialize could not release it ({})", pcan_err(cleanup)).into());
-            }
-            return Err(reason.into());
-        }
-        if s & !PCAN_ERROR_ANYBUSERR != PCAN_ERROR_OK {
+        if s & !(PCAN_ERROR_ANYBUSERR | PCAN_ERROR_CAUTION) != PCAN_ERROR_OK {
             return Err(format!("{api} failed: {}", pcan_err(s)).into());
+        }
+        if s & PCAN_ERROR_CAUTION != 0 {
+            // Linux can also return CAUTION when initialization succeeded but
+            // the bus had yet to become active. Read back the applied rates.
+            let verified = verify_pcan_bitrates(settings, |parameter| {
+                let mut bitrate = 0u32;
+                let status = unsafe {
+                    (lib.get_value)(pcan_handle, parameter, (&mut bitrate as *mut u32).cast(), 4)
+                };
+                if status == PCAN_ERROR_OK { Ok(bitrate) } else { Err(status) }
+            });
+            if let Err(reason) = verified {
+                let cleanup = unsafe { (lib.uninitialize)(pcan_handle) };
+                if cleanup != PCAN_ERROR_OK {
+                    return Err(format!("{reason}. CAN_Uninitialize could not release it ({})", pcan_err(cleanup)).into());
+                }
+                return Err(reason.into());
+            }
+            log::warn!("{api} returned CAUTION with the requested bitrates applied");
         }
 
         // Ask the driver to deliver bus error frames through CAN_Read (as
@@ -583,6 +637,43 @@ fn pcan_fd_bitrate(nominal: u32, data: u32) -> Result<std::ffi::CString, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pcan_indices_follow_registered_channels_across_discovery_changes() {
+        let mut known = Vec::new();
+        let fd = (0x51, "PCAN-USB FD 1".into(), PCAN_FEATURE_FD_CAPABLE);
+        let classical = (0x52, "PCAN-USB 2".into(), 0);
+        assert_eq!(index_pcan_channels(&mut known, vec![fd.clone(), classical.clone()]),
+            [(0, fd.1.clone()), (1, classical.1.clone())]);
+        assert_eq!(index_pcan_channels(&mut known, vec![classical.clone(), fd.clone()]),
+            [(1, classical.1.clone()), (0, fd.1.clone())]);
+        assert_eq!(index_pcan_channels(&mut known, vec![classical]), [(1, "PCAN-USB 2".into())]);
+        assert_eq!(known[0], (fd.0, fd.1));
+    }
+
+    #[test]
+    fn initializing_with_caution_requires_the_requested_pcan_bitrates() {
+        let settings = ChannelSettings {
+            mode: FrameFormat::Fd, bitrate: 500_000, data_bitrate: Some(2_000_000), listen_only: true,
+        };
+        let rates = |parameter| match parameter {
+            PCAN_BUSSPEED_NOMINAL => Ok(500_000),
+            PCAN_BUSSPEED_FD => Ok(2_000_000),
+            _ => unreachable!(),
+        };
+        assert!(verify_pcan_bitrates(settings, rates).is_ok());
+        let different_data_rate = |parameter| {
+            if parameter == PCAN_BUSSPEED_FD { Ok(4_000_000) } else { rates(parameter) }
+        };
+        assert!(verify_pcan_bitrates(settings, different_data_rate).unwrap_err().contains("4000000"));
+        assert!(verify_pcan_bitrates(settings, |_| Err(0x08000)).unwrap_err().contains("Could not verify"));
+
+        let classical = ChannelSettings { mode: FrameFormat::Classical, data_bitrate: None, ..settings };
+        assert!(verify_pcan_bitrates(classical, |parameter| {
+            assert_eq!(parameter, PCAN_BUSSPEED_NOMINAL);
+            Ok(500_000)
+        }).is_ok());
+    }
 
     #[test]
     fn pcan_bus_warning_is_distinct_from_error_passive() {

@@ -448,6 +448,22 @@ test("an armed DBC simulation resumes after its transmit format is resolved", as
     assert.equal(entry.periodicHandle, 42);
 });
 
+test("an armed legacy DBC simulation needs confirmation before switching to FD", () => {
+    const { restoreSimMessageTransmission } = harness([]);
+    const msg = { dlc: 8, frame_format: "fd" };
+    for (const legacyFormat of [undefined, null, "classical"]) {
+        const restored = restoreSimMessageTransmission(msg, legacyFormat, false, true);
+        assert.equal(restored.format, "fd");
+        assert.equal(restored.running, false);
+        assert.match(restored.txError, /Review the format/);
+    }
+    const savedFd = restoreSimMessageTransmission(msg, "fd", true, true);
+    assert.equal(savedFd.running, true);
+    assert.equal(savedFd.brs, true);
+    assert.equal(restoreSimMessageTransmission({ dlc: 8 }, undefined, false, true).running, true);
+    assert.equal(restoreSimMessageTransmission({ dlc: 12 }, null, false, true).running, true);
+});
+
 test("a saved oversized raw length cannot silently transmit a shorter FD frame", async () => {
     const sent = [];
     const { ctx, entry } = simHarness(command => { sent.push(command); return 42; });
