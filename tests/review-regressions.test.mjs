@@ -545,6 +545,37 @@ test("Trace keeps live FD flags and clipped payload tooltips current", () => {
     assert.equal(tooltipEl.textContent, `${"AB ".repeat(63)}CD`);
 });
 
+test("Trace reuses the CAN ID and message cells until the message changes", () => {
+    const replacements = [];
+    const canIdCell = { set outerHTML(_) { assert.fail("CAN ID is part of the overwrite key"); } };
+    const msgCell = { set outerHTML(html) { replacements.push(html); } };
+    const cells = { '[data-col="canId"]': canIdCell, '[data-col="msg"]': msgCell };
+    const row = {
+        dataset: { msg: "First" }, style: {},
+        classList: { toggle() {} }, querySelector: key => cells[key],
+    };
+    const ctx = harness(["updateTraceRowEl"], {
+        buildTraceCellHtml: (col, entry) => [col, entry.messageName, entry.error],
+        traceRowSignals: new WeakMap(), traceRowVisible: () => true,
+    });
+    const entry = { data: [], signals: [], timestampMs: 1, dlc: 0, messageName: "First" };
+    ctx.updateTraceRowEl(row, entry);
+    assert.deepEqual(replacements, []);
+
+    ctx.updateTraceRowEl(row, { ...entry, messageName: "Second" });
+    assert.equal(row.dataset.msg, "Second");
+    assert.deepEqual(replacements, [["msg", "Second", undefined]]);
+
+    row.dataset.msg = "";
+    row.dataset.err = "First bus error";
+    const error = { ...entry, messageName: null, error: "Second bus error" };
+    ctx.updateTraceRowEl(row, error);
+    ctx.updateTraceRowEl(row, error);
+    assert.equal(row.dataset.err, "Second bus error");
+    assert.deepEqual(replacements.at(-1), ["msg", null, "Second bus error"]);
+    assert.equal(replacements.length, 2);
+});
+
 test("Trace rows keep an explicit DBC mismatch through expansion and column rebuilds", () => {
     const message = { id: 0, signals: [] };
     const ctx = harness(["buildTraceRow", "entryFromRow", "expandTraceRow", "traceRowDbcMessageId", "dbcMessageFor", "dbcMessageId"], {

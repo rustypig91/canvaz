@@ -23,6 +23,7 @@ const PCAN_NONEBUS: TPCANHandle = 0x00;
 
 const PCAN_ERROR_OK: TPCANStatus = 0x00000;
 const PCAN_ERROR_QRCVEMPTY: TPCANStatus = 0x00020;
+const PCAN_ERROR_ILLDATA: TPCANStatus = 0x20000;
 const PCAN_ERROR_CAUTION: TPCANStatus = 0x0200_0000;
 
 // Bus-error flags that may be OR'd into an otherwise-valid CAN_Read status.
@@ -440,11 +441,15 @@ impl RxHandle for PcanRxHandle {
                     timestamp_ms: Some(abs_ms),
                     error: None,
                 }));
-            } else if s_primary == PCAN_ERROR_QRCVEMPTY {
+            } else if s_primary & !(PCAN_ERROR_QRCVEMPTY | PCAN_ERROR_ILLDATA) == 0 {
                 if std::time::Instant::now() >= deadline {
                     return Ok(None);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                // ILLDATA indicates a discarded frame. Check the next queued
+                // frame immediately and only wait when the queue is empty.
+                if s_primary & PCAN_ERROR_QRCVEMPTY != 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             } else {
                 return Err(format!("{api} failed: {}", pcan_err(s)));
             }

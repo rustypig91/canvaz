@@ -5469,8 +5469,15 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     else tr.dataset.dbcMessageId = entry.dbcMessageId === null ? "" : String(entry.dbcMessageId);
     tr.dataset.cycle = entry.cycleTimeMs != null ? String(entry.cycleTimeMs) : "";
     if (entry.reassembled) tr.dataset.reassembled = "1"; else delete tr.dataset.reassembled;
-    tr.dataset.msg = entry.messageName ?? "";
-    tr.classList.toggle("dbc-match", entry.messageName !== null);
+    const messageName = entry.messageName ?? "";
+    const error = entry.error ?? undefined;
+    const messageChanged = tr.dataset.msg !== messageName || tr.dataset.err !== error;
+    if (messageChanged) {
+        tr.dataset.msg = messageName;
+        if (error === undefined) delete tr.dataset.err;
+        else tr.dataset.err = error;
+        tr.classList.toggle("dbc-match", entry.messageName !== null);
+    }
     tr.style.display = traceRowVisible(entry.channelHandle, entry.canId, entry.data, entry.direction, entry.cycleTimeMs, entry.dlc, entry.messageName, entry.j1939) ? "" : "none";
     const gc = (k: string) => tr.querySelector<HTMLTableCellElement>(`[data-col="${k}"]`);
     const tsCell = gc("ts"); if (tsCell) tsCell.textContent = fmtElapsed(entry.timestampMs);
@@ -5486,9 +5493,11 @@ function updateTraceRowEl(tr: HTMLTableRowElement, entry: TraceEntry) {
     const dlcCell = gc("dlc"); if (dlcCell) dlcCell.textContent = String(entry.dlc);
     const dataCell = gc("data"); if (dataCell) updateTraceDataCell(dataCell, entry.data);
     const cycleCell = gc("cycle"); if (cycleCell) cycleCell.textContent = entry.cycleTimeMs != null ? entry.cycleTimeMs.toFixed(1) : "—";
-    const canIdCell = gc("canId"); if (canIdCell) canIdCell.outerHTML = buildTraceCellHtml("canId", entry);
-    const msgCell = gc("msg"); if (msgCell) msgCell.outerHTML = buildTraceCellHtml("msg", entry);
-    if (entry.error) tr.dataset.err = entry.error;
+    // The CAN ID and its transport badge are part of the overwrite key.
+    if (messageChanged) {
+        const msgCell = gc("msg");
+        if (msgCell) msgCell.outerHTML = buildTraceCellHtml("msg", entry);
+    }
 
     // Refresh open expansion row with updated signal values + current min/max
     const next = tr.nextElementSibling as HTMLTableRowElement | null;
