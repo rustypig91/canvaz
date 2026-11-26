@@ -577,8 +577,11 @@ function dbcMessageId(canId: number, isExtended: boolean): number {
 function savedDbcMessage(
     dbc: ParsedDbc | null | undefined, id: number, isExtended: boolean | undefined, signalNames: readonly string[],
 ): DbcMessage | undefined {
+    if (isExtended !== undefined) {
+        const match = dbc?.messages[dbcMessageId(id, isExtended)];
+        return match && !!match.is_extended === isExtended ? match : undefined;
+    }
     const exact = dbc?.messages[id];
-    if (isExtended !== undefined) return exact && !!exact.is_extended === isExtended ? exact : undefined;
     if (id > 0x7FF) return exact;
 
     // A legacy bare ID can refer to either identifier width. If both exist,
@@ -3605,7 +3608,7 @@ function idToHandle(id: string): number | undefined {
 
 function buildProject(): Project {
     return {
-        version: 2,
+        version: 3,
         channels: [
             ...[...channels.values()].map(ch => ({
                 name: ch.info.name,

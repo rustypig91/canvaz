@@ -206,6 +206,7 @@ test("restoring an armed DBC simulation preserves the identifier width", async (
         { messages: both, signalName: "Shared" },
         { messages: both, signalName: "Extended", expected: ext },
         { messages: both, savedWidth: false, signalName: "Shared", expected: std },
+        { messages: both, savedWidth: true, signalName: "Shared", expected: ext },
         { messages: both, savedId: ext.key, savedWidth: true, signalName: "Shared", expected: ext },
     ];
     for (const { messages, savedId = id, savedWidth, signalName, expected } of cases) {

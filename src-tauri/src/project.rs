@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use crate::can_communication::FrameFormat;
 use crate::sim_generator::SignalGen;
 
-const PROJECT_VERSION: u32 = 2;
+const PROJECT_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Project {
@@ -239,7 +239,7 @@ impl Project {
     }
 
     fn migrate(&mut self) {
-        if self.version < PROJECT_VERSION {
+        if self.version < 2 {
             // Socketcand was receive-only in v1 regardless of the saved flag.
             for channel in &mut self.channels {
                 if channel.backend == "socketcand" {
@@ -247,8 +247,21 @@ impl Project {
                     channel.bitrate = None;
                 }
             }
-            self.version = PROJECT_VERSION;
         }
+        if self.version == 2 {
+            // v2 saved the DBC key. Extended IDs that fit in 11 bits have bit 31 set.
+            for signal in self.plot_panes.iter_mut().flat_map(|pane| &mut pane.signals) {
+                if signal.message_is_extended.is_none() {
+                    signal.message_is_extended = signal.message_id.map(|id| id > 0x7FF);
+                }
+            }
+            for message in &mut self.simulate_messages {
+                if message.message_is_extended.is_none() {
+                    message.message_is_extended = Some(message.message_id > 0x7FF);
+                }
+            }
+        }
+        self.version = self.version.max(PROJECT_VERSION);
     }
 }
 
@@ -284,6 +297,36 @@ mod tests {
         let reopened = Project::load(path).unwrap();
         assert!(!reopened.channels[0].listen_only);
         assert!(reopened.channels[1].listen_only);
+    }
+
+    #[test]
+    fn project_migration_preserves_dbc_key_widths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.canvaz");
+        for (version, standard, extended) in [(1, None, None), (2, Some(false), Some(true))] {
+            let json = serde_json::json!({
+                "version": version,
+                "channels": [],
+                "plot_panes": [{"signals": [
+                    {"signal_name": "Value", "channel": "test", "message_id": 0x123},
+                    {"signal_name": "Value", "channel": "test", "message_id": 0x80000123_u32}
+                ]}],
+                "simulate_messages": [
+                    {"channel": "test", "message_id": 0x123, "running": true, "period_ms": 100, "signals": []},
+                    {"channel": "test", "message_id": 0x80000123_u32, "running": true, "period_ms": 100, "signals": []}
+                ]
+            });
+            std::fs::write(&path, json.to_string()).unwrap();
+            let project = Project::load(path.to_str().unwrap()).unwrap();
+            assert_eq!(project.version, PROJECT_VERSION);
+            project.save(path.to_str().unwrap()).unwrap();
+            let reopened = Project::load(path.to_str().unwrap()).unwrap();
+            for (index, width) in [standard, extended].into_iter().enumerate() {
+                assert_eq!(reopened.plot_panes[0].signals[index].message_is_extended, width);
+                assert_eq!(reopened.simulate_messages[index].message_is_extended, width);
+                assert!(reopened.simulate_messages[index].running);
+            }
+        }
     }
 
     #[test]

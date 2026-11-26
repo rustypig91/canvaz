@@ -164,16 +164,17 @@ impl ParsedMessage {
     }
 
     fn matches_payload(&self, frame: &CanFrame, reassembled: bool) -> bool {
-        if self.dlc > frame.data.len() as u64 {
-            return false;
-        }
         if reassembled {
             // A variable-length PGN can use the same DBC definition for a
             // single frame and for the leading bytes of a transport message.
             return self.frame_format != Some(DbcFrameFormat::Fd);
         }
         self.wire_format().is_none_or(|format| format == frame.metadata.format)
-            && (frame.metadata.format == FrameFormat::Fd || self.dlc <= 8)
+            && match frame.metadata.format {
+                // Preserve decoding of shorter Classical CAN messages.
+                FrameFormat::Classical => self.dlc <= 8,
+                FrameFormat::Fd => self.dlc <= frame.data.len() as u64,
+            }
     }
 
     pub fn decode_frame(&self, frame: &CanFrame) -> Result<DecodedCanMessage, String> {
@@ -734,7 +735,11 @@ BO_ 291 ShortFd: 2 Vector__XXX
 BO_ 292 LongFd: 10 Vector__XXX
  SG_ Late : 72|8@1+ (1,0) [0|255] "" Vector__XXX
 
+BO_ 293 Classical: 8 Vector__XXX
+ SG_ Early : 0|8@1+ (1,0) [0|255] "" Vector__XXX
+
 BO_ 2364531712 Transport: 10 Vector__XXX
+ SG_ Early : 0|8@1+ (1,0) [0|255] "" Vector__XXX
  SG_ Late : 72|8@1+ (1,0) [0|255] "" Vector__XXX
 
 BA_DEF_ BO_ "VFrameFormat" ENUM "StandardCAN","StandardCAN_FD","J1939PG";
@@ -751,6 +756,11 @@ BA_ "VFrameFormat" BO_ 2364531712 2;
         assert!(dbc.decode_frame(&short).is_none());
         short.metadata.format = FrameFormat::Fd;
         assert_eq!(dbc.decode_frame(&short).unwrap().signals[0].raw, 0xDB);
+        short.data.truncate(1);
+        assert!(dbc.decode_frame(&short).is_none());
+        short.can_id = 293;
+        short.metadata = Default::default();
+        assert_eq!(dbc.decode_frame(&short).unwrap().signals[0].raw, 0xCA);
         let long = &dbc.messages[&292];
         assert_eq!(long.transmit_length(FrameFormat::Fd).unwrap(), 12);
         assert!(long.transmit_length(FrameFormat::Classical).is_err());
@@ -763,7 +773,10 @@ BA_ "VFrameFormat" BO_ 2364531712 2;
             metadata: Default::default(), can_id: id, is_extended: true,
             data: bytes, timestamp_ms: None, error: None,
         };
-        assert_eq!(dbc.decode_frame_j1939(&reassembled, true).unwrap().0.signals[0].raw, 0xAB);
+        assert_eq!(dbc.decode_frame_j1939(&reassembled, true).unwrap().0.signals[1].raw, 0xAB);
+        reassembled.data.truncate(9);
+        reassembled.data[0] = 0xCA;
+        assert_eq!(dbc.decode_frame_j1939(&reassembled, true).unwrap().0.signals[0].raw, 0xCA);
         reassembled.metadata.format = FrameFormat::Fd;
         assert!(dbc.decode_frame_j1939(&reassembled, false).is_none());
     }
