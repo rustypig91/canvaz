@@ -464,8 +464,9 @@ impl PcanBackend {
 }
 
 impl CanBackend for PcanBackend {
-    fn list_channels(&self) -> Vec<String> {
-        enumerate_channels(&self.lib).into_iter().map(|(_, name, _)| name).collect()
+    fn list_channels(&self) -> Vec<(u8, String)> {
+        enumerate_channels(&self.lib).into_iter().take(256).enumerate()
+            .map(|(index, (_, name, _))| (index as u8, name)).collect()
     }
 
     fn capabilities(&self, index: u8) -> ChannelCapabilities {

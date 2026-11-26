@@ -1,5 +1,5 @@
 use std::io::Write as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use socketcan::frame::FdFlags;
@@ -171,21 +171,48 @@ impl TxHandle for SocketCanTxHandle {
 
 // ── Backend ───────────────────────────────────────────────────────────────────
 
-pub struct SocketCanBackend;
+#[derive(Default)]
+pub struct SocketCanBackend {
+    // Registered handles use these indices for both opening and routing frames.
+    // Keep each slot tied to its name across hot-plug and enumeration changes.
+    channel_names: Mutex<Vec<String>>,
+}
+
+impl SocketCanBackend {
+    fn index_interfaces(&self, names: impl IntoIterator<Item = String>) -> Vec<(u8, String)> {
+        let mut known = self.channel_names.lock().unwrap();
+        names.into_iter().filter_map(|name| {
+            let index = known.iter().position(|existing| existing == &name).unwrap_or(known.len());
+            let index = u8::try_from(index).ok()?;
+            if usize::from(index) == known.len() {
+                known.push(name.clone());
+            }
+            Some((index, name))
+        }).collect()
+    }
+
+    fn channel_name(&self, index: u8) -> Option<String> {
+        self.channel_names.lock().unwrap().get(usize::from(index)).cloned()
+    }
+}
 
 impl CanBackend for SocketCanBackend {
-    fn list_channels(&self) -> Vec<String> {
+    fn list_channels(&self) -> Vec<(u8, String)> {
         let mut channels = can_links("can");
         for name in can_links("vcan") {
             if !channels.contains(&name) {
                 channels.push(name);
             }
         }
-        channels
+        self.index_interfaces(channels)
+    }
+
+    fn reinitialize(&self) {
+        self.channel_names.lock().unwrap().clear();
     }
 
     fn capabilities(&self, index: u8) -> ChannelCapabilities {
-        let Some(name) = self.list_channels().get(index as usize).cloned() else {
+        let Some(name) = self.channel_name(index) else {
             return ChannelCapabilities { fd: None, external_timing: false, fd_limitation: None };
         };
         if is_vcan(&name) {
@@ -206,13 +233,9 @@ impl CanBackend for SocketCanBackend {
         settings: ChannelSettings,
         admin_password: Option<&str>,
     ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
-        let channels = self.list_channels();
-        let name = channels
-            .get(index as usize)
-            .ok_or_else(|| {
-                CanOpenError::ChannelIndexOutOfRange(format!("SocketCAN channel index {index} out of range ({} found)", channels.len()))
-            })?
-            .clone();
+        let name = self.channel_name(index).ok_or_else(|| {
+            CanOpenError::ChannelIndexOutOfRange(format!("Unknown SocketCAN channel index {index}"))
+        })?;
 
         let details = link_details(&name).ok_or_else(|| format!("Cannot inspect SocketCAN interface '{name}'"))?;
         let virtual_link = is_vcan_details(&details);
@@ -547,12 +570,14 @@ fn open_reconfigured_socket<S>(
         if !configured_mode_matches(&applied, settings) {
             return Err(format!("SocketCAN '{name}' did not apply the requested CAN mode or listen-only setting").into());
         }
-        if fd && !bitrates_match(&applied, settings) {
+        if !bitrates_match(&applied, settings) {
             let rate = |key| configured_bitrate(&applied, key).map_or_else(|| "unknown".into(), |value| value.to_string());
-            return Err(format!(
-                "SocketCAN '{name}' did not apply the requested ISO CAN FD bitrates (reported nominal {} bit/s, data {} bit/s). Use bitrates supported by the adapter.",
-                rate("bitrate"), rate("dbitrate")
-            ).into());
+            let reported = if fd {
+                format!("nominal {} bit/s, data {} bit/s", rate("bitrate"), rate("dbitrate"))
+            } else {
+                format!("{} bit/s", rate("bitrate"))
+            };
+            return Err(format!("SocketCAN '{name}' did not apply the requested CAN timing (reported {reported}). Use bitrates supported by the adapter.").into());
         }
         run_ip(&up)?;
         raised = true;
@@ -596,10 +621,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn socketcan_indices_keep_the_same_interface_after_discovery_changes() {
+        let backend = SocketCanBackend::default();
+        let discover = |names: &[&str]| backend.index_interfaces(names.iter().map(|name| (*name).into()));
+
+        assert_eq!(discover(&["vcan0"]), [(0, "vcan0".into())]);
+        assert_eq!(discover(&["can0", "vcan0"]), [(1, "can0".into()), (0, "vcan0".into())]);
+        assert_eq!(discover(&["can0"]), [(1, "can0".into())]);
+        assert_eq!(backend.channel_name(0).as_deref(), Some("vcan0"));
+        assert_eq!(backend.channel_name(1).as_deref(), Some("can0"));
+        assert_eq!(discover(&["can0", "vcan0"]), [(1, "can0".into()), (0, "vcan0".into())]);
+    }
+
+    #[test]
     #[ignore = "requires a configured vcan interface with MTU of at least 72"]
     fn socketcan_vcan_mixed_classical_and_fd() {
         let name = std::env::var("CANVAZ_TEST_VCAN").expect("set CANVAZ_TEST_VCAN to the virtual interface name");
-        let mut backend = SocketCanBackend;
+        let mut backend = SocketCanBackend::default();
         let index = backend.channel_index(&name).expect("virtual interface should be listed");
         let settings = ChannelSettings { mode: FrameFormat::Fd, bitrate: 0, data_bitrate: None, listen_only: false };
         let (mut tx, mut rx) = backend.open_channel(index, settings, None).unwrap();
@@ -929,6 +967,34 @@ mod tests {
         assert_eq!(commands, [
             "link set can0 type can bitrate 500000 sample-point 0.875 listen-only off dbitrate 3000000 fd on",
             "link set can0 type can bitrate 500000 sample-point 0.875 listen-only off dbitrate 2000000 dsample-point 0.800 fd on",
+        ]);
+    }
+
+    #[test]
+    fn switching_to_classical_rejects_a_rounded_bitrate_and_restores_fd() {
+        let details = "2: can0: <NOARP,UP,LOWER_UP> mtu 72\n\
+            can <FD> state ERROR-ACTIVE\n\
+            bitrate 500000 sample-point 0.875\n\
+            dbitrate 2000000 dsample-point 0.800";
+        let settings = ChannelSettings {
+            mode: FrameFormat::Classical,
+            bitrate: 490_000,
+            data_bitrate: None,
+            listen_only: false,
+        };
+        let mut commands = Vec::new();
+        let error = open_reconfigured_socket("can0", details, settings, |args| {
+            commands.push(args.join(" "));
+            Ok(())
+        }, || Some("can state STOPPED\nbitrate 500000 sample-point 0.875".into()), || -> Result<(), CanOpenError> {
+            panic!("a socket must not open with the wrong bitrate")
+        }).unwrap_err();
+        assert!(error.to_string().contains("reported 500000 bit/s"));
+        assert_eq!(commands, [
+            "link set can0 down",
+            "link set can0 type can bitrate 490000 listen-only off fd off",
+            "link set can0 type can bitrate 500000 sample-point 0.875 listen-only off dbitrate 2000000 dsample-point 0.800 fd on",
+            "link set can0 up",
         ]);
     }
 

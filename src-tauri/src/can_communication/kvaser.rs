@@ -395,11 +395,11 @@ impl KvaserBackend {
 }
 
 impl CanBackend for KvaserBackend {
-    fn list_channels(&self) -> Vec<String> {
+    fn list_channels(&self) -> Vec<(u8, String)> {
         let mut n: i32 = 0;
         unsafe { (self.lib.get_count)(&mut n) };
-        (0..n.max(0) as i32)
-            .map(|i| kvaser_channel_name(&self.lib, i).unwrap_or_else(|| format!("Channel {i}")))
+        (0..n.min(256))
+            .map(|i| (i as u8, kvaser_channel_name(&self.lib, i).unwrap_or_else(|| format!("Channel {i}"))))
             .collect()
     }
 

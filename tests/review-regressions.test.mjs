@@ -6,7 +6,7 @@ import ts from "typescript";
 
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 function harness(names, globals = {}) {
-    names = [...new Set([...names, "defaultSimFormat", "simFormatControls", "simFormatError", "canRegisterSim"])];
+    names = [...new Set([...names, "defaultSimFormat", "restoreSimMessageTransmission", "simFormatControls", "simFormatError", "canRegisterSim"])];
     const constants = source.statements.filter(n => ts.isVariableStatement(n)
         && n.declarationList.declarations.some(d => d.name.getText(source) === "FD_LENGTHS"));
     const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text));

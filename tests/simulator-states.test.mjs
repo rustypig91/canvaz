@@ -8,7 +8,7 @@ const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.
 const names = ["simEntryStatus", "simFormatError", "canRegisterSim", "updateSimEntryStatus", "updateSimTxStatus", "queueSimOperation",
     "startSim", "stopSim", "openConfiguredChannels", "startApp", "finishStartingCapture", "stopApp", "finishStoppingCapture",
     "onChannelError", "closeFailedChannel", "openChannelByHandle",
-    "scheduleChannelRecovery", "attemptChannelRecovery", "recoverChannel", "reconcileSimMessages", "restoreProjectEntries", "simMessageSettings", "defaultSimFormat"];
+    "scheduleChannelRecovery", "attemptChannelRecovery", "recoverChannel", "reconcileSimMessages", "restoreProjectEntries", "simMessageSettings", "defaultSimFormat", "restoreSimMessageTransmission"];
 const declarations = source.statements.filter(n => (ts.isFunctionDeclaration(n) && names.includes(n.name?.text))
     || (ts.isVariableStatement(n) && n.declarationList.declarations.some(d => d.name.getText(source) === "FD_LENGTHS")));
 const code = ts.transpileModule(declarations.map(n => n.getText(source)).join("\n"), {

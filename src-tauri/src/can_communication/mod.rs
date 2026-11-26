@@ -276,13 +276,12 @@ pub trait CanBackend: Send + 'static {
     fn register_channel(&mut self, _name: &str) -> Result<(), String> { Ok(()) }
     fn unregister_channel(&mut self, _index: u8) {}
     fn replace_registrations(&mut self, _removed: &[u8], _names: &[&str]) -> Result<(), String> { Ok(()) }
-    fn list_channels(&self) -> Vec<String>;
+    fn list_channels(&self) -> Vec<(u8, String)>;
     fn capabilities(&self, _index: u8) -> ChannelCapabilities {
         ChannelCapabilities { fd: None, external_timing: false, fd_limitation: None }
     }
     fn channel_index(&self, name: &str) -> Option<u8> {
-        let index = self.list_channels().iter().position(|channel| channel == name)?;
-        u8::try_from(index).ok()
+        self.list_channels().into_iter().find_map(|(index, channel)| (channel == name).then_some(index))
     }
     /// `listen_only`: open the channel silent (no ACKs, no error flags injected)
     /// so the tool cannot disturb the bus. Backends with external timing and
@@ -412,7 +411,7 @@ impl Can {
         self.backend.channel_index(name)
     }
 
-    pub fn list_channels(&self) -> Vec<String> {
+    pub fn list_channels(&self) -> Vec<(u8, String)> {
         self.backend.list_channels()
     }
 
@@ -830,7 +829,7 @@ mod tests {
 
     struct UnusedBackend;
     impl CanBackend for UnusedBackend {
-        fn list_channels(&self) -> Vec<String> { vec![] }
+        fn list_channels(&self) -> Vec<(u8, String)> { vec![] }
         fn open_channel(&mut self, _: u8, _: ChannelSettings, _: Option<&str>)
             -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> { unreachable!() }
     }

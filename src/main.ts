@@ -2913,6 +2913,18 @@ function defaultSimFormat(msg: DbcMessage): FrameFormat | null {
     return msg.dlc > 8 && !msg.frame_format ? null : "classical";
 }
 
+function restoreSimMessageTransmission(msg: DbcMessage, savedFormat: FrameFormat | null | undefined, savedBrs: boolean | undefined, armed: boolean | undefined) {
+    const defaultFormat = defaultSimFormat(msg);
+    const format = msg.frame_format ? defaultFormat : savedFormat ?? defaultFormat;
+    const formatChanged = savedFormat != null && format !== savedFormat;
+    return {
+        format,
+        brs: format === "fd" && !formatChanged && (savedBrs ?? false),
+        running: !formatChanged && (armed ?? false),
+        ...(formatChanged && armed ? { txError: "The DBC frame format changed. Review the format before starting transmission." } : {}),
+    };
+}
+
 function simFormatControls(entry: SimEntry): string {
     const fd = entry.format === "fd";
     const declared = entry.kind === "message" && entry.dbcFormat;
@@ -3990,11 +4002,10 @@ async function restoreProjectEntries() {
             const simEntry: SimMessageEntry = {
                 kind: "message", channel: handle,
                 messageId: msg.key ?? msg.id, messageName: msg.name, dlc: msg.dlc, dbcFormat: msg.frame_format,
-                format: msg.frame_format ? defaultSimFormat(msg) : m.format ?? defaultSimFormat(msg),
-                brs: (msg.frame_format === "fd" || (!msg.frame_format && m.format === "fd")) && (m.brs ?? false),
+                ...restoreSimMessageTransmission(msg, m.format, m.brs, m.running),
                 signals: msg.signals.map(s => ({ def: s, value: valueByName.get(s.name) ?? simDefaultValue(s), gen: genByName.get(s.name) ?? null })),
                 unresolvedSignals: m.signals.filter(s => !msg.signals.some(def => def.name === s.name)),
-                periodMs: m.period_ms, running: m.running ?? false, periodicHandle: null,
+                periodMs: m.period_ms, periodicHandle: null,
             };
             simEntries.set(key, simEntry);
             simContainer.appendChild(createSimEntryEl(key, simEntry));
@@ -4148,8 +4159,9 @@ function reconcileSimMessages(handle: number) {
         entry.messageName = msg.name;
         entry.dlc = msg.dlc;
         entry.dbcFormat = msg.frame_format;
-        if (msg.frame_format) entry.format = defaultSimFormat(msg);
-        if (entry.format !== "fd") entry.brs = false;
+        if (msg.frame_format) {
+            Object.assign(entry, restoreSimMessageTransmission(msg, entry.format, entry.brs, entry.running));
+        }
         entry.signals = msg.signals.map(s => ({ def: s, value: prevValues.get(s.name) ?? simDefaultValue(s), gen: prevGens.get(s.name) ?? null }));
         simContainer.querySelector(`[data-sim-key="${key}"]`)?.replaceWith(createSimEntryEl(key, entry));
     }

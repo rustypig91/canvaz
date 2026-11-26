@@ -8,7 +8,7 @@ import ts from "typescript";
 // Tauri IPC. No CAN driver or physical interface is needed for these scenarios.
 const source = ts.createSourceFile("main.ts", readFileSync(new URL("../src/main.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
 function harness(names, globals) {
-    names = [...new Set([...names, "savedDbcMessage", "dbcMessageId", "simMessageSettings", "defaultSimFormat"])];
+    names = [...new Set([...names, "savedDbcMessage", "dbcMessageId", "simMessageSettings", "defaultSimFormat", "restoreSimMessageTransmission"])];
     const functions = source.statements.filter(n => ts.isFunctionDeclaration(n) && names.includes(n.name?.text));
     assert.equal(functions.length, names.length);
     const constants = source.statements.filter(n => ts.isVariableStatement(n)
@@ -213,6 +213,35 @@ test("saving and reopening with a partial DBC retains values and generators for 
     assert.deepEqual(restored.signals[1].gen, generator);
     assert.equal(restored.running, true);
     assert.equal(restored.unresolvedSignals.length, 0);
+});
+
+test("a DBC frame format change disarms a saved or reconnecting simulation", async () => {
+    const message = { id: 123, name: "Engine", dlc: 8, frame_format: "fd", signals: [] };
+    const channel = { dbc: { messages: { 123: message } } };
+    const ctx = harness(["restoreProjectEntries", "reconcileSimMessages"], {
+        channels: new Map([[7, channel]]), pendingPaneSignals: [], simEntries: new Map(), msgEntryCounter: 0,
+        pendingSimMessages: [
+            { channel: "can", message_id: 123, format: "classical", running: true, period_ms: 100, signals: [] },
+            { channel: "can", message_id: 123, format: "fd", brs: true, running: true, period_ms: 200, signals: [] },
+        ],
+        idToHandle: () => 7,
+        document: { getElementById: () => ({ appendChild() {}, querySelector: () => null }) },
+        createSimEntryEl: () => ({}), renderSimEntries() {}, updateSignalHighlights() {},
+    });
+    await ctx.restoreProjectEntries();
+    const [changed, unchanged] = ctx.simEntries.values();
+    assert.equal(changed.format, "fd");
+    assert.equal(changed.running, false);
+    assert.match(changed.txError, /DBC frame format changed/);
+    assert.equal(unchanged.running, true);
+    assert.equal(unchanged.brs, true);
+
+    message.frame_format = "classical";
+    ctx.reconcileSimMessages(7);
+    assert.equal(unchanged.format, "classical");
+    assert.equal(unchanged.running, false);
+    assert.equal(unchanged.brs, false);
+    assert.match(unchanged.txError, /DBC frame format changed/);
 });
 
 test("plot restoration autosaves retain unresolved entries in this pane and later panes", async () => {

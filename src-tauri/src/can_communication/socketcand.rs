@@ -148,8 +148,10 @@ impl CanBackend for SocketcandBackend {
         Ok(())
     }
 
-    fn list_channels(&self) -> Vec<String> {
-        self.channels.iter().flatten().map(|channel| channel.name.clone()).collect()
+    fn list_channels(&self) -> Vec<(u8, String)> {
+        self.channels.iter().enumerate().filter_map(|(index, channel)| {
+            channel.as_ref().map(|channel| (index as u8, channel.name.clone()))
+        }).collect()
     }
 
     fn channel_index(&self, name: &str) -> Option<u8> {
@@ -487,7 +489,7 @@ mod tests {
         backend.register_channel(saved).unwrap();
         backend.register_channel(equivalent).unwrap();
         assert_eq!(backend.channel_index(equivalent), backend.channel_index(saved));
-        assert_eq!(backend.list_channels(), [saved]);
+        assert_eq!(backend.list_channels(), [(0, saved.into())]);
         assert!(!SocketcandBackend::same_endpoint(saved, "can://localhost/VCAN0"));
         assert!(!SocketcandBackend::same_endpoint(saved, "can://localhost:30000/vcan0"));
     }
@@ -502,7 +504,7 @@ mod tests {
         assert!(backend.register_channel(replacement).is_err());
         backend.unregister_channel(0);
         assert_eq!(backend.channel_index("can://localhost/can0"), None);
-        assert_eq!(backend.list_channels()[0], "can://localhost/can1");
+        assert_eq!(backend.list_channels()[0], (1, "can://localhost/can1".into()));
         assert_eq!(backend.channel_index("can://localhost/can1"), Some(1));
         backend.register_channel(replacement).unwrap();
         assert_eq!(backend.channel_index(replacement), Some(0));

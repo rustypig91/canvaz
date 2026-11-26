@@ -434,7 +434,7 @@ fn build_cans(shared: &Arc<Mutex<ManagerShared>>) -> BTreeMap<String, Can> {
         cans.insert(
             "socketcan".to_string(),
             Can::new(
-                SocketCanBackend,
+                SocketCanBackend::default(),
                 make_frame_callback("socketcan".into(), Arc::clone(shared), "rx"),
                 make_frame_callback("socketcan".into(), Arc::clone(shared), "tx"),
                 make_error_callback("socketcan".into(), Arc::clone(shared)),
@@ -524,10 +524,10 @@ impl CanManager {
     pub fn list_channels(&self) -> Result<Vec<ChannelInfo>, String> {
         let mut out = Vec::new();
         for (backend_name, can) in &self.cans {
-            for (index, ch) in can.list_channels().into_iter().enumerate() {
+            for (index, ch) in can.list_channels() {
                 debug!("Found channel '{ch}' on backend '{backend_name}'");
                 out.push(ChannelInfo {
-                    capabilities: u8::try_from(index).ok().map(|i| can.capabilities(i)),
+                    capabilities: Some(can.capabilities(index)),
                     backend: backend_name.clone(),
                     name: ch,
                 });
