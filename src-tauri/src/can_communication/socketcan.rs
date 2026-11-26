@@ -465,19 +465,33 @@ fn open_reconfigured_socket<S>(
     let was_fd = controller_flag(details, "FD");
     let was_non_iso = controller_flag(details, "FD-NON-ISO");
     let on_off = |enabled| if enabled { "on" } else { "off" };
-    // A listen-only change can leave the controller's bit timing and TDC intact.
-    let timing_changed = !fd_mode_matches(details, settings) || !bitrates_match(details, settings);
+    let nominal_changed = configured_bitrate(details, "bitrate") != Some(settings.bitrate);
+    let data_changed = fd && configured_bitrate(details, "dbitrate") != settings.data_bitrate;
+    let timing_changed = !fd_mode_matches(details, settings) || nominal_changed || data_changed;
+    let old_nominal = previous_timing(details, "bitrate", "tq");
+    let old_data = was_fd.then(|| previous_timing(details, "dbitrate", "dtq")).flatten();
+    let timing_error = || CanOpenError::Other(format!("Cannot read the previous CAN timing on '{name}'"));
+    let tdc_error = || format!("Cannot read the previous CAN FD transmitter delay compensation on '{name}'");
     let nominal = settings.bitrate.to_string();
     let mut args = base.to_vec();
-    if timing_changed {
+    if nominal_changed {
         args.extend(["bitrate", &nominal]);
+    } else if fd && timing_changed {
+        // Enabling FD requires both phases even when one bitrate is unchanged.
+        args.extend(old_nominal.as_deref().ok_or_else(timing_error)?);
     }
     args.extend(["listen-only", on_off(settings.listen_only)]);
     let data;
     if timing_changed {
         if fd {
-            data = settings.data_bitrate()?.to_string();
-            args.extend(["dbitrate", &data, "fd", "on"]);
+            if was_fd && !data_changed {
+                args.extend(old_data.as_deref().ok_or_else(timing_error)?);
+                args.extend(previous_tdc(details).ok_or_else(tdc_error)?);
+            } else {
+                data = settings.data_bitrate()?.to_string();
+                args.extend(["dbitrate", &data]);
+            }
+            args.extend(["fd", "on"]);
             if was_non_iso {
                 args.extend(["fd-non-iso", "off"]);
             }
@@ -488,26 +502,26 @@ fn open_reconfigured_socket<S>(
 
     let mut restore = base.to_vec();
     let was_up = link_is_up(details);
-    let was_configured = was_up || (configured_bitrate(details, "bitrate").is_some_and(|rate| rate > 0)
-        && (!was_fd || configured_bitrate(details, "dbitrate").is_some_and(|rate| rate > 0)));
-    if was_configured {
-        // A failed netlink request can apply the new controller mode or nominal
-        // bitrate before rejecting the data timing. Save both phases before going down.
-        let timing_error = || CanOpenError::Other(format!("Cannot read the previous CAN timing on '{name}'"));
-        if timing_changed {
-            restore.extend(previous_timing(details, "bitrate", "tq").ok_or_else(timing_error)?);
+    let restore_controller = was_up || !was_fd || (old_nominal.is_some() && old_data.is_some());
+    if restore_controller {
+        // The kernel can apply part of a failed netlink request. Restore the
+        // previous mode even on a new interface, where no prior bitrate is set.
+        if timing_changed && (was_fd || nominal_changed) {
+            if let Some(timing) = old_nominal {
+                restore.extend(timing);
+            } else if was_up {
+                return Err(timing_error());
+            }
         }
         restore.extend(["listen-only", on_off(controller_flag(details, "LISTEN-ONLY"))]);
         if timing_changed {
             if was_fd {
-                restore.extend(previous_timing(details, "dbitrate", "dtq").ok_or_else(timing_error)?);
+                restore.extend(old_data.ok_or_else(timing_error)?);
                 restore.extend(["fd", "on"]);
                 if was_non_iso {
                     restore.extend(["fd-non-iso", "on"]);
                 }
-                restore.extend(previous_tdc(details).ok_or_else(|| {
-                    format!("Cannot read the previous CAN FD transmitter delay compensation on '{name}'")
-                })?);
+                restore.extend(previous_tdc(details).ok_or_else(tdc_error)?);
             } else if fd {
                 restore.extend(["fd", "off"]);
             }
@@ -549,7 +563,7 @@ fn open_reconfigured_socket<S>(
         if raised {
             run_ip(&down)?;
         }
-        if was_configured {
+        if restore_controller {
             run_ip(&restore)?;
         }
         if was_up {
@@ -791,6 +805,57 @@ mod tests {
     }
 
     #[test]
+    fn fd_rate_changes_reuse_the_unchanged_phases_timing() {
+        let details = "2: can0: <NOARP,UP,LOWER_UP> mtu 72\n\
+            can <FD,TDC-MANUAL> state ERROR-ACTIVE\n\
+            bitrate 500000 sample-point 0.875\n\
+            tq 125 prop-seg 6 phase-seg1 7 phase-seg2 2 sjw 1 brp 10\n\
+            dbitrate 2000000 dsample-point 0.800\n\
+            dtq 50 dprop-seg 3 dphase-seg1 4 dphase-seg2 2 dsjw 1 dbrp 4\n\
+            tdcv 3 tdco 9 tdcf 12";
+        for (nominal, data, expected) in [
+            (500_000, 3_000_000, "tq 125 prop-seg 6 phase-seg1 7 phase-seg2 2 sjw 1 listen-only off dbitrate 3000000 fd on"),
+            (250_000, 2_000_000, "bitrate 250000 listen-only off dtq 50 dprop-seg 3 dphase-seg1 4 dphase-seg2 2 dsjw 1 tdc-mode manual tdcv 3 tdco 9 tdcf 12 fd on"),
+        ] {
+            let settings = ChannelSettings {
+                mode: FrameFormat::Fd,
+                bitrate: nominal,
+                data_bitrate: Some(data),
+                listen_only: false,
+            };
+            let mut commands = Vec::new();
+            open_reconfigured_socket("can0", details, settings, |args| {
+                commands.push(args.join(" "));
+                Ok(())
+            }, || Some(format!("can <FD> state STOPPED\nbitrate {nominal}\ndbitrate {data}")), || Ok(())).unwrap();
+            assert_eq!(commands, ["link set can0 down".into(), format!("link set can0 type can {expected}"), "link set can0 up".into()]);
+        }
+    }
+
+    #[test]
+    fn failed_first_fd_configuration_restores_controller_mode() {
+        let details = "2: can0: <NOARP> mtu 16\n\
+            can state STOPPED\n\
+            bitrate 0 sample-point 0.000";
+        let settings = ChannelSettings {
+            mode: FrameFormat::Fd,
+            bitrate: 500_000,
+            data_bitrate: Some(3_000_000),
+            listen_only: true,
+        };
+        let mut commands = Vec::new();
+        let result = open_reconfigured_socket("can0", details, settings, |args| {
+            commands.push(args.join(" "));
+            if commands.len() == 1 { Err("Invalid data timing".into()) } else { Ok(()) }
+        }, || panic!("configuration rejected"), || Ok(()));
+        assert!(result.unwrap_err().to_string().contains("Invalid data timing"));
+        assert_eq!(commands, [
+            "link set can0 type can bitrate 500000 listen-only on dbitrate 3000000 fd on",
+            "link set can0 type can listen-only off fd off",
+        ]);
+    }
+
+    #[test]
     fn down_configured_link_preserves_the_password_prompt() {
         let details = "2: can0: <NOARP> mtu 72\n\
             can <FD> state STOPPED\n\
@@ -834,7 +899,7 @@ mod tests {
             assert!(error.to_string().contains("did not apply the requested CAN mode or listen-only setting"));
             assert_eq!(commands, [
                 "link set can0 down",
-                "link set can0 type can bitrate 500000 listen-only on fd off",
+                "link set can0 type can listen-only on fd off",
                 "link set can0 type can bitrate 500000 sample-point 0.875 listen-only off dbitrate 2000000 dsample-point 0.800 fd on",
                 "link set can0 up",
             ]);
@@ -862,7 +927,7 @@ mod tests {
         }).unwrap_err();
         assert!(error.to_string().contains("2962962 bit/s"));
         assert_eq!(commands, [
-            "link set can0 type can bitrate 500000 listen-only off dbitrate 3000000 fd on",
+            "link set can0 type can bitrate 500000 sample-point 0.875 listen-only off dbitrate 3000000 fd on",
             "link set can0 type can bitrate 500000 sample-point 0.875 listen-only off dbitrate 2000000 dsample-point 0.800 fd on",
         ]);
     }
