@@ -395,20 +395,25 @@ fn timing_fields<'a>(details: &'a str, key: &str) -> Option<Vec<&'a str>> {
 }
 
 fn configured_timing_matches(details: &str, settings: ChannelSettings) -> bool {
-    controller_flag(details, "LISTEN-ONLY") == settings.listen_only && bus_timing_matches(details, settings)
+    configured_mode_matches(details, settings) && bitrates_match(details, settings)
 }
 
 fn configured_bitrate(details: &str, key: &str) -> Option<u32> {
     timing_fields(details, key).and_then(|fields| fields[1].parse().ok())
 }
 
-fn bus_timing_matches(details: &str, settings: ChannelSettings) -> bool {
+fn fd_mode_matches(details: &str, settings: ChannelSettings) -> bool {
     let fd = settings.mode == FrameFormat::Fd;
-    if controller_flag(details, "FD") != fd {
-        return false;
-    }
+    controller_flag(details, "FD") == fd && (!fd || !controller_flag(details, "FD-NON-ISO"))
+}
+
+fn configured_mode_matches(details: &str, settings: ChannelSettings) -> bool {
+    controller_flag(details, "LISTEN-ONLY") == settings.listen_only && fd_mode_matches(details, settings)
+}
+
+fn bitrates_match(details: &str, settings: ChannelSettings) -> bool {
     configured_bitrate(details, "bitrate") == Some(settings.bitrate)
-        && (!fd || (!controller_flag(details, "FD-NON-ISO") && configured_bitrate(details, "dbitrate") == settings.data_bitrate))
+        && (settings.mode != FrameFormat::Fd || configured_bitrate(details, "dbitrate") == settings.data_bitrate)
 }
 
 fn previous_timing<'a>(details: &'a str, rate: &str, quantum: &str) -> Option<Vec<&'a str>> {
@@ -461,7 +466,7 @@ fn open_reconfigured_socket<S>(
     let was_non_iso = controller_flag(details, "FD-NON-ISO");
     let on_off = |enabled| if enabled { "on" } else { "off" };
     // A listen-only change can leave the controller's bit timing and TDC intact.
-    let timing_changed = !bus_timing_matches(details, settings);
+    let timing_changed = !fd_mode_matches(details, settings) || !bitrates_match(details, settings);
     let nominal = settings.bitrate.to_string();
     let mut args = base.to_vec();
     if timing_changed {
@@ -512,24 +517,28 @@ fn open_reconfigured_socket<S>(
         run_ip(&down)?;
     }
 
+    let configured = run_ip(&args);
+    if !was_up && matches!(configured, Err(CanOpenError::PasswordRequired)) {
+        return Err(CanOpenError::PasswordRequired);
+    }
+
     let mut raised = false;
-    let result = run_ip(&args).map_err(|error| match error {
+    let result = configured.map_err(|error| match error {
         CanOpenError::Other(message) if fd && timing_changed => CanOpenError::Other(format!(
             "Cannot configure ISO CAN FD on '{name}'. Check adapter and driver support and both bitrates: {message}"
         )),
         error => error,
     }).and_then(|()| {
-        // Linux can accept a CAN bitrate request and round to a supported
-        // rate. Confirm both FD phases before the interface can join the bus.
-        if fd && timing_changed {
-            let applied = inspect_link().ok_or_else(|| format!("Cannot verify the CAN FD configuration on '{name}'"))?;
-            if !configured_timing_matches(&applied, settings) {
-                let rate = |key| configured_bitrate(&applied, key).map_or_else(|| "unknown".into(), |value| value.to_string());
-                return Err(format!(
-                    "SocketCAN '{name}' did not apply the requested ISO CAN FD settings (reported nominal {} bit/s, data {} bit/s). Use bitrates supported by the adapter.",
-                    rate("bitrate"), rate("dbitrate")
-                ).into());
-            }
+        let applied = inspect_link().ok_or_else(|| format!("Cannot verify the CAN configuration on '{name}'"))?;
+        if !configured_mode_matches(&applied, settings) {
+            return Err(format!("SocketCAN '{name}' did not apply the requested CAN mode or listen-only setting").into());
+        }
+        if fd && !bitrates_match(&applied, settings) {
+            let rate = |key| configured_bitrate(&applied, key).map_or_else(|| "unknown".into(), |value| value.to_string());
+            return Err(format!(
+                "SocketCAN '{name}' did not apply the requested ISO CAN FD bitrates (reported nominal {} bit/s, data {} bit/s). Use bitrates supported by the adapter.",
+                rate("bitrate"), rate("dbitrate")
+            ).into());
         }
         run_ip(&up)?;
         raised = true;
@@ -773,12 +782,63 @@ mod tests {
         open_reconfigured_socket("can0", details, settings, |args| {
             commands.push(args.join(" "));
             Ok(())
-        }, || panic!("only the listen-only flag changes"), || Ok(())).unwrap();
+        }, || Some(details.replace("<FD,", "<LISTEN-ONLY,FD,")), || Ok(())).unwrap();
         assert_eq!(commands, [
             "link set can0 down",
             "link set can0 type can listen-only on",
             "link set can0 up",
         ]);
+    }
+
+    #[test]
+    fn down_configured_link_preserves_the_password_prompt() {
+        let details = "2: can0: <NOARP> mtu 72\n\
+            can <FD> state STOPPED\n\
+            bitrate 500000 sample-point 0.875\n\
+            dbitrate 2000000 dsample-point 0.800";
+        let settings = ChannelSettings {
+            mode: FrameFormat::Fd,
+            bitrate: 500_000,
+            data_bitrate: Some(3_000_000),
+            listen_only: false,
+        };
+        let mut commands = 0;
+        let error = open_reconfigured_socket("can0", details, settings, |_| {
+            commands += 1;
+            Err(CanOpenError::PasswordRequired)
+        }, || panic!("configuration requires privileges"), || Ok(())).unwrap_err();
+        assert!(matches!(error, CanOpenError::PasswordRequired));
+        assert_eq!(commands, 1);
+    }
+
+    #[test]
+    fn unchanged_socketcan_mode_is_rejected_before_bringing_the_link_up() {
+        let details = "2: can0: <NOARP,UP,LOWER_UP> mtu 72\n\
+            can <FD> state ERROR-ACTIVE\n\
+            bitrate 500000 sample-point 0.875\n\
+            dbitrate 2000000 dsample-point 0.800";
+        let settings = ChannelSettings {
+            mode: FrameFormat::Classical,
+            bitrate: 500_000,
+            data_bitrate: None,
+            listen_only: true,
+        };
+        for controller in ["can <LISTEN-ONLY,FD>", "can"] {
+            let mut commands = Vec::new();
+            let error = open_reconfigured_socket("can0", details, settings, |args| {
+                commands.push(args.join(" "));
+                Ok(())
+            }, || Some(details.replace("can <FD>", controller)), || -> Result<(), CanOpenError> {
+                panic!("a socket must not open in the wrong mode")
+            }).unwrap_err();
+            assert!(error.to_string().contains("did not apply the requested CAN mode or listen-only setting"));
+            assert_eq!(commands, [
+                "link set can0 down",
+                "link set can0 type can bitrate 500000 listen-only on fd off",
+                "link set can0 type can bitrate 500000 sample-point 0.875 listen-only off dbitrate 2000000 dsample-point 0.800 fd on",
+                "link set can0 up",
+            ]);
+        }
     }
 
     #[test]
