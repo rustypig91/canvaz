@@ -1855,10 +1855,10 @@ function updateChannelInterfaceInDialog(backend: string, name: string, capabilit
     document.getElementById("row-bitrate")!.style.display = dialogExternalTiming ? "none" : "";
     const mode = document.getElementById("select-can-mode") as HTMLSelectElement;
     if (!mode.options[1].disabled) dialogCanMode = mode.value === "fd" ? "fd" : "classical";
-    mode.options[1].disabled = remote || (capabilities?.fd === false && !preserveConfiguredFd);
+    mode.options[1].disabled = capabilities?.fd === false && !preserveConfiguredFd;
     mode.value = mode.options[1].disabled ? "classical" : dialogCanMode;
     document.getElementById("hint-can-mode")!.textContent = capabilities?.fd_limitation
-        ?? (remote ? "Socketcand supports Classical CAN. Timing is configured by the server."
+        ?? (remote ? "Timing is configured by the server. CAN FD requires a Socketcand server and bus with FD support."
             : virtual ? "Virtual interface. Timing is managed by the operating system." : "");
     document.getElementById("label-listen-only")!.textContent = remote
         ? "Receive only · Send and Simulate disabled, server ACK settings unchanged"

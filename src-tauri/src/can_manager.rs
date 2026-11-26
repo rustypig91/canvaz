@@ -778,7 +778,7 @@ impl CanManager {
                 connection: Arc::clone(&opening),
             });
             drop(guard);
-            let connection = SocketcandBackend::connect(&endpoint, settings.listen_only, &opening);
+            let connection = SocketcandBackend::connect(&endpoint, settings, &opening);
             let mut guard = manager.lock().map_err(|e| e.to_string())?;
             if !guard.opening_socketcand.get(&handle).is_some_and(|current| Arc::ptr_eq(&current.connection, &opening)) {
                 return Err(SOCKETCAND_OPEN_CANCELLED.into());

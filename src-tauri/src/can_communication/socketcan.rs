@@ -547,6 +547,9 @@ fn open_reconfigured_socket<S>(
                 restore.extend(previous_tdc(details).ok_or_else(tdc_error)?);
             } else if fd {
                 restore.extend(["fd", "off"]);
+                if was_non_iso {
+                    restore.extend(["fd-non-iso", "on"]);
+                }
             }
         }
     }
@@ -872,25 +875,28 @@ mod tests {
 
     #[test]
     fn failed_first_fd_configuration_restores_controller_mode() {
-        let details = "2: can0: <NOARP> mtu 16\n\
-            can state STOPPED\n\
-            bitrate 0 sample-point 0.000";
         let settings = ChannelSettings {
             mode: FrameFormat::Fd,
             bitrate: 500_000,
             data_bitrate: Some(3_000_000),
             listen_only: true,
         };
-        let mut commands = Vec::new();
-        let result = open_reconfigured_socket("can0", details, settings, |args| {
-            commands.push(args.join(" "));
-            if commands.len() == 1 { Err("Invalid data timing".into()) } else { Ok(()) }
-        }, || panic!("configuration rejected"), || Ok(()));
-        assert!(result.unwrap_err().to_string().contains("Invalid data timing"));
-        assert_eq!(commands, [
-            "link set can0 type can bitrate 500000 listen-only on dbitrate 3000000 fd on",
-            "link set can0 type can listen-only off fd off",
-        ]);
+        for (flags, configure, restore) in [
+            ("", "", ""),
+            (" <FD-NON-ISO>", " fd-non-iso off", " fd-non-iso on"),
+        ] {
+            let details = format!("2: can0: <NOARP> mtu 16\ncan{flags} state STOPPED\nbitrate 0 sample-point 0.000");
+            let mut commands = Vec::new();
+            let result = open_reconfigured_socket("can0", &details, settings, |args| {
+                commands.push(args.join(" "));
+                if commands.len() == 1 { Err("Invalid data timing".into()) } else { Ok(()) }
+            }, || panic!("configuration rejected"), || Ok(()));
+            assert!(result.unwrap_err().to_string().contains("Invalid data timing"));
+            assert_eq!(commands, [
+                format!("link set can0 type can bitrate 500000 listen-only on dbitrate 3000000 fd on{configure}"),
+                format!("link set can0 type can listen-only off fd off{restore}"),
+            ]);
+        }
     }
 
     #[test]

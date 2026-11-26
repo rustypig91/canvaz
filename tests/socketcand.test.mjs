@@ -63,7 +63,7 @@ test("adding Socketcand without hardware enables sending and saves an unspecifie
     assert.equal(h.element("row-socketcand").style.display, "");
     assert.equal(h.element("row-bitrate").style.display, "none");
     assert.equal(h.element("input-listen-only").checked, false);
-    assert.equal(h.element("select-can-mode").options[1].disabled, true);
+    assert.equal(h.element("select-can-mode").value, "classical");
     assert.equal(h.element("row-data-bitrate").hidden, true);
     assert.match(h.element("label-listen-only").textContent, /server ACK settings unchanged/);
     h.element("input-socketcand").value = "can://127.0.0.1:29537/vcan0";
@@ -170,8 +170,9 @@ test("switching between FD, virtual, and Classical-only interfaces keeps the phy
     assert.equal(mode.value, "fd");
     assert.equal(h.element("row-data-bitrate").hidden, true);
     selectInterface("__socketcand__");
-    assert.equal(mode.value, "classical");
-    assert.equal(mode.options[1].disabled, true);
+    assert.equal(mode.value, "fd");
+    assert.equal(mode.options[1].disabled, false);
+    assert.equal(h.element("row-data-bitrate").hidden, true);
     selectInterface("0");
     assert.equal(mode.value, "fd");
     assert.equal(h.element("row-data-bitrate").hidden, false);
@@ -182,6 +183,22 @@ test("switching between FD, virtual, and Classical-only interfaces keeps the phy
     await h.context.saveChannelDialog();
     assert.equal(h.saved[0].backend, "kvaser");
     assert.equal(h.saved[0].mode, "classical");
+    assert.equal(h.saved[0].data_bitrate, null);
+});
+
+test("Socketcand can save an FD channel with server-configured timing", async () => {
+    const h = harness([]);
+    await h.context.openChannelDialog("add");
+    const mode = h.element("select-can-mode");
+    assert.equal(mode.value, "classical");
+    assert.equal(mode.options[1].disabled, false);
+    assert.match(h.element("hint-can-mode").textContent, /server and bus with FD support/);
+    mode.value = "fd";
+    h.element("input-socketcand").value = "can://localhost:29536/can0";
+    await h.context.saveChannelDialog();
+    assert.equal(h.saved[0].backend, "socketcand");
+    assert.equal(h.saved[0].mode, "fd");
+    assert.equal(h.saved[0].bitrate, null);
     assert.equal(h.saved[0].data_bitrate, null);
 });
 

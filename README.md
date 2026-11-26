@@ -47,7 +47,7 @@ node tests/accessibility.browser.mjs
 | Kvaser CANlib (`canlib32.dll` / `libcanlib.so.1`) | Windows, Linux | Classical CAN and ISO CAN FD on FD-capable adapters | [Kvaser CANlib drivers](https://www.kvaser.com/download/) |
 | PEAK PCAN-Basic (`PCANBasic.dll` / `libpcanbasic.so`) | Windows, Linux | Classical CAN and ISO CAN FD on FD-capable adapters | [PCAN-Basic with the native FD APIs](https://www.peak-system.com/products/software/development-packages/pcan-basic/) |
 | SocketCAN | Linux | Classical CAN and ISO CAN FD, including mixed traffic on `vcan` | Linux SocketCAN and `iproute2` |
-| Socketcand (TCP) | Windows, Linux, macOS | Classical CAN | Reachable Socketcand server. The server configures bus timing. [Socketcand protocol](https://github.com/linux-can/socketcand/blob/master/doc/protocol.md) |
+| Socketcand (TCP) | Windows, Linux, macOS | Classical CAN and ISO CAN FD on compatible servers and buses | Reachable Socketcand server. The server configures bus timing. [Socketcand protocol](https://github.com/linux-can/socketcand/blob/master/doc/protocol.md#can-fd-frames) |
 
 Kvaser and PCAN drivers are loaded at runtime. The corresponding backend is
 available when its driver is installed. SocketCAN is included by default on Linux.
@@ -65,6 +65,10 @@ available when its driver is installed. SocketCAN is included by default on Linu
    Canvaz reuses an active interface when its mode and rates match. Virtual
    SocketCAN interfaces use kernel-managed settings and need an MTU of at
    least 72 for FD. A virtual interface configured for CAN XL also accepts FD.
+   For Socketcand, configure ISO CAN FD on the server's interface and use a
+   daemon that implements RAW mode `fdframe` and `fdsend`. Select **CAN FD
+   (ISO)** for that channel in Canvaz. RAW mode provides no capability query
+   or transmission acknowledgement. Choose **Classical CAN** for legacy servers.
 3. In **Simulate**, choose the frame format independently of the identifier
    width. Choose a legal byte length for raw FD frames and enable **BRS** to
    use the data-phase bitrate. DBC entries use their `VFrameFormat` when
@@ -96,8 +100,10 @@ sudo ip link set dev vcan0 mtu 72 up
 CANVAZ_TEST_VCAN=vcan0 cargo test --locked --manifest-path src-tauri/Cargo.toml socketcan_vcan_mixed_classical_and_fd -- --ignored
 ```
 
-Physical SocketCAN, Kvaser CANlib, and PCAN-Basic adapter testing remains
-pending. Socketcand has a separate localhost Classical CAN test suite.
+Mixed Classical CAN and FD RX/TX also passed on both virtual MTUs through
+[Socketcand 0.6.1 development revision `343fad6`](https://github.com/linux-can/socketcand/commit/343fad6ff62fb3dd1275c4e33a08dc382c987020).
+The localhost tests cover the legacy handshake and mixed periodic transmission.
+Physical SocketCAN, Kvaser CANlib, and PCAN-Basic adapter testing remains pending.
 
 ## Building
 

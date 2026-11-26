@@ -1,5 +1,5 @@
-//! Classic CAN over socketcand RAW mode. Bus configuration stays on the server.
-use super::{CanBackend, CanFrame, CanOpenError, RxHandle, TxHandle, ChannelCapabilities, ChannelSettings, FrameFormat};
+//! Classical CAN and CAN FD over Socketcand RAW mode. The server configures the bus.
+use super::{CanBackend, CanFrame, CanOpenError, ChannelCapabilities, ChannelSettings, FrameFormat, FrameMetadata, RxHandle, TxHandle};
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
@@ -23,6 +23,8 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_EARLY_FRAMES: usize = 1024;
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(3);
+const FD_BRS: u8 = 0x01;
+const FD_ESI: u8 = 0x02;
 
 pub(crate) const SOCKETCAND_OPEN_CANCELLED: &str = "Socketcand connection was cancelled";
 
@@ -159,17 +161,15 @@ impl CanBackend for SocketcandBackend {
     }
 
     fn capabilities(&self, _: u8) -> ChannelCapabilities {
-        ChannelCapabilities {
-            fd: Some(false), external_timing: true,
-            fd_limitation: Some("The Socketcand protocol supports Classical CAN only"),
-        }
+        // RAW mode has no capability query. FD requires both a compatible
+        // daemon and an FD interface configured on the server.
+        ChannelCapabilities { fd: None, external_timing: true, fd_limitation: None }
     }
 
     fn open_channel(&mut self, index: u8, settings: ChannelSettings, _: Option<&str>) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
-        self.capabilities(index).validate(settings)?;
         let channel = self.channels.get(usize::from(index)).and_then(Option::as_ref)
             .ok_or("Unknown socketcand channel")?;
-        Self::connect(&channel.name, settings.listen_only, &SocketcandConnect::default())
+        Self::connect(&channel.name, settings, &SocketcandConnect::default())
     }
 }
 
@@ -186,22 +186,22 @@ impl SocketcandBackend {
     }
 
     pub(crate) fn connect(
-        name: &str, listen_only: bool, opening: &SocketcandConnect,
+        name: &str, settings: ChannelSettings, opening: &SocketcandConnect,
     ) -> Result<(Box<dyn TxHandle>, Box<dyn RxHandle>), CanOpenError> {
         opening.check_cancelled()?;
         let (host, port, bus) = endpoint(name)?;
         let addresses = (host.as_str(), port).to_socket_addrs().map_err(|e| e.to_string())?;
-        let mut rx = Self::connect_addresses(addresses, &bus, opening)?;
+        let mut rx = Self::connect_addresses(addresses, &bus, settings.mode, opening)?;
         // Keep reads independent of writes. Serialize writes so an echo
         // cannot interleave with a send command.
         let writer = Arc::new(Mutex::new(rx.stream.try_clone().map_err(|e| e.to_string())?));
-        let tx = SocketcandTx { writer: Arc::clone(&writer), listen_only };
+        let tx = SocketcandTx { writer: Arc::clone(&writer), settings };
         rx.heartbeat = Some(Heartbeat { writer, due: Instant::now() + HEARTBEAT_INTERVAL, awaiting_echo: false });
         Ok((Box::new(tx), Box::new(rx)))
     }
 
     fn connect_addresses(
-        addresses: impl IntoIterator<Item = SocketAddr>, bus: &str, opening: &SocketcandConnect,
+        addresses: impl IntoIterator<Item = SocketAddr>, bus: &str, mode: FrameFormat, opening: &SocketcandConnect,
     ) -> Result<SocketcandRx, String> {
         let mut last_error = "Socketcand host has no addresses".to_string();
         for address in addresses {
@@ -210,7 +210,7 @@ impl SocketcandBackend {
                 .map_err(|e| e.to_string())
                 .and_then(|stream| {
                     opening.track(&stream)?;
-                    Self::negotiate(stream, bus)
+                    Self::negotiate(stream, bus, mode)
                 });
             opening.finish_handshake()?;
             match result {
@@ -221,10 +221,11 @@ impl SocketcandBackend {
         Err(last_error)
     }
 
-    fn negotiate(stream: TcpStream, bus: &str) -> Result<SocketcandRx, String> {
+    fn negotiate(stream: TcpStream, bus: &str, mode: FrameFormat) -> Result<SocketcandRx, String> {
         stream.set_nodelay(true).map_err(|e| e.to_string())?;
         stream.set_write_timeout(Some(OPEN_TIMEOUT)).map_err(|e| e.to_string())?;
         let mut rx = SocketcandRx::new(stream);
+        rx.mode = mode;
         let deadline = Instant::now() + OPEN_TIMEOUT;
         rx.expect_before("hi", deadline)?;
         rx.stream.write_all(format!("< open {bus} >").as_bytes()).map_err(|e| e.to_string())?;
@@ -248,18 +249,22 @@ fn write_command(writer: &Mutex<TcpStream>, command: &[u8]) -> Result<(), String
     })
 }
 
-struct SocketcandTx { writer: Arc<Mutex<TcpStream>>, listen_only: bool }
+struct SocketcandTx { writer: Arc<Mutex<TcpStream>>, settings: ChannelSettings }
 impl TxHandle for SocketcandTx {
     fn send(&mut self, frame: &mut CanFrame) -> Result<(), String> {
-        if self.listen_only { return Err("Socketcand channel is receive-only".into()); }
+        if self.settings.listen_only { return Err("Socketcand channel is receive-only".into()); }
         frame.validate_transmit()?;
-        if frame.metadata.format == FrameFormat::Fd {
-            return Err("The Socketcand protocol supports Classical CAN only".into());
-        }
-        // Identifier width selects standard vs extended frames, including low
-        // extended IDs. socketcand's send command uses separate hex data bytes.
+        // Both RAW commands use identifier width and separate hex data bytes.
         let id = if frame.is_extended { format!("{:08X}", frame.can_id) } else { format!("{:03X}", frame.can_id) };
-        let mut command = format!("< send {id} {}", frame.data.len());
+        let len = frame.data.len();
+        let mut command = match frame.metadata.format {
+            FrameFormat::Classical => format!("< send {id} {len}"),
+            FrameFormat::Fd if self.settings.mode == FrameFormat::Fd => {
+                let flags = if frame.metadata.brs { FD_BRS } else { 0 };
+                format!("< fdsend {id} {flags:02X} {len}")
+            }
+            FrameFormat::Fd => return Err("Enable CAN FD on the Socketcand channel before sending FD frames".into()),
+        };
         for byte in &frame.data {
             use std::fmt::Write;
             write!(command, " {byte:x}").unwrap();
@@ -277,6 +282,7 @@ impl TxHandle for SocketcandTx {
 }
 struct SocketcandRx {
     stream: TcpStream,
+    mode: FrameFormat,
     pending: Vec<u8>,
     early_frames: VecDeque<CanFrame>,
     clock_anchor: Option<(u64, u64)>,
@@ -307,7 +313,7 @@ impl Heartbeat {
 
 impl SocketcandRx {
     fn new(stream: TcpStream) -> Self {
-        Self { stream, pending: Vec::new(), early_frames: VecDeque::new(), clock_anchor: None, heartbeat: None }
+        Self { stream, mode: FrameFormat::Classical, pending: Vec::new(), early_frames: VecDeque::new(), clock_anchor: None, heartbeat: None }
     }
     fn local_timestamp(&mut self, server_ms: u64, local_ms: u64) -> u64 {
         // Match the hardware backends: anchor the first sample to this host's
@@ -367,8 +373,13 @@ impl SocketcandRx {
     }
 
     fn decode_message(&mut self, message: &str) -> Result<Option<CanFrame>, String> {
-        if matches!(message.split_whitespace().next(), Some("ok" | "echo" | "fdframe")) {
-            return Ok(None);
+        match message.split_whitespace().next() {
+            Some("ok" | "echo") => return Ok(None),
+            Some("fdframe") if self.mode == FrameFormat::Classical => return Ok(None),
+            _ => {}
+        }
+        if self.mode == FrameFormat::Fd && message == "error unknown command" {
+            return Err("Socketcand rejected a command. CAN FD requires an FD-capable Socketcand server and bus".into());
         }
         let mut frame = parse_frame(message)?;
         frame.timestamp_ms = frame.timestamp_ms.map(|ts| self.local_timestamp(ts, now_ms()));
@@ -391,7 +402,7 @@ impl RxHandle for SocketcandRx {
                 heartbeat.echoed();
             }
             if let Some(frame) = self.decode_message(&message)? { return Ok(Some(frame)); }
-            // Unsupported FD traffic must not keep the RX worker from stopping.
+            // Ignored messages must not keep the RX worker from stopping.
             if Instant::now() >= deadline { return Ok(None); }
         }
     }
@@ -417,16 +428,26 @@ fn parse_frame(message: &str) -> Result<CanFrame, String> {
         }
         return Err(format!("Socketcand server reported: {message}"));
     }
-    if !(3..=4).contains(&parts.len()) || parts[0] != "frame" { return Err(invalid()); }
-    let id = parts[1];
+    let (id, timestamp, payload, metadata, max_bytes) = match parts.as_slice() {
+        ["frame", id, timestamp, payload @ ..] if payload.len() <= 1 =>
+            (id, timestamp, payload, FrameMetadata::default(), 8),
+        ["fdframe", id, flags, timestamp, payload @ ..] if payload.len() <= 1 => {
+            if flags.len() > 2 || !flags.bytes().all(|b| b.is_ascii_hexdigit()) { return Err(invalid()); }
+            let flags = u8::from_str_radix(flags, 16).map_err(|_| invalid())?;
+            let metadata = FrameMetadata::fd(flags & FD_BRS != 0, flags & FD_ESI != 0);
+            (id, timestamp, payload, metadata, 64)
+        }
+        _ => return Err(invalid()),
+    };
     let can_id = u32::from_str_radix(id, 16).map_err(|_| invalid())?;
     let is_extended = id.len() == 8;
-    if !(id.len() == 3 || is_extended) || can_id > if is_extended { 0x1fffffff } else { 0x7ff } { return Err(invalid()); }
-    let timestamp_ms = parse_timestamp(parts[2]).ok_or_else(invalid)?;
-    let payload = parts.get(3).copied().unwrap_or("");
-    if payload.len() > 16 || payload.len() % 2 != 0 || !payload.bytes().all(|b| b.is_ascii_hexdigit()) { return Err(invalid()); }
+    if !(id.len() == 3 || is_extended) || !id.bytes().all(|b| b.is_ascii_hexdigit())
+        || can_id > if is_extended { 0x1fffffff } else { 0x7ff } { return Err(invalid()); }
+    let timestamp_ms = parse_timestamp(timestamp).ok_or_else(invalid)?;
+    let payload = payload.first().copied().unwrap_or("");
+    if payload.len() > 2 * max_bytes || payload.len() % 2 != 0 || !payload.bytes().all(|b| b.is_ascii_hexdigit()) { return Err(invalid()); }
     let data = (0..payload.len()).step_by(2).map(|i| u8::from_str_radix(&payload[i..i+2], 16).map_err(|_| invalid())).collect::<Result<_, _>>()?;
-    Ok(CanFrame { metadata: Default::default(), can_id, is_extended, data, timestamp_ms: Some(timestamp_ms), error: None })
+    Ok(CanFrame { metadata, can_id, is_extended, data, timestamp_ms: Some(timestamp_ms), error: None })
 }
 
 fn parse_timestamp(timestamp: &str) -> Option<u64> {
@@ -459,7 +480,14 @@ mod tests {
         assert_eq!(f.data, [1,255]);
         assert_eq!(f.timestamp_ms, Some(1700000000123));
         assert!(parse_frame("frame 123 1.000000").unwrap().data.is_empty());
-        for bad in ["frame 800 1.000000 FF", "frame 123 1.000000 F", "frame 123 NaN FF", "error denied"] { assert!(parse_frame(bad).is_err()); }
+        assert_eq!(parse_frame("fdframe 123 02 1.000000").unwrap().metadata, FrameMetadata::fd(false, true));
+        for bad in [
+            "frame 800 1.000000 FF", "frame 123 1.000000 F", "frame 123 NaN FF", "error denied",
+            "fdframe +12 01 1.000000", "fdframe 123 0100 1.000000", "fdframe 123 03 1.000000 F",
+        ] {
+            assert!(parse_frame(bad).is_err(), "{bad}");
+        }
+        assert!(parse_frame(&format!("fdframe 123 01 1.000000 {}", "FF".repeat(65))).is_err());
     }
 
     #[test]
@@ -596,7 +624,8 @@ mod tests {
             peer.expect("echo").unwrap();
             // The daemon can disconnect here if the RAW socket could not bind.
         });
-        let result = SocketcandBackend::connect(&format!("can://{address}/vcan0"), false, &SocketcandConnect::default());
+        let settings = ChannelSettings { mode: FrameFormat::Classical, bitrate: 0, data_bitrate: None, listen_only: false };
+        let result = SocketcandBackend::connect(&format!("can://{address}/vcan0"), settings, &SocketcandConnect::default());
         assert!(result.is_err());
         server.join().unwrap();
     }
@@ -619,7 +648,7 @@ mod tests {
             peer.expect("echo").unwrap();
             peer.stream.write_all(b"< echo >").unwrap();
         });
-        let rx = SocketcandBackend::connect_addresses(addresses, "vcan0", &SocketcandConnect::default()).unwrap();
+        let rx = SocketcandBackend::connect_addresses(addresses, "vcan0", FrameFormat::Classical, &SocketcandConnect::default()).unwrap();
         assert_eq!(rx.stream.peer_addr().unwrap(), addresses[1]);
         server.join().unwrap();
     }
@@ -634,7 +663,7 @@ mod tests {
         let opening = Arc::new(SocketcandConnect::default());
         let in_flight = Arc::clone(&opening);
         let client = std::thread::spawn(move || {
-            SocketcandBackend::connect_addresses(addresses, "vcan0", &in_flight)
+            SocketcandBackend::connect_addresses(addresses, "vcan0", FrameFormat::Classical, &in_flight)
                 .err().unwrap()
         });
 
@@ -707,7 +736,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_fd_traffic_keeps_classic_frames_and_errors_on_the_local_timeline() {
+    fn classical_mode_skips_fd_frames_and_keeps_the_local_timeline() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let _peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (stream, _) = listener.accept().unwrap();
@@ -792,20 +821,23 @@ mod tests {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (peer, _) = listener.accept().unwrap();
-        let mut tx = SocketcandTx { writer: Arc::new(Mutex::new(stream)), listen_only: true };
+        let settings = ChannelSettings { mode: FrameFormat::Fd, bitrate: 0, data_bitrate: None, listen_only: true };
+        let mut tx = SocketcandTx { writer: Arc::new(Mutex::new(stream)), settings };
         let mut f = frame(0x123, false, vec![1]);
+        assert!(tx.send(&mut f).unwrap_err().contains("receive-only"));
+        f.metadata = FrameMetadata::fd(true, false);
         assert!(tx.send(&mut f).unwrap_err().contains("receive-only"));
         assert!(f.timestamp_ms.is_none());
         let mut peer = SocketcandRx::new(peer);
         assert!(peer.message(Instant::now() + Duration::from_millis(20)).unwrap().is_none());
-        tx.listen_only = false;
+        tx.settings.listen_only = false;
         tx.writer.lock().unwrap().shutdown(Shutdown::Both).unwrap();
         assert!(tx.send(&mut f).is_err());
         assert!(f.timestamp_ms.is_none());
     }
 
     #[test]
-    fn queued_one_shot_and_periodic_transmissions_share_the_capture_connection() {
+    fn queued_classical_and_fd_transmissions_share_the_mixed_capture_connection() {
         use super::super::Can;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -817,15 +849,20 @@ mod tests {
             peer.expect("open vcan0").unwrap();
             peer.stream.write_all(b"< ok >").unwrap();
             peer.expect("rawmode").unwrap();
-            peer.stream.write_all(b"< ok >< frame 321 1.000000 FF >").unwrap();
+            peer.stream.write_all(b"< ok >< frame 00000123 1.000000 FF >< fdframe 00000123 03 1.125000 FF >").unwrap();
             peer.expect("echo").unwrap();
             peer.stream.write_all(b"< echo >").unwrap();
-            let mut once = 0;
+            let incoming = format!("< fdframe 123 00 1.250000 {} >", "AB".repeat(64));
+            peer.stream.write_all(incoming.as_bytes()).unwrap();
+            let fd_command = format!("fdsend 00000123 01 64{}", " ab".repeat(64));
+            let mut classic_once = 0;
+            let mut fd_once = 0;
             let mut periodic = 0;
-            while once < 1 || periodic < 2 {
+            while classic_once < 1 || fd_once < 1 || periodic < 2 {
                 match peer.message(Instant::now() + Duration::from_secs(3)).unwrap().as_deref() {
-                    Some("send 123 1 1") => once += 1,
-                    Some("send 00000123 1 2") => periodic += 1,
+                    Some("send 123 1 1") => classic_once += 1,
+                    Some("fdsend 123 00 0") => fd_once += 1,
+                    Some(command) if command == fd_command => periodic += 1,
                     other => panic!("unexpected command: {other:?}"),
                 }
             }
@@ -837,10 +874,28 @@ mod tests {
         let (failed, errors) = std::sync::mpsc::channel();
         let mut can = Can::new(SocketcandBackend::default(), move |_, f| { received.send(f).unwrap(); }, |_, _| {}, move |_, error, fatal| { failed.send((error, fatal)).unwrap(); }, |_, _| {});
         can.register_channel(&format!("can://{address}/vcan0")).unwrap();
-        can.open(0, ChannelSettings { mode: FrameFormat::Classical, bitrate: 0, data_bitrate: None, listen_only: false }, None).unwrap();
+        can.open(0, ChannelSettings { mode: FrameFormat::Fd, bitrate: 0, data_bitrate: None, listen_only: false }, None).unwrap();
         can.send_once(0, frame(0x123, false, vec![1])).unwrap();
-        let periodic = can.add_periodic(0, frame(0x123, true, vec![2]), 10, None).unwrap();
-        assert_eq!(events.recv_timeout(Duration::from_secs(3)).unwrap().can_id, 0x321);
+        let mut empty_fd = frame(0x123, false, vec![]);
+        empty_fd.metadata = FrameMetadata::fd(false, false);
+        can.send_once(0, empty_fd).unwrap();
+        let mut long_fd = frame(0x123, true, vec![0xAB; 64]);
+        long_fd.metadata = FrameMetadata::fd(true, false);
+        let periodic = can.add_periodic(0, long_fd, 10, None).unwrap();
+        let classic = events.recv_timeout(Duration::from_secs(3)).unwrap();
+        let short = events.recv_timeout(Duration::from_secs(3)).unwrap();
+        let long = events.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(classic.metadata, FrameMetadata::default());
+        assert_eq!(short.metadata, FrameMetadata::fd(true, true));
+        assert_eq!(long.metadata, FrameMetadata::fd(false, false));
+        for f in [&classic, &short] {
+            assert_eq!(f.can_id, 0x123);
+            assert!(f.is_extended);
+            assert_eq!(f.data, [0xFF]);
+        }
+        assert_eq!(short.timestamp_ms, classic.timestamp_ms.map(|ts| ts + 125));
+        assert_eq!(long.timestamp_ms, classic.timestamp_ms.map(|ts| ts + 250));
+        assert_eq!(long.data, [0xAB; 64]);
         // Wait for observed commands rather than relying on a scheduling delay.
         transmitted.recv_timeout(Duration::from_secs(3)).unwrap();
         can.remove_periodic(0, periodic).unwrap();
