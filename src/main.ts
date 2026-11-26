@@ -2278,12 +2278,17 @@ async function saveChannelDialog() {
     }
     const dataInput = document.getElementById("input-data-bitrate") as HTMLInputElement;
     const dataBitrate = mode === "fd" && !dialogExternalTiming ? dataInput.valueAsNumber : null;
-    if (dataBitrate !== null) {
-        const validNominal = bitrate !== null && Number.isInteger(bitrate) && bitrate > 0 && bitrate <= 0xFFFFFFFF;
-        if (!validNominal || !Number.isInteger(dataBitrate) || dataBitrate < bitrate || dataBitrate > 0xFFFFFFFF) {
-            document.getElementById("error-can-timing")!.textContent = "Enter whole-number bitrates from 1 to 4,294,967,295, with the data bitrate at least as high as the nominal bitrate.";
-            const invalidInput = validNominal ? dataInput : document.getElementById("input-bitrate-custom")!;
-            invalidInput.focus();
+    const timingError = document.getElementById("error-can-timing")!;
+    timingError.textContent = "";
+    if (!dialogExternalTiming) {
+        if (bitrate === null || !Number.isInteger(bitrate) || bitrate < 1 || bitrate > 0xFFFFFFFF) {
+            timingError.textContent = "Enter a whole-number nominal bitrate from 1 to 4,294,967,295.";
+            document.getElementById("input-bitrate-custom")!.focus();
+            return;
+        }
+        if (dataBitrate !== null && (!Number.isInteger(dataBitrate) || dataBitrate < bitrate || dataBitrate > 0xFFFFFFFF)) {
+            timingError.textContent = "Enter a whole-number data bitrate up to 4,294,967,295, at least as high as the nominal bitrate.";
+            dataInput.focus();
             return;
         }
     }
@@ -7170,6 +7175,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     document.getElementById("select-can-mode")!.addEventListener("change", updateChannelTimingInDialog);
 
     document.getElementById("select-bitrate")!.addEventListener("change", updateChannelTimingInDialog);
+    document.getElementById("input-bitrate-custom")!.addEventListener("input", updateChannelTimingInDialog);
+    document.getElementById("input-data-bitrate")!.addEventListener("input", updateChannelTimingInDialog);
 
     // DBC browse in dialog
     document.getElementById("btn-browse-dbc")!.addEventListener("click", async () => {

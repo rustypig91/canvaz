@@ -236,12 +236,11 @@ impl CanBackend for SocketCanBackend {
         };
         let run_ip = |args: &[&str]| run_ip_auto(args, admin_password);
         let socket = if !virtual_link && !configured_timing_matches(&details, settings) {
-            open_reconfigured_socket(&name, &details, settings, run_ip, open_socket)?
-        } else {
-            if !link_is_up(&details) {
-                run_ip(&["link", "set", &name, "up"])?;
-            }
+            open_reconfigured_socket(&name, &details, settings, run_ip, || link_details(&name), open_socket)?
+        } else if link_is_up(&details) {
             open_socket()?
+        } else {
+            open_inactive_socket(&name, run_ip, open_socket)?
         };
         let socket = Arc::new(socket);
 
@@ -399,14 +398,17 @@ fn configured_timing_matches(details: &str, settings: ChannelSettings) -> bool {
     controller_flag(details, "LISTEN-ONLY") == settings.listen_only && bus_timing_matches(details, settings)
 }
 
+fn configured_bitrate(details: &str, key: &str) -> Option<u32> {
+    timing_fields(details, key).and_then(|fields| fields[1].parse().ok())
+}
+
 fn bus_timing_matches(details: &str, settings: ChannelSettings) -> bool {
     let fd = settings.mode == FrameFormat::Fd;
     if controller_flag(details, "FD") != fd {
         return false;
     }
-    let bitrate = |key| timing_fields(details, key).and_then(|fields| fields[1].parse::<u32>().ok());
-    bitrate("bitrate") == Some(settings.bitrate)
-        && (!fd || (!controller_flag(details, "FD-NON-ISO") && bitrate("dbitrate") == settings.data_bitrate))
+    configured_bitrate(details, "bitrate") == Some(settings.bitrate)
+        && (!fd || (!controller_flag(details, "FD-NON-ISO") && configured_bitrate(details, "dbitrate") == settings.data_bitrate))
 }
 
 fn previous_timing<'a>(details: &'a str, rate: &str, quantum: &str) -> Option<Vec<&'a str>> {
@@ -448,6 +450,7 @@ fn open_reconfigured_socket<S>(
     details: &str,
     settings: ChannelSettings,
     mut run_ip: impl FnMut(&[&str]) -> Result<(), CanOpenError>,
+    inspect_link: impl FnOnce() -> Option<String>,
     open_socket: impl FnOnce() -> Result<S, CanOpenError>,
 ) -> Result<S, CanOpenError> {
     let base = ["link", "set", name, "type", "can"];
@@ -480,10 +483,12 @@ fn open_reconfigured_socket<S>(
 
     let mut restore = base.to_vec();
     let was_up = link_is_up(details);
-    if was_up {
+    let was_configured = was_up || (configured_bitrate(details, "bitrate").is_some_and(|rate| rate > 0)
+        && (!was_fd || configured_bitrate(details, "dbitrate").is_some_and(|rate| rate > 0)));
+    if was_configured {
         // A failed netlink request can apply the new controller mode or nominal
         // bitrate before rejecting the data timing. Save both phases before going down.
-        let timing_error = || CanOpenError::Other(format!("Cannot read the active CAN timing on '{name}'"));
+        let timing_error = || CanOpenError::Other(format!("Cannot read the previous CAN timing on '{name}'"));
         if timing_changed {
             restore.extend(previous_timing(details, "bitrate", "tq").ok_or_else(timing_error)?);
         }
@@ -496,12 +501,14 @@ fn open_reconfigured_socket<S>(
                     restore.extend(["fd-non-iso", "on"]);
                 }
                 restore.extend(previous_tdc(details).ok_or_else(|| {
-                    format!("Cannot read the active CAN FD transmitter delay compensation on '{name}'")
+                    format!("Cannot read the previous CAN FD transmitter delay compensation on '{name}'")
                 })?);
             } else if fd {
                 restore.extend(["fd", "off"]);
             }
         }
+    }
+    if was_up {
         run_ip(&down)?;
     }
 
@@ -512,6 +519,18 @@ fn open_reconfigured_socket<S>(
         )),
         error => error,
     }).and_then(|()| {
+        // Linux can accept a CAN bitrate request and round to a supported
+        // rate. Confirm both FD phases before the interface can join the bus.
+        if fd && timing_changed {
+            let applied = inspect_link().ok_or_else(|| format!("Cannot verify the CAN FD configuration on '{name}'"))?;
+            if !configured_timing_matches(&applied, settings) {
+                let rate = |key| configured_bitrate(&applied, key).map_or_else(|| "unknown".into(), |value| value.to_string());
+                return Err(format!(
+                    "SocketCAN '{name}' did not apply the requested ISO CAN FD settings (reported nominal {} bit/s, data {} bit/s). Use bitrates supported by the adapter.",
+                    rate("bitrate"), rate("dbitrate")
+                ).into());
+            }
+        }
         run_ip(&up)?;
         raised = true;
         open_socket()
@@ -521,8 +540,10 @@ fn open_reconfigured_socket<S>(
         if raised {
             run_ip(&down)?;
         }
-        if was_up {
+        if was_configured {
             run_ip(&restore)?;
+        }
+        if was_up {
             run_ip(&up)?;
         }
         Ok::<(), CanOpenError>(())
@@ -531,6 +552,20 @@ fn open_reconfigured_socket<S>(
         return Err(format!("{error}. Could not restore the previous SocketCAN configuration on '{name}': {restore_error}").into());
     }
     Err(error)
+}
+
+fn open_inactive_socket<S>(
+    name: &str,
+    mut run_ip: impl FnMut(&[&str]) -> Result<(), CanOpenError>,
+    open_socket: impl FnOnce() -> Result<S, CanOpenError>,
+) -> Result<S, CanOpenError> {
+    run_ip(&["link", "set", name, "up"])?;
+    open_socket().map_err(|error| {
+        match run_ip(&["link", "set", name, "down"]) {
+            Ok(()) => error,
+            Err(restore_error) => format!("{error}. Could not bring '{name}' back down: {restore_error}").into(),
+        }
+    })
 }
 
 #[cfg(test)]
@@ -659,7 +694,7 @@ mod tests {
                 } else {
                     Ok(())
                 }
-            }, || {
+            }, || Some("can <FD> state STOPPED\nbitrate 250000\ndbitrate 3000000".into()), || {
                 assert_eq!(failing_step, 3);
                 Err::<(), _>("Socket open failed".into())
             });
@@ -703,7 +738,7 @@ mod tests {
             let error = open_reconfigured_socket("can0", &details, settings, |args| {
                 commands.push(args.join(" "));
                 if commands.len() == 2 { Err("Invalid timing".to_string().into()) } else { Ok(()) }
-            }, || Ok(())).unwrap_err();
+            }, || panic!("timing rejected by ip"), || Ok(())).unwrap_err();
             assert!(error.to_string().contains("Invalid timing"));
             assert_eq!(commands[2], format!("link set can0 type can bitrate 500000 sample-point 0.875 listen-only off dbitrate 4000000 dsample-point 0.800 fd on {expected}"));
             assert_eq!(commands[3], "link set can0 up");
@@ -717,7 +752,7 @@ mod tests {
             tdcv 0..63 tdco 0..127";
         let error = open_reconfigured_socket("can0", incomplete, settings, |_| {
             panic!("the link must stay up when its active TDC settings cannot be read");
-        }, || Ok(())).unwrap_err();
+        }, || panic!("configuration must stay intact"), || Ok(())).unwrap_err();
         assert!(error.to_string().contains("transmitter delay compensation"));
     }
 
@@ -738,11 +773,48 @@ mod tests {
         open_reconfigured_socket("can0", details, settings, |args| {
             commands.push(args.join(" "));
             Ok(())
-        }, || Ok(())).unwrap();
+        }, || panic!("only the listen-only flag changes"), || Ok(())).unwrap();
         assert_eq!(commands, [
             "link set can0 down",
             "link set can0 type can listen-only on",
             "link set can0 up",
         ]);
+    }
+
+    #[test]
+    fn rounded_fd_bitrate_is_rejected_before_bringing_the_link_up() {
+        let details = "2: can0: <NOARP> mtu 72\n\
+            can <FD> state STOPPED\n\
+            bitrate 500000 sample-point 0.875\n\
+            dbitrate 2000000 dsample-point 0.800";
+        let settings = ChannelSettings {
+            mode: FrameFormat::Fd,
+            bitrate: 500_000,
+            data_bitrate: Some(3_000_000),
+            listen_only: false,
+        };
+        let mut commands = Vec::new();
+        let error = open_reconfigured_socket("can0", details, settings, |args| {
+            commands.push(args.join(" "));
+            Ok(())
+        }, || Some(details.replace("2000000", "2962962")), || -> Result<(), CanOpenError> {
+            panic!("a socket must not open with the wrong bitrate")
+        }).unwrap_err();
+        assert!(error.to_string().contains("2962962 bit/s"));
+        assert_eq!(commands, [
+            "link set can0 type can bitrate 500000 listen-only off dbitrate 3000000 fd on",
+            "link set can0 type can bitrate 500000 sample-point 0.875 listen-only off dbitrate 2000000 dsample-point 0.800 fd on",
+        ]);
+    }
+
+    #[test]
+    fn socket_open_failure_returns_an_inactive_link_to_down() {
+        let mut commands = Vec::new();
+        let error = open_inactive_socket("vcan0", |args| {
+            commands.push(args.join(" "));
+            Ok(())
+        }, || Err::<(), _>("Socket open failed".into())).unwrap_err();
+        assert!(error.to_string().contains("Socket open failed"));
+        assert_eq!(commands, ["link set vcan0 up", "link set vcan0 down"]);
     }
 }

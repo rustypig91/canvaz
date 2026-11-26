@@ -334,6 +334,24 @@ test("CAN FD channel settings keep both bitrates and reject invalid data timing"
     assert.equal(h.saved[0].data_bitrate, 2000000);
 });
 
+test("Classical CAN rejects invalid nominal bitrates before saving", async () => {
+    const h = harness([{ backend: "socketcan", name: "can0" }]);
+    await h.context.openChannelDialog("add");
+    h.element("select-bitrate").value = "custom";
+    h.context.updateChannelTimingInDialog();
+    const input = h.element("input-bitrate-custom");
+    for (const value of ["", "0", "12345.5", "4294967296"]) {
+        input.value = value;
+        await h.context.saveChannelDialog();
+        assert.match(h.element("error-can-timing").textContent, /nominal bitrate/);
+        assert.equal(h.saved.length, 0);
+        assert.equal(h.element("dialog-channel").open, true);
+    }
+    input.value = "800000";
+    await h.context.saveChannelDialog();
+    assert.equal(h.saved[0].bitrate, 800000);
+});
+
 test("removing a Socketcand channel keeps it configured until backend removal succeeds", async () => {
     const h = harness();
     const name = "can://localhost/vcan0";
