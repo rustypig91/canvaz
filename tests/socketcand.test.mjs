@@ -47,7 +47,7 @@ function harness(ifaces = []) {
             assert.fail(command);
         },
         registerChannel: async config => { saved.push(config); return { handle: 7 }; },
-        changeChannelAssignment: async () => true, loadChannelDbc: async () => {},
+        changeChannelAssignment: async () => true, loadChannelDbc: async () => {}, reconcileSimMessages() {},
         restoreProjectEntries: async () => {}, refreshChannelList() {}, rebuildTraceColumns() {},
         renderDbcTree() {}, renderSimEntries() {}, scheduleAutoSave() {},
         log: (level, message) => { if (level === "error") assert.fail(message); },
@@ -218,6 +218,31 @@ test("editing a saved FD channel preserves timing if its driver stops reporting 
     assert.equal(channel.config.display_name, "Test bench");
     assert.equal(channel.config.mode, "fd");
     assert.equal(channel.config.data_bitrate, 4000000);
+});
+
+test("editing a channel reconciles simulation definitions after loading its DBC", async () => {
+    const iface = { backend: "socketcan", name: "can0" };
+    const h = harness([iface]);
+    const channel = { info: iface, config: { ...iface, bitrate: 500000, dbc_path: "classic.dbc" } };
+    h.context.channels.set(7, channel);
+    const replacement = { messages: { 291: { frame_format: "fd" } } };
+    const updates = [];
+    h.context.loadChannelDbc = async handle => {
+        assert.equal(handle, 7);
+        assert.equal(channel.config.dbc_path, "mixed.dbc");
+        channel.dbc = replacement;
+    };
+    h.context.reconcileSimMessages = handle => {
+        assert.equal(handle, 7);
+        assert.equal(channel.dbc, replacement);
+        updates.push("reconciled");
+    };
+    h.context.restoreProjectEntries = async () => { updates.push("restored"); };
+
+    await h.context.openChannelDialog("edit", 7);
+    h.context.dialogPendingDbc = "mixed.dbc";
+    await h.context.saveChannelDialog();
+    assert.deepEqual(updates, ["reconciled", "restored"]);
 });
 
 test("previously registered Socketcand addresses use the same remote controls", async () => {

@@ -2231,8 +2231,8 @@ async function recoverChannel(handle: number, resumeCapture: boolean) {
     if (!await openChannelByHandle(handle, resumeCapture) || !appRunning) return;
     if (resumeCapture) log("info", `Channel ${channelName(handle)} recovered`);
     renderChannelList();
+    reconcileSimMessages(handle);
     if (ch.dbc) {
-        reconcileSimMessages(handle);
         renderDbcTree((document.getElementById("signal-search") as HTMLInputElement).value);
         await restoreProjectEntries();
     }
@@ -2391,6 +2391,7 @@ async function saveChannelDialog() {
             await invoke("set_channel_display_name", { channelHandle: h, displayName: ch.config.display_name })
                 .catch(e => log("error", `Failed to set channel name: ${e}`));
             await loadChannelDbc(h);
+            reconcileSimMessages(h);
             await restoreProjectEntries();
         }
         const name = ch ? channelName(h) : String(h);
@@ -4148,20 +4149,18 @@ function simMessageSettings(entry: SimMessageEntry): SimMessageConfig["signals"]
         ...entry.signals.map(s => ({ name: s.def.name, value: s.value, generator: s.gen ?? null }))];
 }
 
-// Simulation entries cache their DBC definitions. Refresh them using the DBC
-// parsed at open, retaining values and generators until missing signals return.
+// Refresh cached simulation definitions after loading a DBC. Keep the saved
+// values and generators for any missing messages or signals.
 function reconcileSimMessages(handle: number) {
     const dbc = channels.get(handle)?.dbc;
-    if (!dbc) return;
     const simContainer = document.getElementById("sim-entries")!;
     for (const [key, entry] of simEntries) {
         if (entry.kind !== "message" || entry.channel !== handle) continue;
-        const msg = dbc.messages[entry.messageId];
+        const msg = dbc?.messages[entry.messageId];
         const settings = simMessageSettings(entry);
         if (!msg) {
-            // A reconnect can load an edited DBC that temporarily omits this
-            // message. Preserve the user's values, generators and armed state
-            // with the other unresolved project entries instead of losing them.
+            // Keep values, generators and armed state with the unresolved
+            // project entries until the DBC contains this message again.
             pendingSimMessages.push({
                 channel: handleToId(handle), message_id: entry.messageId,
                 message_is_extended: entry.messageId > 0x7FF, format: entry.format, brs: entry.brs,

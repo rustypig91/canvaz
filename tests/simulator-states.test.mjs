@@ -348,7 +348,7 @@ test("Socketcand reconnect preserves missing message simulations until their DBC
     const generator = { mode: "counter" };
     const missing = { messages: {} };
     const restored = { messages: { 123: { id: 123, name: "Engine", dlc: 2, signals: [signal] } } };
-    const opens = [missing, missing, restored];
+    const opens = [null, missing, restored];
     let transmissions = 0;
     const h = harness("message", async command => {
         if (command === "open_channel") return opens.shift();

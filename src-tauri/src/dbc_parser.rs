@@ -500,28 +500,29 @@ impl ParsedDbc {
         self.messages.get(&message_key(frame.can_id, frame.is_extended)).and_then(|msg| msg.decode_frame(frame).ok())
     }
 
-    /// Decode a frame on a J1939 channel: exact id match first, then by
-    /// (PGN, source address) — ignoring only the priority bits and, for PDU1
-    /// groups, the destination address. Returns the decoded message and the
-    /// DBC message id it matched, which callers store so signal-history
-    /// queries keyed on the DBC id can find these frames.
+    /// Decode a frame on a J1939 channel. Single frames prefer the full ID.
+    /// For reassembled payloads, match by (PGN, source address) and prefer a
+    /// layout that fits the payload length. Return the matched DBC key for
+    /// signal history lookups.
     pub fn decode_frame_j1939(&self, frame: &CanFrame, reassembled: bool) -> Option<(DecodedCanMessage, u32)> {
-        if let Some(msg) = self.messages.get(&message_key(frame.can_id, frame.is_extended))
-            .filter(|msg| msg.matches_payload(frame, reassembled))
-        {
+        let exact_key = message_key(frame.can_id, frame.is_extended);
+        let exact = self.messages.get(&exact_key).filter(|msg| msg.matches_payload(frame, reassembled));
+        let match_pgn = frame.is_extended && frame.metadata.format == FrameFormat::Classical;
+        if let Some(msg) = exact.filter(|_| !reassembled || !match_pgn) {
             return Some((msg.decode_data(&frame.data), msg.key));
         }
-        if !frame.is_extended || frame.metadata.format == FrameFormat::Fd {
+        if !match_pgn {
             return None;
         }
         let j = crate::j1939::decode_id(frame.can_id);
-        let key = (j.pgn << 8) | j.sa as u32;
+        let key = (j.pgn << 8) | u32::from(j.sa);
         let len = frame.data.len() as u64;
-        let msg = self.pgn_index.get(&key)?.iter()
+        let msg = self.pgn_index.get(&key).into_iter().flatten()
             .filter_map(|id| self.messages.get(id))
             .filter(|msg| msg.matches_payload(frame, reassembled))
-            // Prefer a layout that fits the received payload, then the closest length.
-            .min_by_key(|msg| (msg.dlc > len, msg.dlc.abs_diff(len), msg.key))?;
+            // Prefer a fitting layout and the closest length. Use the full ID to break ties.
+            .min_by_key(|msg| (msg.dlc > len, msg.dlc.abs_diff(len), msg.key != exact_key, msg.key))
+            .or(exact)?;
         Some((msg.decode_data(&frame.data), msg.key))
     }
 
@@ -1029,10 +1030,12 @@ BA_ "VFrameFormat" BO_ 2364531712 2;
         let (_, key) = dbc.decode_frame_j1939(&incoming, false).unwrap();
         assert_eq!(key, single_id);
 
-        incoming.can_id = 0x1CF00400;
         incoming.data.resize(12, 0);
-        let (_, key) = dbc.decode_frame_j1939(&incoming, true).unwrap();
-        assert_eq!(key, transport_id);
+        for can_id in [single_id, transport_id, 0x1CF00400] {
+            incoming.can_id = can_id;
+            let (_, key) = dbc.decode_frame_j1939(&incoming, true).unwrap();
+            assert_eq!(key, transport_id);
+        }
     }
 
     #[test]
