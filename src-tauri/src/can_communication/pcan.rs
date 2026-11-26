@@ -370,16 +370,14 @@ unsafe impl Send for PcanRxHandle {}
 impl RxHandle for PcanRxHandle {
     fn receive(&mut self, timeout_ms: u64) -> Result<Option<CanFrame>, String> {
         let ch = &*self.0;
-        let deadline =
-            std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-
-        loop {
-            let mut msg = TPCANMsgFd { id: 0, msg_type: 0, dlc: 0, data: [0; 64] };
-            let (s, hw_ms, api) = if let Some(fd) = ch.fd {
+        if let Some(fd) = ch.fd {
+            Self::receive_pcan_frame(timeout_ms, &ch.ts_anchor, "CAN_ReadFD", |msg| {
                 let mut micros = 0u64;
-                let status = unsafe { (fd.read)(ch.handle, &mut msg, &mut micros) };
-                (status, micros / 1_000, "CAN_ReadFD")
-            } else {
+                let status = unsafe { (fd.read)(ch.handle, msg, &mut micros) };
+                (status, micros / 1_000)
+            })
+        } else {
+            Self::receive_pcan_frame(timeout_ms, &ch.ts_anchor, "CAN_Read", |msg| {
                 let mut classic = TPCANMsg { id: 0, msg_type: 0, len: 0, data: [0; 8] };
                 let mut ts = TPCANTimestamp { millis: 0, millis_overflow: 0, micros: 0 };
                 let status = unsafe { (ch.lib.read)(ch.handle, &mut classic, &mut ts) };
@@ -387,19 +385,49 @@ impl RxHandle for PcanRxHandle {
                 msg.msg_type = classic.msg_type;
                 msg.dlc = classic.len;
                 msg.data[..8].copy_from_slice(&classic.data);
-                (status, u64::from(ts.millis_overflow) * 0x1_0000_0000 + u64::from(ts.millis), "CAN_Read")
-            };
+                (status, u64::from(ts.millis_overflow) * 0x1_0000_0000 + u64::from(ts.millis))
+            })
+        }
+    }
+
+    fn poll_status(&mut self) -> Option<BusStatus> {
+        let ch = &*self.0;
+        // SAFETY: handle is a valid initialized channel.
+        let s = unsafe { (ch.lib.get_status)(ch.handle) };
+        Some(BusStatus {
+            bus_state: Some(pcan_bus_state(s)),
+            ..BusStatus::default()
+        })
+    }
+
+    fn close(&mut self) {}
+}
+
+impl PcanRxHandle {
+    fn receive_pcan_frame(
+        timeout_ms: u64,
+        ts_anchor: &Mutex<Option<(u64, u64)>>,
+        api: &str,
+        mut read: impl FnMut(&mut TPCANMsgFd) -> (TPCANStatus, u64),
+    ) -> Result<Option<CanFrame>, String> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+
+        loop {
+            let mut msg = TPCANMsgFd { id: 0, msg_type: 0, dlc: 0, data: [0; 64] };
+            let (s, hw_ms) = read(&mut msg);
             let s_primary = s & !PCAN_ERROR_ANYBUSERR;
 
-            if s_primary == PCAN_ERROR_OK {
-                // Skip RTR, echo and status frames; error frames pass through
-                // as distinct error rows, everything else as data frames.
-                if msg.msg_type & (PCAN_MESSAGE_RTR | PCAN_MESSAGE_ECHO | PCAN_MESSAGE_STATUS) != 0 {
-                    if std::time::Instant::now() >= deadline {
-                        return Ok(None);
-                    }
-                    continue;
+            // Read/ReadFD return the status code carried by a status frame,
+            // including RX overruns. The next queued frame can still be read.
+            let skip = msg.msg_type & PCAN_MESSAGE_STATUS != 0
+                || (s_primary == PCAN_ERROR_OK && msg.msg_type & (PCAN_MESSAGE_RTR | PCAN_MESSAGE_ECHO) != 0);
+            if skip {
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
                 }
+                continue;
+            }
+            if s_primary == PCAN_ERROR_OK {
                 let fd_frame = msg.msg_type & PCAN_MESSAGE_FD != 0 && msg.msg_type & PCAN_MESSAGE_ERRFRAME == 0;
                 let len = if fd_frame {
                     fd_dlc_to_len(msg.dlc).ok_or_else(|| format!("PCAN returned invalid CAN FD DLC {}", msg.dlc))?
@@ -408,7 +436,7 @@ impl RxHandle for PcanRxHandle {
                 // may not reset its counter at CAN_Initialize (it can count from driver
                 // load or device plug-in), so we cannot simply add open_time_ms.
                 let abs_ms = {
-                    let mut anchor = ch.ts_anchor.lock().unwrap();
+                    let mut anchor = ts_anchor.lock().unwrap();
                     if anchor.is_none() {
                         let now = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -455,18 +483,6 @@ impl RxHandle for PcanRxHandle {
             }
         }
     }
-
-    fn poll_status(&mut self) -> Option<BusStatus> {
-        let ch = &*self.0;
-        // SAFETY: handle is a valid initialized channel.
-        let s = unsafe { (ch.lib.get_status)(ch.handle) };
-        Some(BusStatus {
-            bus_state: Some(pcan_bus_state(s)),
-            ..BusStatus::default()
-        })
-    }
-
-    fn close(&mut self) {}
 }
 
 fn pcan_bus_state(status: TPCANStatus) -> BusState {
@@ -681,6 +697,36 @@ mod tests {
             assert_eq!(parameter, PCAN_BUSSPEED_NOMINAL);
             Ok(500_000)
         }).is_ok());
+    }
+
+    #[test]
+    fn pcan_capture_continues_after_an_overrun_status_frame() {
+        const PCAN_ERROR_OVERRUN: TPCANStatus = 0x00002;
+        const PCAN_ERROR_INITIALIZE: TPCANStatus = 0x0400_0000;
+        let anchor = Mutex::new(None);
+        let mut statuses = [PCAN_ERROR_OVERRUN, PCAN_ERROR_OK, PCAN_ERROR_INITIALIZE].into_iter();
+        let mut read = |msg: &mut TPCANMsgFd| {
+            let status = statuses.next().unwrap();
+            match status {
+                PCAN_ERROR_OVERRUN => msg.msg_type = PCAN_MESSAGE_STATUS,
+                PCAN_ERROR_OK => {
+                    msg.id = 0x123;
+                    msg.msg_type = PCAN_MESSAGE_FD | PCAN_MESSAGE_BRS | PCAN_MESSAGE_EXTENDED;
+                    msg.dlc = 9;
+                    msg.data[..12].fill(0xAB);
+                }
+                _ => {}
+            }
+            (status, 1)
+        };
+
+        let frame = PcanRxHandle::receive_pcan_frame(100, &anchor, "CAN_ReadFD", &mut read).unwrap().unwrap();
+        assert_eq!(frame.can_id, 0x123);
+        assert!(frame.is_extended);
+        assert_eq!(frame.metadata, FrameMetadata::fd(true, false));
+        assert_eq!(frame.data, [0xAB; 12]);
+        let failure = PcanRxHandle::receive_pcan_frame(100, &anchor, "CAN_ReadFD", read).unwrap_err();
+        assert!(failure.contains("not initialized"));
     }
 
     #[test]
